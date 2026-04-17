@@ -128,11 +128,16 @@ pub fn make_encoder_with_options(
         .height
         .ok_or_else(|| Error::invalid("Theora encoder: missing height"))?;
     let pix = params.pixel_format.unwrap_or(CorePixelFormat::Yuv420P);
-    if pix != CorePixelFormat::Yuv420P {
-        return Err(Error::unsupported(format!(
-            "Theora encoder: only Yuv420P supported (got {pix:?})"
-        )));
-    }
+    let theora_pf = match pix {
+        CorePixelFormat::Yuv420P => TheoraPixelFormat::Yuv420,
+        CorePixelFormat::Yuv422P => TheoraPixelFormat::Yuv422,
+        CorePixelFormat::Yuv444P => TheoraPixelFormat::Yuv444,
+        other => {
+            return Err(Error::unsupported(format!(
+                "Theora encoder: only Yuv420P/Yuv422P/Yuv444P supported (got {other:?})"
+            )));
+        }
+    };
     if width == 0 || height == 0 {
         return Err(Error::invalid("Theora encoder: zero frame dimensions"));
     }
@@ -143,12 +148,8 @@ pub fn make_encoder_with_options(
         return Err(Error::invalid("Theora encoder: qi must be <= 63"));
     }
     let me_range = opts.me_range.clamp(1, 15);
-
-    let theora_pf = TheoraPixelFormat::Yuv420;
     let fmbw = width.div_ceil(16) as u16;
     let fmbh = height.div_ceil(16) as u16;
-    let frame_w = fmbw as u32 * 16;
-    let frame_h = fmbh as u32 * 16;
 
     let setup = parse_setup_header(STANDARD_SETUP)?;
     let huff_tables = build_all(&setup.huffs);
@@ -177,7 +178,7 @@ pub fn make_encoder_with_options(
     output_params.codec_id = CodecId::new(crate::CODEC_ID_STR);
     output_params.width = Some(width);
     output_params.height = Some(height);
-    output_params.pixel_format = Some(CorePixelFormat::Yuv420P);
+    output_params.pixel_format = Some(theora_pf.to_core());
     output_params.extradata = xiph_lace(&[&id_packet, &comment_packet, &setup_packet]);
 
     let time_base = params
@@ -188,8 +189,7 @@ pub fn make_encoder_with_options(
         output_params,
         width,
         height,
-        frame_w,
-        frame_h,
+        pf: theora_pf,
         layout,
         setup,
         huff_tables,
@@ -214,8 +214,7 @@ struct TheoraEncoder {
     output_params: CodecParameters,
     width: u32,
     height: u32,
-    frame_w: u32,
-    frame_h: u32,
+    pf: TheoraPixelFormat,
     layout: FrameLayout,
     setup: Setup,
     huff_tables: Vec<HuffTable>,
@@ -257,9 +256,10 @@ impl Encoder for TheoraEncoder {
                 "Theora encoder: frame dimensions do not match encoder config",
             ));
         }
-        if v.format != CorePixelFormat::Yuv420P {
+        if v.format != self.pf.to_core() {
             return Err(Error::invalid(format!(
-                "Theora encoder: expected Yuv420P, got {:?}",
+                "Theora encoder: expected {:?}, got {:?}",
+                self.pf.to_core(),
                 v.format
             )));
         }
@@ -391,7 +391,7 @@ impl TheoraEncoder {
         let mut modes = vec![Mode::InterNoMv; nbs];
         let mut mvs = vec![(0i32, 0i32); nbs];
 
-        let pf = TheoraPixelFormat::Yuv420;
+        let pf = self.pf;
         for d in &mb_decisions {
             // Luma blocks.
             for &bi in &d.luma_bis {
@@ -399,12 +399,11 @@ impl TheoraEncoder {
                 mvs[bi] = d.mv;
                 bcoded[bi] = d.bcoded;
             }
-            // Chroma blocks: derive from MB.
+            // Chroma blocks: derive from MB. Chroma MV scaling per Table 7.34.
+            let (cmx, _) = crate::inter::chroma_mv_split(d.mv.0, pf, false);
+            let (cmy, _) = crate::inter::chroma_mv_split(d.mv.1, pf, true);
             for &bj in &d.chroma_bis {
                 modes[bj] = d.mode;
-                // Chroma MV: spec uses /2 round-towards-zero for 4:2:0.
-                let (cmx, _) = crate::inter::chroma_mv_split(d.mv.0, pf, false);
-                let (cmy, _) = crate::inter::chroma_mv_split(d.mv.1, pf, true);
                 mvs[bj] = (cmx, cmy);
                 bcoded[bj] = d.bcoded;
             }
@@ -535,14 +534,14 @@ impl TheoraEncoder {
     fn fetch_block_pixels(&self, frame: &VideoFrame, pli: usize, bx: u32, by: u32) -> [f32; 64] {
         let plane = &frame.planes[pli];
         let stride = plane.stride;
-        let (sw, sh) = match pli {
-            0 => (frame.width as i32, frame.height as i32),
-            _ => ((frame.width / 2) as i32, (frame.height / 2) as i32),
+        let (sx, sy) = if pli == 0 {
+            (0u32, 0u32)
+        } else {
+            (self.pf.chroma_shift_x(), self.pf.chroma_shift_y())
         };
-        let (_cw, ch) = match pli {
-            0 => (self.frame_w as i32, self.frame_h as i32),
-            _ => ((self.frame_w / 2) as i32, (self.frame_h / 2) as i32),
-        };
+        let (sw, sh) = ((frame.width >> sx) as i32, (frame.height >> sy) as i32);
+        let layout_plane = &self.layout.planes[pli];
+        let (_cw, ch) = ((layout_plane.nbw * 8) as i32, (layout_plane.nbh * 8) as i32);
         let bx_px = (bx * 8) as i32;
         let by_px_bottom = (by * 8) as i32;
         let top_row_coded = ch - 1 - (by_px_bottom + 7);
@@ -585,7 +584,7 @@ impl TheoraEncoder {
         // top-left in top-down coords
         let bx_top = bx_px;
         let by_top = ph - 1 - (by_px_bottom + 7);
-        let pf = TheoraPixelFormat::Yuv420;
+        let pf = self.pf;
         let (sub_x, sub_y) = if pli == 0 {
             (false, false)
         } else {
@@ -702,12 +701,28 @@ impl TheoraEncoder {
                         layout.global_coded(0, bxs[2], bys[2]) as usize,
                         layout.global_coded(0, bxs[3], bys[3]) as usize,
                     ];
-                    // Chroma blocks (4:2:0: one 8x8 per chroma plane per MB).
-                    let mut chroma_bis = Vec::with_capacity(2);
+                    // Chroma blocks per MB depend on pixel format:
+                    //   4:2:0 → 1 per chroma plane (2 total)
+                    //   4:2:2 → 2 per chroma plane, stacked vertically (4 total)
+                    //   4:4:4 → 4 per chroma plane, 2×2 tile (8 total)
+                    let (cbx_base, cby_base, dxr, dyr) = match self.pf {
+                        TheoraPixelFormat::Yuv420 => (mbx, mby, 1u32, 1u32),
+                        TheoraPixelFormat::Yuv422 => (mbx, mby * 2, 1u32, 2u32),
+                        TheoraPixelFormat::Yuv444 | TheoraPixelFormat::Reserved => {
+                            (mbx * 2, mby * 2, 2u32, 2u32)
+                        }
+                    };
+                    let mut chroma_bis = Vec::with_capacity(2 * (dxr * dyr) as usize);
                     for pli in 1..3 {
                         let cplane = &layout.planes[pli];
-                        if mbx < cplane.nbw && mby < cplane.nbh {
-                            chroma_bis.push(layout.global_coded(pli, mbx, mby) as usize);
+                        for dy in 0..dyr {
+                            for dx in 0..dxr {
+                                let cx = cbx_base + dx;
+                                let cy = cby_base + dy;
+                                if cx < cplane.nbw && cy < cplane.nbh {
+                                    chroma_bis.push(layout.global_coded(pli, cx, cy) as usize);
+                                }
+                            }
                         }
                     }
 
@@ -994,7 +1009,7 @@ impl TheoraEncoder {
         golden_ref: Option<&[Vec<u8>; 3]>,
     ) -> [Vec<u8>; 3] {
         let id = &self.layout;
-        let pf = TheoraPixelFormat::Yuv420;
+        let pf = self.pf;
         let nbs = self.layout.nbs as usize;
 
         // Restore the original quantised coefficients (un-predict DC) into

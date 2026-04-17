@@ -903,3 +903,251 @@ fn ogg_crc32(data: &[u8]) -> u32 {
     }
     crc
 }
+
+// --- chroma-subsampling roundtrip tests (4:2:2 and 4:4:4) ----------------
+
+/// Generate a synthetic 64x64 frame in the requested chroma format with
+/// distinct, non-flat content on all three planes. Luma is a
+/// diagonal gradient, Cb encodes column index, Cr encodes row index.
+fn make_synthetic_frame(fmt: PixelFormat) -> VideoFrame {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let mut y = vec![0u8; (w * h) as usize];
+    for j in 0..h {
+        for i in 0..w {
+            y[(j * w + i) as usize] = ((i + j) * 2).min(255) as u8;
+        }
+    }
+    let (cw, ch) = match fmt {
+        PixelFormat::Yuv420P => (w / 2, h / 2),
+        PixelFormat::Yuv422P => (w / 2, h),
+        PixelFormat::Yuv444P => (w, h),
+        _ => panic!("unsupported chroma format"),
+    };
+    let mut u = vec![0u8; (cw * ch) as usize];
+    let mut v = vec![0u8; (cw * ch) as usize];
+    for j in 0..ch {
+        for i in 0..cw {
+            u[(j * cw + i) as usize] = (64 + i * 2).min(255) as u8;
+            v[(j * cw + i) as usize] = (64 + j * 2).min(255) as u8;
+        }
+    }
+    VideoFrame {
+        format: fmt,
+        width: w,
+        height: h,
+        pts: Some(0),
+        time_base: TimeBase::new(1, 24),
+        planes: vec![
+            VideoPlane {
+                stride: w as usize,
+                data: y,
+            },
+            VideoPlane {
+                stride: cw as usize,
+                data: u,
+            },
+            VideoPlane {
+                stride: cw as usize,
+                data: v,
+            },
+        ],
+    }
+}
+
+fn psnr_plane(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mut sse: f64 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let d = *x as f64 - *y as f64;
+        sse += d * d;
+    }
+    let mse = sse / a.len() as f64;
+    if mse <= 0.0 {
+        return 99.0;
+    }
+    10.0 * (255.0_f64 * 255.0 / mse).log10()
+}
+
+fn roundtrip_chroma_format(fmt: PixelFormat) -> (VideoFrame, VideoFrame) {
+    let frame = make_synthetic_frame(fmt);
+    // Build encoder for this chroma format.
+    let mut params = CodecParameters::video(CodecId::new("theora"));
+    params.media_type = MediaType::Video;
+    params.width = Some(frame.width);
+    params.height = Some(frame.height);
+    params.pixel_format = Some(fmt);
+    params.frame_rate = Some(Rational::new(24, 1));
+    let mut enc = make_encoder_for_tests(&params).expect("encoder");
+    enc.send_frame(&Frame::Video(frame.clone())).expect("send");
+    let mut pkts = Vec::new();
+    while let Ok(p) = enc.receive_packet() {
+        pkts.push(p);
+    }
+    assert!(pkts.len() >= 4, "expected 3 headers + 1 frame");
+
+    // Decode via own decoder.
+    let extradata = enc.output_params().extradata.clone();
+    let mut p2 = CodecParameters::video(CodecId::new("theora"));
+    p2.extradata = extradata;
+    let mut dec = make_decoder_for_tests(&p2).expect("decoder");
+    let pkt = Packet::new(0, TimeBase::new(1, 24), pkts[3].data.clone());
+    dec.send_packet(&pkt).expect("send packet");
+    let decoded = match dec.receive_frame().expect("receive frame") {
+        Frame::Video(v) => v,
+        _ => panic!(),
+    };
+    assert_eq!(decoded.format, fmt);
+    assert_eq!(decoded.width, frame.width);
+    assert_eq!(decoded.height, frame.height);
+    (frame, decoded)
+}
+
+#[test]
+fn roundtrip_yuv420p_intra_psnr_per_plane() {
+    let (orig, dec) = roundtrip_chroma_format(PixelFormat::Yuv420P);
+    for pli in 0..3 {
+        let p = psnr_plane(&orig.planes[pli].data, &dec.planes[pli].data);
+        eprintln!("Yuv420P plane {pli}: PSNR = {p:.2} dB");
+        assert!(p > 35.0, "Yuv420P plane {pli} PSNR {p:.2} dB < 35");
+    }
+}
+
+#[test]
+fn roundtrip_yuv422p_intra_psnr_per_plane() {
+    let (orig, dec) = roundtrip_chroma_format(PixelFormat::Yuv422P);
+    for pli in 0..3 {
+        let p = psnr_plane(&orig.planes[pli].data, &dec.planes[pli].data);
+        eprintln!("Yuv422P plane {pli}: PSNR = {p:.2} dB");
+        assert!(p > 35.0, "Yuv422P plane {pli} PSNR {p:.2} dB < 35");
+    }
+}
+
+#[test]
+fn roundtrip_yuv444p_intra_psnr_per_plane() {
+    let (orig, dec) = roundtrip_chroma_format(PixelFormat::Yuv444P);
+    for pli in 0..3 {
+        let p = psnr_plane(&orig.planes[pli].data, &dec.planes[pli].data);
+        eprintln!("Yuv444P plane {pli}: PSNR = {p:.2} dB");
+        assert!(p > 35.0, "Yuv444P plane {pli} PSNR {p:.2} dB < 35");
+    }
+}
+
+/// Encode a small clip (5 frames: 1 I + 4 P) in the given chroma format,
+/// decode via the bundled decoder, and check per-plane PSNR on the final
+/// P-frame. Exercises the inter-frame chroma MB block layout.
+fn roundtrip_chroma_format_pframe(fmt: PixelFormat) -> Vec<VideoFrame> {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let (cw, ch) = match fmt {
+        PixelFormat::Yuv420P => (w / 2, h / 2),
+        PixelFormat::Yuv422P => (w / 2, h),
+        PixelFormat::Yuv444P => (w, h),
+        _ => panic!(),
+    };
+    let mut frames = Vec::new();
+    for f in 0..5u32 {
+        let mut y = vec![0u8; (w * h) as usize];
+        for j in 0..h {
+            for i in 0..w {
+                y[(j * w + i) as usize] = ((i + j + f) * 2).min(255) as u8;
+            }
+        }
+        // Translate a 16x16 bright rectangle horizontally by 1 pixel/frame.
+        let rx = (4 + f) % (w - 16);
+        let ry = 20u32;
+        for j in 0..16u32 {
+            for i in 0..16u32 {
+                y[((ry + j) * w + (rx + i)) as usize] = 220;
+            }
+        }
+        let mut u = vec![0u8; (cw * ch) as usize];
+        let mut v = vec![0u8; (cw * ch) as usize];
+        for j in 0..ch {
+            for i in 0..cw {
+                u[(j * cw + i) as usize] = (64 + i * 2).min(255) as u8;
+                v[(j * cw + i) as usize] = (64 + j * 2).min(255) as u8;
+            }
+        }
+        frames.push(VideoFrame {
+            format: fmt,
+            width: w,
+            height: h,
+            pts: Some(f as i64),
+            time_base: TimeBase::new(1, 24),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: cw as usize,
+                    data: u,
+                },
+                VideoPlane {
+                    stride: cw as usize,
+                    data: v,
+                },
+            ],
+        });
+    }
+    let mut params = CodecParameters::video(CodecId::new("theora"));
+    params.media_type = MediaType::Video;
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(fmt);
+    params.frame_rate = Some(Rational::new(24, 1));
+    let opts = EncoderOptions {
+        keyint: 10,
+        ..Default::default()
+    };
+    let mut enc = make_encoder_with_options(&params, opts).expect("encoder");
+    let mut frame_pkts: Vec<Packet> = Vec::new();
+    let mut header_pkts: Vec<Packet> = Vec::new();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        while let Ok(p) = enc.receive_packet() {
+            if p.flags.header {
+                header_pkts.push(p);
+            } else {
+                frame_pkts.push(p);
+            }
+        }
+    }
+    assert_eq!(header_pkts.len(), 3);
+    assert_eq!(frame_pkts.len(), frames.len());
+
+    let extradata = enc.output_params().extradata.clone();
+    let mut p2 = CodecParameters::video(CodecId::new("theora"));
+    p2.extradata = extradata;
+    let mut dec = make_decoder_for_tests(&p2).expect("decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    for p in &frame_pkts {
+        let pkt = Packet::new(0, TimeBase::new(1, 24), p.data.clone());
+        dec.send_packet(&pkt).expect("send packet");
+        while let Ok(f) = dec.receive_frame() {
+            if let Frame::Video(v) = f {
+                decoded.push(v);
+            }
+        }
+    }
+    assert_eq!(decoded.len(), frames.len());
+    for (orig, got) in frames.iter().zip(decoded.iter()) {
+        for pli in 0..3 {
+            let p = psnr_plane(&orig.planes[pli].data, &got.planes[pli].data);
+            eprintln!("{fmt:?} pframe plane {pli}: PSNR = {p:.2} dB");
+            assert!(p > 28.0, "{fmt:?} plane {pli} PSNR {p:.2} < 28");
+        }
+    }
+    decoded
+}
+
+#[test]
+fn roundtrip_yuv422p_pframe_clip() {
+    let _ = roundtrip_chroma_format_pframe(PixelFormat::Yuv422P);
+}
+
+#[test]
+fn roundtrip_yuv444p_pframe_clip() {
+    let _ = roundtrip_chroma_format_pframe(PixelFormat::Yuv444P);
+}

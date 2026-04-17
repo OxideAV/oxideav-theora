@@ -37,7 +37,9 @@ pub mod inter;
 pub mod quant;
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
+use oxideav_core::{
+    CodecCapabilities, CodecId, CodecParameters, PixelFormat as CorePixelFormat, Result,
+};
 
 pub const CODEC_ID_STR: &str = "theora";
 
@@ -46,12 +48,22 @@ pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("theora_sw")
         .with_lossy(true)
         .with_intra_only(false)
-        .with_max_size(16384, 16384);
+        .with_max_size(16384, 16384)
+        .with_pixel_formats(vec![
+            CorePixelFormat::Yuv420P,
+            CorePixelFormat::Yuv422P,
+            CorePixelFormat::Yuv444P,
+        ]);
     reg.register_decoder_impl(cid.clone(), caps, make_decoder);
     let enc_caps = CodecCapabilities::video("theora_sw_enc")
         .with_lossy(true)
         .with_intra_only(false)
-        .with_max_size(16384, 16384);
+        .with_max_size(16384, 16384)
+        .with_pixel_formats(vec![
+            CorePixelFormat::Yuv420P,
+            CorePixelFormat::Yuv422P,
+            CorePixelFormat::Yuv444P,
+        ]);
     reg.register_encoder_impl(cid, enc_caps, make_encoder);
 }
 

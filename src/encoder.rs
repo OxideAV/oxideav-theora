@@ -84,6 +84,34 @@ const LAST_MV_BONUS: i32 = 128;
 /// introduces a RFI flip during DC prediction + breaks the last_mv chain).
 const GOLDEN_PENALTY: i32 = 128;
 
+/// Additional SAD margin charged against INTER_MV_FOUR vs INTER_MV. 4-MV
+/// transmits four MV VLCs (~6-10 bits each) instead of one, plus a longer
+/// mode codeword (rank 7 = 7 leading 1-bits). The margin is expressed in the
+/// same SAD units the rest of the scoreboard uses; 4-MV must therefore save
+/// ~this many SAD units relative to the 1-MV best before it becomes the
+/// winner. Empirically a budget around 3× `MV_GAIN_THRESHOLD` keeps 4-MV from
+/// being emitted on translation-only content while still letting it win on
+/// inputs with genuine per-sub-block motion.
+const FOUR_MV_PENALTY: i32 = 3 * MV_GAIN_THRESHOLD;
+
+/// Half-pel refinement radius (in half-pel units) around a full-pel seed. We
+/// test the eight half-pel neighbours at distance 1.
+const HALF_PEL_NEIGHBOURS: &[(i32, i32)] = &[
+    (-1, 0),
+    (1, 0),
+    (0, -1),
+    (0, 1),
+    (-1, -1),
+    (-1, 1),
+    (1, -1),
+    (1, 1),
+];
+
+/// Diamond-search offsets (half-pel units, step 2 = full-pel) used during the
+/// per-sub-block motion search. The diamond is the classic 4-neighbour
+/// pattern; we restart from the new best each round until convergence.
+const DIAMOND_FULL_PEL: &[(i32, i32)] = &[(-2, 0), (2, 0), (0, -2), (0, 2)];
+
 /// Encoder tunable options exposed by [`make_encoder_with_options`].
 #[derive(Clone, Debug)]
 pub struct EncoderOptions {
@@ -393,15 +421,33 @@ impl TheoraEncoder {
 
         let pf = self.pf;
         for d in &mb_decisions {
-            // Luma blocks.
-            for &bi in &d.luma_bis {
-                modes[bi] = d.mode;
-                mvs[bi] = d.mv;
-                bcoded[bi] = d.bcoded;
+            // Luma blocks: per-sub-block MVs for 4-MV, else the shared MB MV.
+            if d.mode == Mode::InterMvFour {
+                for (i, &bi) in d.luma_bis.iter().enumerate() {
+                    modes[bi] = d.mode;
+                    mvs[bi] = d.mvs4[i];
+                    bcoded[bi] = d.bcoded;
+                }
+            } else {
+                for &bi in &d.luma_bis {
+                    modes[bi] = d.mode;
+                    mvs[bi] = d.mv;
+                    bcoded[bi] = d.bcoded;
+                }
             }
-            // Chroma blocks: derive from MB. Chroma MV scaling per Table 7.34.
-            let (cmx, _) = crate::inter::chroma_mv_split(d.mv.0, pf, false);
-            let (cmy, _) = crate::inter::chroma_mv_split(d.mv.1, pf, true);
+            // Chroma blocks: for INTER_MV_FOUR the decoder uses the average of
+            // the four luma MVs directly (luma-scale half-pel units), and
+            // `motion_compensate` handles the chroma sub-sampling via `sub_x`/
+            // `sub_y`. For other modes, the encoder pre-scales via
+            // `chroma_mv_split` (existing behaviour; matches the decoder's
+            // storage model for those modes).
+            let (cmx, cmy) = if d.mode == Mode::InterMvFour {
+                d.mv
+            } else {
+                let (x, _) = crate::inter::chroma_mv_split(d.mv.0, pf, false);
+                let (y, _) = crate::inter::chroma_mv_split(d.mv.1, pf, true);
+                (x, y)
+            };
             for &bj in &d.chroma_bis {
                 modes[bj] = d.mode;
                 mvs[bj] = (cmx, cmy);
@@ -650,6 +696,76 @@ impl TheoraEncoder {
         s
     }
 
+    /// Search for the best MV for one luma 8×8 sub-block starting from
+    /// `seed_mv`. Runs a radius-`radius` diamond search (full-pel stride),
+    /// then a half-pel refinement. Returns (best_mv, best_sad).
+    ///
+    /// `radius` is the cap on how far the diamond is allowed to stray from
+    /// the seed, measured in full-pels; we also clamp absolute MV magnitude
+    /// to the ±31 half-pel VLC range.
+    fn subblock_search(
+        &self,
+        frame: &VideoFrame,
+        prev: &[Vec<u8>; 3],
+        bx: u32,
+        by: u32,
+        seed_mv: (i32, i32),
+        radius: i32,
+    ) -> ((i32, i32), i32) {
+        let clamp_mv =
+            |mv: (i32, i32)| -> (i32, i32) { (mv.0.clamp(-31, 31), mv.1.clamp(-31, 31)) };
+        let mut best_mv = clamp_mv(seed_mv);
+        let mut best_sad = self.block_sad(frame, prev, 0, bx, by, best_mv);
+        // Evaluate the seed and also the zero-MV as a baseline.
+        let zero_sad = self.block_sad(frame, prev, 0, bx, by, (0, 0));
+        if zero_sad < best_sad {
+            best_sad = zero_sad;
+            best_mv = (0, 0);
+        }
+
+        // Diamond search, stopping when no neighbour improves SAD. Capped at
+        // `2 * radius` iterations to bound worst-case cost.
+        let max_iters = (radius as usize).saturating_mul(2).max(4);
+        for _ in 0..max_iters {
+            let mut improved = false;
+            for &(dx, dy) in DIAMOND_FULL_PEL {
+                let mv = (best_mv.0 + dx, best_mv.1 + dy);
+                // Stay within seed-anchored radius (full-pel) + VLC range.
+                let dx_full = (mv.0 - seed_mv.0) >> 1;
+                let dy_full = (mv.1 - seed_mv.1) >> 1;
+                if dx_full.abs() > radius || dy_full.abs() > radius {
+                    continue;
+                }
+                if mv.0.abs() > 31 || mv.1.abs() > 31 {
+                    continue;
+                }
+                let sad = self.block_sad(frame, prev, 0, bx, by, mv);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_mv = mv;
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+
+        // Half-pel refine around the winning full-pel MV.
+        for &(hx, hy) in HALF_PEL_NEIGHBOURS {
+            let mv = (best_mv.0 + hx, best_mv.1 + hy);
+            if mv.0.abs() > 31 || mv.1.abs() > 31 {
+                continue;
+            }
+            let sad = self.block_sad(frame, prev, 0, bx, by, mv);
+            if sad < best_sad {
+                best_sad = sad;
+                best_mv = mv;
+            }
+        }
+        (best_mv, best_sad)
+    }
+
     /// Sum of absolute deviations of an MB's source from its mean (proxy for
     /// intra coding cost; high value → block has lots of detail).
     fn mb_sad_intra(&self, frame: &VideoFrame, bxs: [u32; 4], bys: [u32; 4]) -> i32 {
@@ -737,6 +853,7 @@ impl TheoraEncoder {
                             mby,
                             mode: Mode::InterNoMv,
                             mv: (0, 0),
+                            mvs4: [(0, 0); 4],
                             bcoded: false,
                             luma_bis: bis,
                             chroma_bis,
@@ -765,6 +882,42 @@ impl TheoraEncoder {
                             }
                         }
                     }
+
+                    // Half-pel refinement around the full-pel best.
+                    if best_mv != (0, 0) {
+                        for &(hx, hy) in HALF_PEL_NEIGHBOURS {
+                            let mv = (best_mv.0 + hx, best_mv.1 + hy);
+                            // Stay within the MV VLC range (±31 half-pel).
+                            if mv.0.abs() > 31 || mv.1.abs() > 31 {
+                                continue;
+                            }
+                            let sad = self.mb_sad(frame, prev, bxs, bys, mv);
+                            if sad < best_sad {
+                                best_sad = sad;
+                                best_mv = mv;
+                            }
+                        }
+                    }
+
+                    // Per-sub-block (4-MV) motion search: each 8x8 luma
+                    // sub-block gets its own MV. Seed each block's search
+                    // from the 16x16 best MV; run a diamond pattern of radius
+                    // ±FOUR_MV_DIAMOND_STEPS (capped at me_range), then
+                    // finish with a half-pel refine.
+                    let mut mvs4 = [best_mv; 4];
+                    let mut sad4 = [0i32; 4];
+                    for i in 0..4 {
+                        let (bx, by) = (bxs[i], bys[i]);
+                        let (mv, sad) = self.subblock_search(frame, prev, bx, by, best_mv, r);
+                        mvs4[i] = mv;
+                        sad4[i] = sad;
+                    }
+                    let total_sad4: i32 = sad4.iter().sum();
+                    // Average the 4 MVs (matches decoder's chroma derivation:
+                    // `(sum_x / 4, sum_y / 4)` via `div_euclid`).
+                    let avg_x = mvs4.iter().map(|m| m.0).sum::<i32>().div_euclid(4);
+                    let avg_y = mvs4.iter().map(|m| m.1).sum::<i32>().div_euclid(4);
+                    let avg_mv = (avg_x, avg_y);
 
                     // LAST / LAST2 candidates: evaluate SAD at the two prior
                     // MVs. If either beats INTER_NOMV and is close to the
@@ -836,6 +989,10 @@ impl TheoraEncoder {
                             MV_GAIN_THRESHOLD
                         },
                     );
+                    // 4-MV: total SAD from per-sub-block best + extra bit
+                    // cost for transmitting four MV VLCs (vs the one VLC pair
+                    // of INTER_MV) and for the longer mode codeword.
+                    let four_mv_score = total_sad4.saturating_add(FOUR_MV_PENALTY);
 
                     #[derive(Clone, Copy)]
                     struct Cand {
@@ -878,6 +1035,11 @@ impl TheoraEncoder {
                             },
                             mv: best_gmv,
                         },
+                        Cand {
+                            score: four_mv_score,
+                            mode: Mode::InterMvFour,
+                            mv: avg_mv,
+                        },
                     ];
                     let mut best_cand = cands[0];
                     for c in &cands[1..] {
@@ -887,11 +1049,17 @@ impl TheoraEncoder {
                     }
 
                     // Update LAST / LAST2 only on modes that transmit a new MV
-                    // (spec §7.3.5.3 Table 7.33).
+                    // (spec §7.3.5.3 Table 7.33). For INTER_MV_FOUR the spec
+                    // (§7.3.5.3, Table 7.33) stores the *last* of the four
+                    // MVs into LAST; mirror the decoder in `read_inter_mvs`.
                     match best_cand.mode {
                         Mode::InterMv | Mode::InterGoldenMv => {
                             last_mv2 = last_mv;
                             last_mv = best_cand.mv;
+                        }
+                        Mode::InterMvFour => {
+                            last_mv2 = last_mv;
+                            last_mv = mvs4[3];
                         }
                         Mode::InterMvLast2 => {
                             std::mem::swap(&mut last_mv, &mut last_mv2);
@@ -899,11 +1067,23 @@ impl TheoraEncoder {
                         _ => {}
                     }
 
+                    let mv_store = if best_cand.mode == Mode::InterMvFour {
+                        avg_mv
+                    } else {
+                        best_cand.mv
+                    };
+                    let mvs4_store = if best_cand.mode == Mode::InterMvFour {
+                        mvs4
+                    } else {
+                        [(0, 0); 4]
+                    };
+
                     out.push(MbDecision {
                         mbx,
                         mby,
                         mode: best_cand.mode,
-                        mv: best_cand.mv,
+                        mv: mv_store,
+                        mvs4: mvs4_store,
                         bcoded: true,
                         luma_bis: bis,
                         chroma_bis,
@@ -1195,8 +1375,15 @@ struct MbDecision {
     #[allow(dead_code)]
     mby: u32,
     mode: Mode,
-    /// Luma motion vector in half-pel units (stored as encoded).
+    /// MB-level luma motion vector in half-pel units (used by the 1-MV modes
+    /// and as the chroma driver for modes that don't transmit per-block MVs).
+    /// For `InterMvFour` this is the average of `mvs4` (matching the decoder's
+    /// chroma derivation in §7.5.1).
     mv: (i32, i32),
+    /// Per-luma-block MVs for `InterMvFour`. `(0,0)` entries for other modes.
+    /// Indexed in raster order within the MB: tl, tr, bl, br (matching the
+    /// Hilbert/coded order that `luma_bis` uses for the 4 sub-blocks).
+    mvs4: [(i32, i32); 4],
     /// True if the MB's blocks are coded (i.e. residuals get DCT-encoded).
     bcoded: bool,
     luma_bis: [usize; 4],
@@ -1499,10 +1686,11 @@ fn write_inter_mvs(bw: &mut BitWriter, decisions: &[MbDecision]) {
                 write_mv_component_vlc(bw, d.mv.1);
             }
             Mode::InterMvFour => {
-                // Not produced by the v1 mode chooser yet; skip safely.
-                for _ in 0..4 {
-                    write_mv_component_vlc(bw, d.mv.0);
-                    write_mv_component_vlc(bw, d.mv.1);
+                // Spec §7.3.5: emit one (x,y) pair per coded luma sub-block,
+                // in the same coded order the decoder reads them.
+                for mv in &d.mvs4 {
+                    write_mv_component_vlc(bw, mv.0);
+                    write_mv_component_vlc(bw, mv.1);
                 }
             }
             _ => {}

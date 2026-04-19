@@ -36,7 +36,7 @@ pub mod huffman;
 pub mod inter;
 pub mod quant;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecParameters, CodecTag, PixelFormat as CorePixelFormat, Result,
 };
@@ -54,7 +54,14 @@ pub fn register(reg: &mut CodecRegistry) {
             CorePixelFormat::Yuv422P,
             CorePixelFormat::Yuv444P,
         ]);
-    reg.register_decoder_impl(cid.clone(), caps, make_decoder);
+    // AVI FourCC — `THEO` is the conventional marker when Theora is
+    // wrapped in AVI (rare; Ogg is the canonical container).
+    reg.register(
+        CodecInfo::new(cid.clone())
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .tag(CodecTag::fourcc(b"THEO")),
+    );
     let enc_caps = CodecCapabilities::video("theora_sw_enc")
         .with_lossy(true)
         .with_intra_only(false)
@@ -64,11 +71,11 @@ pub fn register(reg: &mut CodecRegistry) {
             CorePixelFormat::Yuv422P,
             CorePixelFormat::Yuv444P,
         ]);
-    reg.register_encoder_impl(cid.clone(), enc_caps, make_encoder);
-
-    // AVI FourCC — `THEO` is the conventional marker when Theora is
-    // wrapped in AVI (rare; Ogg is the canonical container).
-    reg.claim_tag(cid, CodecTag::fourcc(b"THEO"), 10, None);
+    reg.register(
+        CodecInfo::new(cid)
+            .capabilities(enc_caps)
+            .encoder(make_encoder),
+    );
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {

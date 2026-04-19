@@ -11,12 +11,17 @@
 //!   → forward DC prediction → token RLE → Huffman encoding using the embedded
 //!   setup's trees.
 //! * Per inter (P) frame we run an SAD-based mode decision per macro-block
-//!   with full-pel motion search inside `ME_RANGE`, considering modes
+//!   with full-pel motion search plus half-pel refinement inside `ME_RANGE`,
+//!   considering modes
 //!   {INTER_NOMV, INTRA, INTER_MV, INTER_MV_LAST, INTER_MV_LAST2,
-//!   INTER_GOLDEN_NOMV, INTER_GOLDEN_MV}. The encoder emits SBPM/BCODED,
-//!   the mode alphabet (MSCHEME=0 with the natural alphabet), the MV stream
-//!   (Table 7.23 VLC), then DCT the residual against the chosen predictor and
-//!   Huffman-codes it with the inter-frame table group.
+//!   INTER_GOLDEN_NOMV, INTER_GOLDEN_MV, INTER_MV_FOUR}. For INTER_MV_FOUR
+//!   each luma 8×8 sub-block runs its own diamond search (seeded from the
+//!   16×16 best MV) and the mode is picked when its RD-biased 4-MV SAD
+//!   beats the 1-MV candidate. The encoder emits SBPM/BCODED, the mode
+//!   alphabet (MSCHEME=0 with the natural alphabet), the MV stream
+//!   (Table 7.23 VLC — one (x,y) pair for 1-MV modes or four for 4-MV),
+//!   then DCT the residual against the chosen predictor and Huffman-codes
+//!   it with the inter-frame table group.
 //!
 //! After encoding we always reconstruct the frame (apply the same
 //! dequant/IDCT pipeline as the decoder) to update `prev_ref` (and
@@ -28,10 +33,12 @@
 //! [`EncoderOptions::keyint`] + [`make_encoder_with_options`].
 //!
 //! Current limitations (future work):
-//!   * Integer-pel motion estimation only (no sub-pel refinement).
+//!   * Half-pel refinement is a single round of 8-neighbour tests around
+//!     the full-pel best; no iterative sub-pel tracking.
 //!   * No rate control: QI is fixed at [`DEFAULT_QI`].
-//!   * 4-MV (`INTER_MV_FOUR`) mode is not produced.
-//!   * Motion search is a brute-force full-pel scan within ±`ME_RANGE`.
+//!   * The 16×16 motion search is a brute-force full-pel scan within
+//!     ±`ME_RANGE`; the 4-MV per-sub-block search is a diamond pattern
+//!     seeded from the 16×16 best (not an independent full scan).
 //!
 //! The encoder always picks HTI 0 for the Huffman group selectors and always
 //! emits `MSCHEME=0` so the alphabet is the natural 0..7 ordering shipped with

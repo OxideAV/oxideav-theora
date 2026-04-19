@@ -14,14 +14,18 @@
 //!   from input parameters; the setup table is shipped as embedded standard
 //!   libtheora bytes; per-frame DCT + DC prediction + token RLE +
 //!   Huffman encoding mirrors the decode path.
-//! * P-frame **encode** — done. Full-pel motion estimation within
-//!   `±DEFAULT_ME_RANGE`; mode decision picks between INTRA, INTER_NOMV,
-//!   INTER_MV, INTER_MV_LAST, INTER_MV_LAST2, INTER_GOLDEN_NOMV,
-//!   INTER_GOLDEN_MV; LAST and GOLDEN reference frames are managed and
-//!   updated per spec. Configurable keyframe interval and ME range via
-//!   [`encoder::EncoderOptions`] (see [`encoder::make_encoder_with_options`]).
-//!   Limitations: integer-pel only (no sub-pel refinement), no rate
-//!   control, `INTER_MV_FOUR` not produced.
+//! * P-frame **encode** — done. Full-pel motion estimation + half-pel
+//!   refinement within `±DEFAULT_ME_RANGE`; mode decision picks between
+//!   INTRA, INTER_NOMV, INTER_MV, INTER_MV_LAST, INTER_MV_LAST2,
+//!   INTER_GOLDEN_NOMV, INTER_GOLDEN_MV, and INTER_MV_FOUR (per-8x8
+//!   sub-block MVs, selected when the RD-biased 4-MV SAD beats the 1-MV
+//!   candidate). LAST and GOLDEN reference frames are managed and updated
+//!   per spec. Configurable keyframe interval, ME range, and 4-MV toggle
+//!   via [`encoder::EncoderOptions`] (see
+//!   [`encoder::make_encoder_with_options`]).
+//!   Limitations: no rate control; 4-MV sub-block search is a diamond
+//!   pattern seeded from the 16x16 best MV rather than an independent
+//!   full scan.
 
 pub mod bitreader;
 pub mod block;

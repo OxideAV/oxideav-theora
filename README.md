@@ -40,9 +40,11 @@ oxideav-theora = "0.0"
 - Intra (key) frames: forward DCT, integer-domain quantisation, forward DC
   prediction, token RLE, Huffman encoding against the setup header's trees.
 - Inter (P) frames: SAD-based mode decision per macro-block with full-pel
-  motion search inside `me_range`, considering
+  motion search (plus half-pel refinement) inside `me_range`, considering
   `{INTER_NOMV, INTRA, INTER_MV, INTER_MV_LAST, INTER_MV_LAST2,
-  INTER_GOLDEN_NOMV, INTER_GOLDEN_MV}`.
+  INTER_GOLDEN_NOMV, INTER_GOLDEN_MV, INTER_MV_FOUR}`. 4-MV runs a
+  per-8x8-sub-block diamond search seeded from the 16x16 best MV and is
+  picked when its RD-biased SAD beats the 1-MV candidate by a margin.
 - Chroma formats: 4:2:0, 4:2:2, 4:4:4.
 - Reference tracking: encoder reconstructs each frame internally (same
   dequant/IDCT/loop-filter path as the decoder), keeping the golden / LAST
@@ -59,11 +61,13 @@ oxideav-theora = "0.0"
 
 ### Known encoder limitations
 
-- Integer-pel motion estimation only (no sub-pel refinement).
+- Half-pel refinement is a single round of 8-neighbour testing around the
+  full-pel best; no iterative sub-pel tracking.
 - No rate control: the quantisation index is fixed
   (`EncoderOptions::qi`, default `DEFAULT_QI = 32`).
-- `INTER_MV_FOUR` (4-MV) mode is decoded but not produced by the encoder.
-- Motion search is a brute-force full-pel scan within `±me_range`.
+- Motion search is a brute-force full-pel scan within `±me_range` for the
+  16x16 MB candidate; 4-MV sub-block search uses a diamond pattern seeded
+  from the 16x16 best, not an independent full scan.
 
 ## Quick use
 

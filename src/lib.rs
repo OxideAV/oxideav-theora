@@ -38,7 +38,7 @@ pub mod quant;
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecParameters, PixelFormat as CorePixelFormat, Result,
+    CodecCapabilities, CodecId, CodecParameters, CodecTag, PixelFormat as CorePixelFormat, Result,
 };
 
 pub const CODEC_ID_STR: &str = "theora";
@@ -64,7 +64,11 @@ pub fn register(reg: &mut CodecRegistry) {
             CorePixelFormat::Yuv422P,
             CorePixelFormat::Yuv444P,
         ]);
-    reg.register_encoder_impl(cid, enc_caps, make_encoder);
+    reg.register_encoder_impl(cid.clone(), enc_caps, make_encoder);
+
+    // AVI FourCC — `THEO` is the conventional marker when Theora is
+    // wrapped in AVI (rare; Ogg is the canonical container).
+    reg.claim_tag(cid, CodecTag::fourcc(b"THEO"), 10, None);
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {

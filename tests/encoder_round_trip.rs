@@ -1151,3 +1151,289 @@ fn roundtrip_yuv422p_pframe_clip() {
 fn roundtrip_yuv444p_pframe_clip() {
     let _ = roundtrip_chroma_format_pframe(PixelFormat::Yuv444P);
 }
+
+// --- 4-MV (INTER_MV_FOUR) round-trip ------------------------------------
+//
+// Build a scene where a single 16x16 macro-block contains four distinct
+// textured 8x8 sub-blocks that translate independently between frame 0 and
+// frame 1. 4-MV should give a near-zero residual on every sub-block; a
+// single 16x16 MV cannot capture all four motions simultaneously, so
+// INTER_MV leaves a large residual on three of the four blocks.
+//
+// Outside the target MB we put a smoothly varying gradient that stays
+// identical between the two frames — those MBs naturally pick INTER_NOMV,
+// keeping the packet small and the mode decision for the target MB
+// uncontaminated by neighbour effects.
+
+/// Deterministic 0..255 noise tile indexed by `(seed, x, y)`. The numbers
+/// are chosen to be obviously non-smooth (so DCT can't trivialise them)
+/// and stable across calls.
+fn tile_value(seed: u32, x: u32, y: u32) -> u8 {
+    let v = seed
+        .wrapping_mul(0x9E37_79B1)
+        .wrapping_add(x.wrapping_mul(0x85EB_CA6B))
+        .wrapping_add(y.wrapping_mul(0xC2B2_AE35))
+        .rotate_left(13);
+    ((v >> 24) & 0xFF) as u8
+}
+
+/// Build a 64x64 Y plane holding a single 16x16 macro-block of four
+/// independently-translating 8x8 tiles at MB position `(mb_x, mb_y)`
+/// (in pixel coords of its top-left corner). The tile offsets per
+/// sub-block are `shifts[i] = (dx, dy)`: each of the four 8x8 tiles is
+/// the `seed[i]` texture at offset `shifts[i]`.
+///
+/// Sub-block index order follows the encoder's `MbDecision.mvs4`:
+///   0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right
+/// (in raster coords, which lines up with the `bxs`/`bys` arrays used in
+/// `decide_mb_modes`).
+fn four_mv_luma_frame(mb_x: u32, mb_y: u32, shifts: [(i32, i32); 4]) -> Vec<u8> {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let mut y = vec![128u8; (w * h) as usize];
+    // Background: smooth gradient identical across frames. Generated
+    // everywhere first, then overwritten on the target MB.
+    for j in 0..h {
+        for i in 0..w {
+            y[(j * w + i) as usize] = (64 + (i + j) / 2).min(255) as u8;
+        }
+    }
+    // Four distinct high-frequency textures, one per sub-block.
+    let seeds: [u32; 4] = [0xA55A_1234, 0x3C3C_C0DE, 0xDEAD_BEEF, 0xFACE_B00C];
+    for (idx, &(sx, sy)) in shifts.iter().enumerate() {
+        let sub_tx = idx % 2; // 0 = left column, 1 = right column
+        let sub_ty = idx / 2; // 0 = top row, 1 = bottom row
+        let dst_x0 = mb_x as i32 + (sub_tx as i32) * 8;
+        let dst_y0 = mb_y as i32 + (sub_ty as i32) * 8;
+        for j in 0..8i32 {
+            for i in 0..8i32 {
+                let dx = dst_x0 + i;
+                let dy = dst_y0 + j;
+                if dx < 0 || dx >= w as i32 || dy < 0 || dy >= h as i32 {
+                    continue;
+                }
+                // Sample the seed's texture at the *shifted* source: so that
+                // reading the next frame's (dx,dy) and predicting from prev
+                // at (dx - sx, dy - sy) yields the same value.
+                let src_x = ((i - sx) & 127) as u32;
+                let src_y = ((j - sy) & 127) as u32;
+                let v = tile_value(seeds[idx], src_x, src_y);
+                y[(dy as u32 * w + dx as u32) as usize] = v;
+            }
+        }
+    }
+    y
+}
+
+/// Build a 2-frame 4-MV-favouring clip. Frame 0 places the four tiles at
+/// shifts (0,0); frame 1 uses `shifts_f1` (one distinct MV per sub-block).
+fn generate_four_mv_favouring_clip(shifts_f1: [(i32, i32); 4]) -> Vec<VideoFrame> {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let mb_x = 24u32; // top-left of the 16x16 target MB (luma pels)
+    let mb_y = 24u32;
+    let y0 = four_mv_luma_frame(mb_x, mb_y, [(0, 0); 4]);
+    let y1 = four_mv_luma_frame(mb_x, mb_y, shifts_f1);
+    let u = vec![128u8; (w / 2 * h / 2) as usize];
+    let v = vec![128u8; (w / 2 * h / 2) as usize];
+    let make = |y: Vec<u8>, pts: i64| VideoFrame {
+        format: PixelFormat::Yuv420P,
+        width: w,
+        height: h,
+        pts: Some(pts),
+        time_base: TimeBase::new(1, 24),
+        planes: vec![
+            VideoPlane {
+                stride: w as usize,
+                data: y,
+            },
+            VideoPlane {
+                stride: (w / 2) as usize,
+                data: u.clone(),
+            },
+            VideoPlane {
+                stride: (w / 2) as usize,
+                data: v.clone(),
+            },
+        ],
+    };
+    vec![make(y0, 0), make(y1, 1)]
+}
+
+fn encode_clip_with_opts(
+    frames: &[VideoFrame],
+    opts: EncoderOptions,
+) -> (Vec<Packet>, Vec<Packet>) {
+    let mut params = CodecParameters::video(CodecId::new("theora"));
+    params.media_type = MediaType::Video;
+    params.width = Some(frames[0].width);
+    params.height = Some(frames[0].height);
+    params.pixel_format = Some(frames[0].format);
+    params.frame_rate = Some(Rational::new(24, 1));
+    let mut enc = make_encoder_with_options(&params, opts).expect("encoder");
+    let mut frame_pkts: Vec<Packet> = Vec::new();
+    let mut header_pkts: Vec<Packet> = Vec::new();
+    for f in frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        while let Ok(p) = enc.receive_packet() {
+            if p.flags.header {
+                header_pkts.push(p);
+            } else {
+                frame_pkts.push(p);
+            }
+        }
+    }
+    assert_eq!(header_pkts.len(), 3, "expected 3 headers");
+    (header_pkts, frame_pkts)
+}
+
+/// Sum-squared-error PSNR between two equal-length buffers.
+fn psnr_db_bytes(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mut sse: f64 = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let d = *x as f64 - *y as f64;
+        sse += d * d;
+    }
+    let mse = sse / a.len() as f64;
+    if mse <= 0.0 {
+        return 99.0;
+    }
+    10.0 * (255.0_f64 * 255.0 / mse).log10()
+}
+
+#[test]
+fn four_mv_encoder_emits_inter_mv_four_mode_and_decodes_cleanly() {
+    use oxideav_theora::{count_mb_modes_in_frame, parse_headers_from_extradata};
+
+    // Per-sub-block shifts that together cannot be captured by a single
+    // 16x16 MV: two sub-blocks shift one way, the other two shift the
+    // opposite way. All shifts are full-pel (`*2` for half-pel units).
+    let shifts_f1 = [(-2, 0), (2, 0), (0, -2), (0, 2)];
+    let frames = generate_four_mv_favouring_clip(shifts_f1);
+
+    let opts = EncoderOptions {
+        keyint: 10, // first frame I, second P
+        ..Default::default()
+    };
+
+    // Encode + find the P-frame packet.
+    let (header_pkts, frame_pkts) = encode_clip_with_opts(&frames, opts.clone());
+    assert_eq!(frame_pkts.len(), 2);
+    let p_pkt = &frame_pkts[1];
+
+    // Build a decoder to validate round-trip, and parse the headers so we
+    // can introspect MB-mode counts on the P-frame.
+    let mut params_dec = CodecParameters::video(CodecId::new("theora"));
+    let extradata = {
+        let mut v = Vec::new();
+        // The encoder's output_params already holds xiph-laced extradata,
+        // but `header_pkts` match the inside payload. Xiph-lace them again
+        // for the decoder here. (Alternatively, reuse the encoder's extradata.)
+        let pkts: Vec<&[u8]> = header_pkts.iter().map(|p| p.data.as_slice()).collect();
+        v.push((pkts.len() - 1) as u8);
+        for p in &pkts[..pkts.len() - 1] {
+            let mut sz = p.len();
+            while sz >= 255 {
+                v.push(255);
+                sz -= 255;
+            }
+            v.push(sz as u8);
+        }
+        for p in &pkts {
+            v.extend_from_slice(p);
+        }
+        v
+    };
+    params_dec.extradata = extradata.clone();
+    let headers = parse_headers_from_extradata(&extradata).expect("headers");
+
+    // Count MB modes in the P-frame.
+    let counts = count_mb_modes_in_frame(&headers, &p_pkt.data)
+        .expect("count_mb_modes_in_frame")
+        .expect("P-frame expected");
+    eprintln!("P-frame MB mode counts: {counts:?}");
+    assert!(
+        counts[oxideav_theora::inter::Mode::InterMvFour as usize] >= 1,
+        "encoder should have picked INTER_MV_FOUR at least once (counts = {counts:?})"
+    );
+
+    // Decode and validate round-trip quality on frame 1.
+    let mut dec = oxideav_theora::make_decoder_for_tests(&params_dec).expect("decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    for p in &frame_pkts {
+        let pkt = Packet::new(0, TimeBase::new(1, 24), p.data.clone());
+        dec.send_packet(&pkt).expect("send packet");
+        while let Ok(f) = dec.receive_frame() {
+            if let Frame::Video(v) = f {
+                decoded.push(v);
+            }
+        }
+    }
+    assert_eq!(decoded.len(), 2);
+
+    let psnr_4mv = psnr_db_bytes(&frames[1].planes[0].data, &decoded[1].planes[0].data);
+    eprintln!("4-MV-favouring clip: P-frame Y PSNR = {psnr_4mv:.2} dB");
+    assert!(
+        psnr_4mv > 24.0,
+        "P-frame PSNR with 4-MV enabled was {psnr_4mv:.2} dB (want > 24)"
+    );
+
+    // Baseline: re-encode with `allow_four_mv = false` to force INTER_MV on
+    // the same input. The 4-MV run MUST match or beat that baseline.
+    let opts_no4 = EncoderOptions {
+        keyint: 10,
+        allow_four_mv: false,
+        ..Default::default()
+    };
+    let (hp2, fp2) = encode_clip_with_opts(&frames, opts_no4);
+    let extradata2 = {
+        let mut v = Vec::new();
+        let pkts: Vec<&[u8]> = hp2.iter().map(|p| p.data.as_slice()).collect();
+        v.push((pkts.len() - 1) as u8);
+        for p in &pkts[..pkts.len() - 1] {
+            let mut sz = p.len();
+            while sz >= 255 {
+                v.push(255);
+                sz -= 255;
+            }
+            v.push(sz as u8);
+        }
+        for p in &pkts {
+            v.extend_from_slice(p);
+        }
+        v
+    };
+    let mut params_dec2 = CodecParameters::video(CodecId::new("theora"));
+    params_dec2.extradata = extradata2.clone();
+    let headers2 = oxideav_theora::parse_headers_from_extradata(&extradata2).expect("headers 2");
+    let counts2 = count_mb_modes_in_frame(&headers2, &fp2[1].data)
+        .expect("count 2")
+        .expect("P 2");
+    assert_eq!(
+        counts2[oxideav_theora::inter::Mode::InterMvFour as usize],
+        0,
+        "baseline must not emit 4-MV (counts = {counts2:?})"
+    );
+    let mut dec2 = oxideav_theora::make_decoder_for_tests(&params_dec2).expect("dec 2");
+    let mut decoded2: Vec<VideoFrame> = Vec::new();
+    for p in &fp2 {
+        let pkt = Packet::new(0, TimeBase::new(1, 24), p.data.clone());
+        dec2.send_packet(&pkt).expect("send 2");
+        while let Ok(f) = dec2.receive_frame() {
+            if let Frame::Video(v) = f {
+                decoded2.push(v);
+            }
+        }
+    }
+    let psnr_1mv = psnr_db_bytes(&frames[1].planes[0].data, &decoded2[1].planes[0].data);
+    eprintln!("baseline (allow_four_mv=false): P-frame Y PSNR = {psnr_1mv:.2} dB");
+    assert!(
+        psnr_4mv >= psnr_1mv - 0.5,
+        "4-MV PSNR {psnr_4mv:.2} should match or beat 1-MV baseline {psnr_1mv:.2}"
+    );
+    eprintln!(
+        "4-MV PSNR delta over 1-MV baseline: {:+.2} dB",
+        psnr_4mv - psnr_1mv
+    );
+}

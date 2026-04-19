@@ -96,7 +96,10 @@ pub fn make_encoder_for_tests(params: &CodecParameters) -> Result<Box<dyn Encode
     encoder::make_encoder(params)
 }
 
-pub use decoder::{classify_packet, codec_parameters_from_identification, FrameType, PacketKind};
+pub use decoder::{
+    classify_packet, codec_parameters_from_identification, count_mb_modes_in_frame, FrameType,
+    PacketKind,
+};
 pub use headers::{
     parse_comment_header, parse_headers_from_extradata, parse_identification_header,
     parse_setup_header, parse_xiph_extradata, Comment, Headers, Identification, PixelFormat, Setup,

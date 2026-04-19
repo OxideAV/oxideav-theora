@@ -539,6 +539,66 @@ fn pixel_format_to_core(pf: PixelFormat) -> CorePixelFormat {
     }
 }
 
+/// Parse a Theora inter-frame packet just far enough to count how many
+/// macro-blocks the encoder assigned to each [`Mode`] (indexed 0..=7). Used
+/// by tests that need to verify mode-selection behaviour without running a
+/// full decode.
+///
+/// Returns `None` if the packet is not an inter frame.
+pub fn count_mb_modes_in_frame(headers: &Headers, packet: &[u8]) -> Result<Option<[u32; 8]>> {
+    let kind = classify_packet(packet)?;
+    let frame_type = match kind {
+        PacketKind::Frame(ft) => ft,
+        _ => return Ok(None),
+    };
+    if frame_type != FrameType::Inter {
+        return Ok(None);
+    }
+    let mut br = BitReader::new(packet);
+    let marker = br.read_bit()?;
+    if marker {
+        return Err(Error::invalid("Theora: frame marker non-zero"));
+    }
+    let _ftype = br.read_bit()?;
+
+    let mut frame = IntraFrameDecoder::new(headers);
+    frame.is_inter = true;
+    frame.read_inter_frame_header(&mut br)?;
+    crate::inter::read_inter_bcoded(&mut br, &frame.layout, &mut frame.bcoded)?;
+
+    use crate::inter::{decode_mode_rank, read_mode_alphabet, read_raw_mode, ModeScheme};
+    let scheme = read_mode_alphabet(&mut br)?;
+    let (alphabet, raw_mode) = match scheme {
+        ModeScheme::Alphabet(a) => (a, false),
+        ModeScheme::Raw => ([Mode::InterNoMv; 8], true),
+    };
+
+    let layout = frame.layout.clone();
+    let mut counts = [0u32; 8];
+    for_each_mb(&layout, |mbx, mby| {
+        let bxs = [mbx * 2, mbx * 2 + 1, mbx * 2, mbx * 2 + 1];
+        let bys = [mby * 2, mby * 2, mby * 2 + 1, mby * 2 + 1];
+        let bis: [usize; 4] = [
+            layout.global_coded(0, bxs[0], bys[0]) as usize,
+            layout.global_coded(0, bxs[1], bys[1]) as usize,
+            layout.global_coded(0, bxs[2], bys[2]) as usize,
+            layout.global_coded(0, bxs[3], bys[3]) as usize,
+        ];
+        let any_coded = bis.iter().any(|&bi| frame.bcoded[bi]);
+        let mode = if !any_coded {
+            Mode::InterNoMv
+        } else if raw_mode {
+            read_raw_mode(&mut br)?
+        } else {
+            let r = decode_mode_rank(&mut br)? as usize;
+            alphabet[r]
+        };
+        counts[mode as usize] += 1;
+        Ok(())
+    })?;
+    Ok(Some(counts))
+}
+
 /// Build a `CodecParameters` for a Theora stream given the identification
 /// header.
 pub fn codec_parameters_from_identification(

@@ -125,6 +125,12 @@ pub struct EncoderOptions {
     /// If true, consider INTER_GOLDEN_NOMV / INTER_GOLDEN_MV against the
     /// golden (last-keyframe) reference during mode decision.
     pub use_golden: bool,
+    /// If true (default), `INTER_MV_FOUR` is a candidate during mode
+    /// selection: the encoder runs a per-8x8-sub-block motion search and
+    /// picks 4-MV when its RD-biased SAD beats INTER_MV's by a margin.
+    /// Set false to mirror the pre-4-MV encoder (useful as a baseline in
+    /// tests).
+    pub allow_four_mv: bool,
 }
 
 impl Default for EncoderOptions {
@@ -134,6 +140,7 @@ impl Default for EncoderOptions {
             keyint: DEFAULT_KEYINT,
             me_range: DEFAULT_ME_RANGE,
             use_golden: true,
+            allow_four_mv: true,
         }
     }
 }
@@ -232,6 +239,7 @@ pub fn make_encoder_with_options(
         keyint: opts.keyint,
         me_range,
         use_golden: opts.use_golden,
+        allow_four_mv: opts.allow_four_mv,
         frame_index: 0,
         prev_ref: None,
         golden_ref: None,
@@ -257,6 +265,7 @@ struct TheoraEncoder {
     keyint: u32,
     me_range: i32,
     use_golden: bool,
+    allow_four_mv: bool,
     frame_index: u32,
     /// Previous reconstructed frame (post-loop-filter pixel buffers).
     /// Each plane is stored TOP-DOWN at the coded frame size.
@@ -904,20 +913,29 @@ impl TheoraEncoder {
                     // from the 16x16 best MV; run a diamond pattern of radius
                     // ±FOUR_MV_DIAMOND_STEPS (capped at me_range), then
                     // finish with a half-pel refine.
+                    //
+                    // When `allow_four_mv` is off we skip the search entirely
+                    // so the scoreboard excludes the 4-MV candidate (score
+                    // set to `i32::MAX`).
                     let mut mvs4 = [best_mv; 4];
-                    let mut sad4 = [0i32; 4];
-                    for i in 0..4 {
-                        let (bx, by) = (bxs[i], bys[i]);
-                        let (mv, sad) = self.subblock_search(frame, prev, bx, by, best_mv, r);
-                        mvs4[i] = mv;
-                        sad4[i] = sad;
+                    let total_sad4: i32;
+                    let avg_mv: (i32, i32);
+                    if self.allow_four_mv {
+                        let mut sad4 = [0i32; 4];
+                        for i in 0..4 {
+                            let (bx, by) = (bxs[i], bys[i]);
+                            let (mv, sad) = self.subblock_search(frame, prev, bx, by, best_mv, r);
+                            mvs4[i] = mv;
+                            sad4[i] = sad;
+                        }
+                        total_sad4 = sad4.iter().sum();
+                        let avg_x = mvs4.iter().map(|m| m.0).sum::<i32>().div_euclid(4);
+                        let avg_y = mvs4.iter().map(|m| m.1).sum::<i32>().div_euclid(4);
+                        avg_mv = (avg_x, avg_y);
+                    } else {
+                        total_sad4 = i32::MAX;
+                        avg_mv = best_mv;
                     }
-                    let total_sad4: i32 = sad4.iter().sum();
-                    // Average the 4 MVs (matches decoder's chroma derivation:
-                    // `(sum_x / 4, sum_y / 4)` via `div_euclid`).
-                    let avg_x = mvs4.iter().map(|m| m.0).sum::<i32>().div_euclid(4);
-                    let avg_y = mvs4.iter().map(|m| m.1).sum::<i32>().div_euclid(4);
-                    let avg_mv = (avg_x, avg_y);
 
                     // LAST / LAST2 candidates: evaluate SAD at the two prior
                     // MVs. If either beats INTER_NOMV and is close to the

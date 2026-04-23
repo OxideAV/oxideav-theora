@@ -35,10 +35,17 @@
 //! Current limitations (future work):
 //!   * Half-pel refinement is a single round of 8-neighbour tests around
 //!     the full-pel best; no iterative sub-pel tracking.
-//!   * No rate control: QI is fixed at [`DEFAULT_QI`].
 //!   * The 16×16 motion search is a brute-force full-pel scan within
 //!     ±`ME_RANGE`; the 4-MV per-sub-block search is a diamond pattern
 //!     seeded from the 16×16 best (not an independent full scan).
+//!
+//! Rate control is optional and opt-in via [`RateControlOptions`]. When
+//! enabled, the encoder runs a simple CBR loop: each frame is tried at a
+//! currently-tracked QI, and if the produced packet is over budget it
+//! re-encodes at a higher QI (bisecting toward `qi_max`). QI is nudged
+//! up/down between frames based on accumulated debt vs. slack. When
+//! `rate_control` is `None` (the default), QI is fixed at
+//! [`DEFAULT_QI`] (or whatever the caller set).
 //!
 //! The encoder always picks HTI 0 for the Huffman group selectors and always
 //! emits `MSCHEME=0` so the alphabet is the natural 0..7 ordering shipped with
@@ -119,10 +126,57 @@ const HALF_PEL_NEIGHBOURS: &[(i32, i32)] = &[
 /// pattern; we restart from the new best each round until convergence.
 const DIAMOND_FULL_PEL: &[(i32, i32)] = &[(-2, 0), (2, 0), (0, -2), (0, 2)];
 
+/// Rate-control configuration for the Theora encoder (CBR-style loop).
+///
+/// When present in [`EncoderOptions::rate_control`], the encoder tries to
+/// keep the running output close to the specified `bitrate_bps`. Strategy:
+///
+/// * Each frame is given a byte budget = `bitrate_bps / fps / 8`.
+/// * Running "VBV-like" credit tracks accumulated slack/debt across frames.
+/// * Before encoding, the encoder picks a trial QI adjusted by the recent
+///   history (debt → lower QI, slack → higher QI), clamped to
+///   `qi_min..=qi_max`. In Theora's convention LOWER QI means COARSER
+///   quantisation (smaller packets), so we lower QI to shrink.
+/// * If the produced packet is larger than `overflow_ratio * budget`, the
+///   encoder re-encodes with a lower QI using bisection, up to
+///   `max_reencodes` extra tries.
+///
+/// This is a deliberately simple CBR loop — no multi-pass, no psy model, no
+/// RD — but it keeps the average output size close to the target.
+#[derive(Clone, Copy, Debug)]
+pub struct RateControlOptions {
+    /// Target bitrate in bits per second (must be > 0).
+    pub bitrate_bps: u32,
+    /// Hard lower bound on quantisation index considered (0..=63).
+    pub qi_min: u8,
+    /// Hard upper bound on quantisation index considered (0..=63).
+    pub qi_max: u8,
+    /// Maximum number of re-encode attempts on a single frame that goes over
+    /// `overflow_ratio * budget`. 0 = disable re-encoding (open-loop only).
+    pub max_reencodes: u8,
+    /// A produced packet exceeding `overflow_ratio * per_frame_budget` is
+    /// considered over-budget and triggers re-encoding. 2.0 = allow 2x.
+    pub overflow_ratio: f32,
+}
+
+impl Default for RateControlOptions {
+    fn default() -> Self {
+        Self {
+            bitrate_bps: 512_000,
+            qi_min: 10,
+            qi_max: 55,
+            max_reencodes: 4,
+            overflow_ratio: 2.0,
+        }
+    }
+}
+
 /// Encoder tunable options exposed by [`make_encoder_with_options`].
 #[derive(Clone, Debug)]
 pub struct EncoderOptions {
-    /// Fixed quantisation index (0..63). Higher = lower quality, smaller packets.
+    /// Fixed quantisation index (0..63). Per the Theora spec convention
+    /// this is a *quality* index: 0 = coarsest quant (smallest packets,
+    /// worst quality), 63 = finest quant (largest packets, best quality).
     pub qi: u8,
     /// Keyframe interval: emit an I-frame every `keyint` frames (≥ 1).
     pub keyint: u32,
@@ -138,6 +192,10 @@ pub struct EncoderOptions {
     /// Set false to mirror the pre-4-MV encoder (useful as a baseline in
     /// tests).
     pub allow_four_mv: bool,
+    /// If `Some`, engage a simple CBR rate-control loop targeting the given
+    /// bitrate; `qi` becomes the starting point and is adjusted between
+    /// frames. When `None`, QI is fixed at `qi` for every frame.
+    pub rate_control: Option<RateControlOptions>,
 }
 
 impl Default for EncoderOptions {
@@ -148,6 +206,7 @@ impl Default for EncoderOptions {
             me_range: DEFAULT_ME_RANGE,
             use_golden: true,
             allow_four_mv: true,
+            rate_control: None,
         }
     }
 }
@@ -227,6 +286,39 @@ pub fn make_encoder_with_options(
         .frame_rate
         .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num));
 
+    // Build optional rate-control state.
+    let rc = if let Some(rc_opts) = opts.rate_control {
+        if rc_opts.bitrate_bps == 0 {
+            return Err(Error::invalid(
+                "Theora encoder: rate_control.bitrate_bps must be > 0",
+            ));
+        }
+        if rc_opts.qi_min > rc_opts.qi_max || rc_opts.qi_max > 63 {
+            return Err(Error::invalid(
+                "Theora encoder: rate_control qi_min/qi_max out of range",
+            ));
+        }
+        if rc_opts.overflow_ratio < 1.0 {
+            return Err(Error::invalid(
+                "Theora encoder: rate_control.overflow_ratio must be >= 1.0",
+            ));
+        }
+        let fps = if frd == 0 {
+            24.0
+        } else {
+            frn as f64 / frd as f64
+        };
+        let per_frame_bytes = (rc_opts.bitrate_bps as f64 / 8.0) / fps.max(1.0);
+        Some(RcState {
+            opts: rc_opts,
+            per_frame_bytes,
+            credit: 0.0,
+            current_qi: opts.qi.clamp(rc_opts.qi_min, rc_opts.qi_max),
+        })
+    } else {
+        None
+    };
+
     Ok(Box::new(TheoraEncoder {
         output_params,
         width,
@@ -250,6 +342,7 @@ pub fn make_encoder_with_options(
         frame_index: 0,
         prev_ref: None,
         golden_ref: None,
+        rc,
     }))
 }
 
@@ -279,6 +372,21 @@ struct TheoraEncoder {
     prev_ref: Option<[Vec<u8>; 3]>,
     /// Golden reference; updated on every keyframe.
     golden_ref: Option<[Vec<u8>; 3]>,
+    /// Optional rate-control state. `None` = fixed-QP (open-loop).
+    rc: Option<RcState>,
+}
+
+/// Running state for the CBR rate-control loop.
+struct RcState {
+    opts: RateControlOptions,
+    /// Per-frame byte budget (bitrate / fps / 8).
+    per_frame_bytes: f64,
+    /// Running "VBV-like" credit: +per_frame_bytes each frame, −bytes_spent
+    /// after each emit. Positive = slack, negative = debt.
+    credit: f64,
+    /// Current trial QI. Updated between frames as a function of recent debt.
+    /// Clamped to `[qi_min, qi_max]`.
+    current_qi: u8,
 }
 
 impl Encoder for TheoraEncoder {
@@ -315,11 +423,7 @@ impl Encoder for TheoraEncoder {
         }
         // Decide frame type.
         let is_keyframe = self.prev_ref.is_none() || self.frame_index % self.keyint == 0;
-        let (data, recon) = if is_keyframe {
-            self.encode_intra_frame(v)?
-        } else {
-            self.encode_inter_frame(v)?
-        };
+        let (data, recon) = self.encode_frame_with_rate_control(v, is_keyframe)?;
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
@@ -350,6 +454,120 @@ impl TheoraEncoder {
         pkt.dts = pts;
         pkt.flags.header = true;
         self.pending.push_back(pkt);
+    }
+
+    /// Encode `frame` (I or P) possibly driving the CBR rate-control loop.
+    ///
+    /// If rate-control is disabled (`self.rc.is_none()`) this just calls
+    /// `encode_intra_frame` / `encode_inter_frame` once at the current
+    /// `self.qi`. With rate-control engaged:
+    ///   1. The frame's QI is picked from `rc.current_qi` (clamped).
+    ///   2. The frame is encoded.
+    ///   3. If the packet exceeds `overflow_ratio * per_frame_bytes`, the
+    ///      encoder re-encodes at a LOWER QI (coarser quant), bisecting
+    ///      downward toward `qi_min` until within budget or
+    ///      `max_reencodes` is hit.
+    ///   4. Credit is updated and `current_qi` is nudged for the next
+    ///      frame.
+    fn encode_frame_with_rate_control(
+        &mut self,
+        v: &VideoFrame,
+        is_keyframe: bool,
+    ) -> Result<(Vec<u8>, [Vec<u8>; 3])> {
+        // No rate control: simple open-loop path at fixed QI.
+        if self.rc.is_none() {
+            return if is_keyframe {
+                self.encode_intra_frame(v)
+            } else {
+                self.encode_inter_frame(v)
+            };
+        }
+
+        // Snapshot RC parameters we'll need throughout the loop.
+        let (per_frame_bytes, overflow_ratio, max_reencodes, qi_min, qi_max) = {
+            let rc = self.rc.as_ref().unwrap();
+            (
+                rc.per_frame_bytes,
+                rc.opts.overflow_ratio as f64,
+                rc.opts.max_reencodes,
+                rc.opts.qi_min,
+                rc.opts.qi_max,
+            )
+        };
+        // I-frames traditionally get a larger budget (they carry the full
+        // reference), so allow the overflow ratio to scale up further on
+        // keyframes.
+        let over_factor = if is_keyframe { 4.0 } else { 1.0 };
+        let overflow_bytes = (per_frame_bytes * overflow_ratio * over_factor).max(64.0);
+
+        // First trial: use rc.current_qi.
+        let saved_qi = self.qi;
+        let mut trial_qi = self.rc.as_ref().unwrap().current_qi;
+        self.qi = trial_qi;
+
+        let (mut data, mut recon) = if is_keyframe {
+            self.encode_intra_frame(v)?
+        } else {
+            self.encode_inter_frame(v)?
+        };
+
+        // Re-encode loop: bisect qi *downward* (toward qi_min / coarser
+        // quantisation) until within overflow, or quit after max_reencodes
+        // attempts. Theora's convention: LOWER qi = COARSER quant = SMALLER
+        // output.
+        let mut attempts = 0u8;
+        while (data.len() as f64) > overflow_bytes
+            && attempts < max_reencodes
+            && trial_qi > qi_min
+        {
+            let new_qi = ((trial_qi as u32 + qi_min as u32) / 2) as u8;
+            let new_qi = new_qi.max(qi_min).min(trial_qi - 1);
+            trial_qi = new_qi;
+            self.qi = trial_qi;
+            let out = if is_keyframe {
+                self.encode_intra_frame(v)?
+            } else {
+                self.encode_inter_frame(v)?
+            };
+            data = out.0;
+            recon = out.1;
+            attempts += 1;
+        }
+
+        // Restore the encoder's "baseline" QI (rc state tracks its own).
+        self.qi = saved_qi;
+
+        // Update rate-control credit and adjust current_qi for the next
+        // frame. A simple proportional controller: if debt > 2 frame
+        // budgets, *lower* QI (→ coarser quant, smaller frames). If credit
+        // > 2 frame budgets, raise QI (→ finer quant, better quality).
+        let bytes = data.len() as f64;
+        if let Some(rc) = self.rc.as_mut() {
+            rc.credit += per_frame_bytes;
+            rc.credit -= bytes;
+            let threshold = per_frame_bytes * 2.0;
+            if rc.credit < -threshold {
+                // Over-budget recently; lower QI (coarser quant).
+                if rc.current_qi > qi_min {
+                    rc.current_qi = rc.current_qi.saturating_sub(1).max(qi_min);
+                }
+                // Clamp extreme debt so a single very-bad frame doesn't lock
+                // us into worst QI forever.
+                if rc.credit < -threshold * 8.0 {
+                    rc.credit = -threshold * 8.0;
+                }
+            } else if rc.credit > threshold {
+                // Under budget; raise QI (finer quant, better quality).
+                if rc.current_qi < qi_max {
+                    rc.current_qi = (rc.current_qi + 1).min(qi_max);
+                }
+                if rc.credit > threshold * 4.0 {
+                    rc.credit = threshold * 4.0;
+                }
+            }
+        }
+
+        Ok((data, recon))
     }
 
     /// Encode an intra (key) frame and return the bitstream + reconstructed
@@ -2363,6 +2581,71 @@ mod tests {
         let mut br = crate::bitreader::BitReader::new(&buf);
         let out = crate::block::read_short_run_bitstring(&mut br, bits.len()).unwrap();
         assert_eq!(out, bits);
+    }
+
+    /// Smoke test: in Theora's convention LOWER qi = COARSER quant =
+    /// SMALLER packet. Verify across a gradient frame.
+    #[test]
+    fn qi_monotone_output_size() {
+        let mut params = CodecParameters::video(CodecId::new("theora"));
+        params.media_type = MediaType::Video;
+        params.width = Some(64);
+        params.height = Some(64);
+        params.pixel_format = Some(CorePixelFormat::Yuv420P);
+        params.frame_rate = Some(oxideav_core::Rational::new(30, 1));
+        let mut y = vec![0u8; 64 * 64];
+        for j in 0..64 {
+            for i in 0..64 {
+                y[j * 64 + i] = ((i * 17 + j * 23) & 0xFF) as u8;
+            }
+        }
+        let mut sizes = Vec::new();
+        for test_qi in [10u8, 20, 30, 40, 50, 55] {
+            let opts = EncoderOptions {
+                qi: test_qi,
+                keyint: 30,
+                ..Default::default()
+            };
+            let mut enc = make_encoder_with_options(&params, opts).unwrap();
+            let f = VideoFrame {
+                format: CorePixelFormat::Yuv420P,
+                width: 64,
+                height: 64,
+                pts: Some(0),
+                time_base: TimeBase::new(1, 30),
+                planes: vec![
+                    oxideav_core::VideoPlane {
+                        stride: 64,
+                        data: y.clone(),
+                    },
+                    oxideav_core::VideoPlane {
+                        stride: 32,
+                        data: vec![128; 32 * 32],
+                    },
+                    oxideav_core::VideoPlane {
+                        stride: 32,
+                        data: vec![128; 32 * 32],
+                    },
+                ],
+            };
+            enc.send_frame(&Frame::Video(f)).unwrap();
+            let mut sz = 0;
+            while let Ok(p) = enc.receive_packet() {
+                if !p.flags.header {
+                    sz = p.data.len();
+                }
+            }
+            eprintln!("qi={test_qi} -> {sz} B");
+            sizes.push(sz);
+        }
+        // Theora convention: LOWER qi = COARSER quant = SMALLER packet.
+        // So qi=10's output must be < qi=55's output.
+        assert!(
+            sizes[0] < sizes[5],
+            "expected qi=10 ({} B) < qi=55 ({} B)",
+            sizes[0],
+            sizes[5]
+        );
     }
 
     #[test]

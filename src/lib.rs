@@ -20,12 +20,12 @@
 //!   INTER_GOLDEN_NOMV, INTER_GOLDEN_MV, and INTER_MV_FOUR (per-8x8
 //!   sub-block MVs, selected when the RD-biased 4-MV SAD beats the 1-MV
 //!   candidate). LAST and GOLDEN reference frames are managed and updated
-//!   per spec. Configurable keyframe interval, ME range, and 4-MV toggle
-//!   via [`encoder::EncoderOptions`] (see
-//!   [`encoder::make_encoder_with_options`]).
-//!   Limitations: no rate control; 4-MV sub-block search is a diamond
-//!   pattern seeded from the 16x16 best MV rather than an independent
-//!   full scan.
+//!   per spec. Configurable keyframe interval, ME range, 4-MV toggle, and
+//!   optional CBR rate-control loop via [`encoder::EncoderOptions`] (see
+//!   [`encoder::make_encoder_with_options`] and
+//!   [`encoder::RateControlOptions`]).
+//!   Limitations: 4-MV sub-block search is a diamond pattern seeded from
+//!   the 16x16 best MV rather than an independent full scan.
 
 pub mod bitreader;
 pub mod block;

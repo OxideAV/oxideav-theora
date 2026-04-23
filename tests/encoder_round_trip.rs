@@ -702,6 +702,132 @@ fn pframe_moving_pattern_psnr_and_bitrate() {
     );
 }
 
+/// Generate a "noisy" 64x64 YUV420P clip with per-frame pseudo-random
+/// luma content (not compressible at low QI) so rate-control decisions
+/// actually affect file size. Chroma is neutral.
+fn generate_noise_clip(n_frames: u32) -> Vec<VideoFrame> {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let mut out = Vec::with_capacity(n_frames as usize);
+    let mut s: u64 = 0xC0FFEE;
+    for f in 0..n_frames {
+        // LCG pseudo-noise.
+        let mut y = vec![0u8; (w * h) as usize];
+        for j in 0..h {
+            for i in 0..w {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let r = (s >> 33) as u32;
+                // Mix with a smooth background so the residual is not *pure*
+                // noise (which would defeat the P-frame path entirely).
+                let base = ((i.wrapping_add(j).wrapping_add(f)) * 2).min(255);
+                let noise = r & 0x3F;
+                y[(j * w + i) as usize] = (base + noise).min(255) as u8;
+            }
+        }
+        let u = vec![128u8; (32 * 32) as usize];
+        let v = vec![128u8; (32 * 32) as usize];
+        out.push(VideoFrame {
+            format: PixelFormat::Yuv420P,
+            width: w,
+            height: h,
+            pts: Some(f as i64),
+            time_base: TimeBase::new(1, 30),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: u,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: v,
+                },
+            ],
+        });
+    }
+    out
+}
+
+/// Exercise the CBR rate-control loop: encode a noisy clip at two
+/// different target bitrates (with a forced low `overflow_ratio` to
+/// engage the re-encode path) and verify the lower target produces a
+/// smaller output. Also checks the resulting stream still round-trips
+/// through our own decoder.
+#[test]
+fn rate_control_respects_target_bitrate_ordering() {
+    use oxideav_theora::encoder::{EncoderOptions, RateControlOptions};
+    let frames = generate_noise_clip(20);
+    assert_eq!(frames.len(), 20);
+
+    // Starting qi=40 gives the RC loop room to drop to qi_min=10 under
+    // pressure. Low bitrate + strict overflow_ratio forces re-encoding to
+    // coarser quant, so low output should be materially smaller.
+    let opts_low = EncoderOptions {
+        keyint: 20,
+        qi: 40,
+        rate_control: Some(RateControlOptions {
+            bitrate_bps: 64_000,
+            qi_min: 10,
+            qi_max: 55,
+            max_reencodes: 5,
+            overflow_ratio: 1.1,
+        }),
+        ..Default::default()
+    };
+    // High target: loose budget. With overflow_ratio=2 and high bitrate
+    // the re-encode loop never triggers and qi drifts toward qi_max, but
+    // the starting point and per-frame adjustment should keep it near qi=40.
+    let opts_high = EncoderOptions {
+        keyint: 20,
+        qi: 40,
+        rate_control: Some(RateControlOptions {
+            bitrate_bps: 4_000_000,
+            qi_min: 10,
+            qi_max: 55,
+            max_reencodes: 5,
+            overflow_ratio: 2.0,
+        }),
+        ..Default::default()
+    };
+
+    let (decoded_low, sizes_low, _) = encode_decode_clip(&frames, opts_low);
+    let (decoded_high, sizes_high, _) = encode_decode_clip(&frames, opts_high);
+    assert_eq!(decoded_low.len(), frames.len());
+    assert_eq!(decoded_high.len(), frames.len());
+
+    let total_low: usize = sizes_low.iter().sum();
+    let total_high: usize = sizes_high.iter().sum();
+    eprintln!(
+        "rate-control: low-bitrate clip = {} B, high-bitrate clip = {} B",
+        total_low, total_high
+    );
+    assert!(
+        total_low < total_high,
+        "CBR low-target bitstream ({total_low} B) must be smaller than high-target ({total_high} B)"
+    );
+
+    // Decoder sanity: low-bitrate stream must still decode and reproduce
+    // the frame sequence. We use a very weak PSNR floor since the tight
+    // budget forces aggressive quantisation on a noise-rich signal.
+    let avg_psnr_low = {
+        let mut sum = 0.0f64;
+        let mut n = 0u32;
+        for (orig, dec) in frames.iter().zip(decoded_low.iter()) {
+            sum += psnr_db(&orig.planes[0].data, &dec.planes[0].data);
+            n += 1;
+        }
+        sum / n as f64
+    };
+    eprintln!("rate-control low-bitrate avg Y-PSNR: {:.2} dB", avg_psnr_low);
+    assert!(
+        avg_psnr_low > 12.0,
+        "low-bitrate PSNR too low: {avg_psnr_low:.2} dB"
+    );
+}
+
 #[test]
 fn pframe_moving_pattern_ffmpeg_interop() {
     if std::process::Command::new("/usr/bin/ffmpeg")

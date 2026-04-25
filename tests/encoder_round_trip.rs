@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, Rational, TimeBase,
     VideoFrame, VideoPlane,
@@ -715,7 +715,9 @@ fn generate_noise_clip(n_frames: u32) -> Vec<VideoFrame> {
         let mut y = vec![0u8; (w * h) as usize];
         for j in 0..h {
             for i in 0..w {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let r = (s >> 33) as u32;
                 // Mix with a smooth background so the residual is not *pure*
                 // noise (which would defeat the P-frame path entirely).
@@ -821,7 +823,10 @@ fn rate_control_respects_target_bitrate_ordering() {
         }
         sum / n as f64
     };
-    eprintln!("rate-control low-bitrate avg Y-PSNR: {:.2} dB", avg_psnr_low);
+    eprintln!(
+        "rate-control low-bitrate avg Y-PSNR: {:.2} dB",
+        avg_psnr_low
+    );
     assert!(
         avg_psnr_low > 12.0,
         "low-bitrate PSNR too low: {avg_psnr_low:.2} dB"

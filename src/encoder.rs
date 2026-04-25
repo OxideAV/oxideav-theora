@@ -53,7 +53,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat as CorePixelFormat,
     Result, TimeBase, VideoFrame,
@@ -516,9 +516,7 @@ impl TheoraEncoder {
         // attempts. Theora's convention: LOWER qi = COARSER quant = SMALLER
         // output.
         let mut attempts = 0u8;
-        while (data.len() as f64) > overflow_bytes
-            && attempts < max_reencodes
-            && trial_qi > qi_min
+        while (data.len() as f64) > overflow_bytes && attempts < max_reencodes && trial_qi > qi_min
         {
             let new_qi = ((trial_qi as u32 + qi_min as u32) / 2) as u8;
             let new_qi = new_qi.max(qi_min).min(trial_qi - 1);

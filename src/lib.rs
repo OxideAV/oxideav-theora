@@ -40,10 +40,10 @@ pub mod huffman;
 pub mod inter;
 pub mod quant;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecParameters, CodecTag, PixelFormat as CorePixelFormat, Result,
 };
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub const CODEC_ID_STR: &str = "theora";
 

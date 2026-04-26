@@ -61,13 +61,19 @@ oxideav-theora = "0.0"
 
 ### Known encoder limitations
 
-- Half-pel refinement is a single round of 8-neighbour testing around the
-  full-pel best; no iterative sub-pel tracking.
-- No rate control: the quantisation index is fixed
-  (`EncoderOptions::qi`, default `DEFAULT_QI = 32`).
+- Half-pel refinement iterates the 8-neighbour test from the running best
+  up to a small bounded number of passes (default 3). This catches the
+  common "two-step diagonal" sub-pel cases for both the 16x16 MB MV and
+  the 4-MV sub-block / golden MVs, but is still bounded for cost reasons.
+- Rate control is opt-in (`EncoderOptions::rate_control`); when not
+  configured the quantisation index is fixed (`EncoderOptions::qi`,
+  default `DEFAULT_QI = 32`). The CBR loop is single-pass with re-encode
+  bisection and does not implement multi-pass / VBV-strict / psy.
 - Motion search is a brute-force full-pel scan within `±me_range` for the
   16x16 MB candidate; 4-MV sub-block search uses a diamond pattern seeded
-  from the 16x16 best, not an independent full scan.
+  from the 16x16 best, not an independent full scan. The golden-reference
+  search uses a coarser stride (step 2) and relies on half-pel refinement
+  to recover the precision the coarse grid loses.
 
 ## Quick use
 

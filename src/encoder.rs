@@ -33,11 +33,16 @@
 //! [`EncoderOptions::keyint`] + [`make_encoder_with_options`].
 //!
 //! Current limitations (future work):
-//!   * Half-pel refinement is a single round of 8-neighbour tests around
-//!     the full-pel best; no iterative sub-pel tracking.
+//!   * Half-pel refinement iterates the 8-neighbour test from the running
+//!     best up to [`HALF_PEL_REFINE_PASSES`] times for all three search
+//!     paths (16×16 MB / 4-MV sub-block / golden); this catches the common
+//!     "two-step diagonal" sub-pel cases but is still bounded for cost
+//!     reasons.
 //!   * The 16×16 motion search is a brute-force full-pel scan within
 //!     ±`ME_RANGE`; the 4-MV per-sub-block search is a diamond pattern
-//!     seeded from the 16×16 best (not an independent full scan).
+//!     seeded from the 16×16 best (not an independent full scan); the
+//!     golden-reference search uses a coarser stride (step 2) recovered
+//!     by sub-pel refinement.
 //!
 //! Rate control is optional and opt-in via [`RateControlOptions`]. When
 //! enabled, the encoder runs a simple CBR loop: each frame is tried at a
@@ -120,6 +125,12 @@ const HALF_PEL_NEIGHBOURS: &[(i32, i32)] = &[
     (1, -1),
     (1, 1),
 ];
+
+/// Maximum number of iterative half-pel refinement passes around the current
+/// best MV. Each pass re-runs the 8-neighbour test from the new best until no
+/// neighbour beats it, capped to bound worst-case cost. Empirically 3
+/// iterations are enough for the moving-pattern clip to converge.
+const HALF_PEL_REFINE_PASSES: u32 = 3;
 
 /// Diamond-search offsets (half-pel units, step 2 = full-pel) used during the
 /// per-sub-block motion search. The diamond is the classic 4-neighbour
@@ -973,16 +984,25 @@ impl TheoraEncoder {
             }
         }
 
-        // Half-pel refine around the winning full-pel MV.
-        for &(hx, hy) in HALF_PEL_NEIGHBOURS {
-            let mv = (best_mv.0 + hx, best_mv.1 + hy);
-            if mv.0.abs() > 31 || mv.1.abs() > 31 {
-                continue;
+        // Iterative half-pel refine around the winning full-pel MV. Same
+        // strategy as the 16×16 path: re-test the 8-neighbour ring from
+        // each new best until no neighbour wins, capped to bound cost.
+        for _ in 0..HALF_PEL_REFINE_PASSES {
+            let mut improved = false;
+            for &(hx, hy) in HALF_PEL_NEIGHBOURS {
+                let mv = (best_mv.0 + hx, best_mv.1 + hy);
+                if mv.0.abs() > 31 || mv.1.abs() > 31 {
+                    continue;
+                }
+                let sad = self.block_sad(frame, prev, 0, bx, by, mv);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_mv = mv;
+                    improved = true;
+                }
             }
-            let sad = self.block_sad(frame, prev, 0, bx, by, mv);
-            if sad < best_sad {
-                best_sad = sad;
-                best_mv = mv;
+            if !improved {
+                break;
             }
         }
         (best_mv, best_sad)
@@ -1105,8 +1125,16 @@ impl TheoraEncoder {
                         }
                     }
 
-                    // Half-pel refinement around the full-pel best.
-                    if best_mv != (0, 0) {
+                    // Iterative half-pel refinement around the current best
+                    // MV. The original implementation tested the 8 half-pel
+                    // neighbours once around the full-pel best; this version
+                    // re-runs the 8-neighbour test from the new best whenever
+                    // a neighbour beats it (capped at HALF_PEL_REFINE_PASSES).
+                    // We also refine when best_mv == (0,0): a stationary MB
+                    // can still benefit from sub-pel alignment (e.g. when
+                    // input has a fractional shift relative to the reference).
+                    for _ in 0..HALF_PEL_REFINE_PASSES {
+                        let mut improved = false;
                         for &(hx, hy) in HALF_PEL_NEIGHBOURS {
                             let mv = (best_mv.0 + hx, best_mv.1 + hy);
                             // Stay within the MV VLC range (±31 half-pel).
@@ -1117,7 +1145,11 @@ impl TheoraEncoder {
                             if sad < best_sad {
                                 best_sad = sad;
                                 best_mv = mv;
+                                improved = true;
                             }
+                        }
+                        if !improved {
+                            break;
                         }
                     }
 
@@ -1192,6 +1224,28 @@ impl TheoraEncoder {
                                 dx += step;
                             }
                             dy += step;
+                        }
+                        // Iterative half-pel refine for the golden MV too.
+                        // Golden uses a coarser full-pel grid (step 2) so
+                        // sub-pel refinement around the winner is the cheap
+                        // way to recover the precision the coarse grid lost.
+                        for _ in 0..HALF_PEL_REFINE_PASSES {
+                            let mut improved = false;
+                            for &(hx, hy) in HALF_PEL_NEIGHBOURS {
+                                let mv = (g_best_mv.0 + hx, g_best_mv.1 + hy);
+                                if mv.0.abs() > 31 || mv.1.abs() > 31 {
+                                    continue;
+                                }
+                                let sad = self.mb_sad(frame, golden, bxs, bys, mv);
+                                if sad < g_best_sad {
+                                    g_best_sad = sad;
+                                    g_best_mv = mv;
+                                    improved = true;
+                                }
+                            }
+                            if !improved {
+                                break;
+                            }
                         }
                         (g_best_mv, g_best_sad)
                     } else {

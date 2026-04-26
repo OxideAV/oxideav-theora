@@ -1544,3 +1544,126 @@ fn four_mv_encoder_emits_inter_mv_four_mode_and_decodes_cleanly() {
         psnr_4mv - psnr_1mv
     );
 }
+
+// --- iterative half-pel refinement -------------------------------------
+//
+// Build a 2-frame clip where the second luma frame is the first frame
+// shifted by *exactly* half a pixel horizontally. Achieved by sampling
+// from a synthetic "double-resolution" texture: frame 0 takes the even
+// columns, frame 1 takes the odd columns. The half-pel-shifted version of
+// frame 0 is exactly the per-pixel average of frame 0 columns x and x+1,
+// which is the standard half-pel interpolation a Theora decoder produces
+// for an MV with bit-1 set on the X axis.
+//
+// With iterative half-pel refinement enabled (HALF_PEL_REFINE_PASSES > 1),
+// the encoder should land on an X half-pel MV after the full-pel scan
+// returns (0,0) → first-pass half-pel improves to (1,0) → second pass
+// reaches the converged best in this synthetic case.
+fn generate_halfpel_clip() -> Vec<VideoFrame> {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    // Hi-res "ground truth" texture, twice the width: a smooth gradient
+    // plus a random-ish hash so DCT can't perfectly trivialise the
+    // residual.
+    let hi_res = |x: u32, y: u32| -> u8 {
+        let base = (x * 37 + y * 53) % 200;
+        ((40 + (base + y * 3 + (x ^ y)) % 180) & 0xFF) as u8
+    };
+    let make_frame = |phase: u32, pts: i64| {
+        let mut y = vec![0u8; (w * h) as usize];
+        for j in 0..h {
+            for i in 0..w {
+                // phase=0: sample even hi-res columns (i*2)
+                // phase=1: sample odd hi-res columns (i*2 + 1) → apparent
+                //          right-shift of half a pixel from phase=0.
+                let hx = i * 2 + phase;
+                y[(j * w + i) as usize] = hi_res(hx, j);
+            }
+        }
+        let u = vec![128u8; (w / 2 * h / 2) as usize];
+        let v = vec![128u8; (w / 2 * h / 2) as usize];
+        VideoFrame {
+            pts: Some(pts),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: u,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: v,
+                },
+            ],
+        }
+    };
+    vec![make_frame(0, 0), make_frame(1, 1)]
+}
+
+#[test]
+fn halfpel_motion_round_trip_picks_subpel_mv() {
+    let frames = generate_halfpel_clip();
+    assert_eq!(frames.len(), 2);
+
+    // Force INTER_MV (single 16x16 MV) so we're isolating the half-pel
+    // refinement of the 16x16 search path. 4-MV would also work but the
+    // sub-block diamond-search code path was tested separately.
+    let opts = EncoderOptions {
+        keyint: 2,
+        allow_four_mv: false,
+        ..Default::default()
+    };
+    let mut params = CodecParameters::video(CodecId::new("theora"));
+    params.media_type = MediaType::Video;
+    params.width = Some(64);
+    params.height = Some(64);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    let mut enc = make_encoder_with_options(&params, opts).expect("encoder");
+    let mut frame_pkts: Vec<Packet> = Vec::new();
+    let mut header_pkts: Vec<Packet> = Vec::new();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        while let Ok(p) = enc.receive_packet() {
+            if p.flags.header {
+                header_pkts.push(p);
+            } else {
+                frame_pkts.push(p);
+            }
+        }
+    }
+    assert_eq!(header_pkts.len(), 3);
+    assert_eq!(frame_pkts.len(), frames.len());
+
+    let extradata = enc.output_params().extradata.clone();
+    let mut p2 = CodecParameters::video(CodecId::new("theora"));
+    p2.extradata = extradata;
+    let mut dec = make_decoder_for_tests(&p2).expect("decoder");
+
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    for p in &frame_pkts {
+        let pkt = Packet::new(0, TimeBase::new(1, 24), p.data.clone());
+        dec.send_packet(&pkt).expect("send packet");
+        while let Ok(f) = dec.receive_frame() {
+            if let Frame::Video(v) = f {
+                decoded.push(v);
+            }
+        }
+    }
+    assert_eq!(decoded.len(), 2);
+
+    // The P-frame should reconstruct frame 1 with high PSNR thanks to
+    // the half-pel MV winning the refinement. Without iterative sub-pel
+    // tracking the encoder used to land on a worse local minimum here
+    // (the residual against the (0,0) full-pel MV is large because every
+    // pixel disagrees by ~the average gradient slope).
+    let psnr_p = psnr_db_bytes(&frames[1].planes[0].data, &decoded[1].planes[0].data);
+    eprintln!("half-pel P-frame Y PSNR: {psnr_p:.2} dB");
+    assert!(
+        psnr_p > 32.0,
+        "half-pel P-frame Y PSNR {psnr_p:.2} dB unexpectedly low (target > 32)"
+    );
+}

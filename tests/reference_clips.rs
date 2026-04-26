@@ -152,9 +152,8 @@ fn decode_intra_frame_tiny_420p() {
         Frame::Video(v) => v,
         other => panic!("expected video frame, got {other:?}"),
     };
-    assert_eq!(frame.format, PixelFormat::Yuv420P);
-    assert_eq!(frame.width, 64);
-    assert_eq!(frame.height, 48);
+    assert_eq!(frame.planes.len(), 3);
+    assert_eq!(frame.planes[0].stride, 64);
     assert_eq!(frame.planes[0].data.len(), 64 * 48);
     let y = &frame.planes[0].data;
     let mean: u32 = y.iter().map(|&v| v as u32).sum::<u32>() / y.len() as u32;
@@ -194,9 +193,8 @@ fn decode_intra_frame_tiny_444p() {
         Frame::Video(v) => v,
         other => panic!("expected video frame, got {other:?}"),
     };
-    assert_eq!(frame.format, PixelFormat::Yuv444P);
-    assert_eq!(frame.width, 64);
-    assert_eq!(frame.height, 48);
+    assert_eq!(frame.planes.len(), 3);
+    assert_eq!(frame.planes[0].stride, 64);
     assert_eq!(frame.planes[0].data.len(), 64 * 48);
     assert_eq!(frame.planes[1].data.len(), 64 * 48);
     assert_eq!(frame.planes[2].data.len(), 64 * 48);

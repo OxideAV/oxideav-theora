@@ -9,8 +9,8 @@ use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat as CorePixelFormat, Rational,
-    Result, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Error, Frame, Packet, Rational, Result, TimeBase, VideoFrame,
+    VideoPlane,
 };
 
 use crate::bitreader::BitReader;
@@ -184,14 +184,9 @@ impl TheoraDecoder {
     fn emit_frame(&mut self, headers: &Headers, planes_buf: &[Vec<u8>; 3]) -> Result<()> {
         let id = &headers.identification;
         let (cropped_planes, out_w, out_h) = crop_to_picture(id, planes_buf);
-        let core_fmt = pixel_format_to_core(id.pf);
         let planes = build_video_planes(&cropped_planes, out_w, out_h, id.pf);
         let video = VideoFrame {
-            format: core_fmt,
-            width: out_w,
-            height: out_h,
             pts: self.pending_pts,
-            time_base: self.pending_tb,
             planes,
         };
         self.ready_frames.push_back(video);
@@ -531,13 +526,9 @@ fn build_video_planes(cropped: &[Vec<u8>], pw: u32, ph: u32, pf: PixelFormat) ->
     ]
 }
 
-fn pixel_format_to_core(pf: PixelFormat) -> CorePixelFormat {
-    match pf {
-        PixelFormat::Yuv420 | PixelFormat::Reserved => CorePixelFormat::Yuv420P,
-        PixelFormat::Yuv422 => CorePixelFormat::Yuv422P,
-        PixelFormat::Yuv444 => CorePixelFormat::Yuv444P,
-    }
-}
+// `pixel_format_to_core` was removed when `VideoFrame::format` was
+// dropped — pixel format is now stream-level (set on `CodecParameters`
+// by the decoder factory) and no longer attached per-frame.
 
 /// Parse a Theora inter-frame packet just far enough to count how many
 /// macro-blocks the encoder assigned to each [`Mode`] (indexed 0..=7). Used

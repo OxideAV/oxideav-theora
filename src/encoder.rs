@@ -403,18 +403,8 @@ impl Encoder for TheoraEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("Theora encoder: video frames only")),
         };
-        if v.width != self.width || v.height != self.height {
-            return Err(Error::invalid(
-                "Theora encoder: frame dimensions do not match encoder config",
-            ));
-        }
-        if v.format != self.pf.to_core() {
-            return Err(Error::invalid(format!(
-                "Theora encoder: expected {:?}, got {:?}",
-                self.pf.to_core(),
-                v.format
-            )));
-        }
+        // Frame dimensions and pixel format are now stream-level; the
+        // pipeline upstream is responsible for matching `output_params`.
         if !self.emitted_headers {
             self.emit_header_packet(self.id_packet.clone(), v.pts);
             self.emit_header_packet(self.comment_packet.clone(), v.pts);
@@ -817,7 +807,7 @@ impl TheoraEncoder {
         } else {
             (self.pf.chroma_shift_x(), self.pf.chroma_shift_y())
         };
-        let (sw, sh) = ((frame.width >> sx) as i32, (frame.height >> sy) as i32);
+        let (sw, sh) = ((self.width >> sx) as i32, (self.height >> sy) as i32);
         let layout_plane = &self.layout.planes[pli];
         let (_cw, ch) = ((layout_plane.nbw * 8) as i32, (layout_plane.nbh * 8) as i32);
         let bx_px = (bx * 8) as i32;
@@ -2430,11 +2420,7 @@ mod tests {
 
     fn make_yuv420_frame(y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> VideoFrame {
         VideoFrame {
-            format: CorePixelFormat::Yuv420P,
-            width: 64,
-            height: 64,
             pts: Some(0),
-            time_base: TimeBase::new(1, 24),
             planes: vec![
                 oxideav_core::VideoPlane {
                     stride: 64,
@@ -2464,11 +2450,7 @@ mod tests {
         let mut enc = make_encoder(&params).unwrap();
 
         let f = VideoFrame {
-            format: CorePixelFormat::Yuv420P,
-            width: 64,
-            height: 64,
             pts: Some(0),
-            time_base: TimeBase::new(1, 24),
             planes: vec![
                 oxideav_core::VideoPlane {
                     stride: 64,
@@ -2606,11 +2588,7 @@ mod tests {
             };
             let mut enc = make_encoder_with_options(&params, opts).unwrap();
             let f = VideoFrame {
-                format: CorePixelFormat::Yuv420P,
-                width: 64,
-                height: 64,
                 pts: Some(0),
-                time_base: TimeBase::new(1, 30),
                 planes: vec![
                     oxideav_core::VideoPlane {
                         stride: 64,

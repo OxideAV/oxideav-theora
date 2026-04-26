@@ -23,11 +23,7 @@ fn load_testsrc_frame() -> Option<VideoFrame> {
     let u = raw[64 * 64..64 * 64 + 32 * 32].to_vec();
     let v = raw[64 * 64 + 32 * 32..64 * 64 + 2 * 32 * 32].to_vec();
     Some(VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: 64,
-        height: 64,
         pts: Some(0),
-        time_base: TimeBase::new(1, 24),
         planes: vec![
             VideoPlane {
                 stride: 64,
@@ -127,9 +123,9 @@ fn encode_intra_frame_round_trip_via_own_decoder() {
         Frame::Video(v) => v,
         _ => panic!("expected video frame"),
     };
-    assert_eq!(decoded.width, 64);
-    assert_eq!(decoded.height, 64);
-    assert_eq!(decoded.format, PixelFormat::Yuv420P);
+    assert_eq!(decoded.planes.len(), 3);
+    assert_eq!(decoded.planes[0].stride, 64);
+    assert_eq!(decoded.planes[0].data.len(), 64 * 64);
 
     // Compare per-plane against original.
     let mut all_decoded = Vec::with_capacity(64 * 64 + 2 * 32 * 32);
@@ -261,11 +257,7 @@ fn load_pframe_input() -> Option<Vec<VideoFrame>> {
         let u = raw[off + 64 * 64..off + 64 * 64 + 32 * 32].to_vec();
         let v = raw[off + 64 * 64 + 32 * 32..off + frame_size].to_vec();
         out.push(VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: 64,
-            height: 64,
             pts: Some(i as i64),
-            time_base: TimeBase::new(1, 24),
             planes: vec![
                 VideoPlane {
                     stride: 64,
@@ -540,11 +532,7 @@ fn generate_moving_pattern_clip(n_frames: u32) -> Vec<VideoFrame> {
         let u = vec![128u8; (w / 2 * h / 2) as usize];
         let v = vec![128u8; (w / 2 * h / 2) as usize];
         out.push(VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: w,
-            height: h,
             pts: Some(f as i64),
-            time_base: TimeBase::new(1, 30),
             planes: vec![
                 VideoPlane {
                     stride: w as usize,
@@ -729,11 +717,7 @@ fn generate_noise_clip(n_frames: u32) -> Vec<VideoFrame> {
         let u = vec![128u8; (32 * 32) as usize];
         let v = vec![128u8; (32 * 32) as usize];
         out.push(VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: w,
-            height: h,
             pts: Some(f as i64),
-            time_base: TimeBase::new(1, 30),
             planes: vec![
                 VideoPlane {
                     stride: w as usize,
@@ -1064,11 +1048,7 @@ fn make_synthetic_frame(fmt: PixelFormat) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: fmt,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 24),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -1102,11 +1082,14 @@ fn psnr_plane(a: &[u8], b: &[u8]) -> f64 {
 
 fn roundtrip_chroma_format(fmt: PixelFormat) -> (VideoFrame, VideoFrame) {
     let frame = make_synthetic_frame(fmt);
+    // `make_synthetic_frame` always builds a 64x64 picture.
+    const W: u32 = 64;
+    const H: u32 = 64;
     // Build encoder for this chroma format.
     let mut params = CodecParameters::video(CodecId::new("theora"));
     params.media_type = MediaType::Video;
-    params.width = Some(frame.width);
-    params.height = Some(frame.height);
+    params.width = Some(W);
+    params.height = Some(H);
     params.pixel_format = Some(fmt);
     params.frame_rate = Some(Rational::new(24, 1));
     let mut enc = make_encoder_for_tests(&params).expect("encoder");
@@ -1128,9 +1111,8 @@ fn roundtrip_chroma_format(fmt: PixelFormat) -> (VideoFrame, VideoFrame) {
         Frame::Video(v) => v,
         _ => panic!(),
     };
-    assert_eq!(decoded.format, fmt);
-    assert_eq!(decoded.width, frame.width);
-    assert_eq!(decoded.height, frame.height);
+    assert_eq!(decoded.planes[0].stride, W as usize);
+    assert_eq!(decoded.planes[0].data.len(), (W * H) as usize);
     (frame, decoded)
 }
 
@@ -1201,11 +1183,7 @@ fn roundtrip_chroma_format_pframe(fmt: PixelFormat) -> Vec<VideoFrame> {
             }
         }
         frames.push(VideoFrame {
-            format: fmt,
-            width: w,
-            height: h,
             pts: Some(f as i64),
-            time_base: TimeBase::new(1, 24),
             planes: vec![
                 VideoPlane {
                     stride: w as usize,
@@ -1368,11 +1346,7 @@ fn generate_four_mv_favouring_clip(shifts_f1: [(i32, i32); 4]) -> Vec<VideoFrame
     let u = vec![128u8; (w / 2 * h / 2) as usize];
     let v = vec![128u8; (w / 2 * h / 2) as usize];
     let make = |y: Vec<u8>, pts: i64| VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(pts),
-        time_base: TimeBase::new(1, 24),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -1395,11 +1369,13 @@ fn encode_clip_with_opts(
     frames: &[VideoFrame],
     opts: EncoderOptions,
 ) -> (Vec<Packet>, Vec<Packet>) {
+    // The 4-MV favouring clip is always 64x64 Yuv420P; pixel format /
+    // frame dims are stream-level now.
     let mut params = CodecParameters::video(CodecId::new("theora"));
     params.media_type = MediaType::Video;
-    params.width = Some(frames[0].width);
-    params.height = Some(frames[0].height);
-    params.pixel_format = Some(frames[0].format);
+    params.width = Some(64);
+    params.height = Some(64);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
     params.frame_rate = Some(Rational::new(24, 1));
     let mut enc = make_encoder_with_options(&params, opts).expect("encoder");
     let mut frame_pkts: Vec<Packet> = Vec::new();

@@ -179,6 +179,7 @@ enum Tier {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 enum ChromaFormat {
     /// 4:2:0 — chroma planes half width × half height of luma.
     Yuv420,

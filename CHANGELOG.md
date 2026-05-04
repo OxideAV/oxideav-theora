@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+
+- docs corpus: add SHA-only fixture mode (`evaluate_sha`) and un-ignore the
+  1920x1080 HD fixture so the decoder is exercised end-to-end at HD against
+  the SHA-256 recorded in `notes.md` without shipping the 6 MB raw `.yuv`.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-theora/compare/v0.0.4...v0.0.5) - 2026-05-03
 
 ### Other

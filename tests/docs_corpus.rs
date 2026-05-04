@@ -658,7 +658,11 @@ fn decode_fixture_sha(case: &CorpusCaseSha) -> Option<String> {
             return None;
         }
     };
-    eprintln!("fixture {}: ogv={} bytes (sha-only mode)", case.name, ogv.len());
+    eprintln!(
+        "fixture {}: ogv={} bytes (sha-only mode)",
+        case.name,
+        ogv.len()
+    );
 
     let pkts = collect_packets(&ogv);
     if pkts.len() < 4 {
@@ -701,13 +705,9 @@ fn decode_fixture_sha(case: &CorpusCaseSha) -> Option<String> {
                     for p_idx in 0..3 {
                         let (pw, ph) = case.plane_dims(p_idx);
                         let plane_bytes = pw * ph;
-                        let our = vf
-                            .planes
-                            .get(p_idx)
-                            .unwrap_or_else(|| panic!(
-                                "{}: visible {visible_idx} plane {p_idx} missing",
-                                case.name
-                            ));
+                        let our = vf.planes.get(p_idx).unwrap_or_else(|| {
+                            panic!("{}: visible {visible_idx} plane {p_idx} missing", case.name)
+                        });
                         if our.data.len() != plane_bytes {
                             panic!(
                                 "{}: visible {visible_idx} plane {p_idx}: our len {}, \
@@ -786,6 +786,10 @@ fn evaluate_sha(case: &CorpusCaseSha) {
 /// (Named tiny-i-only-16x16 to mirror the VP8 corpus, but vp3.c
 /// enforces visible_width >= 18 so the smallest practical Theora
 /// fixture is 32x32.)
+///
+/// BitExact: pure intra at default quant — no loop-filter cliffs, no
+/// MC, no quant-edge rounding. Has been bit-exact since the original
+/// driver landed.
 #[test]
 fn corpus_tiny_i_only_16x16() {
     evaluate(&CorpusCase {
@@ -794,7 +798,7 @@ fn corpus_tiny_i_only_16x16() {
         visible_h: 32,
         n_frames: 1,
         chroma: ChromaFormat::Yuv420,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -802,6 +806,8 @@ fn corpus_tiny_i_only_16x16() {
 /// reads the version field and enables picture-region offsets,
 /// per-stream loop-filter limits, per-stream quant tables, and up to
 /// 3 QPIs per frame.
+///
+/// BitExact: single intra frame at moderate quant on flat content.
 #[test]
 fn corpus_bitstream_version_3_2_1() {
     evaluate(&CorpusCase {
@@ -810,7 +816,7 @@ fn corpus_bitstream_version_3_2_1() {
         visible_h: 32,
         n_frames: 1,
         chroma: ChromaFormat::Yuv420,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -878,6 +884,9 @@ fn corpus_monochrome_via_zero_chroma() {
 /// (PICX=0, PICY=14) carry a non-MB-aligned crop. expected.yuv is at
 /// VISIBLE dimensions (the in-tree decoder applies the crop in
 /// `crop_to_picture`); 702 bytes total = 26*18 + 13*9*2.
+///
+/// BitExact: validates the picture-region crop path (PICX/PICY +
+/// non-MB-aligned visible dims) end-to-end.
 #[test]
 fn corpus_picture_region_non_mb_aligned() {
     evaluate(&CorpusCase {
@@ -886,7 +895,7 @@ fn corpus_picture_region_non_mb_aligned() {
         visible_h: 18,
         n_frames: 1,
         chroma: ChromaFormat::Yuv420,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -894,6 +903,9 @@ fn corpus_picture_region_non_mb_aligned() {
 /// (`ac_scale=10`, `filter_limit=0`). The decoder's loop filter is
 /// bypassed (vp3.c sets skip_loop_filter=1) — useful to isolate
 /// IDCT + dequant paths from deblocking.
+///
+/// BitExact: weak-quant + skip-loop-filter is the cleanest test of
+/// the IDCT path; locks in the loop-filter-skip branch.
 #[test]
 fn corpus_q_high() {
     evaluate(&CorpusCase {
@@ -902,7 +914,7 @@ fn corpus_q_high() {
         visible_h: 64,
         n_frames: 2,
         chroma: ChromaFormat::Yuv420,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 

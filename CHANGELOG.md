@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `picture-region-non-mb-aligned`, `q-high`) so any regression on the
   intra / picture-region-crop / weak-quant paths now fails CI.
 
+### Encoder
+
+- `send_frame` now validates each frame's plane count, per-plane stride
+  and data length against the encoder's configured pixel format and
+  dimensions, returning a descriptive `Error::invalid` instead of
+  panicking deep inside the encode loop on misshapen input.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-theora/compare/v0.0.4...v0.0.5) - 2026-05-03
 
 ### Other

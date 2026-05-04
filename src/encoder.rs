@@ -414,8 +414,12 @@ impl Encoder for TheoraEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("Theora encoder: video frames only")),
         };
-        // Frame dimensions and pixel format are now stream-level; the
-        // pipeline upstream is responsible for matching `output_params`.
+        // Stream-level shape (pixel format / width / height) is fixed at
+        // encoder construction; reject frames that don't match — without
+        // this check, fetch_block_pixels indexes planes[0..3] directly
+        // and undersized planes / wrong stride panic deep in the encode
+        // loop with no diagnostic context.
+        self.validate_frame_shape(v)?;
         if !self.emitted_headers {
             self.emit_header_packet(self.id_packet.clone(), v.pts);
             self.emit_header_packet(self.comment_packet.clone(), v.pts);
@@ -805,6 +809,53 @@ impl TheoraEncoder {
             out[bi] = coeffs[bi * 64];
         }
         out
+    }
+
+    /// Reject frames whose plane shape doesn't match what the encoder
+    /// was constructed for. Without this, `fetch_block_pixels` indexes
+    /// `frame.planes[pli]` directly and undersized / wrong-format
+    /// frames panic deep inside the encode loop with no diagnostic.
+    /// We require:
+    ///   * exactly 3 planes (Theora is always 3-plane),
+    ///   * each plane's `stride >= width` for that plane (luma stride
+    ///     >= picture width; chroma stride >= picture width >> shift_x),
+    ///   * `data.len() >= stride * height` (so the encoder's
+    ///     bottom-up clamp never reads past the buffer).
+    fn validate_frame_shape(&self, v: &VideoFrame) -> Result<()> {
+        if v.planes.len() != 3 {
+            return Err(Error::invalid(format!(
+                "Theora encoder: expected 3 video planes, got {}",
+                v.planes.len()
+            )));
+        }
+        for pli in 0..3 {
+            let (sx, sy) = if pli == 0 {
+                (0u32, 0u32)
+            } else {
+                (self.pf.chroma_shift_x(), self.pf.chroma_shift_y())
+            };
+            let plane_w = (self.width >> sx) as usize;
+            let plane_h = (self.height >> sy) as usize;
+            let plane = &v.planes[pli];
+            if plane.stride < plane_w {
+                return Err(Error::invalid(format!(
+                    "Theora encoder: plane {pli} stride {} < required width {plane_w}",
+                    plane.stride,
+                )));
+            }
+            let need = plane.stride.saturating_mul(plane_h);
+            if plane.data.len() < need {
+                return Err(Error::invalid(format!(
+                    "Theora encoder: plane {pli} data length {} < required {} \
+                     (stride {} * height {})",
+                    plane.data.len(),
+                    need,
+                    plane.stride,
+                    plane_h,
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Read 8x8 block of luma/chroma samples into a buffer indexed in
@@ -2688,5 +2739,101 @@ mod tests {
             let got = crate::inter::decode_mv_component_vlc(&mut br).unwrap();
             assert_eq!(got, v, "mismatch at v={v}");
         }
+    }
+
+    /// Frames with the wrong plane count must fail with a clear error,
+    /// not panic deep inside `fetch_block_pixels` or the bottom-up
+    /// indexing.
+    #[test]
+    fn rejects_frame_with_too_few_planes() {
+        let mut enc = make_test_encoder();
+        let bad = VideoFrame {
+            pts: Some(0),
+            planes: vec![oxideav_core::VideoPlane {
+                stride: 64,
+                data: vec![128; 64 * 64],
+            }],
+        };
+        let err = enc
+            .send_frame(&Frame::Video(bad))
+            .expect_err("expected reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("3 video planes") || msg.contains("3"),
+            "error mentions plane count requirement: {msg}",
+        );
+    }
+
+    /// A plane with `stride < width` would corrupt indexing; reject it
+    /// at the door rather than reading past row boundaries.
+    #[test]
+    fn rejects_frame_with_undersized_stride() {
+        let mut enc = make_test_encoder();
+        // 64x64 yuv420: luma needs stride>=64.
+        let bad = VideoFrame {
+            pts: Some(0),
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: 32, // half what's needed
+                    data: vec![128; 32 * 64],
+                },
+                oxideav_core::VideoPlane {
+                    stride: 32,
+                    data: vec![128; 32 * 32],
+                },
+                oxideav_core::VideoPlane {
+                    stride: 32,
+                    data: vec![128; 32 * 32],
+                },
+            ],
+        };
+        let err = enc
+            .send_frame(&Frame::Video(bad))
+            .expect_err("expected reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("stride"), "error mentions stride: {msg}");
+    }
+
+    /// A plane with sufficient stride but truncated data must also be
+    /// rejected (would otherwise hit the silent 128.0 fallback in
+    /// `fetch_block_pixels` and produce garbage output).
+    #[test]
+    fn rejects_frame_with_truncated_plane_data() {
+        let mut enc = make_test_encoder();
+        let bad = VideoFrame {
+            pts: Some(0),
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: 64,
+                    // Only 16 rows instead of 64.
+                    data: vec![128; 64 * 16],
+                },
+                oxideav_core::VideoPlane {
+                    stride: 32,
+                    data: vec![128; 32 * 32],
+                },
+                oxideav_core::VideoPlane {
+                    stride: 32,
+                    data: vec![128; 32 * 32],
+                },
+            ],
+        };
+        let err = enc
+            .send_frame(&Frame::Video(bad))
+            .expect_err("expected reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("data length") || msg.contains("data") || msg.contains("length"),
+            "error mentions data length: {msg}",
+        );
+    }
+
+    /// Sanity: a properly-shaped frame still succeeds.
+    #[test]
+    fn accepts_well_formed_frame() {
+        let mut enc = make_test_encoder();
+        let good = make_yuv420_frame(vec![128; 64 * 64], vec![128; 32 * 32], vec![128; 32 * 32]);
+        enc.send_frame(&Frame::Video(good))
+            .expect("good frame should encode");
     }
 }

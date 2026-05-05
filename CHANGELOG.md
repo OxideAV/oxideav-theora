@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-theora/compare/v0.0.5...v0.0.6) - 2026-05-04
+
+### Other
+
+- validate frame shape in send_frame, return Error not panic
+- promote 4 bit-exact-clean fixtures to BitExact + cargo fmt
+- add SHA-only fixture mode + un-ignore 1080p HD
+- silence dead-code on Yuv444
+- wire docs/video/theora/ fixture corpus as docs_corpus.rs
+
 ### Tests
 
 - docs corpus: add SHA-only fixture mode (`evaluate_sha`) and un-ignore the

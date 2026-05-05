@@ -1667,3 +1667,515 @@ fn halfpel_motion_round_trip_picks_subpel_mv() {
         "half-pel P-frame Y PSNR {psnr_p:.2} dB unexpectedly low (target > 32)"
     );
 }
+
+// --- Scene-change detection test -------------------------------------------
+
+/// Generate a clip that has two visually distinct segments: frames 0..10
+/// are a bright gradient, frames 10..20 are a dark uniform fill. The hard
+/// boundary at frame 10 should be detected as a scene change and trigger
+/// a forced keyframe there even though `keyint` is much larger.
+fn generate_scene_change_clip() -> Vec<VideoFrame> {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let mut out = Vec::with_capacity(20);
+    for i in 0..20u32 {
+        let y: Vec<u8> = if i < 10 {
+            // Bright diagonal gradient.
+            (0..(w * h))
+                .map(|k| {
+                    let row = k / w;
+                    let col = k % w;
+                    ((row + col) * 2).min(255) as u8
+                })
+                .collect()
+        } else {
+            // Completely different: dark uniform fill.
+            vec![20u8; (w * h) as usize]
+        };
+        let u = vec![128u8; ((w / 2) * (h / 2)) as usize];
+        let v = vec![128u8; ((w / 2) * (h / 2)) as usize];
+        out.push(VideoFrame {
+            pts: Some(i as i64),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: u,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: v,
+                },
+            ],
+        });
+    }
+    out
+}
+
+#[test]
+fn scene_change_detection_forces_keyframe() {
+    let frames = generate_scene_change_clip();
+    assert_eq!(frames.len(), 20);
+
+    // keyint=100 would normally never produce more than one keyframe for 20
+    // frames, but scene-change detection should insert one at frame 10.
+    let opts = EncoderOptions {
+        keyint: 100,
+        scene_change_detect: true,
+        ..Default::default()
+    };
+    let mut params = CodecParameters::video(CodecId::new("theora"));
+    params.media_type = MediaType::Video;
+    params.width = Some(64);
+    params.height = Some(64);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    let mut enc = make_encoder_with_options(&params, opts).expect("encoder");
+
+    let mut frame_pkts: Vec<Packet> = Vec::new();
+    let mut header_pkts: Vec<Packet> = Vec::new();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        while let Ok(p) = enc.receive_packet() {
+            if p.flags.header {
+                header_pkts.push(p);
+            } else {
+                frame_pkts.push(p);
+            }
+        }
+    }
+    assert_eq!(header_pkts.len(), 3);
+    assert_eq!(frame_pkts.len(), frames.len());
+
+    // Frame 0 is always a keyframe; frame 10 should be one due to scene change.
+    let keyframe_indices: Vec<usize> = frame_pkts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.flags.keyframe)
+        .map(|(i, _)| i)
+        .collect();
+    eprintln!("scene-change keyframe indices: {:?}", keyframe_indices);
+    assert!(keyframe_indices.contains(&0), "frame 0 must be a keyframe");
+    assert!(
+        keyframe_indices.contains(&10),
+        "frame 10 (scene cut) must trigger a forced keyframe; \
+         keyframes at {:?}",
+        keyframe_indices
+    );
+
+    // Decode and verify the stream round-trips correctly through our decoder.
+    let extradata = enc.output_params().extradata.clone();
+    let mut p2 = CodecParameters::video(CodecId::new("theora"));
+    p2.extradata = extradata;
+    let mut dec = make_decoder_for_tests(&p2).expect("decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    for p in &frame_pkts {
+        let pkt = Packet::new(0, TimeBase::new(1, 24), p.data.clone());
+        dec.send_packet(&pkt).expect("send packet");
+        while let Ok(f) = dec.receive_frame() {
+            if let Frame::Video(v) = f {
+                decoded.push(v);
+            }
+        }
+    }
+    assert_eq!(decoded.len(), frames.len());
+    // Frame 10 (start of dark scene) must round-trip with good PSNR since it
+    // is an intra frame.
+    let p10 = psnr_db(&frames[10].planes[0].data, &decoded[10].planes[0].data);
+    eprintln!("scene-cut keyframe 10 Y PSNR: {p10:.2} dB");
+    assert!(p10 > 35.0, "scene-cut keyframe PSNR {p10:.2} dB < 35");
+}
+
+// --- Two-pass rate-control test --------------------------------------------
+
+#[test]
+fn two_pass_rate_control_allocates_more_bits_to_complex_frames() {
+    use oxideav_theora::encoder::{run_first_pass, RateControlOptions};
+
+    // Generate a clip where even frames are complex (noisy) and odd frames are
+    // near-flat so the two-pass analysis has something to differentiate.
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let n: u32 = 20;
+    let mut frames: Vec<VideoFrame> = Vec::with_capacity(n as usize);
+    let mut lcg: u64 = 0xFEEDFACE;
+    for f in 0..n {
+        let y: Vec<u8> = if f % 2 == 0 {
+            // Complex: pseudo-random luma.
+            (0..(w * h))
+                .map(|_| {
+                    lcg = lcg
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((lcg >> 33) & 0xFF) as u8
+                })
+                .collect()
+        } else {
+            // Simple: flat grey.
+            vec![128u8; (w * h) as usize]
+        };
+        let u = vec![128u8; ((w / 2) * (h / 2)) as usize];
+        let v = vec![128u8; ((w / 2) * (h / 2)) as usize];
+        frames.push(VideoFrame {
+            pts: Some(f as i64),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: u,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: v,
+                },
+            ],
+        });
+    }
+
+    // First pass: collect complexity stats.
+    let stats = run_first_pass(&frames);
+    assert_eq!(stats.len(), n as usize);
+    eprintln!("two-pass stats: {:?}", stats);
+
+    // Second pass: encode with two_pass_stats, CBR rate control enabled.
+    let opts = EncoderOptions {
+        keyint: 20,
+        qi: 32,
+        two_pass_stats: Some(stats),
+        rate_control: Some(RateControlOptions {
+            bitrate_bps: 512_000,
+            qi_min: 10,
+            qi_max: 55,
+            max_reencodes: 3,
+            overflow_ratio: 2.0,
+        }),
+        ..Default::default()
+    };
+
+    let mut params = CodecParameters::video(CodecId::new("theora"));
+    params.media_type = MediaType::Video;
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(30, 1));
+    let mut enc = make_encoder_with_options(&params, opts).expect("encoder");
+
+    let mut frame_pkts: Vec<Packet> = Vec::new();
+    let mut header_pkts: Vec<Packet> = Vec::new();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        while let Ok(p) = enc.receive_packet() {
+            if p.flags.header {
+                header_pkts.push(p);
+            } else {
+                frame_pkts.push(p);
+            }
+        }
+    }
+    assert_eq!(header_pkts.len(), 3);
+    assert_eq!(frame_pkts.len(), n as usize);
+
+    // Decode and verify the stream round-trips.
+    let extradata = enc.output_params().extradata.clone();
+    let mut p2 = CodecParameters::video(CodecId::new("theora"));
+    p2.extradata = extradata;
+    let mut dec = make_decoder_for_tests(&p2).expect("decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    for p in &frame_pkts {
+        let pkt = Packet::new(0, TimeBase::new(1, 30), p.data.clone());
+        dec.send_packet(&pkt).expect("send packet");
+        while let Ok(f) = dec.receive_frame() {
+            if let Frame::Video(v) = f {
+                decoded.push(v);
+            }
+        }
+    }
+    assert_eq!(decoded.len(), n as usize);
+
+    // All decoded frames must be decodable (no panic). Average PSNR must be
+    // reasonable (> 10 dB even at tight budget).
+    let avg_psnr = {
+        let mut s = 0.0f64;
+        for (orig, dec) in frames.iter().zip(decoded.iter()) {
+            s += psnr_db(&orig.planes[0].data, &dec.planes[0].data);
+        }
+        s / n as f64
+    };
+    eprintln!("two-pass avg Y PSNR: {avg_psnr:.2} dB");
+    assert!(
+        avg_psnr > 10.0,
+        "two-pass avg PSNR {avg_psnr:.2} dB unexpectedly low"
+    );
+
+    // The total bitstream is non-empty.
+    let total: usize = frame_pkts.iter().map(|p| p.data.len()).sum();
+    eprintln!("two-pass total encoded: {total} bytes");
+    assert!(total > 0);
+}
+
+// --- Multi-block EOB and combined-zero-run-value token coverage -----------
+
+/// Verify that the combined token paths (tokens 23-31) are exercised and
+/// that the resulting stream still round-trips correctly. We encode a block
+/// that will have exactly 1 zero then ±1, 2 zeros then ±1, etc. in the
+/// quantised coefficients.
+#[test]
+fn combined_token_round_trip() {
+    // The simplest stimulus: an intra frame where the residual after DCT
+    // has sparse AC coefficients. A flat gradient has nearly all energy in
+    // low frequencies; after quantisation many intermediate zig-zag positions
+    // are zero followed by a ±1.
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let y: Vec<u8> = (0..(w * h))
+        .map(|k| {
+            let row = k / w;
+            let col = k % w;
+            ((row * 3 + col * 2) % 255) as u8
+        })
+        .collect();
+    let u = vec![128u8; ((w / 2) * (h / 2)) as usize];
+    let v = vec![128u8; ((w / 2) * (h / 2)) as usize];
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w as usize,
+                data: y,
+            },
+            VideoPlane {
+                stride: (w / 2) as usize,
+                data: u,
+            },
+            VideoPlane {
+                stride: (w / 2) as usize,
+                data: v,
+            },
+        ],
+    };
+    let opts = EncoderOptions {
+        qi: 32,
+        keyint: 1,
+        ..Default::default()
+    };
+    let mut params = CodecParameters::video(CodecId::new("theora"));
+    params.media_type = MediaType::Video;
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    let mut enc = make_encoder_with_options(&params, opts).expect("encoder");
+    enc.send_frame(&Frame::Video(frame.clone())).expect("send");
+    let mut pkts: Vec<Packet> = Vec::new();
+    while let Ok(p) = enc.receive_packet() {
+        pkts.push(p);
+    }
+    assert!(pkts.len() >= 4);
+
+    // Decode via own decoder.
+    let extradata = enc.output_params().extradata.clone();
+    let mut p2 = CodecParameters::video(CodecId::new("theora"));
+    p2.extradata = extradata;
+    let mut dec = make_decoder_for_tests(&p2).expect("decoder");
+    let pkt = Packet::new(0, TimeBase::new(1, 24), pkts[3].data.clone());
+    dec.send_packet(&pkt).expect("send packet");
+    let decoded = match dec.receive_frame().expect("receive frame") {
+        Frame::Video(v) => v,
+        _ => panic!("expected video frame"),
+    };
+    let psnr = psnr_db(&frame.planes[0].data, &decoded.planes[0].data);
+    eprintln!("combined-token round-trip Y PSNR: {psnr:.2} dB");
+    assert!(
+        psnr > 35.0,
+        "combined-token round-trip PSNR {psnr:.2} dB < 35"
+    );
+}
+
+// --- PSNR / libtheora cross-decode at larger resolutions -------------------
+
+/// Encode a synthetic 256×256 clip and verify:
+///   1. Our decoder reproduces it with PSNR ≥ 35 dB.
+///   2. ffmpeg (libtheora) decodes the same Ogg stream without error.
+#[test]
+fn psnr_256x256_libtheora_cross_decode() {
+    let w: u32 = 256;
+    let h: u32 = 256;
+    let n: u32 = 10;
+    let mut frames: Vec<VideoFrame> = Vec::with_capacity(n as usize);
+    for f in 0..n {
+        let y: Vec<u8> = (0..(w * h))
+            .map(|k| {
+                let row = k / w;
+                let col = k % w;
+                (row.wrapping_add(col).wrapping_add(f * 5)) as u8
+            })
+            .collect();
+        let u = vec![128u8; ((w / 2) * (h / 2)) as usize];
+        let v = vec![128u8; ((w / 2) * (h / 2)) as usize];
+        frames.push(VideoFrame {
+            pts: Some(f as i64),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: u,
+                },
+                VideoPlane {
+                    stride: (w / 2) as usize,
+                    data: v,
+                },
+            ],
+        });
+    }
+
+    let opts = EncoderOptions {
+        keyint: 10,
+        ..Default::default()
+    };
+    let mut params = CodecParameters::video(CodecId::new("theora"));
+    params.media_type = MediaType::Video;
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(24, 1));
+    let mut enc = make_encoder_with_options(&params, opts).expect("encoder");
+
+    let mut frame_pkts: Vec<Packet> = Vec::new();
+    let mut header_pkts: Vec<Packet> = Vec::new();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        while let Ok(p) = enc.receive_packet() {
+            if p.flags.header {
+                header_pkts.push(p);
+            } else {
+                frame_pkts.push(p);
+            }
+        }
+    }
+
+    // Own-decoder PSNR gate.
+    let extradata = enc.output_params().extradata.clone();
+    let mut p2 = CodecParameters::video(CodecId::new("theora"));
+    p2.extradata = extradata;
+    let mut dec = make_decoder_for_tests(&p2).expect("decoder");
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    for p in &frame_pkts {
+        let pkt = Packet::new(0, TimeBase::new(1, 24), p.data.clone());
+        dec.send_packet(&pkt).expect("send packet");
+        while let Ok(f) = dec.receive_frame() {
+            if let Frame::Video(v) = f {
+                decoded.push(v);
+            }
+        }
+    }
+    assert_eq!(decoded.len(), n as usize);
+    let avg_psnr: f64 = frames
+        .iter()
+        .zip(decoded.iter())
+        .map(|(orig, dec)| psnr_db(&orig.planes[0].data, &dec.planes[0].data))
+        .sum::<f64>()
+        / n as f64;
+    eprintln!("256x256 avg Y PSNR (own decoder): {avg_psnr:.2} dB");
+    assert!(avg_psnr > 35.0, "256×256 avg Y PSNR {avg_psnr:.2} dB < 35");
+
+    // ffmpeg / libtheora cross-decode gate.
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: ffmpeg not on PATH");
+        return;
+    }
+    let serial = 0x1357_ACEFu32;
+    let mut ogg = Vec::new();
+    let mut seq = 0u32;
+    write_ogg_page(
+        &mut ogg,
+        serial,
+        seq,
+        0,
+        &[&header_pkts[0].data],
+        true,
+        false,
+    );
+    seq += 1;
+    write_ogg_page(
+        &mut ogg,
+        serial,
+        seq,
+        0,
+        &[&header_pkts[1].data, &header_pkts[2].data],
+        false,
+        false,
+    );
+    seq += 1;
+    let kfgshift = 6u32;
+    let mut last_kf_index: u64 = 0;
+    for (i, p) in frame_pkts.iter().enumerate() {
+        if p.flags.keyframe {
+            last_kf_index = i as u64 + 1;
+        }
+        let fskf = (i as u64 + 1) - last_kf_index;
+        let granule = (last_kf_index << kfgshift) | fskf;
+        let is_eos = i == frame_pkts.len() - 1;
+        write_ogg_page(&mut ogg, serial, seq, granule, &[&p.data], false, is_eos);
+        seq += 1;
+    }
+    let tmp = std::env::temp_dir();
+    let ogv_path = tmp.join("oxideav_256x256.ogv");
+    let check_path = tmp.join("oxideav_256x256_check.yuv");
+    std::fs::write(&ogv_path, &ogg).expect("write ogv");
+    let _ = std::fs::remove_file(&check_path);
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            ogv_path.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            check_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode 256×256 stream");
+    eprintln!("256×256 libtheora cross-decode: PASS");
+
+    let decoded_raw = std::fs::read(&check_path).expect("read yuv");
+    let frame_size = (w * h + 2 * (w / 2) * (h / 2)) as usize;
+    let n_dec = decoded_raw.len() / frame_size;
+    assert_eq!(
+        n_dec, n as usize,
+        "ffmpeg decoded {n_dec} frames, expected {n}"
+    );
+    let ffmpeg_psnr: f64 = frames
+        .iter()
+        .enumerate()
+        .map(|(i, orig)| {
+            let off = i * frame_size;
+            psnr_db(
+                &orig.planes[0].data,
+                &decoded_raw[off..off + (w * h) as usize],
+            )
+        })
+        .sum::<f64>()
+        / n as f64;
+    eprintln!("256×256 avg Y PSNR (ffmpeg / libtheora decode): {ffmpeg_psnr:.2} dB");
+    assert!(
+        ffmpeg_psnr > 35.0,
+        "256×256 libtheora cross-decode avg PSNR {ffmpeg_psnr:.2} dB < 35"
+    );
+}

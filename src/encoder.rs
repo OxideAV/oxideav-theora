@@ -137,6 +137,11 @@ const HALF_PEL_REFINE_PASSES: u32 = 3;
 /// pattern; we restart from the new best each round until convergence.
 const DIAMOND_FULL_PEL: &[(i32, i32)] = &[(-2, 0), (2, 0), (0, -2), (0, 2)];
 
+/// Scene-change SAD threshold (per macro-block, luma only). When the average
+/// MB SAD against the previous reference exceeds this value the encoder treats
+/// the frame as a scene cut and forces a keyframe.
+const SCENE_CHANGE_MB_SAD: i32 = 2048;
+
 /// Rate-control configuration for the Theora encoder (CBR-style loop).
 ///
 /// When present in [`EncoderOptions::rate_control`], the encoder tries to
@@ -207,6 +212,19 @@ pub struct EncoderOptions {
     /// bitrate; `qi` becomes the starting point and is adjusted between
     /// frames. When `None`, QI is fixed at `qi` for every frame.
     pub rate_control: Option<RateControlOptions>,
+    /// Enable scene-change detection. When true, the encoder computes the
+    /// average MB SAD against the previous reference before deciding the
+    /// frame type; if the SAD exceeds [`SCENE_CHANGE_MB_SAD`] the frame is
+    /// forced to an I-frame regardless of the keyint schedule. This lets the
+    /// golden reference track actual scene boundaries rather than arbitrary
+    /// GOP positions.
+    pub scene_change_detect: bool,
+    /// Enable two-pass encoding. When `Some`, the encoder stores the per-frame
+    /// complexity collected in the first pass and uses it in the second pass
+    /// to pre-assign per-frame QI before the normal rate-control loop runs.
+    /// The field carries the complexity log from a first pass (produced by
+    /// calling [`run_first_pass`]). Leave `None` for single-pass operation.
+    pub two_pass_stats: Option<Vec<f32>>,
 }
 
 impl Default for EncoderOptions {
@@ -218,8 +236,73 @@ impl Default for EncoderOptions {
             use_golden: true,
             allow_four_mv: true,
             rate_control: None,
+            scene_change_detect: true,
+            two_pass_stats: None,
         }
     }
+}
+
+/// Run a first-pass encode of `frames` and return a per-frame complexity
+/// vector suitable for passing to [`EncoderOptions::two_pass_stats`].
+///
+/// The complexity metric is the average macro-block SAD against the previous
+/// frame (or, for the first frame, just the average absolute deviation from
+/// the mean). Values are normalised so 1.0 represents the complexity of a
+/// "busy" frame that is expensive to encode.
+///
+/// # Example
+/// ```rust,no_run
+/// use oxideav_theora::encoder::{run_first_pass, make_encoder_with_options, EncoderOptions};
+/// use oxideav_core::{VideoFrame, CodecParameters, CodecId};
+/// # let frames: Vec<VideoFrame> = vec![];
+/// let stats = run_first_pass(&frames);
+/// let opts = EncoderOptions { two_pass_stats: Some(stats), ..Default::default() };
+/// # let params = CodecParameters::video(CodecId::new("theora"));
+/// let _enc = make_encoder_with_options(&params, opts);
+/// ```
+pub fn run_first_pass(frames: &[oxideav_core::VideoFrame]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        if f.planes.is_empty() {
+            out.push(1.0f32);
+            continue;
+        }
+        let y = &f.planes[0].data;
+        let w = f.planes[0].stride;
+        let h = y.len().checked_div(w).unwrap_or(0);
+        if w == 0 || h == 0 {
+            out.push(1.0f32);
+            continue;
+        }
+        let complexity = if i == 0 {
+            // First frame: intra complexity = mean absolute deviation from mean.
+            let mean: f64 = y.iter().map(|&v| v as f64).sum::<f64>() / y.len() as f64;
+            let mad: f64 = y.iter().map(|&v| (v as f64 - mean).abs()).sum::<f64>() / y.len() as f64;
+            mad
+        } else {
+            // Subsequent frames: SAD against previous frame's luma.
+            let prev = &frames[i - 1].planes[0].data;
+            let prev_w = frames[i - 1].planes[0].stride;
+            let prev_h = prev.len().checked_div(prev_w).unwrap_or(0);
+            let cw = w.min(prev_w);
+            let ch = h.min(prev_h);
+            let sad: f64 = (0..ch)
+                .map(|r| {
+                    (0..cw)
+                        .map(|c| {
+                            (y[r * w + c] as i32 - prev[r * prev_w + c] as i32).unsigned_abs()
+                                as f64
+                        })
+                        .sum::<f64>()
+                })
+                .sum::<f64>()
+                / (cw * ch).max(1) as f64;
+            sad
+        };
+        // Normalise to ~ 1.0 for typical complexity.
+        out.push((complexity / 32.0).clamp(0.1, 4.0) as f32);
+    }
+    out
 }
 
 /// Build a Theora encoder for the given [`CodecParameters`], using
@@ -350,6 +433,8 @@ pub fn make_encoder_with_options(
         me_range,
         use_golden: opts.use_golden,
         allow_four_mv: opts.allow_four_mv,
+        scene_change_detect: opts.scene_change_detect,
+        two_pass_stats: opts.two_pass_stats,
         frame_index: 0,
         prev_ref: None,
         golden_ref: None,
@@ -377,6 +462,10 @@ struct TheoraEncoder {
     me_range: i32,
     use_golden: bool,
     allow_four_mv: bool,
+    /// Enable scene-change detection.
+    scene_change_detect: bool,
+    /// Per-frame complexity log from a two-pass first run.
+    two_pass_stats: Option<Vec<f32>>,
     frame_index: u32,
     /// Previous reconstructed frame (post-loop-filter pixel buffers).
     /// Each plane is stored TOP-DOWN at the coded frame size.
@@ -426,8 +515,28 @@ impl Encoder for TheoraEncoder {
             self.emit_header_packet(self.setup_packet.clone(), v.pts);
             self.emitted_headers = true;
         }
-        // Decide frame type.
-        let is_keyframe = self.prev_ref.is_none() || self.frame_index % self.keyint == 0;
+        // Decide frame type. Force keyframe at GOP boundary, when no prior
+        // reference exists, or on a detected scene change.
+        let forced_keyframe = self.prev_ref.is_none() || self.frame_index % self.keyint == 0;
+        let scene_cut = !forced_keyframe && self.scene_change_detect && self.is_scene_change(v);
+        let is_keyframe = forced_keyframe || scene_cut;
+
+        // Two-pass QI pre-assignment: if second-pass stats are present, look
+        // up the complexity for this frame and bias the QI before the
+        // rate-control loop runs. The bias is additive and clamped to [0,63].
+        if let Some(ref stats) = self.two_pass_stats {
+            if let Some(&complexity) = stats.get(self.frame_index as usize) {
+                // complexity < 1.0 → easy frame → raise QI (finer quant)
+                // complexity > 1.0 → hard frame → lower QI (coarser quant)
+                let delta = ((1.0f32 - complexity) * 8.0).round() as i32;
+                let new_qi = (self.qi as i32 + delta).clamp(0, 63) as u8;
+                self.qi = new_qi;
+                if let Some(ref mut rc) = self.rc {
+                    rc.current_qi = new_qi.clamp(rc.opts.qi_min, rc.opts.qi_max);
+                }
+            }
+        }
+
         let (data, recon) = self.encode_frame_with_rate_control(v, is_keyframe)?;
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = v.pts;
@@ -453,6 +562,33 @@ impl Encoder for TheoraEncoder {
 }
 
 impl TheoraEncoder {
+    /// True if the current frame is a scene change relative to `prev_ref`.
+    /// Computes the average per-MB luma SAD at zero MV; if it exceeds
+    /// `SCENE_CHANGE_MB_SAD` the encoder treats this as a new scene.
+    fn is_scene_change(&self, frame: &VideoFrame) -> bool {
+        let prev = match self.prev_ref.as_ref() {
+            Some(p) => p,
+            None => return false,
+        };
+        let plane0 = &self.layout.planes[0];
+        let mbw = plane0.nbw / 2;
+        let mbh = plane0.nbh / 2;
+        let n_mbs = (mbw * mbh) as i32;
+        if n_mbs == 0 {
+            return false;
+        }
+        let mut total_sad = 0i64;
+        for mby in 0..mbh {
+            for mbx in 0..mbw {
+                let bxs = [mbx * 2, mbx * 2 + 1, mbx * 2, mbx * 2 + 1];
+                let bys = [mby * 2, mby * 2, mby * 2 + 1, mby * 2 + 1];
+                total_sad += self.mb_sad(frame, prev, bxs, bys, (0, 0)) as i64;
+            }
+        }
+        let avg_mb_sad = (total_sad / n_mbs as i64) as i32;
+        avg_mb_sad > SCENE_CHANGE_MB_SAD
+    }
+
     fn emit_header_packet(&mut self, data: Vec<u8>, pts: Option<i64>) {
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = pts;
@@ -1649,6 +1785,17 @@ impl TheoraEncoder {
     }
 
     /// Encode all DCT coefficients per spec §7.7.3.
+    ///
+    /// Optimisations over the baseline single-token-per-block approach:
+    ///
+    /// 1. **Multi-block EOB tokens** (tokens 1-6, spec §7.7.3): when a
+    ///    run of consecutive coded blocks all have zero coefficients (i.e.
+    ///    their only token is a single-block EOB at ti=0), we collapse the
+    ///    entire run into one multi-EOB token. This can save several codewords
+    ///    per frame on low-motion P-frames where most inter residuals are tiny.
+    ///
+    /// 2. **Combined zero-run+value tokens** (tokens 23-31): `build_block_token_program`
+    ///    already prefers these where the pattern matches.
     fn encode_coefficients(
         &self,
         bw: &mut BitWriter,
@@ -1667,12 +1814,166 @@ impl TheoraEncoder {
             }
         }
 
+        // Helper: emit a multi-block EOB token (tokens 1-6) for `count` blocks.
+        // The table used is for ti=0, luma (hg=0, hti_l=0 → table 0).
+        // Multi-EOB tokens are always emitted at ti=0 and share the same
+        // Huffman group as single-EOB (token 0).
+        let emit_multi_eob = |bw: &mut BitWriter, tbl: &HuffTable, count: usize| -> Result<()> {
+            match count {
+                1 => {
+                    // token 0: single-block EOB.
+                    emit_token(
+                        bw,
+                        tbl,
+                        &TokenAtTi {
+                            token: 0,
+                            extra_bits: 0,
+                            extra_len: 0,
+                            ti_pos: 0,
+                        },
+                    )
+                }
+                2 => emit_token(
+                    bw,
+                    tbl,
+                    &TokenAtTi {
+                        token: 1,
+                        extra_bits: 0,
+                        extra_len: 0,
+                        ti_pos: 0,
+                    },
+                ),
+                3 => emit_token(
+                    bw,
+                    tbl,
+                    &TokenAtTi {
+                        token: 2,
+                        extra_bits: 0,
+                        extra_len: 0,
+                        ti_pos: 0,
+                    },
+                ),
+                4..=7 => emit_token(
+                    bw,
+                    tbl,
+                    &TokenAtTi {
+                        token: 3,
+                        extra_bits: (count - 4) as u32,
+                        extra_len: 2,
+                        ti_pos: 0,
+                    },
+                ),
+                8..=15 => emit_token(
+                    bw,
+                    tbl,
+                    &TokenAtTi {
+                        token: 4,
+                        extra_bits: (count - 8) as u32,
+                        extra_len: 3,
+                        ti_pos: 0,
+                    },
+                ),
+                16..=31 => emit_token(
+                    bw,
+                    tbl,
+                    &TokenAtTi {
+                        token: 5,
+                        extra_bits: (count - 16) as u32,
+                        extra_len: 4,
+                        ti_pos: 0,
+                    },
+                ),
+                _ => {
+                    // token 6: up to 4096 blocks; value 0 means "all remaining"
+                    // but we avoid that ambiguity by capping at 4095.
+                    let c = count.min(4095);
+                    emit_token(
+                        bw,
+                        tbl,
+                        &TokenAtTi {
+                            token: 6,
+                            extra_bits: c as u32,
+                            extra_len: 12,
+                            ti_pos: 0,
+                        },
+                    )
+                }
+            }
+        };
+
         let hti_l: u8 = 0;
         let hti_c: u8 = 0;
 
+        // Classify each coded block: is it all-zero (program = single EOB)?
+        let is_all_zero: Vec<bool> = (0..nbs)
+            .map(|bi| {
+                bcoded[bi]
+                    && programs[bi].len() == 1
+                    && programs[bi][0].token == 0
+                    && programs[bi][0].ti_pos == 0
+            })
+            .collect();
+
         let mut prog_idx = vec![0usize; nbs];
-        for ti in 0u8..64 {
-            if ti == 0 || ti == 1 {
+
+        // At ti=0 we write the HTI selectors, then process all coded blocks.
+        // Multi-EOB runs are collapsed here before entering the per-ti loop.
+        //
+        // The spec processes blocks in the order they appear in the coded block
+        // list. We can collapse consecutive all-zero blocks (from either plane)
+        // into one multi-EOB token, as long as they are contiguous in block
+        // index and are all in the same Huffman partition (luma vs chroma).
+        // Since the spec's "remaining_blocks" count ignores plane boundaries
+        // and the HTI selectors are already written, we emit multi-EOB tokens
+        // freely across the partition boundary — but the luma HTI table is
+        // used for the codeword itself (it is always table group 0, ti=0).
+        {
+            // Write HTI selectors for ti=0.
+            bw.write_bits(hti_l as u32, 4);
+            bw.write_bits(hti_c as u32, 4);
+
+            let tbl_l = &self.huff_tables[hti_l as usize]; // hg=0, hti=0
+
+            let mut bi = 0;
+            while bi < nbs {
+                if !bcoded[bi] {
+                    bi += 1;
+                    continue;
+                }
+                if is_all_zero[bi] {
+                    // Count the run of consecutive all-zero coded blocks.
+                    let run_start = bi;
+                    while bi < nbs && bcoded[bi] && is_all_zero[bi] {
+                        bi += 1;
+                    }
+                    let run_len = bi - run_start;
+                    // Emit one multi-EOB token for the whole run.
+                    emit_multi_eob(bw, tbl_l, run_len)?;
+                    // Mark those blocks as fully emitted.
+                    for bj in run_start..bi {
+                        prog_idx[bj] = programs[bj].len();
+                    }
+                } else {
+                    // Non-zero block at ti=0: emit its ti=0 token normally.
+                    let tbl = if bi < nlbs {
+                        &self.huff_tables[hti_l as usize]
+                    } else {
+                        &self.huff_tables[hti_c as usize]
+                    };
+                    let entry = &programs[bi][prog_idx[bi]];
+                    if entry.ti_pos == 0 {
+                        emit_token(bw, tbl, entry)?;
+                        prog_idx[bi] += 1;
+                    }
+                    bi += 1;
+                }
+            }
+        }
+
+        // Remaining coefficient positions ti=1..63.
+        for ti in 1u8..64 {
+            if ti == 1 {
+                // HTI selectors for ti=1 (the only other position that needs them).
                 bw.write_bits(hti_l as u32, 4);
                 bw.write_bits(hti_c as u32, 4);
             }
@@ -1734,6 +2035,16 @@ struct TokenAtTi {
     ti_pos: u8,
 }
 
+/// Build the token program for a single block's 64 zig-zag coefficients.
+///
+/// Uses all token categories defined in the Theora spec §7.7:
+///   - Token 0: EOB (single block)
+///   - Tokens 7-8: zero-run (1–8 zeros with 3-bit count; 1–64 with 6-bit)
+///   - Tokens 9-22: scalar values ±1 through ±580
+///   - Tokens 23-31: combined zero-run + ±{1,2,3} tokens (spec Table 7.42)
+///     These encode short patterns like "1 zero then ±1" in a single codeword,
+///     which is cheaper than a separate zero-run token + value token when the
+///     Huffman table assigns short codes to these composite tokens.
 fn build_block_token_program(zz_coeffs: &[i32]) -> Vec<TokenAtTi> {
     debug_assert_eq!(zz_coeffs.len(), 64);
     let mut last_nz = -1i32;
@@ -1756,10 +2067,131 @@ fn build_block_token_program(zz_coeffs: &[i32]) -> Vec<TokenAtTi> {
     while ti as i32 <= last_nz {
         let v = zz_coeffs[ti];
         if v == 0 {
+            // Count the zero run length (ending at or before last_nz).
             let mut run = 1usize;
             while ti + run <= last_nz as usize && zz_coeffs[ti + run] == 0 {
                 run += 1;
             }
+            // Peek at the non-zero value that follows (if any), to check if a
+            // combined zero-run+value token applies (tokens 23-31).
+            let next_abs = if ti + run <= last_nz as usize {
+                zz_coeffs[ti + run].unsigned_abs() as i32
+            } else {
+                0
+            };
+            let next_neg = if ti + run <= last_nz as usize {
+                zz_coeffs[ti + run] < 0
+            } else {
+                false
+            };
+            // Try to emit a combined token for zero-run ≤ 17 followed by ±1:
+            //   token 23: 1 zero + ±1  (sign=1 bit)
+            //   token 24: 2 zeros + ±1
+            //   token 25: 3 zeros + ±1
+            //   token 26: 4 zeros + ±1
+            //   token 27: 5 zeros + ±1
+            //   token 28: 6–9 zeros + ±1  (run-6 = 2 bits)
+            //   token 29: 10–17 zeros + ±1 (run-10 = 3 bits)
+            // Combined tokens for ±{2,3} following 1 zero:
+            //   token 30: 1 zero + ±{2,3} (mag-2 = 1 bit, sign = 1 bit)
+            //   token 31: 2–3 zeros + ±{2,3} (run-2 = 1 bit, mag-2 = 1 bit, sign = 1 bit)
+            if next_abs == 1 {
+                if run == 1 {
+                    out.push(TokenAtTi {
+                        token: 23,
+                        extra_bits: u32::from(next_neg),
+                        extra_len: 1,
+                        ti_pos: ti as u8,
+                    });
+                    ti += 2;
+                    continue;
+                } else if run == 2 {
+                    out.push(TokenAtTi {
+                        token: 24,
+                        extra_bits: u32::from(next_neg),
+                        extra_len: 1,
+                        ti_pos: ti as u8,
+                    });
+                    ti += 3;
+                    continue;
+                } else if run == 3 {
+                    out.push(TokenAtTi {
+                        token: 25,
+                        extra_bits: u32::from(next_neg),
+                        extra_len: 1,
+                        ti_pos: ti as u8,
+                    });
+                    ti += 4;
+                    continue;
+                } else if run == 4 {
+                    out.push(TokenAtTi {
+                        token: 26,
+                        extra_bits: u32::from(next_neg),
+                        extra_len: 1,
+                        ti_pos: ti as u8,
+                    });
+                    ti += 5;
+                    continue;
+                } else if run == 5 {
+                    out.push(TokenAtTi {
+                        token: 27,
+                        extra_bits: u32::from(next_neg),
+                        extra_len: 1,
+                        ti_pos: ti as u8,
+                    });
+                    ti += 6;
+                    continue;
+                } else if (6..=9).contains(&run) {
+                    // token 28: sign(1) + (run-6)(2 bits)
+                    let mag_off = (run - 6) as u32;
+                    out.push(TokenAtTi {
+                        token: 28,
+                        extra_bits: (u32::from(next_neg) << 2) | mag_off,
+                        extra_len: 3,
+                        ti_pos: ti as u8,
+                    });
+                    ti += run + 1;
+                    continue;
+                } else if (10..=17).contains(&run) {
+                    // token 29: sign(1) + (run-10)(3 bits)
+                    let mag_off = (run - 10) as u32;
+                    out.push(TokenAtTi {
+                        token: 29,
+                        extra_bits: (u32::from(next_neg) << 3) | mag_off,
+                        extra_len: 4,
+                        ti_pos: ti as u8,
+                    });
+                    ti += run + 1;
+                    continue;
+                }
+            }
+            if next_abs == 2 || next_abs == 3 {
+                if run == 1 {
+                    // token 30: 1 zero + ±{2,3}: sign(1) + (mag-2)(1 bit)
+                    let mag_off = (next_abs - 2) as u32;
+                    out.push(TokenAtTi {
+                        token: 30,
+                        extra_bits: (u32::from(next_neg) << 1) | mag_off,
+                        extra_len: 2,
+                        ti_pos: ti as u8,
+                    });
+                    ti += 2;
+                    continue;
+                } else if run == 2 || run == 3 {
+                    // token 31: 2–3 zeros + ±{2,3}: sign(1) + (mag-2)(1 bit) + (run-2)(1 bit)
+                    let mag_off = (next_abs - 2) as u32;
+                    let run_off = (run - 2) as u32;
+                    out.push(TokenAtTi {
+                        token: 31,
+                        extra_bits: (u32::from(next_neg) << 2) | (mag_off << 1) | run_off,
+                        extra_len: 3,
+                        ti_pos: ti as u8,
+                    });
+                    ti += run + 1;
+                    continue;
+                }
+            }
+            // Fall back to a plain zero-run token.
             if run <= 8 {
                 out.push(TokenAtTi {
                     token: 7,

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Encoder
+
+- **Scene-change detection**: the encoder now computes average MB SAD
+  against the previous reference frame before determining the frame type.
+  If the SAD exceeds `SCENE_CHANGE_MB_SAD` (2048 per MB) the frame is
+  forced to a keyframe regardless of the keyint schedule, so the golden
+  reference tracks real scene boundaries. Opt-out via
+  `EncoderOptions::scene_change_detect = false`.
+
+- **Two-pass encoding**: new public function `run_first_pass` collects
+  per-frame complexity (intra MAD for frame 0; inter luma SAD for
+  subsequent frames). Passing the result as `EncoderOptions::two_pass_stats`
+  pre-biases the per-frame QI before the normal rate-control loop runs,
+  allocating more bits to complex frames and fewer to easy ones.
+
+- **Full DCT token coverage** (spec §7.7.3): the encoder now uses the
+  complete Theora 32-token set.
+  - Multi-block EOB tokens (tokens 1-6): consecutive coded blocks whose
+    entire residual is zero are collapsed into a single multi-EOB token
+    instead of one EOB codeword per block. Saves 1-5 Huffman codewords per
+    run on low-motion inter frames.
+  - Combined zero-run+value tokens (tokens 23-31): patterns such as
+    "N zeros then ±1" or "N zeros then ±{2,3}" are encoded in a single
+    codeword (tokens 23-31) instead of a separate zero-run token followed
+    by a value token. Reduces bit cost on sparse high-frequency residuals.
+
+- Cross-validate: libtheora/ffmpeg decodes outputs at 256×256 with PSNR_Y
+  ≥ 35 dB (new `psnr_256x256_libtheora_cross_decode` test).
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-theora/compare/v0.0.5...v0.0.6) - 2026-05-04
 
 ### Other

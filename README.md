@@ -56,8 +56,21 @@ oxideav-theora = "0.0"
   reference blob; the ID and comment headers are synthesized from
   `CodecParameters`.
 - Verified with ffmpeg: Ogg-muxed output decodes cleanly in
-  `ffmpeg`/`libtheora`, and the round-trip via our own decoder achieves more
-  than 35 dB PSNR on synthetic inputs across all three chroma formats.
+  `ffmpeg`/`libtheora` at 64×64, 256×256, 720p and 1080p, and the
+  round-trip via our own decoder achieves more than 35 dB PSNR on
+  synthetic inputs across all three chroma formats.
+- Scene-change detection: the encoder computes the average MB SAD against
+  the previous frame and forces a keyframe at scene boundaries even when
+  the keyint schedule would not (configurable via
+  `EncoderOptions::scene_change_detect`).
+- Two-pass encoding: `run_first_pass` collects per-frame complexity;
+  passing the result as `EncoderOptions::two_pass_stats` pre-biases the
+  per-frame QI for the second pass before the rate-control loop runs.
+- Full DCT token coverage: the encoder now uses the complete Theora token
+  set, including multi-block EOB tokens (tokens 1-6 for runs of all-zero
+  coded blocks) and combined zero-run+value tokens (tokens 23-31, e.g.
+  "N zeros then ±1"). These reduce per-frame bitstream size on sparse
+  inter residuals.
 
 ### Known encoder limitations
 
@@ -68,7 +81,8 @@ oxideav-theora = "0.0"
 - Rate control is opt-in (`EncoderOptions::rate_control`); when not
   configured the quantisation index is fixed (`EncoderOptions::qi`,
   default `DEFAULT_QI = 32`). The CBR loop is single-pass with re-encode
-  bisection and does not implement multi-pass / VBV-strict / psy.
+  bisection and does not implement VBV-strict / psy. Two-pass pre-biasing
+  is available via `EncoderOptions::two_pass_stats`.
 - Motion search is a brute-force full-pel scan within `±me_range` for the
   16x16 MB candidate; 4-MV sub-block search uses a diamond pattern seeded
   from the 16x16 best, not an independent full scan. The golden-reference

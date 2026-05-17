@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Encoder
+
+- **Bit-cost-aware mode decision (round 73)**: `decide_mb_modes` now scores
+  each candidate (INTER_NOMV / INTER_MV / INTER_MV_LAST{,2} / INTRA /
+  INTER_GOLDEN_{NO,}MV / INTER_MV_FOUR) as `sad + lambda(qi) * bits`, where
+  `bits` is the actual mode-codeword length plus, for MV-bearing modes, the
+  real per-component Theora MV-VLC bit count (`mv_component_bits`). Replaces
+  the previous fixed `MV_GAIN_THRESHOLD` / `LAST_MV_BONUS` /
+  `GOLDEN_PENALTY` / `FOUR_MV_PENALTY` constants. The non-bit
+  reference-switch penalty (`GOLDEN_REF_SAD_PENALTY`) is preserved as a
+  separate term because it represents a DC-prediction chain break, not a
+  bitstream cost.
+
+- **MSCHEME (mode-alphabet) selection (round 73)**: `pick_mode_scheme` now
+  counts the per-frame mode-frequency histogram and chooses the MSCHEME
+  (0..6, spec §7.3.4 / Table 7.19) that minimises total mode-codeword bits.
+  MSCHEMEs 1..6 use the fixed alphabets in `MODE_ALPHABETS` (no payload);
+  MSCHEME 0 transmits a custom 8 × 3-bit alphabet (24-bit overhead) sorted
+  by descending frequency, optimal for the per-MB part by construction.
+  The encoder picks whichever total (alphabet payload + per-MB
+  codewords) is smallest. Previously the encoder always emitted MSCHEME=0
+  with the natural alphabet, paying the 24-bit overhead even on
+  short-frame / low-mode-diversity streams.
+
+- New unit tests (`mv_component_bits_matches_writer`,
+  `mode_rank_bits_matches_writer`, `pick_mode_scheme_handles_extremes`)
+  pin the bit-cost helpers to what the bitstream writer actually emits so
+  they cannot drift apart silently.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-theora/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other

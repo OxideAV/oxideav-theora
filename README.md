@@ -39,12 +39,14 @@ oxideav-theora = "0.0"
 
 - Intra (key) frames: forward DCT, integer-domain quantisation, forward DC
   prediction, token RLE, Huffman encoding against the setup header's trees.
-- Inter (P) frames: SAD-based mode decision per macro-block with full-pel
-  motion search (plus half-pel refinement) inside `me_range`, considering
-  `{INTER_NOMV, INTRA, INTER_MV, INTER_MV_LAST, INTER_MV_LAST2,
-  INTER_GOLDEN_NOMV, INTER_GOLDEN_MV, INTER_MV_FOUR}`. 4-MV runs a
-  per-8x8-sub-block diamond search seeded from the 16x16 best MV and is
-  picked when its RD-biased SAD beats the 1-MV candidate by a margin.
+- Inter (P) frames: rate-distortion mode decision per macro-block. Each
+  candidate (`INTER_NOMV`, `INTRA`, `INTER_MV`, `INTER_MV_LAST`,
+  `INTER_MV_LAST2`, `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`,
+  `INTER_MV_FOUR`) is scored as `sad + lambda(qi) * actual_bits`, where
+  `actual_bits` is the spec-§7.3.4 mode codeword length plus, for
+  MV-bearing modes, the real per-component Theora MV-VLC bit count. Motion
+  search is full-pel inside `me_range` followed by half-pel refinement;
+  4-MV runs a per-8x8-sub-block diamond seeded from the 16x16 best MV.
 - Chroma formats: 4:2:0, 4:2:2, 4:4:4.
 - Reference tracking: encoder reconstructs each frame internally (same
   dequant/IDCT/loop-filter path as the decoder), keeping the golden / LAST
@@ -55,6 +57,11 @@ oxideav-theora = "0.0"
   matrices, 80 Huffman trees) is shipped verbatim as a libtheora-compatible
   reference blob; the ID and comment headers are synthesized from
   `CodecParameters`.
+- Per-frame mode-alphabet (MSCHEME, spec §7.3.4) selection: the encoder
+  counts the per-frame mode-frequency histogram and picks whichever
+  MSCHEME (0..6) minimises total mode-codeword bits, including MSCHEME=0's
+  24-bit alphabet payload. MSCHEMEs 1..6 use the fixed alphabets from
+  Table 7.19; MSCHEME 0 transmits a frequency-sorted custom alphabet.
 - Verified with ffmpeg: Ogg-muxed output decodes cleanly in
   `ffmpeg`/`libtheora` at 64×64, 256×256, 720p and 1080p, and the
   round-trip via our own decoder achieves more than 35 dB PSNR on

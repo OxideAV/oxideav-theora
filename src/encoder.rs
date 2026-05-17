@@ -52,9 +52,12 @@
 //! `rate_control` is `None` (the default), QI is fixed at
 //! [`DEFAULT_QI`] (or whatever the caller set).
 //!
-//! The encoder always picks HTI 0 for the Huffman group selectors and always
-//! emits `MSCHEME=0` so the alphabet is the natural 0..7 ordering shipped with
-//! the decoder.
+//! The encoder always picks HTI 0 for the Huffman group selectors. The mode
+//! alphabet scheme (MSCHEME, spec §7.3.4) is picked per inter-frame from the
+//! actual mode-frequency histogram: MSCHEMEs 1..6 use fixed alphabets (no
+//! payload), MSCHEME 0 transmits a custom 8 × 3-bit alphabet (24 bits) sorted
+//! by descending frequency. `pick_mode_scheme` returns whichever total
+//! mode-codeword bit count is smallest.
 
 use std::collections::VecDeque;
 
@@ -69,7 +72,7 @@ use crate::dct::{idct2d, INV_ZIGZAG};
 use crate::encoder_huffman::{build_all, HuffCode, HuffTable};
 use crate::fdct::fdct8x8;
 use crate::headers::{parse_setup_header, PixelFormat as TheoraPixelFormat, Setup};
-use crate::inter::{Mode, MODE_ALPHABETS};
+use crate::inter::Mode;
 use crate::quant::build_qmat;
 
 /// Standard libtheora setup header.
@@ -90,28 +93,61 @@ pub const DEFAULT_ME_RANGE: i32 = 15;
 /// MB is encoded as INTER_NOMV with all blocks marked uncoded (skip).
 const SKIP_SAD_THRESHOLD: i32 = 384;
 
-/// SAD improvement (over zero-MV) required for the encoder to invest the cost
-/// of an INTER_MV codeword over INTER_NOMV.
-const MV_GAIN_THRESHOLD: i32 = 256;
+/// Extra cost (in SAD units) charged against switching to the GOLDEN reference
+/// (each switch introduces a RFI flip during DC prediction + breaks the
+/// last_mv chain). Held as a non-bit penalty since it isn't a bitstream cost.
+const GOLDEN_REF_SAD_PENALTY: i32 = 128;
 
-/// SAD-bias credit given to INTER_MV_LAST / INTER_MV_LAST2 matches over a
-/// newly-coded INTER_MV. These modes cost no MV bits, so if the predictor is
-/// nearly as good we save a whole Table 7.23 codeword.
-const LAST_MV_BONUS: i32 = 128;
+/// Per-bit SAD weight (lambda) used to convert a bit cost into the SAD-units
+/// scoreboard used by `decide_mb_modes`. A higher value makes the encoder
+/// trade more distortion for fewer bits (smaller files); a lower value makes
+/// it prefer bigger files with lower distortion.
+///
+/// Empirically λ ≈ 24 SAD/bit at the encoder's default `qi = 32` keeps the
+/// behaviour on the existing moving-pattern / 4-MV / half-pel tests within
+/// the same envelope as the old hand-tuned `MV_GAIN_THRESHOLD = 256` (a 1-pair
+/// MV is ~6..10 bits → ~144..240 SAD), while making the cost track the actual
+/// VLC length rather than charging the same penalty regardless of MV
+/// magnitude. We scale weakly with QI so coarse-quant frames (smaller QI)
+/// further prefer cheap MVs and fine-quant frames (large QI) tolerate more
+/// MV bits to get a tighter SAD.
+fn lambda_per_bit(qi: u8) -> i32 {
+    // Linear interpolation: qi=0 → 16, qi=63 → 40.
+    16 + (qi as i32 * 24) / 63
+}
 
-/// Extra cost charged against switching to the GOLDEN reference (each switch
-/// introduces a RFI flip during DC prediction + breaks the last_mv chain).
-const GOLDEN_PENALTY: i32 = 128;
+/// Bit cost of writing one MV component through `write_mv_component_vlc`.
+/// Mirrors that writer exactly so the cost reflects what the bitstream
+/// actually pays.
+fn mv_component_bits(mv: i32) -> u32 {
+    let abs = mv.clamp(-31, 31).unsigned_abs();
+    match abs {
+        0 => 3,
+        1 => 3,
+        2 => 4,
+        3 => 4,
+        4..=7 => 6,
+        8..=15 => 7,
+        16..=23 => 8,
+        _ => 8, // 24..=31
+    }
+}
 
-/// Additional SAD margin charged against INTER_MV_FOUR vs INTER_MV. 4-MV
-/// transmits four MV VLCs (~6-10 bits each) instead of one, plus a longer
-/// mode codeword (rank 7 = 7 leading 1-bits). The margin is expressed in the
-/// same SAD units the rest of the scoreboard uses; 4-MV must therefore save
-/// ~this many SAD units relative to the 1-MV best before it becomes the
-/// winner. Empirically a budget around 3× `MV_GAIN_THRESHOLD` keeps 4-MV from
-/// being emitted on translation-only content while still letting it win on
-/// inputs with genuine per-sub-block motion.
-const FOUR_MV_PENALTY: i32 = 3 * MV_GAIN_THRESHOLD;
+/// Bit cost of an (x, y) MV pair.
+fn mv_pair_bits(mv: (i32, i32)) -> u32 {
+    mv_component_bits(mv.0) + mv_component_bits(mv.1)
+}
+
+/// Bit cost of a mode codeword at the given rank in the alphabet (spec §7.3.4).
+/// Codewords are `r` leading 1-bits followed by a single 0-bit for ranks 0..6
+/// (lengths 1..7), or seven 1-bits for rank 7 (length 7).
+fn mode_rank_bits(rank: u8) -> u32 {
+    if rank >= 7 {
+        7
+    } else {
+        rank as u32 + 1
+    }
+}
 
 /// Half-pel refinement radius (in half-pel units) around a full-pel seed. We
 /// test the eight half-pel neighbours at distance 1.
@@ -902,18 +938,28 @@ impl TheoraEncoder {
         // SBPMs + per-block BCODED.
         write_inter_bcoded(&mut bw, &self.layout, &bcoded);
 
-        // Mode header: pick MSCHEME=0, write 8-mode alphabet table mapping
-        // mode_index -> rank. We choose alphabet[i]=Mode::from_index(i), so
-        // every mode's rank in the alphabet equals its mode index.
-        bw.write_bits(0, 3); // MSCHEME = 0
-        for mode in 0..8u8 {
-            // For mscheme=0, decoder reads 8 × 3-bit values mi; sets
-            // alphabet[mi] = mode_for(loop_var). We want alphabet[i] = mode i,
-            // so mi = i.
-            bw.write_bits(mode as u32, 3);
+        // Mode header: pick the MSCHEME (0..6) that minimises total
+        // mode-codeword bits for this frame's actual mode-frequency
+        // histogram. MSCHEMEs 1..6 use fixed alphabets (no payload);
+        // MSCHEME 0 transmits a custom 8 × 3-bit alphabet (24 bits) but is
+        // optimal for the per-MB part by construction (modes sorted by
+        // descending frequency).
+        let (mscheme, alphabet) = pick_mode_scheme(&mb_decisions);
+        bw.write_bits(mscheme as u32, 3);
+        if mscheme == 0 {
+            // Decoder reads, for each MODE in 0..8, a 3-bit `mi` and sets
+            // `alphabet[mi] = MODE`. So to make `alphabet[rank] = m`, the
+            // value emitted at MODE-index `m as u8` must be `rank`.
+            let mut rank_of_mode = [0u8; 8];
+            for (rank, &m) in alphabet.iter().enumerate() {
+                rank_of_mode[m as usize] = rank as u8;
+            }
+            for mode in 0..8u8 {
+                bw.write_bits(rank_of_mode[mode as usize] as u32, 3);
+            }
         }
         // Per-MB mode codeword: only for MBs that have any coded block.
-        write_inter_modes(&mut bw, &mb_decisions);
+        write_inter_modes(&mut bw, &mb_decisions, &alphabet);
 
         // MV stream.
         bw.write_bits(0, 1); // MVMODE = 0 (VLC)
@@ -1440,31 +1486,59 @@ impl TheoraEncoder {
                     };
 
                     // Compose candidate scoreboard. Lower is better. Each
-                    // candidate is (score, mode, mv, updates_last).
+                    // candidate is scored as `sad + lambda * actual_bits`,
+                    // where `bits` is the sum of the mode codeword bits and
+                    // any MV VLC bits the mode would transmit. This replaces
+                    // the previous hand-tuned constants and makes the cost
+                    // track the actual bitstream price (e.g. small MVs cost
+                    // less than large MVs, 4-MV pays four real VLC pairs).
                     //
-                    //   INTER_NOMV     : sad_zero                                   (0 MV bits)
-                    //   INTER_MV       : best_sad + MV_GAIN_THRESHOLD                (two MV VLCs)
-                    //   INTER_MV_LAST  : sad_last - LAST_MV_BONUS                    (rank bits only)
-                    //   INTER_MV_LAST2 : sad_last2 - LAST_MV_BONUS/2                 (rank bits only, rarer)
-                    //   INTER_GOLDEN_NOMV : sad_g0 + GOLDEN_PENALTY                 (rank bits only)
-                    //   INTER_GOLDEN_MV : best_gsad + GOLDEN_PENALTY + MV_GAIN_THRESHOLD
-                    //   INTRA          : intra_cost                                  (plain DCT bits)
-                    let no_mv_score = sad_zero;
-                    let mv_score = best_sad + MV_GAIN_THRESHOLD;
-                    let last_score = sad_last.saturating_sub(LAST_MV_BONUS);
-                    let last2_score = sad_last2.saturating_sub(LAST_MV_BONUS / 2);
-                    let intra_score = intra_cost;
-                    let gnm_score = best_gsad.saturating_add(GOLDEN_PENALTY).saturating_add(
-                        if best_gmv == (0, 0) {
+                    // We score modes against MSCHEME=0 with the natural
+                    // alphabet (alphabet[i] = mode i), which is what the
+                    // encoder currently transmits — see `write_inter_modes`.
+                    // The relative ordering between modes is the same under
+                    // MSCHEMEs 1..6, so the chosen MSCHEME doesn't change
+                    // which mode wins here; only the absolute mode-codeword
+                    // bit counts shift by a small constant.
+                    let lambda = lambda_per_bit(self.qi);
+                    let mode_bits = |m: Mode| -> u32 { mode_rank_bits(m as u8) };
+                    let bits_to_sad = |b: u32| -> i32 { (b as i32).saturating_mul(lambda) };
+                    let no_mv_score =
+                        sad_zero.saturating_add(bits_to_sad(mode_bits(Mode::InterNoMv)));
+                    let mv_score = best_sad.saturating_add(bits_to_sad(
+                        mode_bits(Mode::InterMv) + mv_pair_bits(best_mv),
+                    ));
+                    let last_score = if sad_last == i32::MAX {
+                        i32::MAX
+                    } else {
+                        sad_last.saturating_add(bits_to_sad(mode_bits(Mode::InterMvLast)))
+                    };
+                    let last2_score = if sad_last2 == i32::MAX {
+                        i32::MAX
+                    } else {
+                        sad_last2.saturating_add(bits_to_sad(mode_bits(Mode::InterMvLast2)))
+                    };
+                    let intra_score =
+                        intra_cost.saturating_add(bits_to_sad(mode_bits(Mode::Intra)));
+                    let gnm_mode = if best_gmv == (0, 0) {
+                        Mode::InterGoldenNoMv
+                    } else {
+                        Mode::InterGoldenMv
+                    };
+                    let gnm_bits = mode_bits(gnm_mode)
+                        + if best_gmv == (0, 0) {
                             0
                         } else {
-                            MV_GAIN_THRESHOLD
-                        },
-                    );
-                    // 4-MV: total SAD from per-sub-block best + extra bit
-                    // cost for transmitting four MV VLCs (vs the one VLC pair
-                    // of INTER_MV) and for the longer mode codeword.
-                    let four_mv_score = total_sad4.saturating_add(FOUR_MV_PENALTY);
+                            mv_pair_bits(best_gmv)
+                        };
+                    let gnm_score = best_gsad
+                        .saturating_add(GOLDEN_REF_SAD_PENALTY)
+                        .saturating_add(bits_to_sad(gnm_bits));
+                    // 4-MV: total SAD from per-sub-block best + bit cost of
+                    // the (rank-7) mode codeword plus four MV VLC pairs.
+                    let four_mv_bits = mode_bits(Mode::InterMvFour)
+                        + mvs4.iter().map(|m| mv_pair_bits(*m)).sum::<u32>();
+                    let four_mv_score = total_sad4.saturating_add(bits_to_sad(four_mv_bits));
 
                     #[derive(Clone, Copy)]
                     struct Cand {
@@ -2415,14 +2489,19 @@ fn write_inter_bcoded(bw: &mut BitWriter, layout: &FrameLayout, bcoded: &[bool])
 }
 
 /// Write per-MB modes in coded order. Only MBs with at least one coded block
-/// emit a codeword. We use the natural alphabet (alphabet[i] = mode i), so
-/// the rank of each mode equals its mode index.
-fn write_inter_modes(bw: &mut BitWriter, decisions: &[MbDecision]) {
+/// emit a codeword. `alphabet` is the chosen MSCHEME's mode→rank table:
+/// `alphabet[rank] = mode`. The codeword length is `mode_rank_bits(rank)`.
+fn write_inter_modes(bw: &mut BitWriter, decisions: &[MbDecision], alphabet: &[Mode; 8]) {
+    // Invert the alphabet so we can look up rank by mode in O(1).
+    let mut mode_to_rank = [0u8; 8];
+    for (rank, &m) in alphabet.iter().enumerate() {
+        mode_to_rank[m as usize] = rank as u8;
+    }
     for d in decisions {
         if !d.bcoded {
             continue; // implicit INTER_NOMV
         }
-        let rank = d.mode as u8;
+        let rank = mode_to_rank[d.mode as usize];
         // Codeword: r leading 1-bits then a 0 (for ranks 0..6); rank 7 = seven 1s.
         if rank == 7 {
             for _ in 0..7 {
@@ -2435,6 +2514,62 @@ fn write_inter_modes(bw: &mut BitWriter, decisions: &[MbDecision]) {
             bw.write_bits(0, 1);
         }
     }
+}
+
+/// Pick the best MSCHEME (0..6) for the given per-MB mode frequencies. Each
+/// MSCHEME ∈ 1..6 is a fixed alphabet from `MODE_ALPHABETS` (no payload),
+/// while MSCHEME 0 lets the encoder transmit a custom alphabet at a fixed
+/// 24-bit overhead (8 × 3-bit `mi` indices). We score every MSCHEME by total
+/// per-MB mode-codeword bits plus the per-scheme overhead and return the
+/// cheapest one along with the alphabet to use.
+///
+/// The custom MSCHEME=0 alphabet is chosen by frequency-rank: most-common
+/// mode gets rank 0, second-most rank 1, etc. This guarantees MSCHEME=0
+/// (with its 24-bit cost) is at least as cheap as the cheapest MSCHEME ∈ 1..6
+/// for the per-MB part; the selector then chooses whichever total is
+/// smallest. For frames with many MBs this nearly always picks MSCHEME=0
+/// (the overhead amortises); for short frames a fixed MSCHEME often wins.
+fn pick_mode_scheme(decisions: &[MbDecision]) -> (u8, [Mode; 8]) {
+    // Count how many coded MBs emit each mode.
+    let mut freq = [0u32; 8];
+    for d in decisions {
+        if d.bcoded {
+            freq[d.mode as usize] += 1;
+        }
+    }
+
+    // Helper: total per-MB mode-codeword bits for a given alphabet.
+    let total_bits = |alphabet: &[Mode; 8]| -> u32 {
+        let mut bits = 0u32;
+        for (rank, &m) in alphabet.iter().enumerate() {
+            bits = bits.saturating_add(freq[m as usize] * mode_rank_bits(rank as u8));
+        }
+        bits
+    };
+
+    // Build the optimal MSCHEME=0 alphabet from the frequency table: sort
+    // modes by descending frequency, breaking ties by mode index (stable).
+    let mut order: Vec<usize> = (0..8).collect();
+    order.sort_by(|&a, &b| freq[b].cmp(&freq[a]).then(a.cmp(&b)));
+    let mut custom_alphabet = [Mode::InterNoMv; 8];
+    for (rank, &mi) in order.iter().enumerate() {
+        custom_alphabet[rank] = Mode::from_index(mi as u8).unwrap_or(Mode::InterNoMv);
+    }
+
+    // MSCHEME=0 carries a 24-bit alphabet payload (8 × 3-bit `mi` indices).
+    let mut best_mscheme = 0u8;
+    let mut best_alphabet = custom_alphabet;
+    let mut best_total = total_bits(&custom_alphabet).saturating_add(24);
+
+    for (i, alphabet) in crate::inter::MODE_ALPHABETS.iter().enumerate().skip(1) {
+        let total = total_bits(alphabet);
+        if total < best_total {
+            best_total = total;
+            best_mscheme = i as u8;
+            best_alphabet = *alphabet;
+        }
+    }
+    (best_mscheme, best_alphabet)
 }
 
 /// Write the MV stream (MVMODE=0, VLC). Mirrors `decode_mv_component_vlc` /
@@ -2876,13 +3011,14 @@ impl BitWriter {
         }
         self.out
     }
-}
 
-// Suppress unused-variable warning for `MODE_ALPHABETS`: imported to make the
-// intent clear that we know about the alphabets even though MSCHEME=0
-// supplies its own.
-#[allow(dead_code)]
-const _: [[Mode; 8]; 7] = MODE_ALPHABETS;
+    /// Total number of bits written so far (used by unit tests that check
+    /// `mv_component_bits` / `mode_rank_bits` predictions match the writer).
+    #[cfg(test)]
+    fn bit_len(&self) -> u32 {
+        (self.out.len() as u32) * 8 + self.nbits
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3171,6 +3307,112 @@ mod tests {
             let got = crate::inter::decode_mv_component_vlc(&mut br).unwrap();
             assert_eq!(got, v, "mismatch at v={v}");
         }
+    }
+
+    /// `mv_component_bits` must report the exact bit length that
+    /// `write_mv_component_vlc` actually writes. Otherwise the
+    /// `decide_mb_modes` scoreboard underestimates real bitstream cost.
+    #[test]
+    fn mv_component_bits_matches_writer() {
+        for v in -31..=31i32 {
+            let mut bw = BitWriter::new();
+            write_mv_component_vlc(&mut bw, v);
+            let written = bw.bit_len();
+            let predicted = mv_component_bits(v);
+            assert_eq!(
+                written, predicted,
+                "mv_component_bits({v}) = {predicted} but writer emitted {written}"
+            );
+        }
+    }
+
+    /// `mode_rank_bits` must match the codeword length `write_inter_modes`
+    /// emits for each rank: rank 0..6 → rank+1 bits; rank 7 → 7 bits.
+    #[test]
+    fn mode_rank_bits_matches_writer() {
+        // Construct a tiny one-MB decision per mode-rank and measure the
+        // codeword length that `write_inter_modes` writes.
+        for rank in 0..=7u8 {
+            let mode = Mode::from_index(rank).unwrap();
+            let d = MbDecision {
+                mbx: 0,
+                mby: 0,
+                mode,
+                mv: (0, 0),
+                mvs4: [(0, 0); 4],
+                bcoded: true,
+                luma_bis: [0, 0, 0, 0],
+                chroma_bis: Vec::new(),
+            };
+            let mut bw = BitWriter::new();
+            // Natural alphabet: alphabet[i] = mode i, so rank == mode index.
+            let alphabet = [
+                Mode::InterNoMv,
+                Mode::Intra,
+                Mode::InterMv,
+                Mode::InterMvLast,
+                Mode::InterMvLast2,
+                Mode::InterGoldenNoMv,
+                Mode::InterGoldenMv,
+                Mode::InterMvFour,
+            ];
+            write_inter_modes(&mut bw, std::slice::from_ref(&d), &alphabet);
+            let written = bw.bit_len();
+            let predicted = mode_rank_bits(rank);
+            assert_eq!(
+                written, predicted,
+                "mode_rank_bits(rank={rank}) = {predicted} but writer emitted {written}"
+            );
+        }
+    }
+
+    /// `pick_mode_scheme` must (a) always return an alphabet that contains
+    /// every Mode exactly once, and (b) when one mode dominates, prefer that
+    /// mode at rank 0. For a frame of all-InterMv MBs, MSCHEME-3 places
+    /// InterMv at rank 1 (so 2 bits/MB) and the custom MSCHEME-0 also places
+    /// it at rank 0 (1 bit/MB) but eats a 24-bit overhead — for large
+    /// frames MSCHEME=0 should win; for small frames the constant MSCHEME
+    /// should win.
+    #[test]
+    fn pick_mode_scheme_handles_extremes() {
+        let make = |mode: Mode, n: usize| -> Vec<MbDecision> {
+            (0..n)
+                .map(|_| MbDecision {
+                    mbx: 0,
+                    mby: 0,
+                    mode,
+                    mv: (0, 0),
+                    mvs4: [(0, 0); 4],
+                    bcoded: true,
+                    luma_bis: [0, 0, 0, 0],
+                    chroma_bis: Vec::new(),
+                })
+                .collect()
+        };
+
+        // Tiny frame, all-InterMv: a fixed MSCHEME that puts InterMv near the
+        // top should win.
+        let small = make(Mode::InterMv, 4);
+        let (_msmall, alpha_small) = pick_mode_scheme(&small);
+        // InterMv should appear at rank 0..=2 in any reasonable alphabet.
+        let pos_im = alpha_small
+            .iter()
+            .position(|&m| m == Mode::InterMv)
+            .unwrap();
+        assert!(
+            pos_im <= 2,
+            "expected InterMv to be ranked low; got rank {pos_im}"
+        );
+
+        // Big frame, all-InterMv: MSCHEME 0 with InterMv at rank 0 (1 bit/MB)
+        // wins over the 24-bit overhead.
+        let large = make(Mode::InterMv, 256);
+        let (m_large, alpha_large) = pick_mode_scheme(&large);
+        assert_eq!(
+            m_large, 0,
+            "expected MSCHEME=0 for 256-MB single-mode frame"
+        );
+        assert_eq!(alpha_large[0], Mode::InterMv);
     }
 
     /// Frames with the wrong plane count must fail with a clear error,

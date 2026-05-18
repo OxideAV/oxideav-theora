@@ -148,6 +148,12 @@ impl<'a> IntraFrameDecoder<'a> {
         let nlbs = (self.layout.planes[0].nbw * self.layout.planes[0].nbh) as usize;
         let mut tis = vec![0u8; nbs]; // current token index per block
         let mut eobs: u32 = 0;
+        // Number of coded blocks whose token index is still < 64. Initialised
+        // as the count of bcoded blocks (all start at ti=0) and decremented
+        // every time a block's tis[bi] reaches 64. Used by the EOB-6 token
+        // path; maintaining it incrementally avoids an O(blocks) rescan of
+        // tis on every EOB token (which dominates decode time at HD sizes).
+        let mut n_remaining: u32 = self.bcoded.iter().filter(|&&c| c).count() as u32;
         for ti in 0..64u8 {
             if ti == 0 {
                 // DC: read 4-bit HTI for luma and chroma.
@@ -174,6 +180,7 @@ impl<'a> IntraFrameDecoder<'a> {
                         self.coeffs[bi * 64 + tj] = 0;
                     }
                     tis[bi] = 64;
+                    n_remaining -= 1;
                     eobs -= 1;
                 } else {
                     // Pick the Huffman table group based on ti (Table 7.42).
@@ -192,12 +199,13 @@ impl<'a> IntraFrameDecoder<'a> {
                     let token = tree.decode(br)?;
                     if token < 7 {
                         // EOB token.
-                        eobs = decode_eob_token(br, token, self.n_remaining(&tis))?;
+                        eobs = decode_eob_token(br, token, n_remaining)?;
                         // Apply to this block.
                         for tj in (ti as usize)..64 {
                             self.coeffs[bi * 64 + tj] = 0;
                         }
                         tis[bi] = 64;
+                        n_remaining -= 1;
                         eobs = eobs.saturating_sub(1);
                     } else {
                         decode_coef_token(
@@ -209,6 +217,11 @@ impl<'a> IntraFrameDecoder<'a> {
                             &mut tis,
                             &mut self.ncoeffs,
                         )?;
+                        // decode_coef_token may have advanced tis[bi] to 64
+                        // (long zero-run tokens, or a normal token at ti=63).
+                        if tis[bi] == 64 {
+                            n_remaining -= 1;
+                        }
                     }
                 }
             }
@@ -219,16 +232,6 @@ impl<'a> IntraFrameDecoder<'a> {
             ));
         }
         Ok(())
-    }
-
-    /// Count remaining coded blocks whose token index is < 64 (used for the
-    /// special "zero-length" EOB-6 token).
-    fn n_remaining(&self, tis: &[u8]) -> u32 {
-        self.bcoded
-            .iter()
-            .zip(tis.iter())
-            .filter(|(&c, &t)| c && t < 64)
-            .count() as u32
     }
 
     /// §7.8.2 Inverting DC prediction. Runs in raster order per plane. Each

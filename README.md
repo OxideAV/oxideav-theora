@@ -47,6 +47,14 @@ oxideav-theora = "0.0"
   MV-bearing modes, the real per-component Theora MV-VLC bit count. Motion
   search is full-pel inside `me_range` followed by half-pel refinement;
   4-MV runs a per-8x8-sub-block diamond seeded from the 16x16 best MV.
+  All three motion-search paths (16x16 MB / 4-MV sub-block / golden) pick
+  candidates by an RD-biased score `sad + mv_search_bias(qi, mv)` rather
+  than raw SAD, where `mv_search_bias` is `lambda(qi)/2 *
+  mv_pair_bits(mv)`. This tips the picker toward cheaper MV codewords
+  when SADs are close (e.g. abs-MV 7 vs 8 swaps from the 6-bit VLC
+  bracket to the 7-bit one), while still letting the downstream
+  mode-decision RD apply the full `lambda * bits` term without
+  double-counting.
 - Chroma formats: 4:2:0, 4:2:2, 4:4:4.
 - Reference tracking: encoder reconstructs each frame internally (same
   dequant/IDCT/loop-filter path as the decoder), keeping the golden / LAST

@@ -32,6 +32,16 @@
 //! (default [`DEFAULT_KEYINT`]). Callers can override via
 //! [`EncoderOptions::keyint`] + [`make_encoder_with_options`].
 //!
+//! Motion search is rate-distortion biased on all three paths (16×16 MB /
+//! 4-MV sub-block / golden). At each candidate MV the picker compares
+//! `sad + mv_search_bias(qi, mv)` rather than raw `sad`, where
+//! `mv_search_bias` is half of `lambda_per_bit(qi) × mv_pair_bits(mv)`. This
+//! tips the picker toward cheaper MV codewords when their SAD is close to
+//! the unbiased winner; the stored `best_sad` is still the *plain* SAD so
+//! the mode-decision scoreboard's own full `lambda × bits` term doesn't
+//! double-count. (The factor-of-2 is what keeps the search bias gentle
+//! enough that the mode decision still has the final say.)
+//!
 //! Current limitations (future work):
 //!   * Half-pel refinement iterates the 8-neighbour test from the running
 //!     best up to [`HALF_PEL_REFINE_PASSES`] times for all three search
@@ -136,6 +146,20 @@ fn mv_component_bits(mv: i32) -> u32 {
 /// Bit cost of an (x, y) MV pair.
 fn mv_pair_bits(mv: (i32, i32)) -> u32 {
     mv_component_bits(mv.0) + mv_component_bits(mv.1)
+}
+
+/// SAD-domain MV cost: the (linearised) bit-equivalent SAD penalty we add to a
+/// candidate MV's raw SAD when picking between MVs during motion search. We
+/// only bias by *half* of `lambda_per_bit(qi)` here, because the
+/// mode-decision scoreboard in `decide_mb_modes` already adds the full
+/// `lambda_per_bit(qi) * mv_pair_bits` term. Using half during search keeps
+/// the bias gentle (the search just leans toward cheaper MVs when the SAD
+/// difference is small) and avoids double-counting the bit cost at the
+/// mode-decision stage. Returned as a SAD-units integer so it composes
+/// naturally with `mb_sad` / `block_sad`.
+fn mv_search_bias(qi: u8, mv: (i32, i32)) -> i32 {
+    let lam = (lambda_per_bit(qi) / 2).max(1);
+    (mv_pair_bits(mv) as i32).saturating_mul(lam)
 }
 
 /// Bit cost of a mode codeword at the given rank in the alphabet (spec §7.3.4).
@@ -1182,15 +1206,20 @@ impl TheoraEncoder {
             |mv: (i32, i32)| -> (i32, i32) { (mv.0.clamp(-31, 31), mv.1.clamp(-31, 31)) };
         let mut best_mv = clamp_mv(seed_mv);
         let mut best_sad = self.block_sad(frame, prev, 0, bx, by, best_mv);
-        // Evaluate the seed and also the zero-MV as a baseline.
+        let mut best_score = best_sad.saturating_add(mv_search_bias(self.qi, best_mv));
+        // Evaluate the seed and also the zero-MV as a baseline. RD-biased
+        // picking: zero-MV is cheap (3+3=6 bits) so it gets favoured when
+        // its SAD is close to the seed's.
         let zero_sad = self.block_sad(frame, prev, 0, bx, by, (0, 0));
-        if zero_sad < best_sad {
+        let zero_score = zero_sad.saturating_add(mv_search_bias(self.qi, (0, 0)));
+        if zero_score < best_score {
             best_sad = zero_sad;
             best_mv = (0, 0);
+            best_score = zero_score;
         }
 
-        // Diamond search, stopping when no neighbour improves SAD. Capped at
-        // `2 * radius` iterations to bound worst-case cost.
+        // Diamond search, stopping when no neighbour improves the RD-biased
+        // score. Capped at `2 * radius` iterations to bound worst-case cost.
         let max_iters = (radius as usize).saturating_mul(2).max(4);
         for _ in 0..max_iters {
             let mut improved = false;
@@ -1206,9 +1235,11 @@ impl TheoraEncoder {
                     continue;
                 }
                 let sad = self.block_sad(frame, prev, 0, bx, by, mv);
-                if sad < best_sad {
+                let score = sad.saturating_add(mv_search_bias(self.qi, mv));
+                if score < best_score {
                     best_sad = sad;
                     best_mv = mv;
+                    best_score = score;
                     improved = true;
                 }
             }
@@ -1228,9 +1259,11 @@ impl TheoraEncoder {
                     continue;
                 }
                 let sad = self.block_sad(frame, prev, 0, bx, by, mv);
-                if sad < best_sad {
+                let score = sad.saturating_add(mv_search_bias(self.qi, mv));
+                if score < best_score {
                     best_sad = sad;
                     best_mv = mv;
+                    best_score = score;
                     improved = true;
                 }
             }
@@ -1238,6 +1271,9 @@ impl TheoraEncoder {
                 break;
             }
         }
+        // Return PLAIN SAD (not the RD-biased score) so the caller's
+        // mode-decision scoreboard can add the full lambda × bits without
+        // double-counting.
         (best_mv, best_sad)
     }
 
@@ -1341,8 +1377,18 @@ impl TheoraEncoder {
 
                     // Full-pel motion search against LAST within ±me_range.
                     // Encoded MV is in half-pel units: full_pel × 2.
+                    //
+                    // The picking comparison is rate-distortion biased: we
+                    // compare candidates by `sad + mv_search_bias(mv)` so a
+                    // marginally lower-SAD MV that costs many more VLC bits
+                    // loses to a slightly higher-SAD MV with a cheaper
+                    // codeword. We KEEP `best_sad` as the *plain* SAD of
+                    // the winning MV so the downstream mode-decision
+                    // scoreboard (which adds its own full lambda × bits)
+                    // doesn't double-count.
                     let mut best_mv = (0i32, 0i32);
                     let mut best_sad = sad_zero;
+                    let mut best_score = sad_zero.saturating_add(mv_search_bias(self.qi, (0, 0)));
                     let r = self.me_range;
                     for dy in -r..=r {
                         for dx in -r..=r {
@@ -1351,7 +1397,9 @@ impl TheoraEncoder {
                                 continue;
                             }
                             let sad = self.mb_sad(frame, prev, bxs, bys, mv);
-                            if sad < best_sad {
+                            let score = sad.saturating_add(mv_search_bias(self.qi, mv));
+                            if score < best_score {
+                                best_score = score;
                                 best_sad = sad;
                                 best_mv = mv;
                             }
@@ -1366,6 +1414,10 @@ impl TheoraEncoder {
                     // We also refine when best_mv == (0,0): a stationary MB
                     // can still benefit from sub-pel alignment (e.g. when
                     // input has a fractional shift relative to the reference).
+                    // RD-biased comparison: as in the full-pel scan, picking
+                    // accounts for the MV's VLC cost so a slightly worse SAD
+                    // at a cheaper MV beats a slightly better SAD at a more
+                    // expensive MV (e.g. crossing a VLC bracket boundary).
                     for _ in 0..HALF_PEL_REFINE_PASSES {
                         let mut improved = false;
                         for &(hx, hy) in HALF_PEL_NEIGHBOURS {
@@ -1375,7 +1427,9 @@ impl TheoraEncoder {
                                 continue;
                             }
                             let sad = self.mb_sad(frame, prev, bxs, bys, mv);
-                            if sad < best_sad {
+                            let score = sad.saturating_add(mv_search_bias(self.qi, mv));
+                            if score < best_score {
+                                best_score = score;
                                 best_sad = sad;
                                 best_mv = mv;
                                 improved = true;
@@ -1439,6 +1493,8 @@ impl TheoraEncoder {
                         let sad_gzero = self.mb_sad(frame, golden, bxs, bys, (0, 0));
                         let mut g_best_mv = (0i32, 0i32);
                         let mut g_best_sad = sad_gzero;
+                        let mut g_best_score =
+                            sad_gzero.saturating_add(mv_search_bias(self.qi, (0, 0)));
                         // Coarser search grid for golden (step 2) — it matters
                         // less for compression.
                         let step = 2i32;
@@ -1449,9 +1505,11 @@ impl TheoraEncoder {
                                 let mv = (dx * 2, dy * 2);
                                 if mv != (0, 0) {
                                     let sad = self.mb_sad(frame, golden, bxs, bys, mv);
-                                    if sad < g_best_sad {
+                                    let score = sad.saturating_add(mv_search_bias(self.qi, mv));
+                                    if score < g_best_score {
                                         g_best_sad = sad;
                                         g_best_mv = mv;
+                                        g_best_score = score;
                                     }
                                 }
                                 dx += step;
@@ -1470,9 +1528,11 @@ impl TheoraEncoder {
                                     continue;
                                 }
                                 let sad = self.mb_sad(frame, golden, bxs, bys, mv);
-                                if sad < g_best_sad {
+                                let score = sad.saturating_add(mv_search_bias(self.qi, mv));
+                                if score < g_best_score {
                                     g_best_sad = sad;
                                     g_best_mv = mv;
+                                    g_best_score = score;
                                     improved = true;
                                 }
                             }
@@ -3362,6 +3422,48 @@ mod tests {
             assert_eq!(
                 written, predicted,
                 "mode_rank_bits(rank={rank}) = {predicted} but writer emitted {written}"
+            );
+        }
+    }
+
+    /// `mv_search_bias` invariants used by the RD-biased motion search:
+    ///   1. The bias is monotone non-decreasing in `mv_pair_bits`, so a
+    ///      higher-VLC-cost MV always pays at least as much penalty.
+    ///   2. The bias for the cheapest MVs (those that encode in 3+3 = 6
+    ///      bits — i.e. abs ≤ 1) is strictly smaller than the bias for
+    ///      MVs that need 8+8 = 16 bits (abs in 16..=31).
+    ///   3. The bias is at most the full mode-decision lambda × bits term
+    ///      that `decide_mb_modes` adds downstream (since search uses
+    ///      lambda/2). This keeps the search-stage bias from dominating
+    ///      the mode-decision RD.
+    ///
+    /// Note: the bias for MV=(0,0) is non-zero (6 bits × lambda/2) — this
+    /// is the cost the bitstream would pay IF an MV-bearing mode (InterMv)
+    /// were chosen with the zero MV. The downstream mode decision still
+    /// gets to pick InterNoMv (which transmits no MV) over InterMv, so the
+    /// non-zero bias at (0,0) doesn't unfairly penalise the static case.
+    #[test]
+    fn mv_search_bias_invariants() {
+        for qi in [0u8, 16, 32, 48, 63] {
+            // Monotone in bit cost.
+            let big_mv = (24, 24); // 8+8 = 16 MV bits
+            let small_mv = (1, 1); // 3+3 = 6 MV bits
+            assert!(
+                mv_search_bias(qi, big_mv) > mv_search_bias(qi, small_mv),
+                "qi={qi}: big MV bias {} should be > small MV bias {}",
+                mv_search_bias(qi, big_mv),
+                mv_search_bias(qi, small_mv)
+            );
+            // Zero MV pays the same minimal bias as other 6-bit MVs.
+            assert_eq!(mv_search_bias(qi, (0, 0)), mv_search_bias(qi, (1, 1)));
+            // Search bias must not exceed the full mode-decision bit-to-SAD
+            // weight (so it can't dominate the mode-decision RD).
+            let big_full = (mv_pair_bits(big_mv) as i32) * lambda_per_bit(qi);
+            assert!(
+                mv_search_bias(qi, big_mv) <= big_full,
+                "qi={qi}: search bias {} must not exceed full lambda*bits {}",
+                mv_search_bias(qi, big_mv),
+                big_full
             );
         }
     }

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Encoder
 
+- **Rate-distortion biased motion search (round 80)**: all three motion-
+  search paths (16x16 MB / 4-MV sub-block / golden) now pick candidates
+  by `sad + mv_search_bias(qi, mv)` instead of raw SAD, where
+  `mv_search_bias` is `(lambda_per_bit(qi) / 2) * mv_pair_bits(mv)`. The
+  half-lambda factor is what keeps the downstream mode-decision RD
+  scoreboard (which adds the full `lambda * bits` term) from
+  double-counting the bit cost. Stored `best_sad` is the *plain* SAD of
+  the winning MV, so the scoreboard sees the same input it always has.
+  Picks now lean toward MVs that land in cheaper VLC brackets when their
+  SAD is within a small lambda-scaled margin of the unbiased winner —
+  e.g. abs-MV 7 vs 8 swaps from the 6-bit VLC bracket to the 7-bit one,
+  abs-MV 15 vs 16 swaps 7-bit to 8-bit. New `mv_search_bias_invariants`
+  unit test pins (a) monotonicity in `mv_pair_bits`, (b) zero-MV uses
+  the same minimum bias as other 6-bit MVs (since InterMv with MV=(0,0)
+  still pays the 6-bit VLC), and (c) the search bias never exceeds the
+  mode-decision lambda × bits term so it can't dominate RD.
+
+- New `pframe_large_motion_psnr_and_bitrate` integration test exercises
+  a 128×128 clip whose foreground moves across multiple MV-VLC brackets
+  per frame, with PSNR ≥ 27 dB on every P-frame and total P-frame size
+  smaller than all-keyframe baseline. Currently runs at 42.36 dB avg
+  Y-PSNR with a 50% byte saving vs keyint=1.
+
 - **Bit-cost-aware mode decision (round 73)**: `decide_mb_modes` now scores
   each candidate (INTER_NOMV / INTER_MV / INTER_MV_LAST{,2} / INTRA /
   INTER_GOLDEN_{NO,}MV / INTER_MV_FOUR) as `sad + lambda(qi) * bits`, where

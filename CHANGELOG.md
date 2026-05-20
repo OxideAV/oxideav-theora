@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-theora/compare/v0.0.7...v0.0.8) - 2026-05-20
+
+### Other
+
+- RD-biased motion search across all three paths (round 80)
+- bit-cost-aware mode decision + per-frame MSCHEME selection (round 73)
+
 ### Encoder
 
 - **Rate-distortion biased motion search (round 80)**: all three motion-

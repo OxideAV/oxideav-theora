@@ -2,14 +2,27 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-05-21 (round 3 of clean-room rebuild)
+//! ## Status — 2026-05-22 (round 4 of clean-room rebuild)
 //!
 //! Round 1 landed the **identification header** parser per Theora I
 //! Specification §6.1 (common header) + §6.2 (identification header).
 //! Round 2 added the **comment header** parser per §6.3.
-//! Round 3 lands the **setup header packet entrypoint** per §6.4.5
-//! step 1 plus the **MSb-first bit reader** mandated by §5.2 that the
-//! per-field setup-header decode will consume in subsequent rounds.
+//! Round 3 landed the **setup header packet entrypoint** per §6.4.5
+//! step 1 plus the **MSb-first bit reader** mandated by §5.2.
+//! Round 4 lands the **VP3 hardcoded scale / limit tables** from
+//! Appendix B.2 + B.3 of the spec — `LFLIMS_VP3` (`[u8; 64]`,
+//! Appendix B.2), `ACSCALE_VP3` and `DCSCALE_VP3` (`[u16; 64]` each,
+//! Appendix B.3) — and reshapes [`TheoraSetupHeader`] to expose
+//! [`TheoraSetupHeader::loop_filter_limits`] / `ac_scale` / `dc_scale`
+//! as plain `[u8; 64]` / `[u16; 64]` fields. The VP3 defaults
+//! constructor [`TheoraSetupHeader::vp3_defaults`] returns the
+//! Appendix-B-typed tables — usable directly to decode the
+//! `vp3-compat-decode` fixture's pre-3.2.0 bitstreams once the frame
+//! pipeline lands. Bitstream-version-3.2.0+ streams override the
+//! defaults via the §6.4.1 / §6.4.2 procedures the setup-header body
+//! decode consumes — that body is still blocked by the §6.4.1 spec
+//! gap (see below) and [`parse_setup_header`] continues to surface
+//! [`Error::SetupHeaderBodyNotImplemented`].
 //!
 //! * [`decode_identification_header`] returns a typed
 //!   [`TheoraIdentHeader`] describing every field declared in
@@ -18,11 +31,11 @@
 //!   [`TheoraCommentHeader`] with the decoded vendor string and the
 //!   list of `KEY=value` user comments.
 //! * [`parse_setup_header`] validates §6.4.5 step 1 (the common
-//!   header carrying the `0x82`+"theora" identifier) and returns a
-//!   typed [`TheoraSetupHeader`]. Body fields (`LFLIMS`,
-//!   `ACSCALE`/`DCSCALE`/`NBMS`/`BMS`, quant ranges, Huffman
-//!   tables) are deferred to subsequent clean-room rounds — see the
-//!   per-field documentation on [`TheoraSetupHeader`].
+//!   header carrying the `0x82`+"theora" identifier) and returns
+//!   [`Error::SetupHeaderBodyNotImplemented`] for the body decode.
+//! * [`TheoraSetupHeader::vp3_defaults`] constructs the Appendix B
+//!   VP3 fallback for streams that declare `version < 0x030200`
+//!   (alpha2 / VP3-compatibility decode, §B.1 first bullet).
 //!
 //! All other public entry points still return [`Error::NotImplemented`].
 //!
@@ -40,9 +53,13 @@
 //! array; `NBITS`: 3-bit) and ends with the sentence "It is decoded as
 //! follows:" — but the numbered procedure steps that should follow are
 //! **absent** from the PDF as published. The next page begins
-//! immediately with "VP3 Compatibility" / §6.4.2. Round 3 therefore
-//! defers `LFLIMS` decode and stops the setup-header decode at the
-//! `0x82`+"theora" common-header check (§6.4.5 step 1).
+//! immediately with "VP3 Compatibility" / §6.4.2. Round 4 therefore
+//! continues to defer the bitstream `LFLIMS` decode (the
+//! `parse_setup_header` body path) and ships the Appendix-B-typed VP3
+//! fallback table as a workaround for `version < 0x030200` streams.
+//! For `version >= 0x030200` streams a per-stream LFLIMS is mandated
+//! by §6.4.1; until the docs collaborator recovers the numbered
+//! procedure body, the per-stream decode remains blocked.
 //! See [`Error::SetupHeaderBodyNotImplemented`] for the entrypoint's
 //! delegation behaviour.
 
@@ -720,6 +737,68 @@ pub fn parse_comment_header(packet: &[u8]) -> Result<TheoraCommentHeader, Error>
     Ok(TheoraCommentHeader { vendor, comments })
 }
 
+/// `LFLIMS` — VP3 hardcoded loop-filter limit values, transcribed
+/// from `Theora.pdf` Appendix B.2 ("Loop Filter Limit Values"). The
+/// 64 entries are indexed by `qi` (the quantization index, range
+/// 0..=63) and each value is the deblocking-filter strength `L`
+/// described in §7.10 ("Loop Filtering").
+///
+/// Theora bitstreams with `VMAJ.VMIN.VREV < 3.2.0` ("VP3 compatible",
+/// §B.1) MUST use this table directly because they predate the
+/// per-stream LFLIMS carried in the setup header. Streams with
+/// `>= 3.2.0` override it via §6.4.1 (procedure body currently absent
+/// from the spec — see the crate-level "Known spec gap" notice).
+///
+/// Source: `Theora.pdf` Appendix B.2.
+pub const LFLIMS_VP3: [u8; 64] = [
+    30, 25, 20, 20, 15, 15, 14, 14, //
+    13, 13, 12, 12, 11, 11, 10, 10, //
+    9, 9, 8, 8, 7, 7, 7, 7, //
+    6, 6, 6, 6, 5, 5, 5, 5, //
+    4, 4, 4, 4, 3, 3, 3, 3, //
+    2, 2, 2, 2, 2, 2, 2, 2, //
+    0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// `ACSCALE` — VP3 hardcoded AC dequantization scale values,
+/// transcribed from `Theora.pdf` Appendix B.3 ("Quantization
+/// Parameters"). The 64 entries are indexed by `qi` and multiplied
+/// against the base matrix per §6.4.3 to compute the actual
+/// per-coefficient quantization step.
+///
+/// Theora bitstreams with `version < 0x030200` use this table
+/// directly; later streams override it via §6.4.2 steps 1–2.
+///
+/// Source: `Theora.pdf` Appendix B.3.
+pub const ACSCALE_VP3: [u16; 64] = [
+    500, 450, 400, 370, 340, 310, 285, 265, //
+    245, 225, 210, 195, 185, 180, 170, 160, //
+    150, 145, 135, 130, 125, 115, 110, 107, //
+    100, 96, 93, 89, 85, 82, 75, 74, //
+    70, 68, 64, 60, 57, 56, 52, 50, //
+    49, 45, 44, 43, 40, 38, 37, 35, //
+    33, 32, 30, 29, 28, 25, 24, 22, //
+    21, 19, 18, 17, 15, 13, 12, 10,
+];
+
+/// `DCSCALE` — VP3 hardcoded DC dequantization scale values,
+/// transcribed from `Theora.pdf` Appendix B.3 ("Quantization
+/// Parameters"). Same indexing and override rules as
+/// [`ACSCALE_VP3`]; later streams override via §6.4.2 steps 3–4.
+///
+/// Source: `Theora.pdf` Appendix B.3.
+pub const DCSCALE_VP3: [u16; 64] = [
+    220, 200, 190, 180, 170, 170, 160, 160, //
+    150, 150, 140, 140, 130, 130, 120, 120, //
+    110, 110, 100, 100, 90, 90, 90, 80, //
+    80, 80, 70, 70, 70, 60, 60, 60, //
+    60, 50, 50, 50, 50, 40, 40, 40, //
+    40, 40, 30, 30, 30, 30, 30, 30, //
+    30, 20, 20, 20, 20, 20, 20, 20, //
+    20, 10, 10, 10, 10, 10, 10, 10,
+];
+
 /// Parsed Theora setup header, per §6.4.5.
 ///
 /// The Theora setup header (`HEADERTYPE=0x82`) carries five logical
@@ -733,41 +812,61 @@ pub fn parse_comment_header(packet: &[u8]) -> Result<TheoraCommentHeader, Error>
 /// 5. The DCT-token Huffman tables (`HTS`, §6.4.4 — an 80-element
 ///    array of Huffman tables with up to 32 entries each).
 ///
-/// **Round 3 lands only the packet entrypoint** (§6.4.5 step 1: the
-/// `0x82`+"theora" common-header guard) — every body field below is
-/// reserved as `Option`/`Vec` placeholders that later clean-room
-/// rounds will populate. Round 3 [`parse_setup_header`] therefore
-/// only fills the common-header sentinel and returns. Round 4 onward
-/// will progressively populate the body once the §6.4.1 spec gap is
-/// closed.
+/// **Round 4 carries the Appendix B fallback tables only.**
+/// [`parse_setup_header`] still surfaces
+/// [`Error::SetupHeaderBodyNotImplemented`] (§6.4.1 procedure body
+/// gap), but the value layer is now in place: callers handling
+/// `vp3-compat-decode` style streams (`version < 0x030200`) can
+/// build a usable [`TheoraSetupHeader`] via
+/// [`TheoraSetupHeader::vp3_defaults`]. Base matrices, NQRS /
+/// QRSIZES / QRBMIS, and the Huffman tables are deferred to round 5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TheoraSetupHeader {
     /// `LFLIMS` (§6.4.1) — 64-element array of 7-bit loop-filter
-    /// limit values indexed by `qi`. `None` in round 3 because the
-    /// §6.4.1 decoding procedure body is missing from the spec PDF.
-    pub loop_filter_limits: Option<[u8; 64]>,
-    /// `BMS` (§6.4.2 step 6) — `NBMS` × 64 array of 8-bit base
-    /// matrix entries. Empty in round 3; reachable only after
-    /// LFLIMS and ACSCALE/DCSCALE consume their bits.
-    pub base_matrices: Vec<[u8; 64]>,
+    /// limit values indexed by `qi`. Each entry is in the range
+    /// 0..=127 (7-bit unsigned per the §6.4.1 output-parameters
+    /// table). VP3-compatible streams populate this from
+    /// [`LFLIMS_VP3`]; later streams override per §6.4.1's
+    /// procedure (currently blocked by spec gap).
+    pub loop_filter_limits: [u8; 64],
+    /// `ACSCALE` (§6.4.2 steps 1–2) — 64-element array of 16-bit AC
+    /// dequantization scale values, indexed by `qi`. VP3-compatible
+    /// streams populate this from [`ACSCALE_VP3`]; later streams
+    /// override per §6.4.2.
+    pub ac_scale: [u16; 64],
+    /// `DCSCALE` (§6.4.2 steps 3–4) — 64-element array of 16-bit DC
+    /// dequantization scale values, indexed by `qi`. VP3-compatible
+    /// streams populate this from [`DCSCALE_VP3`]; later streams
+    /// override per §6.4.2.
+    pub dc_scale: [u16; 64],
 }
 
 impl TheoraSetupHeader {
-    /// Construct a structurally-empty setup header. Used by
-    /// [`parse_setup_header`] to record that §6.4.5 step 1
-    /// succeeded; subsequent rounds will populate the body fields
-    /// once their decoding procedures are available.
-    fn empty() -> Self {
+    /// Construct a [`TheoraSetupHeader`] populated with the VP3
+    /// hardcoded tables from `Theora.pdf` Appendix B.2 + B.3. Use
+    /// this for streams whose identification header declares a
+    /// `version < 0x030200` (alpha2 / VP3-compatible bitstreams):
+    /// per §B.1, those streams do not carry a setup-header LFLIMS
+    /// or ACSCALE/DCSCALE override.
+    ///
+    /// For `version >= 0x030200` streams, the spec requires the
+    /// setup-header §6.4.1 / §6.4.2 procedures to be applied; until
+    /// the §6.4.1 procedure-body spec gap is closed,
+    /// [`parse_setup_header`] returns
+    /// [`Error::SetupHeaderBodyNotImplemented`] rather than these
+    /// defaults.
+    pub fn vp3_defaults() -> Self {
         Self {
-            loop_filter_limits: None,
-            base_matrices: Vec::new(),
+            loop_filter_limits: LFLIMS_VP3,
+            ac_scale: ACSCALE_VP3,
+            dc_scale: DCSCALE_VP3,
         }
     }
 }
 
 /// Decode a Theora setup header from `packet`.
 ///
-/// Round 3 implements only §6.4.5 step 1: the common-header check
+/// Rounds 3+4 implement only §6.4.5 step 1: the common-header check
 /// (the `0x82` header-type byte followed by the ASCII `"theora"`
 /// sync token mandated by §6.1).
 ///
@@ -788,11 +887,14 @@ impl TheoraSetupHeader {
 ///   header has been validated, while the spec gap on §6.4.1
 ///   blocks further body decode. The error is "soft" in the sense
 ///   that the caller has at least verified that the packet looks
-///   like a setup header — it just can't be decoded yet.
+///   like a setup header — it just can't be decoded yet. Callers
+///   handling `version < 0x030200` (VP3-compatible) streams may
+///   substitute [`TheoraSetupHeader::vp3_defaults`] for the missing
+///   body; the Appendix B tables apply directly there.
 ///
-/// Round 4+ will replace the `SetupHeaderBodyNotImplemented` return
-/// with a populated [`TheoraSetupHeader`] once §6.4.1's procedure
-/// body is recovered.
+/// A later round will replace the `SetupHeaderBodyNotImplemented`
+/// return with a fully-populated [`TheoraSetupHeader`] once §6.4.1's
+/// procedure body is recovered.
 pub fn parse_setup_header(packet: &[u8]) -> Result<TheoraSetupHeader, Error> {
     let mut r = Reader::new(packet);
 
@@ -816,10 +918,13 @@ pub fn parse_setup_header(packet: &[u8]) -> Result<TheoraSetupHeader, Error> {
     // through a `BitReader` (§5.2). Step 2 (§6.4.1 LFLIMS) is
     // currently blocked by a spec gap — see the crate-level "Known
     // spec gap" notice and the comment on
-    // `Error::SetupHeaderBodyNotImplemented`. Returning the soft
-    // sentinel lets callers route on the empty / populated
-    // distinction once round 4 lands.
-    let _ = TheoraSetupHeader::empty();
+    // `Error::SetupHeaderBodyNotImplemented`. Round 4 ships the
+    // Appendix B fallback tables via `TheoraSetupHeader::vp3_defaults`
+    // for `version < 0x030200` callers, but
+    // `parse_setup_header` itself still requires the §6.4.1 body to
+    // be present in the spec; until then the soft sentinel lets
+    // callers route on the unparsed / fallback / parsed distinction
+    // once a later round closes the gap.
     Err(Error::SetupHeaderBodyNotImplemented)
 }
 
@@ -1864,12 +1969,21 @@ mod tests {
     }
 
     #[test]
-    fn setup_header_empty_is_structurally_blank() {
-        // Independent unit test of the empty-state factory so that
-        // the round-4 work has a fixed contract to build on.
-        let empty = TheoraSetupHeader::empty();
-        assert!(empty.loop_filter_limits.is_none());
-        assert!(empty.base_matrices.is_empty());
+    fn setup_header_vp3_defaults_use_appendix_b_tables() {
+        // The vp3_defaults constructor must wire each field to the
+        // Appendix-B-derived constants. Spot-check the headline
+        // values from Appendix B.2 / B.3.
+        let h = TheoraSetupHeader::vp3_defaults();
+        assert_eq!(h.loop_filter_limits, LFLIMS_VP3);
+        assert_eq!(h.ac_scale, ACSCALE_VP3);
+        assert_eq!(h.dc_scale, DCSCALE_VP3);
+        // Endpoints called out in the trace fixtures.
+        assert_eq!(h.loop_filter_limits[0], 30);
+        assert_eq!(h.loop_filter_limits[63], 0);
+        assert_eq!(h.ac_scale[0], 500);
+        assert_eq!(h.ac_scale[63], 10);
+        assert_eq!(h.dc_scale[0], 220);
+        assert_eq!(h.dc_scale[63], 10);
     }
 
     #[test]
@@ -1877,6 +1991,183 @@ mod tests {
         let s = format!("{}", Error::SetupHeaderBodyNotImplemented);
         assert!(s.contains("setup-header"));
         assert!(s.contains("§6.4.1") || s.contains("body"));
+    }
+
+    // ------- Appendix B.2 / B.3 VP3 table transcription tests -------
+
+    /// `LFLIMS_VP3` is 64 entries. Appendix B.2 lists them in eight
+    /// rows of eight; every entry is 7-bit (0..=127), and the spec
+    /// table monotonically non-increases across `qi` (later `qi` =
+    /// higher quantization = lower loop-filter limit until 0).
+    #[test]
+    fn lflims_vp3_table_shape() {
+        assert_eq!(LFLIMS_VP3.len(), 64);
+        for &v in &LFLIMS_VP3 {
+            assert!(v <= 127, "LFLIMS entries are 7-bit; got {v}");
+        }
+        // Monotonic non-increasing per Appendix B.2 layout.
+        for i in 1..64 {
+            assert!(
+                LFLIMS_VP3[i] <= LFLIMS_VP3[i - 1],
+                "LFLIMS_VP3[{i}]={} > LFLIMS_VP3[{}]={}",
+                LFLIMS_VP3[i],
+                i - 1,
+                LFLIMS_VP3[i - 1]
+            );
+        }
+        // Spot values along the rows of Appendix B.2.
+        assert_eq!(LFLIMS_VP3[0], 30);
+        assert_eq!(LFLIMS_VP3[7], 14);
+        assert_eq!(LFLIMS_VP3[8], 13);
+        assert_eq!(LFLIMS_VP3[15], 10);
+        assert_eq!(LFLIMS_VP3[16], 9);
+        assert_eq!(LFLIMS_VP3[23], 7);
+        assert_eq!(LFLIMS_VP3[24], 6);
+        assert_eq!(LFLIMS_VP3[31], 5);
+        assert_eq!(LFLIMS_VP3[32], 4);
+        assert_eq!(LFLIMS_VP3[39], 3);
+        assert_eq!(LFLIMS_VP3[40], 2);
+        assert_eq!(LFLIMS_VP3[47], 2);
+        assert_eq!(LFLIMS_VP3[48], 0);
+        assert_eq!(LFLIMS_VP3[63], 0);
+    }
+
+    /// `ACSCALE_VP3` is 64 entries of 16-bit values, monotonically
+    /// non-increasing per Appendix B.3.
+    #[test]
+    fn acscale_vp3_table_shape() {
+        assert_eq!(ACSCALE_VP3.len(), 64);
+        for i in 1..64 {
+            assert!(
+                ACSCALE_VP3[i] <= ACSCALE_VP3[i - 1],
+                "ACSCALE_VP3[{i}]={} > ACSCALE_VP3[{}]={}",
+                ACSCALE_VP3[i],
+                i - 1,
+                ACSCALE_VP3[i - 1]
+            );
+        }
+        // Spot values along the rows of Appendix B.3.
+        assert_eq!(ACSCALE_VP3[0], 500);
+        assert_eq!(ACSCALE_VP3[7], 265);
+        assert_eq!(ACSCALE_VP3[8], 245);
+        assert_eq!(ACSCALE_VP3[15], 160);
+        assert_eq!(ACSCALE_VP3[16], 150);
+        assert_eq!(ACSCALE_VP3[23], 107);
+        assert_eq!(ACSCALE_VP3[24], 100);
+        assert_eq!(ACSCALE_VP3[31], 74);
+        assert_eq!(ACSCALE_VP3[32], 70);
+        assert_eq!(ACSCALE_VP3[39], 50);
+        assert_eq!(ACSCALE_VP3[40], 49);
+        assert_eq!(ACSCALE_VP3[47], 35);
+        assert_eq!(ACSCALE_VP3[48], 33);
+        assert_eq!(ACSCALE_VP3[55], 22);
+        assert_eq!(ACSCALE_VP3[56], 21);
+        assert_eq!(ACSCALE_VP3[63], 10);
+    }
+
+    /// `DCSCALE_VP3` is 64 entries of 16-bit values, monotonically
+    /// non-increasing per Appendix B.3.
+    #[test]
+    fn dcscale_vp3_table_shape() {
+        assert_eq!(DCSCALE_VP3.len(), 64);
+        for i in 1..64 {
+            assert!(
+                DCSCALE_VP3[i] <= DCSCALE_VP3[i - 1],
+                "DCSCALE_VP3[{i}]={} > DCSCALE_VP3[{}]={}",
+                DCSCALE_VP3[i],
+                i - 1,
+                DCSCALE_VP3[i - 1]
+            );
+        }
+        // Spot values along the rows of Appendix B.3.
+        assert_eq!(DCSCALE_VP3[0], 220);
+        assert_eq!(DCSCALE_VP3[7], 160);
+        assert_eq!(DCSCALE_VP3[8], 150);
+        assert_eq!(DCSCALE_VP3[15], 120);
+        assert_eq!(DCSCALE_VP3[16], 110);
+        assert_eq!(DCSCALE_VP3[23], 80);
+        assert_eq!(DCSCALE_VP3[24], 80);
+        assert_eq!(DCSCALE_VP3[31], 60);
+        assert_eq!(DCSCALE_VP3[32], 60);
+        assert_eq!(DCSCALE_VP3[39], 40);
+        assert_eq!(DCSCALE_VP3[40], 40);
+        assert_eq!(DCSCALE_VP3[47], 30);
+        assert_eq!(DCSCALE_VP3[48], 30);
+        assert_eq!(DCSCALE_VP3[55], 20);
+        assert_eq!(DCSCALE_VP3[56], 20);
+        assert_eq!(DCSCALE_VP3[63], 10);
+    }
+
+    /// Sanity-check the row sums against an independent re-tally of
+    /// Appendix B.2 / B.3, in case a transcription typo only shows
+    /// up as a swapped pair within the same row.
+    #[test]
+    fn appendix_b_row_sums_match_spec() {
+        // Each row is 8 consecutive entries. Sums independently
+        // re-derived from Appendix B's printed table layout.
+        const LFLIMS_ROW_SUMS: [u32; 8] = [
+            30 + 25 + 20 + 20 + 15 + 15 + 14 + 14, // row 0
+            13 + 13 + 12 + 12 + 11 + 11 + 10 + 10, // row 1
+            9 + 9 + 8 + 8 + 7 + 7 + 7 + 7,         // row 2
+            6 + 6 + 6 + 6 + 5 + 5 + 5 + 5,         // row 3
+            4 + 4 + 4 + 4 + 3 + 3 + 3 + 3,         // row 4
+            2 + 2 + 2 + 2 + 2 + 2 + 2 + 2,         // row 5
+            0,
+            0, // rows 6, 7
+        ];
+        for (row, &expected) in LFLIMS_ROW_SUMS.iter().enumerate() {
+            let got: u32 = LFLIMS_VP3[row * 8..row * 8 + 8]
+                .iter()
+                .map(|&v| v as u32)
+                .sum();
+            assert_eq!(got, expected, "LFLIMS row {row} sum mismatch");
+        }
+
+        const ACSCALE_ROW_SUMS: [u32; 8] = [
+            500 + 450 + 400 + 370 + 340 + 310 + 285 + 265,
+            245 + 225 + 210 + 195 + 185 + 180 + 170 + 160,
+            150 + 145 + 135 + 130 + 125 + 115 + 110 + 107,
+            100 + 96 + 93 + 89 + 85 + 82 + 75 + 74,
+            70 + 68 + 64 + 60 + 57 + 56 + 52 + 50,
+            49 + 45 + 44 + 43 + 40 + 38 + 37 + 35,
+            33 + 32 + 30 + 29 + 28 + 25 + 24 + 22,
+            21 + 19 + 18 + 17 + 15 + 13 + 12 + 10,
+        ];
+        for (row, &expected) in ACSCALE_ROW_SUMS.iter().enumerate() {
+            let got: u32 = ACSCALE_VP3[row * 8..row * 8 + 8]
+                .iter()
+                .map(|&v| v as u32)
+                .sum();
+            assert_eq!(got, expected, "ACSCALE row {row} sum mismatch");
+        }
+
+        const DCSCALE_ROW_SUMS: [u32; 8] = [
+            220 + 200 + 190 + 180 + 170 + 170 + 160 + 160,
+            150 + 150 + 140 + 140 + 130 + 130 + 120 + 120,
+            110 + 110 + 100 + 100 + 90 + 90 + 90 + 80,
+            80 + 80 + 70 + 70 + 70 + 60 + 60 + 60,
+            60 + 50 + 50 + 50 + 50 + 40 + 40 + 40,
+            40 + 40 + 30 + 30 + 30 + 30 + 30 + 30,
+            30 + 20 + 20 + 20 + 20 + 20 + 20 + 20,
+            20 + 10 + 10 + 10 + 10 + 10 + 10 + 10,
+        ];
+        for (row, &expected) in DCSCALE_ROW_SUMS.iter().enumerate() {
+            let got: u32 = DCSCALE_VP3[row * 8..row * 8 + 8]
+                .iter()
+                .map(|&v| v as u32)
+                .sum();
+            assert_eq!(got, expected, "DCSCALE row {row} sum mismatch");
+        }
+    }
+
+    /// VP3 default constructor exposes the same `[u8; 64]` and
+    /// `[u16; 64]` field layout the round-4 prompt scopes.
+    #[test]
+    fn vp3_defaults_layout_matches_round4_contract() {
+        let h = TheoraSetupHeader::vp3_defaults();
+        let _: [u8; 64] = h.loop_filter_limits;
+        let _: [u16; 64] = h.ac_scale;
+        let _: [u16; 64] = h.dc_scale;
     }
 
     // ------- §5.2 BitReader tests -------

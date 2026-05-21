@@ -6,6 +6,43 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **VP3 hardcoded `LFLIMS` / `ACSCALE` / `DCSCALE` tables (2026-05-22,
+  round 4).** Transcribed from Appendix B.2 + B.3 of `Theora.pdf`
+  ("The hard-coded loop filter limit values used in VP3 are defined as
+  follows: …" / "The hard-coded quantization parameters used by VP3 are
+  defined as follows: …") and exposed as public constants:
+  * `LFLIMS_VP3: [u8; 64]` — 7-bit loop-filter limits (range 0..=30),
+    monotonically non-increasing across `qi`.
+  * `ACSCALE_VP3: [u16; 64]` — AC dequantization scale values (range
+    10..=500), monotonically non-increasing across `qi`.
+  * `DCSCALE_VP3: [u16; 64]` — DC dequantization scale values (range
+    10..=220), monotonically non-increasing across `qi`.
+
+  Reshaped `TheoraSetupHeader` to the round-4 contract:
+  `{ loop_filter_limits: [u8; 64], ac_scale: [u16; 64],
+  dc_scale: [u16; 64] }` (dropping the round-3
+  `Option<[u8; 64]>` / `Vec<[u8; 64]>` placeholders). A new
+  `TheoraSetupHeader::vp3_defaults()` constructor returns the
+  Appendix-B-typed fallback for `version < 0x030200` streams (per
+  Appendix B.1 first bullet — VP3-compatible decode). Base matrices,
+  NQRS / QRSIZES / QRBMIS, and the Huffman tables are deferred to
+  round 5.
+
+  5 new tests bring the total from 63 to 68: transcription-fidelity
+  monotonicity + spot-value asserts on each of the three Appendix B
+  tables, an independent row-sum re-tally, plus the
+  `vp3_defaults()` round-trip.
+
+  **§6.4.1 spec gap still unresolved.** `parse_setup_header` continues
+  to surface `Error::SetupHeaderBodyNotImplemented` for the per-stream
+  decode path: the numbered procedure body for §6.4.1 ("It is decoded
+  as follows:") remains absent from the spec PDF (page 50 ends with
+  the sentence, page 51 begins with "VP3 Compatibility" / §6.4.2).
+  Round 4's Appendix B fallback applies cleanly to streams that
+  predate the per-stream tables (`vp3-compat-decode` fixture); a
+  later round will populate the body once the docs collaborator
+  recovers the §6.4.1 procedure steps.
+
 * **Setup-header entrypoint + MSb-first bit reader (2026-05-21, round 3).**
   `parse_setup_header` returns a typed `TheoraSetupHeader` whose
   body fields (`loop_filter_limits`, `base_matrices`) are reserved

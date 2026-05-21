@@ -2,12 +2,14 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-21
+## Status — 2026-05-22
 
-**Identification + comment + setup-entrypoint parsers (rounds 1–3).**
+**Identification + comment + setup-entrypoint parsers (rounds 1–4).**
 §6.1, §6.2 (identification), §6.3 (comment), and §6.4.5 step 1
 (setup-header common-header guard) of the Theora I Specification are
-wired up. Three entry points plus an MSb-first bit reader:
+wired up. Three entry points plus an MSb-first bit reader; round 4
+adds the Appendix B VP3 fallback tables and the typed
+`TheoraSetupHeader` field layout the round-4 prompt scopes.
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -20,7 +22,10 @@ wired up. Three entry points plus an MSb-first bit reader:
 * [`parse_setup_header`] — round 3 entrypoint validating §6.4.5
   step 1 (the `0x82`+"theora" common-header guard). Returns
   `Error::SetupHeaderBodyNotImplemented` after the common header
-  passes — see "Round 3 spec gap" below.
+  passes — see "§6.4.1 spec gap" below.
+* `TheoraSetupHeader::vp3_defaults` — round 4 constructor returning
+  the Appendix-B-typed `LFLIMS` / `ACSCALE` / `DCSCALE` fallback
+  applicable to `version < 0x030200` streams.
 
 ### Identification header (round 1)
 The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
@@ -75,45 +80,68 @@ under `docs/video/theora/fixtures/` carries
 (`vendor="Lavf62.13.102"`, `comments=[("encoder", "Lavc62.30.100
 libtheora")]`).
 
-### Setup header (round 3)
+### Setup header (rounds 3 + 4)
 [`parse_setup_header`] implements only §6.4.5 step 1: it validates
 the 7-byte common header (`0x82` + ASCII `"theora"`) and returns
 [`Error::SetupHeaderBodyNotImplemented`] once the preamble checks
 out. The body — `LFLIMS` (§6.4.1), `ACSCALE`/`DCSCALE`/`NBMS`/`BMS`
 (§6.4.2), quant ranges (§6.4.2 step 7), and DCT-token Huffman
-tables (§6.4.4) — is deferred to subsequent clean-room rounds.
+tables (§6.4.4) — is deferred until the §6.4.1 spec gap closes.
 
-A crate-private MSb-first [`BitReader`] implementing §5.2 is landed
-in this round too. The bit reader is held private until the
-setup-header body lands; it is the substrate the §6.4.1 / §6.4.2 /
-§6.4.4 procedures will consume in round 4+.
+`TheoraSetupHeader` exposes the round-4 contract directly:
 
-### Round 3 spec gap
+```rust
+pub struct TheoraSetupHeader {
+    pub loop_filter_limits: [u8;  64], // §6.4.1 LFLIMS
+    pub ac_scale:           [u16; 64], // §6.4.2 ACSCALE
+    pub dc_scale:           [u16; 64], // §6.4.2 DCSCALE
+}
+```
+
+Round 4 ships the VP3 hardcoded tables from Appendix B.2 + B.3 of
+`Theora.pdf` as public constants:
+
+* `LFLIMS_VP3: [u8; 64]` — Appendix B.2. Range 0..=30, monotonically
+  non-increasing across `qi`.
+* `ACSCALE_VP3: [u16; 64]` — Appendix B.3. Range 10..=500,
+  monotonically non-increasing across `qi`.
+* `DCSCALE_VP3: [u16; 64]` — Appendix B.3. Range 10..=220,
+  monotonically non-increasing across `qi`.
+
+`TheoraSetupHeader::vp3_defaults()` returns a `TheoraSetupHeader`
+populated from these three constants. Per Appendix B.1 first bullet,
+streams declaring `version < 0x030200` use this fallback directly
+because they predate the per-stream setup-header overrides.
+
+A crate-private MSb-first [`BitReader`] implementing §5.2 remains
+held private (used by the §6.4.1 / §6.4.2 procedures once their
+bodies land).
+
+### §6.4.1 spec gap
 
 The spec PDF as published does not contain the numbered procedure
 steps for §6.4.1 (Loop Filter Limit Table Decode). Page 50 ends
 with "It is decoded as follows:" and page 51 begins immediately
 with "VP3 Compatibility" / §6.4.2 — the steps that should bridge
-the two pages are absent from the PDF stream we have. By
-symmetry with §6.4.2 the procedure is presumably: read 3-bit
-`NBITS`+1, then for each `qi` in 0..63 read `NBITS`-bit values into
-`LFLIMS[qi]` — but the guardrails prohibit guessing where a spec
-gap exists. Round 3 therefore lands only the §6.4.5 step 1 guard
-and stops, surfacing `SetupHeaderBodyNotImplemented` to callers.
+the two pages are absent from the PDF stream we have. The
+guardrails prohibit guessing where a spec gap exists, so the
+`parse_setup_header` body decode remains blocked.
 
-Resolution path: docs collaborator to recover the §6.4.1 procedure
-steps (possibly via a different source revision of the spec) before
-round 4. Until then, the entrypoint is callable and verifies the
-packet type, but cannot consume the body bits.
+Round 4 mitigates the blockage for VP3-compatible bitstreams via
+`vp3_defaults()`. `version >= 0x030200` streams continue to require
+the §6.4.1 / §6.4.2 procedures and remain blocked until the docs
+collaborator recovers the missing procedure body.
 
-63 unit tests cover happy-path parses on all three header types,
+68 unit tests cover happy-path parses on all three header types,
 every spec-mandated reject path on each, the optional
 revision-future-compatible path on the identification header,
 truncated packets at every prefix length, UTF-8 multi-byte payloads,
 empty vendor / value, zero comments, trailing bytes, per-comment
-index error reporting, all six §6.4.5 step 1 outcomes, and the §5.2
+index error reporting, all six §6.4.5 step 1 outcomes, the §5.2
 `BitReader` (MSb-first byte reads, multi-byte spans, full 32-bit
-reads, zero-width reads, mid-field truncation).
+reads, zero-width reads, mid-field truncation), monotonicity + spot
+values + row-sum re-tally on each of the three Appendix B tables,
+and the `vp3_defaults()` constructor.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

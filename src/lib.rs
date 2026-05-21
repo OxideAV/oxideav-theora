@@ -2,12 +2,14 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-05-21 (round 2 of clean-room rebuild)
+//! ## Status — 2026-05-21 (round 3 of clean-room rebuild)
 //!
 //! Round 1 landed the **identification header** parser per Theora I
 //! Specification §6.1 (common header) + §6.2 (identification header).
-//! Round 2 adds the **comment header** parser per §6.3 (comment
-//! length decode, comment header decode, user comment format).
+//! Round 2 added the **comment header** parser per §6.3.
+//! Round 3 lands the **setup header packet entrypoint** per §6.4.5
+//! step 1 plus the **MSb-first bit reader** mandated by §5.2 that the
+//! per-field setup-header decode will consume in subsequent rounds.
 //!
 //! * [`decode_identification_header`] returns a typed
 //!   [`TheoraIdentHeader`] describing every field declared in
@@ -15,6 +17,12 @@
 //! * [`parse_comment_header`] returns a typed
 //!   [`TheoraCommentHeader`] with the decoded vendor string and the
 //!   list of `KEY=value` user comments.
+//! * [`parse_setup_header`] validates §6.4.5 step 1 (the common
+//!   header carrying the `0x82`+"theora" identifier) and returns a
+//!   typed [`TheoraSetupHeader`]. Body fields (`LFLIMS`,
+//!   `ACSCALE`/`DCSCALE`/`NBMS`/`BMS`, quant ranges, Huffman
+//!   tables) are deferred to subsequent clean-room rounds — see the
+//!   per-field documentation on [`TheoraSetupHeader`].
 //!
 //! All other public entry points still return [`Error::NotImplemented`].
 //!
@@ -24,6 +32,19 @@
 //! Theora I Specification) and the fixture corpus under
 //! `docs/video/theora/fixtures/`. No libtheora, no FFmpeg vp3.c, no
 //! theora-rs.
+//!
+//! ## Known spec gap — §6.4.1 procedure body
+//!
+//! The §6.4.1 Loop Filter Limit Table Decode section in
+//! `Theora.pdf` declares its inputs/outputs (`LFLIMS`: 64-element 7-bit
+//! array; `NBITS`: 3-bit) and ends with the sentence "It is decoded as
+//! follows:" — but the numbered procedure steps that should follow are
+//! **absent** from the PDF as published. The next page begins
+//! immediately with "VP3 Compatibility" / §6.4.2. Round 3 therefore
+//! defers `LFLIMS` decode and stops the setup-header decode at the
+//! `0x82`+"theora" common-header check (§6.4.5 step 1).
+//! See [`Error::SetupHeaderBodyNotImplemented`] for the entrypoint's
+//! delegation behaviour.
 
 #![warn(missing_debug_implementations)]
 #![deny(unsafe_code)]
@@ -133,6 +154,13 @@ pub enum Error {
         /// Which vector failed UTF-8 decoding.
         field: CommentField,
     },
+    /// The setup-header body (§6.4.1 LFLIMS through §6.4.4 Huffman
+    /// tables) is not yet implemented. Returned by
+    /// [`parse_setup_header`] after the common-header check
+    /// succeeds. See the crate-level "Known spec gap" notice for
+    /// the underlying reason: §6.4.1's numbered procedure steps are
+    /// absent from the spec PDF.
+    SetupHeaderBodyNotImplemented,
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -224,6 +252,10 @@ impl core::fmt::Display for Error {
             Error::CommentNotUtf8 { field } => write!(
                 f,
                 "oxideav-theora: comment header {field:?} is not valid UTF-8"
+            ),
+            Error::SetupHeaderBodyNotImplemented => write!(
+                f,
+                "oxideav-theora: setup-header common header validated; body (§6.4.1–§6.4.4) deferred to later clean-room round"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -686,6 +718,174 @@ pub fn parse_comment_header(packet: &[u8]) -> Result<TheoraCommentHeader, Error>
     }
 
     Ok(TheoraCommentHeader { vendor, comments })
+}
+
+/// Parsed Theora setup header, per §6.4.5.
+///
+/// The Theora setup header (`HEADERTYPE=0x82`) carries five logical
+/// payloads:
+///
+/// 1. The loop-filter limit table (`LFLIMS`, §6.4.1).
+/// 2. The AC/DC scale tables (`ACSCALE`, `DCSCALE`, §6.4.2 steps 1–4).
+/// 3. The base matrices (`NBMS`, `BMS`, §6.4.2 steps 5–6).
+/// 4. The quant-range index tables (`NQRS`, `QRSIZES`, `QRBMIS`,
+///    §6.4.2 step 7).
+/// 5. The DCT-token Huffman tables (`HTS`, §6.4.4 — an 80-element
+///    array of Huffman tables with up to 32 entries each).
+///
+/// **Round 3 lands only the packet entrypoint** (§6.4.5 step 1: the
+/// `0x82`+"theora" common-header guard) — every body field below is
+/// reserved as `Option`/`Vec` placeholders that later clean-room
+/// rounds will populate. Round 3 [`parse_setup_header`] therefore
+/// only fills the common-header sentinel and returns. Round 4 onward
+/// will progressively populate the body once the §6.4.1 spec gap is
+/// closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TheoraSetupHeader {
+    /// `LFLIMS` (§6.4.1) — 64-element array of 7-bit loop-filter
+    /// limit values indexed by `qi`. `None` in round 3 because the
+    /// §6.4.1 decoding procedure body is missing from the spec PDF.
+    pub loop_filter_limits: Option<[u8; 64]>,
+    /// `BMS` (§6.4.2 step 6) — `NBMS` × 64 array of 8-bit base
+    /// matrix entries. Empty in round 3; reachable only after
+    /// LFLIMS and ACSCALE/DCSCALE consume their bits.
+    pub base_matrices: Vec<[u8; 64]>,
+}
+
+impl TheoraSetupHeader {
+    /// Construct a structurally-empty setup header. Used by
+    /// [`parse_setup_header`] to record that §6.4.5 step 1
+    /// succeeded; subsequent rounds will populate the body fields
+    /// once their decoding procedures are available.
+    fn empty() -> Self {
+        Self {
+            loop_filter_limits: None,
+            base_matrices: Vec::new(),
+        }
+    }
+}
+
+/// Decode a Theora setup header from `packet`.
+///
+/// Round 3 implements only §6.4.5 step 1: the common-header check
+/// (the `0x82` header-type byte followed by the ASCII `"theora"`
+/// sync token mandated by §6.1).
+///
+/// `packet` must contain the whole header packet starting from the
+/// `0x82` header-type byte — i.e. the payload of the third Ogg
+/// packet on a Theora stream, with Ogg framing already stripped.
+///
+/// Returns:
+///
+/// * [`Error::BadHeaderType`] if called on an identification (`0x80`)
+///   or comment (`0x81`) packet, or on a video data packet (high
+///   bit clear).
+/// * [`Error::BadMagic`] if the six bytes following the header-type
+///   byte are not `"theora"`.
+/// * [`Error::TruncatedHeader`] if the packet is shorter than the
+///   7-byte common header.
+/// * [`Error::SetupHeaderBodyNotImplemented`] after the common
+///   header has been validated, while the spec gap on §6.4.1
+///   blocks further body decode. The error is "soft" in the sense
+///   that the caller has at least verified that the packet looks
+///   like a setup header — it just can't be decoded yet.
+///
+/// Round 4+ will replace the `SetupHeaderBodyNotImplemented` return
+/// with a populated [`TheoraSetupHeader`] once §6.4.1's procedure
+/// body is recovered.
+pub fn parse_setup_header(packet: &[u8]) -> Result<TheoraSetupHeader, Error> {
+    let mut r = Reader::new(packet);
+
+    // --- §6.1 common header (called out by §6.4.5 step 1).
+    let header_type = r.read_u8("header_type")?;
+    if header_type & 0x80 == 0 {
+        return Err(Error::BadHeaderType { got: header_type });
+    }
+    if header_type != 0x82 {
+        return Err(Error::BadHeaderType { got: header_type });
+    }
+    const MAGIC: [u8; 6] = [0x74, 0x68, 0x65, 0x6f, 0x72, 0x61];
+    for expected in MAGIC {
+        let got = r.read_u8("magic")?;
+        if got != expected {
+            return Err(Error::BadMagic);
+        }
+    }
+
+    // --- §6.4.5 steps 2–4 would follow here, consuming the body
+    // through a `BitReader` (§5.2). Step 2 (§6.4.1 LFLIMS) is
+    // currently blocked by a spec gap — see the crate-level "Known
+    // spec gap" notice and the comment on
+    // `Error::SetupHeaderBodyNotImplemented`. Returning the soft
+    // sentinel lets callers route on the empty / populated
+    // distinction once round 4 lands.
+    let _ = TheoraSetupHeader::empty();
+    Err(Error::SetupHeaderBodyNotImplemented)
+}
+
+/// MSb-first bit reader implementing §5.2 of the Theora I
+/// Specification.
+///
+/// Theora differs from Vorbis in bit packing: per §5.2 "the decoder
+/// logically unpacks integers by first reading the MSb of a binary
+/// integer from the logical bitstream, followed by the next most
+/// significant bit, etc." — i.e. each output integer is built MSb
+/// first, and within each source byte the MSb is consumed first.
+///
+/// This is the bit reader that §6.4.1 / §6.4.2 / §6.4.4 will consume
+/// once their full decoding procedures are available. It is held
+/// crate-private until then; the public API only exposes the byte-
+/// aligned parsers ([`decode_identification_header`],
+/// [`parse_comment_header`], [`parse_setup_header`] step 1).
+///
+/// The reader is non-panicking: every read returns `Err` rather than
+/// indexing past end-of-buffer. The byte position is advanced
+/// automatically as bits are consumed.
+#[derive(Debug)]
+struct BitReader<'a> {
+    buf: &'a [u8],
+    /// Byte index of the byte currently being consumed. `bit_pos`
+    /// counts down from 7 to 0 within this byte.
+    byte_pos: usize,
+    /// Bit index within `buf[byte_pos]`. Values 7..=0 correspond to
+    /// the MSb..LSb of the current byte; -1 means "advance to the
+    /// next byte before the next read". Stored as `i8` (signed)
+    /// rather than `u8` so the underflow is cheap to test.
+    bit_pos: i8,
+}
+
+impl<'a> BitReader<'a> {
+    /// Create a reader positioned at the MSb of `buf[0]`.
+    #[allow(dead_code)] // used by round-4 setup-body decode
+    fn new(buf: &'a [u8]) -> Self {
+        Self {
+            buf,
+            byte_pos: 0,
+            bit_pos: 7,
+        }
+    }
+
+    /// Read `n` bits (0 ≤ n ≤ 32) as an unsigned integer, MSb first.
+    /// Returns [`Error::TruncatedHeader`] if the stream is exhausted
+    /// before `n` bits have been read.
+    #[allow(dead_code)] // used by round-4 setup-body decode
+    fn read_bits(&mut self, n: u32, field: &'static str) -> Result<u32, Error> {
+        debug_assert!(n <= 32, "read_bits called with n > 32");
+        let mut value: u32 = 0;
+        for _ in 0..n {
+            if self.byte_pos >= self.buf.len() {
+                return Err(Error::TruncatedHeader { field });
+            }
+            let bit = (self.buf[self.byte_pos] >> (self.bit_pos as u8)) & 1;
+            value = (value << 1) | (bit as u32);
+            self.bit_pos -= 1;
+            if self.bit_pos < 0 {
+                self.bit_pos = 7;
+                self.byte_pos += 1;
+            }
+        }
+        Ok(value)
+    }
 }
 
 /// Big-endian byte-stream cursor. Crate-private; consumers should call
@@ -1577,5 +1777,194 @@ mod tests {
             }
         }
         assert!(parse_comment_header(&TINY_COMMENT).is_ok());
+    }
+
+    // ------- §6.4.5 setup header entrypoint tests -------
+
+    /// Minimal setup-header common header: `0x82` + "theora". Round
+    /// 3 doesn't decode the body, so the test fixtures only need to
+    /// carry the 7-byte preamble.
+    const SETUP_PREAMBLE: [u8; 7] = [0x82, b't', b'h', b'e', b'o', b'r', b'a'];
+
+    #[test]
+    fn parse_setup_header_returns_body_not_implemented_on_valid_preamble() {
+        // Round 3: any packet whose first 7 bytes are 0x82 + "theora"
+        // should pass the §6.4.5 step 1 guard and surface the
+        // SetupHeaderBodyNotImplemented sentinel.
+        match parse_setup_header(&SETUP_PREAMBLE) {
+            Err(Error::SetupHeaderBodyNotImplemented) => {}
+            other => panic!("expected SetupHeaderBodyNotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_header_accepts_trailing_body_bytes() {
+        // The setup-header body lives after the 7-byte common header;
+        // round 3's entrypoint must not care about its content. Drop
+        // some arbitrary trailing bytes onto the preamble and confirm
+        // we still get the body-not-implemented sentinel rather than
+        // any parsing-derived error.
+        let mut pkt = SETUP_PREAMBLE.to_vec();
+        pkt.extend_from_slice(&[0xff, 0x00, 0xaa, 0x55, 0x12, 0x34]);
+        match parse_setup_header(&pkt) {
+            Err(Error::SetupHeaderBodyNotImplemented) => {}
+            other => panic!("expected SetupHeaderBodyNotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_header_rejects_identification_type() {
+        let mut bad = SETUP_PREAMBLE;
+        bad[0] = 0x80;
+        match parse_setup_header(&bad) {
+            Err(Error::BadHeaderType { got: 0x80 }) => {}
+            other => panic!("expected BadHeaderType(0x80), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_header_rejects_comment_type() {
+        let mut bad = SETUP_PREAMBLE;
+        bad[0] = 0x81;
+        match parse_setup_header(&bad) {
+            Err(Error::BadHeaderType { got: 0x81 }) => {}
+            other => panic!("expected BadHeaderType(0x81), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_header_rejects_video_data_packet() {
+        let mut bad = SETUP_PREAMBLE;
+        bad[0] = 0x42;
+        match parse_setup_header(&bad) {
+            Err(Error::BadHeaderType { got: 0x42 }) => {}
+            other => panic!("expected BadHeaderType(0x42), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_header_rejects_bad_magic() {
+        let mut bad = SETUP_PREAMBLE;
+        bad[3] = b'X';
+        assert_eq!(parse_setup_header(&bad), Err(Error::BadMagic));
+    }
+
+    #[test]
+    fn parse_setup_header_rejects_truncation() {
+        for len in 0..SETUP_PREAMBLE.len() {
+            match parse_setup_header(&SETUP_PREAMBLE[..len]) {
+                Err(Error::TruncatedHeader { .. }) => {}
+                Err(Error::BadHeaderType { .. }) if len == 0 => {
+                    panic!("len={len} should hit TruncatedHeader before BadHeaderType")
+                }
+                Ok(_) => panic!("len={len} should not parse"),
+                Err(other) => panic!("len={len} unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn setup_header_empty_is_structurally_blank() {
+        // Independent unit test of the empty-state factory so that
+        // the round-4 work has a fixed contract to build on.
+        let empty = TheoraSetupHeader::empty();
+        assert!(empty.loop_filter_limits.is_none());
+        assert!(empty.base_matrices.is_empty());
+    }
+
+    #[test]
+    fn setup_header_body_not_implemented_error_renders() {
+        let s = format!("{}", Error::SetupHeaderBodyNotImplemented);
+        assert!(s.contains("setup-header"));
+        assert!(s.contains("§6.4.1") || s.contains("body"));
+    }
+
+    // ------- §5.2 BitReader tests -------
+
+    #[test]
+    fn bitreader_reads_msb_first_within_byte() {
+        // §5.2 example: byte 0b1100_0000 produces 3 (b11) for the
+        // first 2-bit read, then 0 (b00) for the next 2-bit read.
+        // (Adapted from the spec's §5.2.3 decoding example.)
+        let mut r = BitReader::new(&[0b1100_1110, 0b0100_0111, 0b0110_0111, 0b0010_0000]);
+        assert_eq!(r.read_bits(2, "a").unwrap(), 3);
+        assert_eq!(r.read_bits(2, "b").unwrap(), 0);
+    }
+
+    #[test]
+    fn bitreader_reads_4_bit_value() {
+        // The spec's §5.2.2 encoding example writes 12 (b1100) as
+        // the first 4-bit field. Reading 4 bits from byte 0
+        // 0b1100_0000 must return 12.
+        let mut r = BitReader::new(&[0b1100_0000]);
+        assert_eq!(r.read_bits(4, "x").unwrap(), 12);
+    }
+
+    #[test]
+    fn bitreader_spans_byte_boundary() {
+        // Read 12 bits across two bytes: byte0=0xAB, byte1=0xCD
+        // 0xAB = 1010_1011, 0xCD = 1100_1101
+        // First 12 MSb-first bits = 1010_1011_1100 = 0xABC.
+        let mut r = BitReader::new(&[0xAB, 0xCD]);
+        assert_eq!(r.read_bits(12, "x").unwrap(), 0xABC);
+    }
+
+    #[test]
+    fn bitreader_reads_full_32_bits() {
+        // 32 bits MSb-first equals u32::from_be_bytes.
+        let bytes = [0xDE, 0xAD, 0xBE, 0xEF];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_bits(32, "x").unwrap(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn bitreader_zero_width_read_does_nothing() {
+        let mut r = BitReader::new(&[0xFF]);
+        assert_eq!(r.read_bits(0, "x").unwrap(), 0);
+        // Subsequent 8-bit read must still see the original byte.
+        assert_eq!(r.read_bits(8, "x").unwrap(), 0xFF);
+    }
+
+    #[test]
+    fn bitreader_returns_truncated_when_exhausted() {
+        let mut r = BitReader::new(&[0xAB]);
+        // Consume the byte, then attempt one more bit.
+        assert_eq!(r.read_bits(8, "byte").unwrap(), 0xAB);
+        match r.read_bits(1, "overflow") {
+            Err(Error::TruncatedHeader { field: "overflow" }) => {}
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bitreader_returns_truncated_mid_field() {
+        // Buffer has 12 bits available; requesting 16 fails at the
+        // 13th bit.
+        let mut r = BitReader::new(&[0xAB, 0xC0]);
+        // First 12 bits succeed.
+        assert_eq!(r.read_bits(12, "first").unwrap(), 0xABC);
+        // Next 16 bits fail because only 4 remain.
+        match r.read_bits(16, "tail") {
+            Err(Error::TruncatedHeader { field: "tail" }) => {}
+            other => panic!("expected TruncatedHeader(tail), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bitreader_3_then_4_then_5_bit_sequence() {
+        // §6.4.5 step 2 will read a 3-bit NBITS (§6.4.1) immediately
+        // after the 7-byte common header. Smoke-test mixed bit
+        // widths against a hand-traced value.
+        //
+        // Bits in order MSb-first: a=010 b=1010 c=11100
+        //   (3-bit value 2 + 4-bit value 10 + 5-bit value 28 = 12 bits).
+        //
+        // Packed 12-bit value = 0101_0101_1100 = 0x55C.
+        // As MSb-first bytes: byte0 = 0101_0101 = 0x55,
+        //                     byte1 = 1100_xxxx (low 4 bits unused).
+        let mut r = BitReader::new(&[0x55, 0xC0]);
+        assert_eq!(r.read_bits(3, "a").unwrap(), 0b010);
+        assert_eq!(r.read_bits(4, "b").unwrap(), 0b1010);
+        assert_eq!(r.read_bits(5, "c").unwrap(), 0b11100);
     }
 }

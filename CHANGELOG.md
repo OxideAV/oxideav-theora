@@ -6,6 +6,28 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **Setup-header entrypoint + MSb-first bit reader (2026-05-21, round 3).**
+  `parse_setup_header` returns a typed `TheoraSetupHeader` whose
+  body fields (`loop_filter_limits`, `base_matrices`) are reserved
+  placeholders, and surfaces a new
+  `Error::SetupHeaderBodyNotImplemented` once §6.4.5 step 1 (the
+  `0x82`+"theora" common-header guard from §6.1) succeeds. Reject
+  paths cover wrong header type (`0x80` / `0x81` / video-data),
+  bad magic, and truncation at every prefix.
+  A crate-private MSb-first `BitReader` implementing §5.2 is also
+  landed, ready for the §6.4.1 / §6.4.2 / §6.4.4 setup-body decode
+  procedures that subsequent rounds will plug into the entrypoint.
+  17 new tests bring the total from 46 to 63.
+
+  **Known spec gap — §6.4.1.** The numbered procedure steps for
+  §6.4.1 (Loop Filter Limit Table Decode) are absent from the
+  current spec PDF: page 50 ends with "It is decoded as follows:"
+  and page 51 begins immediately with "VP3 Compatibility" / §6.4.2.
+  Round 3 declines to guess and surfaces
+  `SetupHeaderBodyNotImplemented` until the docs collaborator
+  recovers the procedure body. Round 4 onward will populate the
+  setup-header body fields once the gap is closed.
+
 * **Comment-header parser (2026-05-21, round 2).**
   `parse_comment_header` returns a typed `TheoraCommentHeader`
   (`vendor: String`, `comments: Vec<(String, String)>`) per §6.3.1

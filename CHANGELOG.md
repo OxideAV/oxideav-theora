@@ -4,6 +4,16 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-theora/compare/v0.0.7...v0.0.8) - 2026-05-21
+
+### Other
+
+- VP3 LFLIMS/ACSCALE/DCSCALE tables from Appendix B (round 4)
+- Setup-header entrypoint (§6.4.5 step 1) + MSb-first BitReader (§5.2)
+- Comment-header parser per §6.3 of the Theora I Specification
+- Identification-header parser per §6.1 + §6.2 of the Theora I Specification
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **VP3 hardcoded `LFLIMS` / `ACSCALE` / `DCSCALE` tables (2026-05-22,

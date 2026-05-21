@@ -4,10 +4,21 @@ Pure-Rust Theora video codec — clean-room implementation in progress.
 
 ## Status — 2026-05-21
 
-**Identification-header parser (round 1).** §6.1 (common header) +
-§6.2 (identification header) of the Theora I Specification are wired
-up via [`decode_identification_header`], returning a typed
-`TheoraIdentHeader` that exposes every field from Figure 6.2:
+**Identification + comment header parsers (rounds 1–2).** §6.1, §6.2
+(identification) and §6.3 (comment) of the Theora I Specification
+are wired up. Two entry points:
+
+* [`decode_identification_header`] — typed `TheoraIdentHeader` per
+  Figure 6.2 (round 1).
+* [`parse_comment_header`] — typed `TheoraCommentHeader` per
+  §6.3.1 / §6.3.2 / §6.3.3 (round 2). 7-byte `0x81`+"theora" sync,
+  4-octet **little-endian** vendor length (§6.3.1's
+  Vorbis-compatible memory layout), UTF-8 vendor string, 4-octet LE
+  `NCOMMENTS`, then a length-prefixed `KEY=value` vector per comment.
+  Case-insensitive `lookup("encoder")` helper exposed per §6.3.3.
+
+### Identification header (round 1)
+The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
 
 * 7-byte sync (`0x80` + ASCII `"theora"`).
 * `VMAJ` / `VMIN` / `VREV` — version triple. The parser enforces
@@ -38,13 +49,36 @@ Verified against three fixtures from `docs/video/theora/fixtures/`:
 * `dimensions-1080p-very-short` — coded 1920×1088 with
   `nsbs=3060`, `nbs=48960`.
 
-25 unit tests cover happy-path parses, every spec-mandated reject
-path, the optional revision-future-compatible path, and truncated
-packets at every prefix length.
+### Comment header (round 2)
+The typed `TheoraCommentHeader` carries:
 
-No setup header, comment header, or video-data packet decode yet.
-[`register`] is still a no-op — `RuntimeContext` integration arrives
-once the codec can actually decode a frame.
+* `vendor: String` — the muxer/encoder name from the first vector
+  (e.g. `"Lavf62.13.102"` for libtheora-via-FFmpeg).
+* `comments: Vec<(String, String)>` — parsed `KEY=value` user
+  comments. A vector lacking `=` is preserved with an empty value
+  rather than rejected; §6.3.3 mandates `=` but we stay tolerant of
+  real-world streams.
+* `lookup(name) -> Option<&str>` — case-insensitive search for the
+  first matching key (§6.3.3).
+
+Reject paths: wrong header-type byte (`0x80`/`0x82`/video-data),
+bad magic, declared length exceeds packet remaining, invalid UTF-8
+on either the vendor string or any individual comment vector.
+
+Verified against the comment-header packet that every fixture
+under `docs/video/theora/fixtures/` carries
+(`vendor="Lavf62.13.102"`, `comments=[("encoder", "Lavc62.30.100
+libtheora")]`).
+
+46 unit tests cover happy-path parses on both header types, every
+spec-mandated reject path on both, the optional
+revision-future-compatible path, truncated packets at every prefix
+length, UTF-8 multi-byte payloads, empty vendor / value, zero
+comments, trailing bytes, and per-comment-index error reporting.
+
+No setup header or video-data packet decode yet. [`register`] is
+still a no-op — `RuntimeContext` integration arrives once the codec
+can actually decode a frame.
 
 ## Clean-room sources
 

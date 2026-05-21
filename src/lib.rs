@@ -2,13 +2,19 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-05-21 (round 1 of clean-room rebuild)
+//! ## Status — 2026-05-21 (round 2 of clean-room rebuild)
 //!
-//! This round lands the **identification header** parser per Theora I
+//! Round 1 landed the **identification header** parser per Theora I
 //! Specification §6.1 (common header) + §6.2 (identification header).
-//! No setup header, comment header, or video-data packet decode yet —
-//! [`decode_identification_header`] returns a typed
-//! [`TheoraIdentHeader`] describing every field declared in Figure 6.2.
+//! Round 2 adds the **comment header** parser per §6.3 (comment
+//! length decode, comment header decode, user comment format).
+//!
+//! * [`decode_identification_header`] returns a typed
+//!   [`TheoraIdentHeader`] describing every field declared in
+//!   Figure 6.2.
+//! * [`parse_comment_header`] returns a typed
+//!   [`TheoraCommentHeader`] with the decoded vendor string and the
+//!   list of `KEY=value` user comments.
 //!
 //! All other public entry points still return [`Error::NotImplemented`].
 //!
@@ -107,9 +113,43 @@ pub enum Error {
         /// The reserved bit pattern.
         bits: u8,
     },
+    /// A length field inside the comment header (vendor length,
+    /// comment count, or per-comment length) declared more octets than
+    /// the remaining packet contained — see §6.3.1 / §6.3.2.
+    CommentLengthOverflow {
+        /// Field name being read (e.g. `"vendor"`, `"comment"`).
+        field: &'static str,
+        /// Length value pulled from the wire.
+        len: u32,
+        /// Number of octets still available in the packet body.
+        remaining: usize,
+    },
+    /// The vendor string or a `COMMENTS[i]` payload was not valid
+    /// UTF-8. §6.3.3 says the comment value is "encoded as a UTF-8
+    /// string"; the vendor string is described as a "vector" but is
+    /// also UTF-8 in every libtheora-emitted stream we observe and the
+    /// reference implementations expose it as a C string.
+    CommentNotUtf8 {
+        /// Which vector failed UTF-8 decoding.
+        field: CommentField,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
+}
+
+/// Identifies which UTF-8 vector in the comment header triggered an
+/// [`Error::CommentNotUtf8`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentField {
+    /// The single vendor string (Figure 6.4, first vector).
+    Vendor,
+    /// One of the per-comment `KEY=value` vectors. `index` matches the
+    /// `ci` loop variable in §6.3.2.
+    Comment {
+        /// Zero-based index of the offending comment.
+        index: u32,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -172,6 +212,18 @@ impl core::fmt::Display for Error {
             Error::NonZeroReservedBits { bits } => write!(
                 f,
                 "oxideav-theora: trailing reserved bits = 0b{bits:03b}, expected 0"
+            ),
+            Error::CommentLengthOverflow {
+                field,
+                len,
+                remaining,
+            } => write!(
+                f,
+                "oxideav-theora: comment header {field} length {len} exceeds remaining {remaining} octets"
+            ),
+            Error::CommentNotUtf8 { field } => write!(
+                f,
+                "oxideav-theora: comment header {field:?} is not valid UTF-8"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -513,6 +565,129 @@ pub fn decode_identification_header(packet: &[u8]) -> Result<TheoraIdentHeader, 
     })
 }
 
+/// Parsed Theora comment header, per Figure 6.4 / §6.3.2.
+///
+/// The header carries a single vendor string and a list of user
+/// comments. Each user comment is a `KEY=value` vector; §6.3.3
+/// constrains the key (case-insensitive ASCII, no `=` byte) and lets
+/// the value be any UTF-8 string up to the per-vector length limit.
+///
+/// We surface the comments split into `(key, value)` tuples for
+/// convenience. A vector that does **not** contain an `=` byte is
+/// preserved with an empty value (per §6.3.3 the field name "is
+/// immediately followed by ASCII 0x3D ('=')"; we keep malformed
+/// vectors in the parsed output rather than reject because real-world
+/// files occasionally carry vendor-format strings without `=`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TheoraCommentHeader {
+    /// Vendor string from Figure 6.4 (the first vector of the comment
+    /// header). libtheora-via-FFmpeg writes the muxer name here
+    /// (e.g. `"Lavf62.13.102"`).
+    pub vendor: String,
+    /// User comments from §6.3.3. Each entry is a parsed
+    /// `(key, value)` pair. Keys are returned in the case they
+    /// appeared on the wire; per §6.3.3 they must be compared
+    /// case-insensitively.
+    pub comments: Vec<(String, String)>,
+}
+
+impl TheoraCommentHeader {
+    /// Look up the first comment whose key matches `name`
+    /// case-insensitively, per §6.3.3 ("the field name is case-
+    /// insensitive").
+    ///
+    /// Returns the value of the first matching entry, or `None` if no
+    /// comment has that key. Comments may legally repeat; callers
+    /// that need every value should iterate
+    /// [`TheoraCommentHeader::comments`] directly.
+    pub fn lookup(&self, name: &str) -> Option<&str> {
+        self.comments
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Decode a Theora comment header from `packet`.
+///
+/// Implements §6.3.1 (length decode) and §6.3.2 (comment header
+/// decode) verbatim. The packet body uses the Vorbis-compatible
+/// memory layout from §6.3.1: a 7-byte common header (`0x81` +
+/// `"theora"`), followed by the vendor-string length as 4 LE octets,
+/// the vendor string itself, a 4-octet LE comment count, and then
+/// each comment as a 4-octet LE length plus the comment vector.
+///
+/// `packet` must contain the whole header packet starting from the
+/// `0x81` header-type byte — i.e. the payload of the second Ogg
+/// packet on a Theora stream, with Ogg framing already stripped.
+///
+/// The comment header packet is allowed to contain trailing bytes
+/// after the last comment vector per §6.3.2 ("the comment header
+/// comprises the entirety of the second header packet"); we accept
+/// trailing bytes silently to keep the parser robust against
+/// real-world streams.
+pub fn parse_comment_header(packet: &[u8]) -> Result<TheoraCommentHeader, Error> {
+    let mut r = Reader::new(packet);
+
+    // --- §6.1 common header (called out by §6.3.2 step 1).
+    let header_type = r.read_u8("header_type")?;
+    if header_type & 0x80 == 0 {
+        return Err(Error::BadHeaderType { got: header_type });
+    }
+    if header_type != 0x81 {
+        return Err(Error::BadHeaderType { got: header_type });
+    }
+    const MAGIC: [u8; 6] = [0x74, 0x68, 0x65, 0x6f, 0x72, 0x61];
+    for expected in MAGIC {
+        let got = r.read_u8("magic")?;
+        if got != expected {
+            return Err(Error::BadMagic);
+        }
+    }
+
+    // --- §6.3.2 step 2: vendor-string length (§6.3.1 little-endian
+    // decode).
+    let vendor_len = r.read_u32_le("vendor_len")?;
+    let vendor_bytes = r.read_octets("vendor", vendor_len)?;
+    let vendor = match core::str::from_utf8(vendor_bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => {
+            return Err(Error::CommentNotUtf8 {
+                field: CommentField::Vendor,
+            });
+        }
+    };
+
+    // --- §6.3.2 step 5: NCOMMENTS.
+    let ncomments = r.read_u32_le("ncomments")?;
+    let mut comments = Vec::with_capacity(ncomments.min(64) as usize);
+
+    // --- §6.3.2 step 7: per-comment loop.
+    for ci in 0..ncomments {
+        let comment_bytes = {
+            let len = r.read_u32_le("comment_len")?;
+            r.read_octets("comment", len)?
+        };
+        let text = match core::str::from_utf8(comment_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(Error::CommentNotUtf8 {
+                    field: CommentField::Comment { index: ci },
+                });
+            }
+        };
+        // §6.3.3: split on the first `=`. A vector without `=` is
+        // unusual but preserved with an empty value.
+        let (key, value) = match text.split_once('=') {
+            Some((k, v)) => (k.to_owned(), v.to_owned()),
+            None => (text.to_owned(), String::new()),
+        };
+        comments.push((key, value));
+    }
+
+    Ok(TheoraCommentHeader { vendor, comments })
+}
+
 /// Big-endian byte-stream cursor. Crate-private; consumers should call
 /// [`decode_identification_header`] instead.
 struct Reader<'a> {
@@ -566,6 +741,42 @@ impl<'a> Reader<'a> {
         ]);
         self.pos += 4;
         Ok(v)
+    }
+
+    /// Little-endian u32 reader used by the comment-header parser.
+    /// §6.3.1 step 5 explicitly defines the construction as
+    /// `LEN0 + (LEN1 << 8) + (LEN2 << 16) + (LEN3 << 24)`, i.e. LE
+    /// across 4 octets read in order.
+    fn read_u32_le(&mut self, field: &'static str) -> Result<u32, Error> {
+        if self.pos + 4 > self.buf.len() {
+            return Err(Error::TruncatedHeader { field });
+        }
+        let v = u32::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(v)
+    }
+
+    /// Borrow the next `len` octets as a slice. Returns
+    /// [`Error::CommentLengthOverflow`] when the wire length exceeds
+    /// the packet's remaining bytes.
+    fn read_octets(&mut self, field: &'static str, len: u32) -> Result<&'a [u8], Error> {
+        let remaining = self.buf.len() - self.pos;
+        let len_usize = len as usize;
+        if len_usize > remaining {
+            return Err(Error::CommentLengthOverflow {
+                field,
+                len,
+                remaining,
+            });
+        }
+        let s = &self.buf[self.pos..self.pos + len_usize];
+        self.pos += len_usize;
+        Ok(s)
     }
 }
 
@@ -1038,6 +1249,333 @@ mod tests {
         );
         let _ = format!("{}", Error::ReservedPixelFormat);
         let _ = format!("{}", Error::NonZeroReservedBits { bits: 1 });
+        let _ = format!(
+            "{}",
+            Error::CommentLengthOverflow {
+                field: "vendor",
+                len: 99,
+                remaining: 5,
+            }
+        );
+        let _ = format!(
+            "{}",
+            Error::CommentNotUtf8 {
+                field: CommentField::Vendor
+            }
+        );
+        let _ = format!(
+            "{}",
+            Error::CommentNotUtf8 {
+                field: CommentField::Comment { index: 7 }
+            }
+        );
         let _ = format!("{}", Error::NotImplemented);
+    }
+
+    // ------- §6.3 comment header tests -------
+
+    /// Bytes extracted from
+    /// `docs/video/theora/fixtures/tiny-i-only-16x16/input.ogv`:
+    /// second Ogg packet payload, framing already stripped. Encoder
+    /// emitted vendor `"Lavf62.13.102"` and one comment
+    /// `"encoder=Lavc62.30.100 libtheora"`. Every fixture currently
+    /// in the corpus carries the same comment header byte-for-byte
+    /// because all of them came out of the same FFmpeg / libtheora
+    /// build.
+    const TINY_COMMENT: [u8; 63] = [
+        0x81, 0x74, 0x68, 0x65, 0x6f, 0x72, 0x61, // 0x81 + "theora"
+        0x0d, 0x00, 0x00, 0x00, // vendor_len = 13 (LE)
+        b'L', b'a', b'v', b'f', b'6', b'2', b'.', b'1', b'3', b'.', b'1', b'0', b'2', 0x01, 0x00,
+        0x00, 0x00, // ncomments = 1 (LE)
+        0x1f, 0x00, 0x00, 0x00, // comment[0] length = 31 (LE)
+        b'e', b'n', b'c', b'o', b'd', b'e', b'r', b'=', b'L', b'a', b'v', b'c', b'6', b'2', b'.',
+        b'3', b'0', b'.', b'1', b'0', b'0', b' ', b'l', b'i', b'b', b't', b'h', b'e', b'o', b'r',
+        b'a',
+    ];
+
+    #[test]
+    fn parses_tiny_fixture_comment_header() {
+        let c = parse_comment_header(&TINY_COMMENT).expect("tiny comment header should decode");
+        assert_eq!(c.vendor, "Lavf62.13.102");
+        assert_eq!(c.comments.len(), 1);
+        assert_eq!(c.comments[0].0, "encoder");
+        assert_eq!(c.comments[0].1, "Lavc62.30.100 libtheora");
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive() {
+        let c = parse_comment_header(&TINY_COMMENT).unwrap();
+        assert_eq!(c.lookup("encoder"), Some("Lavc62.30.100 libtheora"));
+        assert_eq!(c.lookup("ENCODER"), Some("Lavc62.30.100 libtheora"));
+        assert_eq!(c.lookup("Encoder"), Some("Lavc62.30.100 libtheora"));
+        assert_eq!(c.lookup("missing"), None);
+    }
+
+    /// Build a comment-header packet inline; used by negative-path
+    /// tests so they can pin down exact bytes.
+    fn synth_comment(vendor: &[u8], comments: &[&[u8]]) -> Vec<u8> {
+        let mut out = vec![0x81, b't', b'h', b'e', b'o', b'r', b'a'];
+        out.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        out.extend_from_slice(vendor);
+        out.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            out.extend_from_slice(c);
+        }
+        out
+    }
+
+    #[test]
+    fn handles_zero_comments() {
+        let pkt = synth_comment(b"Xiph.Org libtheora 1.2", &[]);
+        let c = parse_comment_header(&pkt).unwrap();
+        assert_eq!(c.vendor, "Xiph.Org libtheora 1.2");
+        assert!(c.comments.is_empty());
+    }
+
+    #[test]
+    fn handles_multiple_comments() {
+        let pkt = synth_comment(
+            b"libfaux 0.1",
+            &[
+                b"TITLE=the look of Theora",
+                b"DIRECTOR=me",
+                b"DATE=2026-05-21",
+            ],
+        );
+        let c = parse_comment_header(&pkt).unwrap();
+        assert_eq!(c.vendor, "libfaux 0.1");
+        assert_eq!(c.comments.len(), 3);
+        assert_eq!(c.comments[0], ("TITLE".into(), "the look of Theora".into()));
+        assert_eq!(c.comments[1], ("DIRECTOR".into(), "me".into()));
+        assert_eq!(c.comments[2], ("DATE".into(), "2026-05-21".into()));
+        assert_eq!(c.lookup("title"), Some("the look of Theora"));
+    }
+
+    #[test]
+    fn handles_utf8_value_payload() {
+        // §6.3.3 explicitly permits UTF-8 in values; key is ASCII only.
+        // The Yen-sign + Japanese character pair is 4 UTF-8 bytes.
+        let comment = "TITLE=¥日".as_bytes();
+        let pkt = synth_comment(b"v", &[comment]);
+        let c = parse_comment_header(&pkt).unwrap();
+        assert_eq!(c.comments[0].0, "TITLE");
+        assert_eq!(c.comments[0].1, "¥日");
+    }
+
+    #[test]
+    fn handles_empty_vendor() {
+        let pkt = synth_comment(b"", &[b"X=y"]);
+        let c = parse_comment_header(&pkt).unwrap();
+        assert!(c.vendor.is_empty());
+        assert_eq!(c.comments[0], ("X".into(), "y".into()));
+    }
+
+    #[test]
+    fn handles_empty_value_after_equals() {
+        let pkt = synth_comment(b"v", &[b"NULL="]);
+        let c = parse_comment_header(&pkt).unwrap();
+        assert_eq!(c.comments[0], ("NULL".into(), "".into()));
+    }
+
+    #[test]
+    fn handles_comment_without_equals() {
+        // §6.3.3 says the field name MUST be followed by '='; if a
+        // vector lacks one we keep the whole text as the key with an
+        // empty value rather than reject, to stay tolerant of
+        // real-world streams.
+        let pkt = synth_comment(b"v", &[b"NOEQUALSHERE"]);
+        let c = parse_comment_header(&pkt).unwrap();
+        assert_eq!(c.comments[0], ("NOEQUALSHERE".into(), "".into()));
+    }
+
+    #[test]
+    fn allows_trailing_bytes_after_last_comment() {
+        let mut pkt = synth_comment(b"v", &[b"K=v"]);
+        pkt.extend_from_slice(b"trailing-garbage-that-should-be-ignored");
+        let c = parse_comment_header(&pkt).expect("trailing bytes must not fail");
+        assert_eq!(c.vendor, "v");
+        assert_eq!(c.comments[0], ("K".into(), "v".into()));
+    }
+
+    #[test]
+    fn rejects_identification_header_type() {
+        let mut bad = TINY_COMMENT;
+        bad[0] = 0x80;
+        match parse_comment_header(&bad) {
+            Err(Error::BadHeaderType { got: 0x80 }) => {}
+            other => panic!("expected BadHeaderType(0x80), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_setup_header_type() {
+        let mut bad = TINY_COMMENT;
+        bad[0] = 0x82;
+        match parse_comment_header(&bad) {
+            Err(Error::BadHeaderType { got: 0x82 }) => {}
+            other => panic!("expected BadHeaderType(0x82), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_video_data_packet_in_comment_path() {
+        let mut bad = TINY_COMMENT;
+        bad[0] = 0x40;
+        match parse_comment_header(&bad) {
+            Err(Error::BadHeaderType { got: 0x40 }) => {}
+            other => panic!("expected BadHeaderType(0x40), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_magic_in_comment_path() {
+        let mut bad = TINY_COMMENT;
+        bad[2] = b'X';
+        assert_eq!(parse_comment_header(&bad), Err(Error::BadMagic));
+    }
+
+    #[test]
+    fn rejects_vendor_length_overflow() {
+        // Declare a 99-byte vendor in a packet that only has 0
+        // payload octets after the length field.
+        let pkt = [
+            0x81, b't', b'h', b'e', b'o', b'r', b'a', // header
+            0x63, 0x00, 0x00, 0x00, // vendor_len = 99
+        ];
+        match parse_comment_header(&pkt) {
+            Err(Error::CommentLengthOverflow {
+                field: "vendor",
+                len: 99,
+                remaining: 0,
+            }) => {}
+            other => panic!("expected CommentLengthOverflow(vendor), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_comment_length_overflow() {
+        // Declare 1 comment of length 99 with only a few payload
+        // bytes available.
+        let pkt = synth_comment(b"v", &[b"K=v"])
+            .into_iter()
+            .chain([].iter().copied())
+            .collect::<Vec<u8>>();
+        // Take the prefix up through ncomments, replace the comment
+        // length with 99, drop the rest.
+        // Layout: 7-byte header + 4 (vendor_len) + 1 (vendor) + 4
+        // (ncomments) + 4 (comment_len) + 3 (K=v) = 23 bytes.
+        let mut bad = pkt[..16].to_vec(); // header + vendor_len + vendor + ncomments
+        bad.extend_from_slice(&99u32.to_le_bytes());
+        bad.extend_from_slice(b"K=v"); // only 3 bytes available
+        match parse_comment_header(&bad) {
+            Err(Error::CommentLengthOverflow {
+                field: "comment",
+                len: 99,
+                remaining: 3,
+            }) => {}
+            other => panic!("expected CommentLengthOverflow(comment), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_ncomments_with_no_payload() {
+        // Claim ncomments=1 but provide no comment-length octets.
+        let mut bad = vec![0x81, b't', b'h', b'e', b'o', b'r', b'a'];
+        bad.extend_from_slice(&0u32.to_le_bytes()); // vendor_len = 0
+        bad.extend_from_slice(&1u32.to_le_bytes()); // ncomments = 1
+                                                    // (no comment_len follows)
+        match parse_comment_header(&bad) {
+            Err(Error::TruncatedHeader {
+                field: "comment_len",
+            }) => {}
+            other => panic!("expected TruncatedHeader(comment_len), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_vendor_length() {
+        // Drop everything after the 7-byte header.
+        match parse_comment_header(&TINY_COMMENT[..7]) {
+            Err(Error::TruncatedHeader {
+                field: "vendor_len",
+            }) => {}
+            other => panic!("expected TruncatedHeader(vendor_len), got {other:?}"),
+        }
+        // Partial vendor_len (3 of 4 octets).
+        match parse_comment_header(&TINY_COMMENT[..10]) {
+            Err(Error::TruncatedHeader {
+                field: "vendor_len",
+            }) => {}
+            other => panic!("expected TruncatedHeader(vendor_len), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_vendor() {
+        // Vendor length = 2 with bytes 0xff 0xfe (not valid UTF-8).
+        let mut bad = vec![0x81, b't', b'h', b'e', b'o', b'r', b'a'];
+        bad.extend_from_slice(&2u32.to_le_bytes());
+        bad.extend_from_slice(&[0xff, 0xfe]);
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        match parse_comment_header(&bad) {
+            Err(Error::CommentNotUtf8 {
+                field: CommentField::Vendor,
+            }) => {}
+            other => panic!("expected CommentNotUtf8(Vendor), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_comment() {
+        // Valid vendor, comment[0] contains a lone 0xff byte.
+        let mut bad = vec![0x81, b't', b'h', b'e', b'o', b'r', b'a'];
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(b"v");
+        bad.extend_from_slice(&1u32.to_le_bytes()); // ncomments = 1
+        bad.extend_from_slice(&1u32.to_le_bytes()); // comment_len = 1
+        bad.push(0xff);
+        match parse_comment_header(&bad) {
+            Err(Error::CommentNotUtf8 {
+                field: CommentField::Comment { index: 0 },
+            }) => {}
+            other => panic!("expected CommentNotUtf8(Comment{{0}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ncomments_loop_records_comment_index_on_utf8_error() {
+        // Two valid comments then a third with invalid UTF-8 — make
+        // sure the reported index is the offending one.
+        let mut pkt = vec![0x81, b't', b'h', b'e', b'o', b'r', b'a'];
+        pkt.extend_from_slice(&0u32.to_le_bytes()); // vendor_len = 0
+        pkt.extend_from_slice(&3u32.to_le_bytes()); // ncomments = 3
+        for body in [b"A=1" as &[u8], b"B=2"] {
+            pkt.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            pkt.extend_from_slice(body);
+        }
+        pkt.extend_from_slice(&1u32.to_le_bytes());
+        pkt.push(0xff);
+        match parse_comment_header(&pkt) {
+            Err(Error::CommentNotUtf8 {
+                field: CommentField::Comment { index: 2 },
+            }) => {}
+            other => panic!("expected CommentNotUtf8(Comment{{2}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_at_each_prefix() {
+        // Every strict prefix of TINY_COMMENT must error; the full
+        // packet must succeed. Allowed terminal error variants:
+        // TruncatedHeader / BadMagic (for the very short ones).
+        for len in 0..TINY_COMMENT.len() {
+            match parse_comment_header(&TINY_COMMENT[..len]) {
+                Err(Error::TruncatedHeader { .. }) | Err(Error::CommentLengthOverflow { .. }) => {}
+                Ok(_) => panic!("len={len} should not parse"),
+                Err(other) => panic!("len={len} unexpected {other:?}"),
+            }
+        }
+        assert!(parse_comment_header(&TINY_COMMENT).is_ok());
     }
 }

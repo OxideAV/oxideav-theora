@@ -6,6 +6,26 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **Comment-header parser (2026-05-21, round 2).**
+  `parse_comment_header` returns a typed `TheoraCommentHeader`
+  (`vendor: String`, `comments: Vec<(String, String)>`) per §6.3.1
+  / §6.3.2 / §6.3.3 of the Xiph Theora I Specification. Handles the
+  Vorbis-compatible 4-octet **little-endian** length encoding from
+  §6.3.1 ("on platforms with 8-bit bytes, the memory organization
+  of the comment header is identical with that of Vorbis I"), the
+  `0x81`+"theora" common-header guard, UTF-8 decoding for both the
+  vendor string and each user-comment vector, and `KEY=value`
+  splitting per §6.3.3. A `lookup(&str) -> Option<&str>` helper
+  performs the case-insensitive key lookup §6.3.3 mandates.
+  Reject paths cover wrong header type (`0x80` / `0x82` /
+  video-data), bad magic, declared length exceeds packet remaining,
+  invalid UTF-8 on either the vendor or any individual comment
+  vector (with per-comment index reporting via `CommentField`), and
+  truncation at every prefix. Verified against the comment header
+  carried by every fixture under `docs/video/theora/fixtures/`
+  (vendor `"Lavf62.13.102"`, one comment `encoder=Lavc62.30.100
+  libtheora`). 21 new tests bring the total from 25 to 46.
+
 * **Identification-header parser (2026-05-21).**
   `decode_identification_header` returns a typed `TheoraIdentHeader`
   per §6.1 + §6.2 of the Xiph Theora I Specification: 7-byte

@@ -1,32 +1,60 @@
 # oxideav-theora
 
-Pure-Rust Theora video codec.
+Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-20
+## Status — 2026-05-21
 
-**Orphan-rebuild scaffold.** The crate's prior implementation was
-retired under the workspace clean-room policy: provenance for several
-data tables and at least one structural decode loop could not be
-defended against the "no external library source as reference" rule
-that governs every crate in this workspace.
+**Identification-header parser (round 1).** §6.1 (common header) +
+§6.2 (identification header) of the Theora I Specification are wired
+up via [`decode_identification_header`], returning a typed
+`TheoraIdentHeader` that exposes every field from Figure 6.2:
 
-Per workspace policy, the only acceptable response is a full
-clean-room re-implementation against the Theora I Specification and
-black-box validator binaries. That work has not yet been scheduled.
+* 7-byte sync (`0x80` + ASCII `"theora"`).
+* `VMAJ` / `VMIN` / `VREV` — version triple. The parser enforces
+  `VMAJ=3`, `VMIN=2` and accepts any `VREV` (forward-compatible
+  per §6.2 step 4).
+* `FMBW` / `FMBH` — coded frame size in macroblocks (× 16 → pixels).
+* `PICW` / `PICH` / `PICX` / `PICY` — visible picture region.
+  `PICY` is stored in the spec's lower-left convention; consumers
+  that need top-left flip via `coded_h − pich − picy`.
+* `FRN` / `FRD` — frame-rate fraction (both must be non-zero).
+* `PARN` / `PARD` — pixel-aspect-ratio fraction (zero/zero = "not
+  declared").
+* `CS` — color space (Table 6.3): `Undefined`, `Rec470M`,
+  `Rec470Bg`, or `Reserved(u8)` for values 3..=255.
+* `NOMBR` — nominal bitrate hint (24-bit; saturated value
+  `2^24-1` means "≥ 2^24-1 bps").
+* `QUAL`, `KFGSHIFT`, `PF` — extracted from the packed final 16-bit
+  field. `PF=1` (reserved) and non-zero reserved trailing bits are
+  rejected per §6.2 steps 19–20.
 
-Every public entry point currently returns `Error::NotImplemented`.
+The parser also derives `NSBS`, `NBS`, `NMBS` per Tables 6.5 / 6.6,
+and `coded_width()` / `coded_height()` in pixels.
 
-## Planned clean-room sources
+Verified against three fixtures from `docs/video/theora/fixtures/`:
+* `tiny-i-only-16x16` — coded 32×32 with `nsbs=3`, `nbs=24`.
+* `picture-region-non-mb-aligned` — visible 26×18 / coded 32×32
+  with `PICY=14`.
+* `dimensions-1080p-very-short` — coded 1920×1088 with
+  `nsbs=3060`, `nbs=48960`.
 
-The clean-room rebuild will consult only:
+25 unit tests cover happy-path parses, every spec-mandated reject
+path, the optional revision-future-compatible path, and truncated
+packets at every prefix length.
 
-* Theora I Specification (Xiph) — the authoritative format spec.
-* Black-box invocations of `ffmpeg` (the binary — not its source) and
-  the `theoradec` / `theoraenc` CLI binaries as opaque validators.
+No setup header, comment header, or video-data packet decode yet.
+[`register`] is still a no-op — `RuntimeContext` integration arrives
+once the codec can actually decode a frame.
 
-No external library source — libtheora, Xiph reference source, FFmpeg
-theora source, etc. — is permitted as a reference under the workspace
-clean-room policy.
+## Clean-room sources
+
+Only the Xiph Theora I Specification
+(`docs/video/theora/Theora.pdf`) and the fixture corpus under
+`docs/video/theora/fixtures/` are consulted. No libtheora, no
+FFmpeg `vp3.c`, no theora-rs.
+
+Black-box `ffmpeg` and `theoradec` binary invocations are allowed
+as opaque validators.
 
 ## License
 

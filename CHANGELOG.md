@@ -6,6 +6,47 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§6.4.2 Quantization Parameters Decode (2026-05-24, round 5).**
+  New public `decode_quantization_parameters(bits: &[u8]) ->
+  Result<QuantizationParameters, Error>` transcribing the full §6.4.2
+  procedure of the Xiph Theora I Specification ("Quantization
+  Parameters Decode") onto the §5.2 MSb-first `BitReader`:
+  * Steps 1–4: the 4-bit-NBITS-prefixed `ACSCALE` / `DCSCALE` tables
+    (64 entries each).
+  * Step 5: the 9-bit `NBMS`, incremented per spec and validated
+    `<= 384` (`Error::TooManyBaseMatrices` otherwise).
+  * Step 6: the `NBMS × 64` base-matrix array `BMS`.
+  * Step 7: the per-`(qti, pli)` quant-range tables `NQRS` /
+    `QRSIZES` / `QRBMIS`, including the NEWQR/RPQR copy-set selection
+    logic (both the "previous quantization type, same plane" and
+    "most recent set" sources) and the `ilog(NBMS−1)` /
+    `ilog(62−qi)` variable field widths. Undecodable streams return
+    `Error::BaseMatrixIndexOutOfRange` (a `QRBMIS >= NBMS` at step
+    7(a)ivC) or `Error::QuantRangeOverflow` (range sizes overshooting
+    63 at step 7(a)ivI).
+
+  New typed `QuantizationParameters { ac_scale, dc_scale,
+  num_base_matrices, base_matrices, num_quant_ranges,
+  quant_range_sizes, quant_range_base_matrix_indices }` and a free
+  `ilog` helper matching the spec's Notation and Conventions
+  definition. Three new `Error` variants
+  (`TooManyBaseMatrices` / `BaseMatrixIndexOutOfRange` /
+  `QuantRangeOverflow`) with `Display` arms.
+
+  11 new tests bring the total from 68 to 79: `ilog` against every
+  spec worked example, synthesized-payload round-trips (single-range,
+  two-range size sums, NEWQR/RPQR copy variants on INTRA and INTER
+  planes), the `NBMS = 384` boundary, the three undecodable-stream
+  rejects, and mid-field truncation. A test-only MSb-first bit writer
+  mirrors `BitReader` to build the fixtures bit-exactly.
+
+  **§6.4.1 spec gap still blocks the end-to-end `parse_setup_header`
+  body.** §6.4.5 step 2 (§6.4.1 LFLIMS) precedes step 3 (§6.4.2), so
+  `parse_setup_header` continues to surface
+  `Error::SetupHeaderBodyNotImplemented`; the §6.4.2 procedure is
+  exposed as a standalone entry point and will be chained onto a
+  shared bit reader once §6.4.1's procedure body is recovered.
+
 * **VP3 hardcoded `LFLIMS` / `ACSCALE` / `DCSCALE` tables (2026-05-22,
   round 4).** Transcribed from Appendix B.2 + B.3 of `Theora.pdf`
   ("The hard-coded loop filter limit values used in VP3 are defined as

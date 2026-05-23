@@ -178,6 +178,32 @@ pub enum Error {
     /// the underlying reason: §6.4.1's numbered procedure steps are
     /// absent from the spec PDF.
     SetupHeaderBodyNotImplemented,
+    /// `NBMS` (number of base matrices, §6.4.2 step 5) exceeded the
+    /// spec maximum of 384. The spec says "NBMS MUST be no greater
+    /// than 384".
+    TooManyBaseMatrices {
+        /// The decoded `NBMS` value (already incremented by one per
+        /// step 5).
+        nbms: u32,
+    },
+    /// A `QRBMIS` base-matrix index read in §6.4.2 step 7(a)ivC was
+    /// greater than or equal to `NBMS`, which the spec declares
+    /// makes the stream undecodable ("If this is greater than or
+    /// equal to NBMS, stop. The stream is undecodable.").
+    BaseMatrixIndexOutOfRange {
+        /// The offending `QRBMIS` value.
+        bmi: u32,
+        /// `NBMS` (number of base matrices).
+        nbms: u32,
+    },
+    /// The accumulated quant-range size `qi` overshot 63 in §6.4.2
+    /// step 7(a)ivI ("If qi is greater than 63, stop. The stream is
+    /// undecodable."). The sum of all range sizes for a (qti, pli)
+    /// pair MUST land exactly on 63.
+    QuantRangeOverflow {
+        /// The accumulated `qi` value that overshot 63.
+        qi: u32,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -273,6 +299,18 @@ impl core::fmt::Display for Error {
             Error::SetupHeaderBodyNotImplemented => write!(
                 f,
                 "oxideav-theora: setup-header common header validated; body (§6.4.1–§6.4.4) deferred to later clean-room round"
+            ),
+            Error::TooManyBaseMatrices { nbms } => write!(
+                f,
+                "oxideav-theora: NBMS={nbms} exceeds the §6.4.2 maximum of 384"
+            ),
+            Error::BaseMatrixIndexOutOfRange { bmi, nbms } => write!(
+                f,
+                "oxideav-theora: QRBMIS base-matrix index {bmi} >= NBMS={nbms} (§6.4.2 step 7(a)ivC: undecodable)"
+            ),
+            Error::QuantRangeOverflow { qi } => write!(
+                f,
+                "oxideav-theora: quant-range sizes summed to qi={qi} > 63 (§6.4.2 step 7(a)ivI: undecodable)"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -864,6 +902,55 @@ impl TheoraSetupHeader {
     }
 }
 
+/// The quantization parameters decoded from the setup header per
+/// §6.4.2 ("Quantization Parameters Decode").
+///
+/// These five logical payloads together drive dequantization
+/// (§7.9.2): the AC/DC scale tables select a per-`qi` step multiplier,
+/// while the base matrices, referenced through the quant-range tables,
+/// supply the per-coefficient shape that §6.4.3 interpolates into a
+/// full quantization matrix.
+///
+/// Field semantics follow the §6.4.2 output-parameters table verbatim:
+///
+/// * `qti` — the quantization type index (`0` = INTRA DC/AC matrices,
+///   `1` = INTER), per Table 3.1. There are two types.
+/// * `pli` — the color-plane index (`0` = luma, `1` = Cb, `2` = Cr),
+///   per Table 2.1. There are three planes.
+///
+/// Both indices appear in the 2×3 / 2×3×N quant-range arrays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuantizationParameters {
+    /// `ACSCALE` (§6.4.2 steps 1–2) — 64-element array of AC scale
+    /// values, one per `qi`. Each is a 16-bit unsigned integer.
+    pub ac_scale: [u16; 64],
+    /// `DCSCALE` (§6.4.2 steps 3–4) — 64-element array of DC scale
+    /// values, one per `qi`. Each is a 16-bit unsigned integer.
+    pub dc_scale: [u16; 64],
+    /// `NBMS` (§6.4.2 step 5) — the number of base matrices. Already
+    /// incremented per the spec ("NBMS the value decoded, plus one")
+    /// and validated `<= 384`.
+    pub num_base_matrices: u16,
+    /// `BMS` (§6.4.2 step 6) — an `NBMS × 64` array of base matrices.
+    /// Only the first `num_base_matrices` rows are meaningful; the
+    /// remaining rows (up to the 384-row capacity) are left zeroed.
+    /// Each entry is an 8-bit unsigned integer.
+    pub base_matrices: Vec<[u8; 64]>,
+    /// `NQRS` (§6.4.2 step 7) — a `2 × 3` array (indexed
+    /// `[qti][pli]`) giving the number of quant ranges defined for
+    /// each quantization type and color plane. At most 63.
+    pub num_quant_ranges: [[u8; 3]; 2],
+    /// `QRSIZES` (§6.4.2 step 7) — a `2 × 3 × 63` array of quant-range
+    /// sizes. Only the first `num_quant_ranges[qti][pli]` entries of
+    /// each `[qti][pli]` row are used.
+    pub quant_range_sizes: [[[u8; 63]; 3]; 2],
+    /// `QRBMIS` (§6.4.2 step 7) — a `2 × 3 × 64` array of base-matrix
+    /// indices, one for each end of each quant range. Only the first
+    /// `num_quant_ranges[qti][pli] + 1` entries of each `[qti][pli]`
+    /// row are used.
+    pub quant_range_base_matrix_indices: [[[u16; 64]; 3]; 2],
+}
+
 /// Decode a Theora setup header from `packet`.
 ///
 /// Rounds 3+4 implement only §6.4.5 step 1: the common-header check
@@ -928,6 +1015,190 @@ pub fn parse_setup_header(packet: &[u8]) -> Result<TheoraSetupHeader, Error> {
     Err(Error::SetupHeaderBodyNotImplemented)
 }
 
+/// `ilog(a)` per the spec's Notation and Conventions section: the
+/// minimum number of bits required to store a positive integer `a`
+/// in two's-complement notation, or `0` for a non-positive integer.
+///
+/// `ilog(a) = 0` for `a <= 0`, and `floor(log2(a)) + 1` for `a > 0`.
+/// Worked examples from the spec: `ilog(0) = 0`, `ilog(1) = 1`,
+/// `ilog(2) = 2`, `ilog(3) = 2`, `ilog(4) = 3`, `ilog(7) = 3`.
+///
+/// The argument is `i64` so callers can pass `62 - qi` (which can go
+/// to `-1` at `qi = 63` in §6.4.2 step 7) without an underflow.
+fn ilog(a: i64) -> u32 {
+    if a <= 0 {
+        0
+    } else {
+        // floor(log2(a)) + 1; for a u64 that is `64 - leading_zeros`.
+        64 - (a as u64).leading_zeros()
+    }
+}
+
+/// Decode the quantization parameters from the §6.4.2 setup-header
+/// payload carried by `bits`.
+///
+/// `bits` must start at the first bit of the §6.4.2 payload — i.e.
+/// immediately after the §6.4.1 LFLIMS table within the setup-header
+/// body (§6.4.5 step 3 runs after step 2). This entry point decodes
+/// the payload in isolation so it can be exercised independently of
+/// the §6.4.1 procedure-body spec gap; once that gap closes,
+/// `parse_setup_header` will chain §6.4.1 then call this on the same
+/// underlying bit reader.
+///
+/// Because the §6.4.2 payload is bit-packed and not byte-aligned in a
+/// real setup header, this helper is most useful in two situations:
+/// (1) a synthesized payload that is byte-aligned at offset 0, and
+/// (2) a future caller that hands over a slice starting on the
+/// §6.4.2 byte boundary. Sub-byte continuation from §6.4.1 is handled
+/// inside `parse_setup_header` once that section lands.
+///
+/// Returns:
+///
+/// * [`Error::TruncatedHeader`] if the bitstream runs out before a
+///   field is fully read.
+/// * [`Error::TooManyBaseMatrices`] if `NBMS > 384` (step 5).
+/// * [`Error::BaseMatrixIndexOutOfRange`] if a `QRBMIS` value read in
+///   step 7(a)ivC is `>= NBMS`.
+/// * [`Error::QuantRangeOverflow`] if the accumulated range sizes
+///   overshoot 63 (step 7(a)ivI).
+///
+/// The procedure transcribes the numbered steps of §6.4.2 of the
+/// Xiph Theora I Specification directly.
+pub fn decode_quantization_parameters(bits: &[u8]) -> Result<QuantizationParameters, Error> {
+    let mut r = BitReader::new(bits);
+    decode_quant_params_inner(&mut r)
+}
+
+/// Inner §6.4.2 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so a future `parse_setup_header` can chain
+/// it onto the same reader after §6.4.1 without re-aligning.
+fn decode_quant_params_inner(r: &mut BitReader<'_>) -> Result<QuantizationParameters, Error> {
+    // Step 1: read 4-bit NBITS, then add one.
+    let mut nbits = r.read_bits(4, "ACSCALE NBITS")? + 1;
+
+    // Step 2: read ACSCALE[qi] for qi = 0..=63 as NBITS-bit values.
+    let mut ac_scale = [0u16; 64];
+    for slot in ac_scale.iter_mut() {
+        *slot = r.read_bits(nbits, "ACSCALE")? as u16;
+    }
+
+    // Step 3: read 4-bit NBITS, then add one.
+    nbits = r.read_bits(4, "DCSCALE NBITS")? + 1;
+
+    // Step 4: read DCSCALE[qi] for qi = 0..=63 as NBITS-bit values.
+    let mut dc_scale = [0u16; 64];
+    for slot in dc_scale.iter_mut() {
+        *slot = r.read_bits(nbits, "DCSCALE")? as u16;
+    }
+
+    // Step 5: read 9-bit NBMS, then add one. NBMS MUST be <= 384.
+    let nbms = r.read_bits(9, "NBMS")? + 1;
+    if nbms > 384 {
+        return Err(Error::TooManyBaseMatrices { nbms });
+    }
+
+    // Step 6: read BMS[bmi][ci] (8-bit) for bmi = 0..NBMS, ci = 0..=63.
+    let mut base_matrices: Vec<[u8; 64]> = Vec::with_capacity(nbms as usize);
+    for _bmi in 0..nbms {
+        let mut matrix = [0u8; 64];
+        for slot in matrix.iter_mut() {
+            *slot = r.read_bits(8, "BMS")? as u8;
+        }
+        base_matrices.push(matrix);
+    }
+
+    // Step 7: quant-range tables for each (qti, pli).
+    let mut num_quant_ranges = [[0u8; 3]; 2];
+    let mut quant_range_sizes = [[[0u8; 63]; 3]; 2];
+    let mut quant_range_base_matrix_indices = [[[0u16; 64]; 3]; 2];
+
+    // ilog(NBMS - 1) is the field width of each QRBMIS read.
+    let bmi_bits = ilog(nbms as i64 - 1);
+
+    for qti in 0usize..2 {
+        for pli in 0usize..3 {
+            // Step 7(a)i / 7(a)ii: NEWQR flag.
+            let newqr = if qti > 0 || pli > 0 {
+                r.read_bits(1, "NEWQR")?
+            } else {
+                1
+            };
+
+            if newqr == 0 {
+                // Step 7(a)iii: copy a previously defined set.
+                // A / B: RPQR flag.
+                let rpqr = if qti > 0 { r.read_bits(1, "RPQR")? } else { 0 };
+
+                // C / D: select source (qtj, plj).
+                let (qtj, plj) = if rpqr == 1 {
+                    // Same color plane, previous quantization type.
+                    (qti - 1, pli)
+                } else {
+                    // Most recent set defined.
+                    ((3 * qti + pli - 1) / 3, (pli + 2) % 3)
+                };
+
+                // E / F / G: copy NQRS / QRSIZES / QRBMIS.
+                num_quant_ranges[qti][pli] = num_quant_ranges[qtj][plj];
+                quant_range_sizes[qti][pli] = quant_range_sizes[qtj][plj];
+                quant_range_base_matrix_indices[qti][pli] =
+                    quant_range_base_matrix_indices[qtj][plj];
+            } else {
+                // Step 7(a)iv: define a new set of quant ranges.
+                let mut qri = 0usize; // A
+                let mut qi = 0i64; // B
+
+                // C: first QRBMIS, range-checked against NBMS.
+                let bmi0 = r.read_bits(bmi_bits, "QRBMIS")?;
+                if bmi0 >= nbms {
+                    return Err(Error::BaseMatrixIndexOutOfRange { bmi: bmi0, nbms });
+                }
+                quant_range_base_matrix_indices[qti][pli][qri] = bmi0 as u16;
+
+                loop {
+                    // D: QRSIZES[qri] = ilog(62 - qi)-bit value + 1.
+                    let size = r.read_bits(ilog(62 - qi), "QRSIZES")? + 1;
+                    quant_range_sizes[qti][pli][qri] = size as u8;
+
+                    // E: qi += QRSIZES[qri].
+                    qi += size as i64;
+
+                    // F: qri += 1.
+                    qri += 1;
+
+                    // G: QRBMIS[qri] (NOT range-checked here, per spec).
+                    let bmi = r.read_bits(bmi_bits, "QRBMIS")?;
+                    quant_range_base_matrix_indices[qti][pli][qri] = bmi as u16;
+
+                    // H: if qi < 63, loop back to D.
+                    if qi < 63 {
+                        continue;
+                    }
+                    // I: if qi > 63, undecodable.
+                    if qi > 63 {
+                        return Err(Error::QuantRangeOverflow { qi: qi as u32 });
+                    }
+                    // qi == 63: fall through to J.
+                    break;
+                }
+
+                // J: NQRS[qti][pli] = qri.
+                num_quant_ranges[qti][pli] = qri as u8;
+            }
+        }
+    }
+
+    Ok(QuantizationParameters {
+        ac_scale,
+        dc_scale,
+        num_base_matrices: nbms as u16,
+        base_matrices,
+        num_quant_ranges,
+        quant_range_sizes,
+        quant_range_base_matrix_indices,
+    })
+}
+
 /// MSb-first bit reader implementing §5.2 of the Theora I
 /// Specification.
 ///
@@ -961,7 +1232,6 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     /// Create a reader positioned at the MSb of `buf[0]`.
-    #[allow(dead_code)] // used by round-4 setup-body decode
     fn new(buf: &'a [u8]) -> Self {
         Self {
             buf,
@@ -973,7 +1243,6 @@ impl<'a> BitReader<'a> {
     /// Read `n` bits (0 ≤ n ≤ 32) as an unsigned integer, MSb first.
     /// Returns [`Error::TruncatedHeader`] if the stream is exhausted
     /// before `n` bits have been read.
-    #[allow(dead_code)] // used by round-4 setup-body decode
     fn read_bits(&mut self, n: u32, field: &'static str) -> Result<u32, Error> {
         debug_assert!(n <= 32, "read_bits called with n > 32");
         let mut value: u32 = 0;
@@ -2257,5 +2526,433 @@ mod tests {
         assert_eq!(r.read_bits(3, "a").unwrap(), 0b010);
         assert_eq!(r.read_bits(4, "b").unwrap(), 0b1010);
         assert_eq!(r.read_bits(5, "c").unwrap(), 0b11100);
+    }
+
+    // ------- §6.4.2 Quantization Parameters tests -------
+
+    /// MSb-first bit writer mirroring [`BitReader`]. Used to synthesize
+    /// §6.4.2 payloads bit-exactly so the decode can be round-tripped
+    /// against a known encoding. (Test-only — the crate ships no
+    /// encoder yet.)
+    struct BitWriter {
+        bytes: Vec<u8>,
+        /// Number of bits already filled in the current (last) byte,
+        /// from the MSb down. 0 means "start a new byte".
+        used: u8,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                used: 0,
+            }
+        }
+
+        /// Append the low `n` bits of `value`, MSb first.
+        fn put(&mut self, value: u32, n: u32) {
+            for i in (0..n).rev() {
+                let bit = ((value >> i) & 1) as u8;
+                if self.used == 0 {
+                    self.bytes.push(0);
+                }
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= bit << (7 - self.used);
+                self.used = (self.used + 1) % 8;
+            }
+        }
+
+        fn finish(self) -> Vec<u8> {
+            self.bytes
+        }
+    }
+
+    /// `ilog` helper mirrored in the test to compute field widths for
+    /// the synthesizer, independent of the impl's `ilog`.
+    fn test_ilog(a: i64) -> u32 {
+        if a <= 0 {
+            0
+        } else {
+            let mut v = a as u64;
+            let mut bits = 0;
+            while v > 0 {
+                v >>= 1;
+                bits += 1;
+            }
+            bits
+        }
+    }
+
+    #[test]
+    fn ilog_matches_spec_examples() {
+        // Worked examples from the spec's Notation and Conventions
+        // section.
+        assert_eq!(ilog(-1), 0);
+        assert_eq!(ilog(0), 0);
+        assert_eq!(ilog(1), 1);
+        assert_eq!(ilog(2), 2);
+        assert_eq!(ilog(3), 2);
+        assert_eq!(ilog(4), 3);
+        assert_eq!(ilog(7), 3);
+        // A few more boundary values.
+        assert_eq!(ilog(8), 4);
+        assert_eq!(ilog(62), 6);
+        assert_eq!(ilog(63), 6);
+        assert_eq!(ilog(383), 9); // ilog(NBMS-1) for NBMS=384
+    }
+
+    /// Encode the AC + DC scale tables (§6.4.2 steps 1–4) into `w`,
+    /// using a fixed NBITS of 16 (4-bit field value 15, plus one) so
+    /// the full 16-bit scale range is representable.
+    fn encode_scales(w: &mut BitWriter, ac: &[u16; 64], dc: &[u16; 64]) {
+        w.put(15, 4); // ACSCALE NBITS = 16
+        for &v in ac.iter() {
+            w.put(v as u32, 16);
+        }
+        w.put(15, 4); // DCSCALE NBITS = 16
+        for &v in dc.iter() {
+            w.put(v as u32, 16);
+        }
+    }
+
+    #[test]
+    fn decode_quant_params_minimal_single_range() {
+        // Synthesize a minimal but spec-valid §6.4.2 payload:
+        //   * ACSCALE / DCSCALE = a recognizable ramp.
+        //   * NBMS = 2 (two base matrices).
+        //   * Each (qti, pli) defines ONE quant range of size 63 with
+        //     endpoints {bmi 0, bmi 1}.
+        let mut ac = [0u16; 64];
+        let mut dc = [0u16; 64];
+        for i in 0..64 {
+            ac[i] = (500 - i * 7) as u16;
+            dc[i] = (220 - i * 3) as u16;
+        }
+
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+
+        let nbms = 2u32;
+        w.put(nbms - 1, 9); // NBMS field
+        let bmi_bits = test_ilog(nbms as i64 - 1); // ilog(1) = 1
+                                                   // Base matrices: matrix 0 = all 16, matrix 1 = all 100.
+        for _ci in 0..64 {
+            w.put(16, 8);
+        }
+        for _ci in 0..64 {
+            w.put(100, 8);
+        }
+
+        // Step 7: for each (qti, pli), define a single 63-wide range.
+        for qti in 0..2 {
+            for pli in 0..3 {
+                if qti > 0 || pli > 0 {
+                    w.put(1, 1); // NEWQR = 1 (define new)
+                }
+                // 7(a)iv: qri=0, qi=0
+                w.put(0, bmi_bits); // QRBMIS[0] = 0
+                                    // D: ilog(62 - 0) = 6 bits; size = read + 1 = 63 -> read 62.
+                w.put(62, test_ilog(62));
+                // G: QRBMIS[1] = 1
+                w.put(1, bmi_bits);
+                // qi == 63 -> stop; NQRS = 1.
+            }
+        }
+
+        let payload = w.finish();
+        let qp = decode_quantization_parameters(&payload).expect("valid payload decodes");
+
+        assert_eq!(qp.ac_scale, ac);
+        assert_eq!(qp.dc_scale, dc);
+        assert_eq!(qp.num_base_matrices, 2);
+        assert_eq!(qp.base_matrices.len(), 2);
+        assert_eq!(qp.base_matrices[0], [16u8; 64]);
+        assert_eq!(qp.base_matrices[1], [100u8; 64]);
+        for qti in 0..2 {
+            for pli in 0..3 {
+                assert_eq!(qp.num_quant_ranges[qti][pli], 1, "NQRS[{qti}][{pli}]");
+                assert_eq!(qp.quant_range_sizes[qti][pli][0], 63);
+                assert_eq!(qp.quant_range_base_matrix_indices[qti][pli][0], 0);
+                assert_eq!(qp.quant_range_base_matrix_indices[qti][pli][1], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_quant_params_two_ranges_sum_to_63() {
+        // A (qti=0, pli=0) range list with two ranges 20 + 43 = 63,
+        // exercising the inner loop's continuation (step 7(a)ivH).
+        // Remaining (qti, pli) copy the first via NEWQR=0.
+        let ac = [400u16; 64];
+        let dc = [200u16; 64];
+
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+
+        let nbms = 4u32;
+        w.put(nbms - 1, 9);
+        let bmi_bits = test_ilog(nbms as i64 - 1); // ilog(3) = 2
+        for bmi in 0..nbms {
+            for _ci in 0..64 {
+                w.put(bmi * 10, 8);
+            }
+        }
+
+        // (0,0): NEWQR forced 1. Define two ranges.
+        // qri=0, qi=0:  QRBMIS[0]=0
+        w.put(0, bmi_bits);
+        //   D: ilog(62-0)=6 bits, size=20 -> read 19
+        w.put(19, test_ilog(62));
+        //   qi=20; G: QRBMIS[1]=1
+        w.put(1, bmi_bits);
+        //   qi<63 -> back to D: ilog(62-20)=ilog(42)=6 bits, size=43 -> read 42
+        w.put(42, test_ilog(62 - 20));
+        //   qi=63; G: QRBMIS[2]=2
+        w.put(2, bmi_bits);
+        //   qi==63 -> stop. NQRS[0][0]=2.
+
+        // (0,1): NEWQR=0 -> copy. qti==0 so RPQR=0 forced (not read).
+        //   selects (qtj,plj) = ((3*0+1-1)/3, (1+2)%3) = (0, 0).
+        w.put(0, 1);
+        // (0,2): NEWQR=0 -> copy from (0,1).
+        w.put(0, 1);
+        // (1,0): NEWQR=0 -> qti>0 so read RPQR. RPQR=1 -> copy (0,0).
+        w.put(0, 1); // NEWQR
+        w.put(1, 1); // RPQR
+                     // (1,1): NEWQR=0 -> RPQR=1 -> copy (0,1).
+        w.put(0, 1);
+        w.put(1, 1);
+        // (1,2): NEWQR=0 -> RPQR=1 -> copy (0,2).
+        w.put(0, 1);
+        w.put(1, 1);
+
+        let payload = w.finish();
+        let qp = decode_quantization_parameters(&payload).expect("valid payload decodes");
+
+        assert_eq!(qp.num_quant_ranges[0][0], 2);
+        assert_eq!(qp.quant_range_sizes[0][0][0], 20);
+        assert_eq!(qp.quant_range_sizes[0][0][1], 43);
+        assert_eq!(qp.quant_range_base_matrix_indices[0][0][0], 0);
+        assert_eq!(qp.quant_range_base_matrix_indices[0][0][1], 1);
+        assert_eq!(qp.quant_range_base_matrix_indices[0][0][2], 2);
+        // Copied sets must match the source set exactly.
+        for (qti, pli) in [(0, 1), (0, 2), (1, 0), (1, 1), (1, 2)] {
+            assert_eq!(qp.num_quant_ranges[qti][pli], 2, "NQRS[{qti}][{pli}] copy");
+            assert_eq!(qp.quant_range_sizes[qti][pli][0], 20);
+            assert_eq!(qp.quant_range_sizes[qti][pli][1], 43);
+        }
+    }
+
+    #[test]
+    fn decode_quant_params_rejects_nbms_over_384() {
+        let ac = [10u16; 64];
+        let dc = [10u16; 64];
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+        // NBMS field of 384 -> decoded NBMS = 385 > 384.
+        w.put(384, 9);
+        let payload = w.finish();
+        match decode_quantization_parameters(&payload) {
+            Err(Error::TooManyBaseMatrices { nbms: 385 }) => {}
+            other => panic!("expected TooManyBaseMatrices(385), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_quant_params_accepts_nbms_exactly_384() {
+        // Boundary: NBMS field 383 -> decoded NBMS = 384, the maximum.
+        let ac = [10u16; 64];
+        let dc = [10u16; 64];
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+        let nbms = 384u32;
+        w.put(nbms - 1, 9);
+        let bmi_bits = test_ilog(nbms as i64 - 1); // ilog(383) = 9
+        for _bmi in 0..nbms {
+            for _ci in 0..64 {
+                w.put(0, 8);
+            }
+        }
+        // One 63-wide range per (qti, pli), endpoints {0, 1}.
+        for qti in 0..2 {
+            for pli in 0..3 {
+                if qti > 0 || pli > 0 {
+                    w.put(1, 1);
+                }
+                w.put(0, bmi_bits);
+                w.put(62, test_ilog(62));
+                w.put(1, bmi_bits);
+            }
+        }
+        let payload = w.finish();
+        let qp = decode_quantization_parameters(&payload).expect("NBMS=384 is valid");
+        assert_eq!(qp.num_base_matrices, 384);
+        assert_eq!(qp.base_matrices.len(), 384);
+    }
+
+    #[test]
+    fn decode_quant_params_rejects_qrbmis_ge_nbms() {
+        // First QRBMIS read (step 7(a)ivC) >= NBMS is undecodable.
+        let ac = [10u16; 64];
+        let dc = [10u16; 64];
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+        let nbms = 2u32; // bmi_bits = ilog(1) = 1, range 0..=1
+        w.put(nbms - 1, 9);
+        for _bmi in 0..nbms {
+            for _ci in 0..64 {
+                w.put(0, 8);
+            }
+        }
+        // (0,0) NEWQR forced 1. QRBMIS[0] = ... but ilog(1)=1 can only
+        // encode 0 or 1, both < 2. To force an out-of-range index we
+        // need NBMS where the field can encode >= NBMS. Use NBMS=3:
+        // ilog(2)=2 bits encode 0..=3; value 3 >= 3 is undecodable.
+        // Rebuild with NBMS=3.
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+        let nbms = 3u32;
+        w.put(nbms - 1, 9);
+        let bmi_bits = test_ilog(nbms as i64 - 1); // ilog(2) = 2
+        for _bmi in 0..nbms {
+            for _ci in 0..64 {
+                w.put(0, 8);
+            }
+        }
+        // (0,0): QRBMIS[0] = 3 >= NBMS=3 -> undecodable.
+        w.put(3, bmi_bits);
+        let payload = w.finish();
+        match decode_quantization_parameters(&payload) {
+            Err(Error::BaseMatrixIndexOutOfRange { bmi: 3, nbms: 3 }) => {}
+            other => panic!("expected BaseMatrixIndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_quant_params_rejects_qi_overflow() {
+        // A range whose accumulated qi overshoots 63 is undecodable
+        // (step 7(a)ivI).
+        let ac = [10u16; 64];
+        let dc = [10u16; 64];
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+        let nbms = 2u32;
+        w.put(nbms - 1, 9);
+        let bmi_bits = test_ilog(nbms as i64 - 1);
+        for _bmi in 0..nbms {
+            for _ci in 0..64 {
+                w.put(0, 8);
+            }
+        }
+        // (0,0): one range, size = 64 (read 63 over ilog(62)=6 bits).
+        // qi becomes 64 > 63 -> undecodable.
+        w.put(0, bmi_bits);
+        w.put(63, test_ilog(62)); // size = 64
+        w.put(1, bmi_bits); // QRBMIS[1]
+        let payload = w.finish();
+        match decode_quantization_parameters(&payload) {
+            Err(Error::QuantRangeOverflow { qi: 64 }) => {}
+            other => panic!("expected QuantRangeOverflow(64), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_quant_params_truncated_in_scales() {
+        // A payload that ends mid-ACSCALE returns TruncatedHeader.
+        let mut w = BitWriter::new();
+        w.put(7, 4); // ACSCALE NBITS = 8
+                     // Only 3 ACSCALE values, then EOF.
+        w.put(100, 8);
+        w.put(99, 8);
+        w.put(98, 8);
+        let payload = w.finish();
+        match decode_quantization_parameters(&payload) {
+            Err(Error::TruncatedHeader { field: "ACSCALE" }) => {}
+            other => panic!("expected TruncatedHeader(ACSCALE), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_quant_params_truncated_at_nbms() {
+        let ac = [10u16; 64];
+        let dc = [10u16; 64];
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+        // Stop before the 9-bit NBMS field.
+        let payload = w.finish();
+        match decode_quantization_parameters(&payload) {
+            Err(Error::TruncatedHeader { field: "NBMS" }) => {}
+            other => panic!("expected TruncatedHeader(NBMS), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_quant_params_chroma_copy_via_rpqr_zero() {
+        // Exercise the "most recent set" copy branch (RPQR=0 / step
+        // 7(a)iiiD) on an INTER plane. (qti=1, pli=0) with NEWQR=0,
+        // RPQR=0 selects (qtj,plj) = ((3*1+0-1)/3, (0+2)%3) = (0, 2).
+        let ac = [300u16; 64];
+        let dc = [150u16; 64];
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+        let nbms = 2u32;
+        w.put(nbms - 1, 9);
+        let bmi_bits = test_ilog(nbms as i64 - 1);
+        for _bmi in 0..nbms {
+            for _ci in 0..64 {
+                w.put(0, 8);
+            }
+        }
+        // Define new ranges for all three INTRA planes with distinct
+        // single-range sizes so we can tell which one is copied.
+        // (0,0): size 63, QRBMIS {0,1}
+        w.put(0, bmi_bits);
+        w.put(62, test_ilog(62));
+        w.put(1, bmi_bits);
+        // (0,1): NEWQR=1, size 63, QRBMIS {1,0}
+        w.put(1, 1);
+        w.put(1, bmi_bits);
+        w.put(62, test_ilog(62));
+        w.put(0, bmi_bits);
+        // (0,2): NEWQR=1, size 63, QRBMIS {0,0}
+        w.put(1, 1);
+        w.put(0, bmi_bits);
+        w.put(62, test_ilog(62));
+        w.put(0, bmi_bits);
+        // (1,0): NEWQR=0, RPQR=0 -> copy (0,2): QRBMIS {0,0}
+        w.put(0, 1); // NEWQR
+        w.put(0, 1); // RPQR
+                     // (1,1): NEWQR=1, size 63, QRBMIS {1,1}
+        w.put(1, 1);
+        w.put(1, bmi_bits);
+        w.put(62, test_ilog(62));
+        w.put(1, bmi_bits);
+        // (1,2): NEWQR=1, size 63, QRBMIS {0,1}
+        w.put(1, 1);
+        w.put(0, bmi_bits);
+        w.put(62, test_ilog(62));
+        w.put(1, bmi_bits);
+
+        let payload = w.finish();
+        let qp = decode_quantization_parameters(&payload).expect("valid payload decodes");
+
+        // (1,0) copied (0,2): endpoints {0, 0}.
+        assert_eq!(qp.num_quant_ranges[1][0], 1);
+        assert_eq!(qp.quant_range_base_matrix_indices[1][0][0], 0);
+        assert_eq!(qp.quant_range_base_matrix_indices[1][0][1], 0);
+        // (0,2) source endpoints {0, 0} confirm it really matched.
+        assert_eq!(qp.quant_range_base_matrix_indices[0][2][0], 0);
+        assert_eq!(qp.quant_range_base_matrix_indices[0][2][1], 0);
+    }
+
+    #[test]
+    fn quant_params_error_displays_render() {
+        // Smoke-test the three new error Display arms don't panic.
+        let e1 = Error::TooManyBaseMatrices { nbms: 385 };
+        let e2 = Error::BaseMatrixIndexOutOfRange { bmi: 3, nbms: 3 };
+        let e3 = Error::QuantRangeOverflow { qi: 64 };
+        assert!(format!("{e1}").contains("NBMS=385"));
+        assert!(format!("{e2}").contains("QRBMIS"));
+        assert!(format!("{e3}").contains("qi=64"));
     }
 }

@@ -2,14 +2,16 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-22
+## Status — 2026-05-24
 
-**Identification + comment + setup-entrypoint parsers (rounds 1–4).**
-§6.1, §6.2 (identification), §6.3 (comment), and §6.4.5 step 1
-(setup-header common-header guard) of the Theora I Specification are
-wired up. Three entry points plus an MSb-first bit reader; round 4
-adds the Appendix B VP3 fallback tables and the typed
-`TheoraSetupHeader` field layout the round-4 prompt scopes.
+**Identification + comment + setup-entrypoint + §6.4.2 quant-params
+decode (rounds 1–5).** §6.1, §6.2 (identification), §6.3 (comment),
+§6.4.5 step 1 (setup-header common-header guard), and §6.4.2
+(Quantization Parameters Decode) of the Theora I Specification are
+wired up. Three byte-aligned entry points plus a public §6.4.2
+bit-level decoder over an MSb-first bit reader; round 4 added the
+Appendix B VP3 fallback tables, round 5 adds the full §6.4.2 procedure
+(ACSCALE / DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS).
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -26,6 +28,9 @@ adds the Appendix B VP3 fallback tables and the typed
 * `TheoraSetupHeader::vp3_defaults` — round 4 constructor returning
   the Appendix-B-typed `LFLIMS` / `ACSCALE` / `DCSCALE` fallback
   applicable to `version < 0x030200` streams.
+* [`decode_quantization_parameters`] — round 5 public §6.4.2 decoder
+  producing a typed `QuantizationParameters` from the §6.4.2
+  setup-header payload bytes.
 
 ### Identification header (round 1)
 The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
@@ -80,13 +85,43 @@ under `docs/video/theora/fixtures/` carries
 (`vendor="Lavf62.13.102"`, `comments=[("encoder", "Lavc62.30.100
 libtheora")]`).
 
-### Setup header (rounds 3 + 4)
+### Setup header (rounds 3 + 4 + 5)
 [`parse_setup_header`] implements only §6.4.5 step 1: it validates
 the 7-byte common header (`0x82` + ASCII `"theora"`) and returns
 [`Error::SetupHeaderBodyNotImplemented`] once the preamble checks
-out. The body — `LFLIMS` (§6.4.1), `ACSCALE`/`DCSCALE`/`NBMS`/`BMS`
-(§6.4.2), quant ranges (§6.4.2 step 7), and DCT-token Huffman
-tables (§6.4.4) — is deferred until the §6.4.1 spec gap closes.
+out. The end-to-end body decode — which begins with `LFLIMS`
+(§6.4.1) per §6.4.5 step 2 — stays blocked on the §6.4.1 spec gap.
+
+Round 5 lands the §6.4.2 (Quantization Parameters Decode) procedure
+as a standalone public entry point so it can be exercised
+independently of the §6.4.1 gap (§6.4.5 step 3 follows step 2; once
+§6.4.1 is recovered, `parse_setup_header` will chain the two on a
+shared bit reader):
+
+```rust
+pub fn decode_quantization_parameters(bits: &[u8])
+    -> Result<QuantizationParameters, Error>;
+
+pub struct QuantizationParameters {
+    pub ac_scale:          [u16; 64],       // §6.4.2 steps 1–2 ACSCALE
+    pub dc_scale:          [u16; 64],       // §6.4.2 steps 3–4 DCSCALE
+    pub num_base_matrices: u16,             // §6.4.2 step 5 NBMS (≤ 384)
+    pub base_matrices:     Vec<[u8; 64]>,   // §6.4.2 step 6 BMS
+    pub num_quant_ranges:  [[u8; 3]; 2],    // §6.4.2 step 7 NQRS
+    pub quant_range_sizes: [[[u8; 63]; 3]; 2],          // QRSIZES
+    pub quant_range_base_matrix_indices: [[[u16; 64]; 3]; 2], // QRBMIS
+}
+```
+
+The procedure transcribes all eight numbered steps of §6.4.2: the
+4-bit-NBITS-prefixed AC/DC scale tables, the 9-bit `NBMS` (validated
+`≤ 384`), the `NBMS × 64` base matrices, and the per-`(qti, pli)`
+quant-range tables. Step 7's copy logic (NEWQR / RPQR set selection)
+and the `ilog(NBMS−1)` / `ilog(62−qi)` field widths are implemented
+verbatim. Undecodable streams (`NBMS > 384`, a `QRBMIS ≥ NBMS` at
+step 7(a)ivC, or quant-range sizes overshooting 63 at step 7(a)ivI)
+return typed errors. The remaining setup-header body — `LFLIMS`
+(§6.4.1) and DCT-token Huffman tables (§6.4.4) — is deferred.
 
 `TheoraSetupHeader` exposes the round-4 contract directly:
 
@@ -132,7 +167,7 @@ Round 4 mitigates the blockage for VP3-compatible bitstreams via
 the §6.4.1 / §6.4.2 procedures and remain blocked until the docs
 collaborator recovers the missing procedure body.
 
-68 unit tests cover happy-path parses on all three header types,
+79 unit tests cover happy-path parses on all three header types,
 every spec-mandated reject path on each, the optional
 revision-future-compatible path on the identification header,
 truncated packets at every prefix length, UTF-8 multi-byte payloads,
@@ -141,7 +176,14 @@ index error reporting, all six §6.4.5 step 1 outcomes, the §5.2
 `BitReader` (MSb-first byte reads, multi-byte spans, full 32-bit
 reads, zero-width reads, mid-field truncation), monotonicity + spot
 values + row-sum re-tally on each of the three Appendix B tables,
-and the `vp3_defaults()` constructor.
+and the `vp3_defaults()` constructor. Round 5 adds the §6.4.2 quant-
+parameters tests: `ilog` against every spec worked example, a
+round-trip of synthesized payloads (single-range and two-range size
+sums, NEWQR/RPQR copy variants for both INTRA and INTER planes), the
+`NBMS = 384` boundary, and the three undecodable-stream rejects
+(`NBMS > 384`, `QRBMIS ≥ NBMS`, quant-range overflow) plus mid-field
+truncation. A test-only MSb-first bit writer mirrors `BitReader` to
+build the fixtures bit-exactly.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

@@ -2,21 +2,25 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-24
+## Status — 2026-05-25
 
 **Identification + comment + setup-entrypoint + §6.4.2 quant-params
 decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
-(rounds 1–7).** §6.1, §6.2 (identification), §6.3 (comment), §6.4.5
-step 1 (setup-header common-header guard), §6.4.2 (Quantization
-Parameters Decode), §6.4.3 (Computing a Quantization Matrix), and
-§6.4.4 (DCT Token Huffman Tables) of the Theora I Specification are
-wired up. Three byte-aligned entry points plus three public bit-level
-decoders over an MSb-first bit reader; round 4 added the Appendix B
-VP3 fallback tables, round 5 added the full §6.4.2 procedure (ACSCALE
-/ DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added
-§6.4.3 (64-entry interpolated quantization matrix per `(qti, pli, qi)`
-selector), round 7 adds §6.4.4 — decode the 80-element array of binary-
-tree Huffman tables that §7.7 will use to decode DCT-residual tokens.
++ §7.1 frame-header decode (rounds 1–8).** §6.1, §6.2 (identification),
+§6.3 (comment), §6.4.5 step 1 (setup-header common-header guard),
+§6.4.2 (Quantization Parameters Decode), §6.4.3 (Computing a
+Quantization Matrix), §6.4.4 (DCT Token Huffman Tables), and §7.1
+(Frame Header Decode) of the Theora I Specification are wired up.
+Three byte-aligned entry points plus four public bit-level decoders
+over an MSb-first bit reader; round 4 added the Appendix B VP3
+fallback tables, round 5 added the full §6.4.2 procedure (ACSCALE /
+DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added §6.4.3
+(64-entry interpolated quantization matrix per `(qti, pli, qi)`
+selector), round 7 added §6.4.4 — decode the 80-element array of
+binary-tree Huffman tables that §7.7 will use to decode DCT-residual
+tokens, round 8 adds §7.1 — the first standalone step of the §7 frame-
+decode pipeline returning the typed `TheoraFrameHeader` (frame type +
+1..=3 `qi` values) from the start of a video-data packet.
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -48,6 +52,14 @@ tree Huffman tables that §7.7 will use to decode DCT-residual tokens.
   resolves a code back to its token. Implementation is iterative
   (explicit DFS stack) per the spec's own §6.4.4 recursion-depth
   caveat.
+* [`decode_frame_header`] — round 8 public §7.1 procedure returning a
+  typed `TheoraFrameHeader { ftype: FrameType, qis: Vec<u8> }` from the
+  start of any video-data packet. Validates the leading 0-bit data-
+  packet marker (step 1), the `FTYPE` field (step 2; first-frame Intra
+  check), unrolls the `MOREQIS` chain for the 1..=3 `QIS` slots (steps
+  3–6), and enforces the 3-bit reserved trailer on intra frames
+  (step 7) — the first standalone procedure of the §7 frame-decode
+  pipeline.
 
 ### Identification header (round 1)
 The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
@@ -257,7 +269,7 @@ Round 4 mitigates the blockage for VP3-compatible bitstreams via
 the §6.4.1 / §6.4.2 procedures and remain blocked until the docs
 collaborator recovers the missing procedure body.
 
-99 unit tests cover happy-path parses on all three header types,
+118 unit tests cover happy-path parses on all three header types,
 every spec-mandated reject path on each, the optional
 revision-future-compatible path on the identification header,
 truncated packets at every prefix length, UTF-8 multi-byte payloads,
@@ -289,7 +301,17 @@ all 80 slots, the four failure modes (truncated `ISLEAF`, hand-crafted
 truncated `TOKEN`, depth-33 left-spine code-too-long, 33-entry table-
 full), multi-table truncation reporting the correct field, `Error`
 `Display` rendering, and `HuffmanTable::lookup` returning `None` for
-codes at the wrong length.
+codes at the wrong length. Round 8 adds nineteen §7.1 frame-header
+tests: intra single/two/three-`qi` happy paths (with the 63 upper-
+boundary on every slot), inter-frame happy paths (single and three
+`qi`), `first_frame` Intra-only enforcement (and the legal inter-after-
+keyframe path), header-packet rejection (high bit set), step 7 reserved-
+bits rejection on every non-zero 3-bit pattern, truncation at the
+packet-type bit / `MOREQIS[0]` / `QIS[2]` field boundaries, the
+sentinel-byte "doesn't consume past header" check, error `Display`
+rendering for all three new variants, the `FrameType` Table 7.3 numeric
+mapping, the `MAX_FRAME_QIS = 3` constant, and a five-case
+independent-slot round-trip across byte boundaries.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

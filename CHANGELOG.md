@@ -6,6 +6,44 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§7.1 Frame Header Decode (2026-05-25, round 8).**
+  New public `decode_frame_header(packet: &[u8], first_frame: bool) ->
+  Result<TheoraFrameHeader, Error>` transcribing the full §7.1
+  procedure of the Xiph Theora I Specification ("Frame Header Decode").
+  The procedure decodes the first bits of every video-data packet on
+  the §5.2 MSb-first `BitReader`: step 1 reads the 1-bit data-packet
+  flag (and surfaces `Error::NotDataPacket` if the high bit is set,
+  identifying a §6-series header packet); step 2 reads the 1-bit
+  `FTYPE` (`Intra=0` / `Inter=1` per Table 7.3) and enforces the first-
+  frame Intra mandate (`Error::FirstFrameMustBeIntra` for the violation);
+  steps 3–6 unroll the `MOREQIS` chain into a 1..=3-element `qis` list;
+  and step 7 reads the 3-bit reserved trailer on intra frames
+  (`Error::FrameReservedBitsNonZero` for any non-zero value).
+
+  New public types: `FrameType` (Intra/Inter), `TheoraFrameHeader
+  { ftype, qis }` with `nqis()` accessor, `MAX_FRAME_QIS = 3`.
+  Three new `Error` variants (`NotDataPacket` /
+  `FirstFrameMustBeIntra { ftype }` / `FrameReservedBitsNonZero { bits }`)
+  with `Display` arms citing the §7.1 step they correspond to.
+
+  19 new tests bring the total from 99 to 118: intra single/two/three-
+  `qi` happy paths (with the 63 upper-boundary on every slot), inter-
+  frame happy paths (single and three `qi`), `first_frame` enforcement
+  + inter-after-keyframe allowed path, header-packet rejection,
+  step 7 reserved-bits rejection on every non-zero 3-bit pattern,
+  truncation at the packet-type bit / `MOREQIS[0]` / `QIS[2]` field
+  boundaries, "doesn't consume past header" sentinel-byte check, error
+  `Display` rendering for all three new variants, `FrameType` Table 7.3
+  numeric mapping, the `MAX_FRAME_QIS = 3` constant, and a five-case
+  independent-slot round-trip across byte boundaries.
+
+  §7.1 is unblocked by the still-open §6.4.1 spec gap (docs-gap #944):
+  §7.1 operates on a video-data packet's own payload and does not
+  require the setup-header body decode to have completed. A future
+  end-to-end frame decoder will chain §7.1 → §7.2 (run-length bit
+  strings) → §7.3 (coded block flags) → … on a shared bit reader; the
+  inner `decode_frame_header_inner` is split out for that purpose.
+
 * **§6.4.4 DCT Token Huffman Tables (2026-05-24, round 7).**
   New public `decode_dct_token_huffman_tables(bits: &[u8]) ->
   Result<Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>, Error>` transcribing

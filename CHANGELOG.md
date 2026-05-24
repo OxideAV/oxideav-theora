@@ -6,6 +6,44 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§6.4.4 DCT Token Huffman Tables (2026-05-24, round 7).**
+  New public `decode_dct_token_huffman_tables(bits: &[u8]) ->
+  Result<Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>, Error>` transcribing
+  the full §6.4.4 procedure of the Xiph Theora I Specification ("DCT
+  Token Huffman Tables"). The procedure decodes the 80-table setup-
+  header payload that drives §7.7's DCT-token decode: each table is
+  described as a binary tree where every `1`-bit `ISLEAF` flag is
+  followed by a 5-bit `TOKEN` value at every leaf, with up to 32
+  entries per table and a 32-bit maximum code length. The
+  implementation walks each table iteratively (explicit DFS stack, no
+  host recursion — addresses the spec's own §6.4.4 caveat about
+  recursion depth on adversarial inputs) and emits leaves in the
+  spec's `0`-before-`1` order. Each table is materialised both as a
+  `Vec<HuffmanEntry { code, len, token }>` (for inspection / round-
+  trip testing) and as a flat binary-tree representation suitable for
+  the per-bit lookup §7.7.2 will use. Two new `Error` variants
+  (`HuffmanCodeTooLong` / `HuffmanTableFull`) reject the two
+  step 1(b) / step 1(d)i undecodable-stream paths with the offending
+  `hti` for diagnostics, each with a `Display` arm.
+
+  New public types: `HuffmanEntry`, `HuffmanTable` (with
+  `HuffmanTable::lookup(code, len) -> Option<u8>` for bit-string
+  lookup including the degenerate single-leaf-at-root case),
+  `NUM_HUFFMAN_TABLES = 80`, `MAX_HUFFMAN_ENTRIES = 32`.
+
+  11 new tests bring the total from 88 to 99: trivial single-leaf
+  tables on every slot, the balanced 32-leaf table with full lookup
+  coverage, variable-length codes in the order the §6.4.4 recursion
+  visits the leaves, independent tables across all 80 slots,
+  truncated-ISLEAF rejection, hand-crafted truncated-TOKEN rejection
+  (single-byte payload exercising the within-leaf truncation path),
+  the step 1(b) code-too-long reject via a depth-33 left-spine
+  construction, the step 1(d)i 33-entry reject via a balanced
+  32-leaf left subtree plus a right-child 33rd leaf, multi-table
+  truncation reporting the correct field, `Error` `Display` rendering
+  for both new variants, and `HuffmanTable::lookup` returning `None`
+  for codes at the wrong length.
+
 * **§6.4.3 Computing a Quantization Matrix (2026-05-24, round 6).**
   New public `compute_quantization_matrix(params: &QuantizationParameters,
   qti: usize, pli: usize, qi: usize) -> Result<QuantizationMatrix, Error>`

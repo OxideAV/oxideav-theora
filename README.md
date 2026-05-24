@@ -5,16 +5,18 @@ Pure-Rust Theora video codec — clean-room implementation in progress.
 ## Status — 2026-05-24
 
 **Identification + comment + setup-entrypoint + §6.4.2 quant-params
-decode + §6.4.3 quant-matrix compute (rounds 1–6).** §6.1, §6.2
-(identification), §6.3 (comment), §6.4.5 step 1 (setup-header
-common-header guard), §6.4.2 (Quantization Parameters Decode), and
-§6.4.3 (Computing a Quantization Matrix) of the Theora I Specification
-are wired up. Three byte-aligned entry points plus a public §6.4.2
-bit-level decoder over an MSb-first bit reader; round 4 added the
-Appendix B VP3 fallback tables, round 5 added the full §6.4.2 procedure
-(ACSCALE / DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6
-adds §6.4.3 — interpolate a 64-entry quantization matrix for any
-`(qti, pli, qi)` selector from those parameters.
+decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
+(rounds 1–7).** §6.1, §6.2 (identification), §6.3 (comment), §6.4.5
+step 1 (setup-header common-header guard), §6.4.2 (Quantization
+Parameters Decode), §6.4.3 (Computing a Quantization Matrix), and
+§6.4.4 (DCT Token Huffman Tables) of the Theora I Specification are
+wired up. Three byte-aligned entry points plus three public bit-level
+decoders over an MSb-first bit reader; round 4 added the Appendix B
+VP3 fallback tables, round 5 added the full §6.4.2 procedure (ACSCALE
+/ DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added
+§6.4.3 (64-entry interpolated quantization matrix per `(qti, pli, qi)`
+selector), round 7 adds §6.4.4 — decode the 80-element array of binary-
+tree Huffman tables that §7.7 will use to decode DCT-residual tokens.
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -38,6 +40,14 @@ adds §6.4.3 — interpolate a 64-entry quantization matrix for any
   interpolating a typed `QuantizationMatrix` (`[u16; 64]`, natural
   order) for a `(qti, pli, qi)` selector from a
   `QuantizationParameters`.
+* [`decode_dct_token_huffman_tables`] — round 7 public §6.4.4 procedure
+  returning a `Box<[HuffmanTable; 80]>` of typed
+  `HuffmanTable { entries, .. }` decoded from the setup-header's
+  binary-tree description. Each table carries up to 32
+  `HuffmanEntry { code, len, token }` leaves; `HuffmanTable::lookup`
+  resolves a code back to its token. Implementation is iterative
+  (explicit DFS stack) per the spec's own §6.4.4 recursion-depth
+  caveat.
 
 ### Identification header (round 1)
 The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
@@ -159,6 +169,45 @@ spec's `//` reduces to ordinary integer division. Out-of-range `qti` /
 body — `LFLIMS` (§6.4.1) and DCT-token Huffman tables (§6.4.4) — is
 deferred.
 
+Round 7 adds §6.4.4 (DCT Token Huffman Tables), which decodes the 80
+binary-tree Huffman tables the setup header carries for §7.7's DCT-
+token decode. Like §6.4.3 the procedure is unblocked by the §6.4.1
+spec gap because §6.4.4 follows §6.4.2 in §6.4.5 step 4:
+
+```rust
+pub fn decode_dct_token_huffman_tables(bits: &[u8])
+    -> Result<Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>, Error>;
+
+pub struct HuffmanEntry { pub code: u32, pub len: u8, pub token: u8 }
+
+pub struct HuffmanTable { pub entries: Vec<HuffmanEntry>, /* + tree */ }
+
+impl HuffmanTable {
+    pub fn len(&self) -> usize;
+    pub fn lookup(&self, code: u32, len: u8) -> Option<u8>;
+}
+
+pub const NUM_HUFFMAN_TABLES: usize = 80;
+pub const MAX_HUFFMAN_ENTRIES: usize = 32;
+```
+
+The procedure transcribes the §6.4.4 binary-tree recursion: at every
+node read a 1-bit `ISLEAF`; if 1, read a 5-bit `TOKEN` and add the
+`(HBITS, TOKEN)` pair as a leaf; otherwise recurse `0` then `1`. It is
+implemented iteratively with an explicit DFS stack (the spec itself
+warns against host recursion on adversarial inputs that grow the path
+to 32 bits), with the same depth-first `0`-before-`1` ordering. Each
+decoded table is materialised twice: as a flat `Vec<HuffmanEntry>` in
+spec-visit order (for inspection and round-trip testing) and as a flat
+binary-tree node array for the per-bit lookup §7.7.2 will perform.
+Undecodable streams — `HBITS` longer than 32 bits (step 1(b)) or a
+33rd entry in a single table (step 1(d)i) — return typed errors
+(`HuffmanCodeTooLong { hti }` / `HuffmanTableFull { hti }`). The
+degenerate single-leaf-at-root case (which the spec explicitly
+tolerates — "multiple codes for the same token value in a single
+table" is allowed) is preserved by storing the root leaf and routing
+the empty-code lookup to it.
+
 `TheoraSetupHeader` exposes the round-4 contract directly:
 
 ```rust
@@ -196,14 +245,19 @@ with "It is decoded as follows:" and page 51 begins immediately
 with "VP3 Compatibility" / §6.4.2 — the steps that should bridge
 the two pages are absent from the PDF stream we have. The
 guardrails prohibit guessing where a spec gap exists, so the
-`parse_setup_header` body decode remains blocked.
+end-to-end `parse_setup_header` body decode (§6.4.5 step 2 onward,
+on a shared bit reader) remains blocked. With §6.4.4 landed in round
+7, every other section the setup-header body chains through (§6.4.2 /
+§6.4.3 / §6.4.4) is implemented as a standalone entry point that can
+be exercised independently; only §6.4.1 still blocks the chained
+end-to-end body decode.
 
 Round 4 mitigates the blockage for VP3-compatible bitstreams via
 `vp3_defaults()`. `version >= 0x030200` streams continue to require
 the §6.4.1 / §6.4.2 procedures and remain blocked until the docs
 collaborator recovers the missing procedure body.
 
-88 unit tests cover happy-path parses on all three header types,
+99 unit tests cover happy-path parses on all three header types,
 every spec-mandated reject path on each, the optional
 revision-future-compatible path on the identification header,
 truncated packets at every prefix length, UTF-8 multi-byte payloads,
@@ -227,6 +281,15 @@ and inter), the 4096 ceiling clamp, direct `qmin_table` values,
 out-of-range selector rejects, per-`(qti, pli)` selector-wiring
 isolation, and an end-to-end chain that decodes a synthesized §6.4.2
 payload and feeds it straight into `compute_quantization_matrix`.
+Round 7 adds eleven §6.4.4 Huffman-table tests: trivial single-leaf
+tables on every `hti` slot with empty-code lookup, the balanced 32-leaf
+table with full lookup coverage and depth-first leaf ordering checks,
+variable-length codes in spec-visit order, independent shapes across
+all 80 slots, the four failure modes (truncated `ISLEAF`, hand-crafted
+truncated `TOKEN`, depth-33 left-spine code-too-long, 33-entry table-
+full), multi-table truncation reporting the correct field, `Error`
+`Display` rendering, and `HuffmanTable::lookup` returning `None` for
+codes at the wrong length.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

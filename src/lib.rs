@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-05-24 (round 6 of clean-room rebuild)
+//! ## Status — 2026-05-24 (round 7 of clean-room rebuild)
 //!
 //! Round 1 landed the **identification header** parser per Theora I
 //! Specification §6.1 (common header) + §6.2 (identification header).
@@ -20,18 +20,22 @@
 //! `vp3-compat-decode` fixture's pre-3.2.0 bitstreams once the frame
 //! pipeline lands. Round 5 landed the **§6.4.2 Quantization Parameters
 //! Decode** procedure as the standalone
-//! [`decode_quantization_parameters`] entry point. Round 6 lands the
+//! [`decode_quantization_parameters`] entry point. Round 6 landed the
 //! **§6.4.3 Computing a Quantization Matrix** procedure as
 //! [`compute_quantization_matrix`], which interpolates a 64-entry
 //! [`QuantizationMatrix`] for a `(qti, pli, qi)` selector from a
-//! [`QuantizationParameters`].
+//! [`QuantizationParameters`]. Round 7 lands the **§6.4.4 DCT Token
+//! Huffman Tables** procedure as [`decode_dct_token_huffman_tables`],
+//! decoding the 80 binary-tree Huffman tables that §7.7's DCT-token
+//! decode will consume.
 //!
 //! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
 //! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
-//! consumes — that body is still blocked by the §6.4.1 spec gap (see
-//! below) and [`parse_setup_header`] continues to surface
-//! [`Error::SetupHeaderBodyNotImplemented`]. §6.4.3 is unblocked by
-//! that gap because it operates purely on the §6.4.2 outputs.
+//! consumes — the end-to-end body chain remains blocked by the §6.4.1
+//! spec gap (see below) and [`parse_setup_header`] continues to
+//! surface [`Error::SetupHeaderBodyNotImplemented`]. §6.4.3 / §6.4.4
+//! are unblocked by that gap because they operate purely on the
+//! §6.4.2 outputs / their own bit payload.
 //!
 //! * [`decode_identification_header`] returns a typed
 //!   [`TheoraIdentHeader`] describing every field declared in
@@ -49,6 +53,9 @@
 //!   [`QuantizationParameters`] from a §6.4.2 setup-header payload.
 //! * [`compute_quantization_matrix`] interpolates a typed
 //!   [`QuantizationMatrix`] per §6.4.3 from those parameters.
+//! * [`decode_dct_token_huffman_tables`] returns the
+//!   80-element [`HuffmanTable`] array per §6.4.4 from the
+//!   binary-tree payload that follows §6.4.2 in the setup header.
 //!
 //! ## Clean-room provenance
 //!
@@ -236,6 +243,22 @@ pub enum Error {
         /// The offending `qi` value.
         qi: usize,
     },
+    /// While decoding a §6.4.4 DCT-token Huffman table, the path string
+    /// `HBITS` grew past 32 bits without reaching a leaf, violating the
+    /// step 1(b) bound ("If HBITS is longer than 32 bits in length,
+    /// stop. The stream is undecodable.").
+    HuffmanCodeTooLong {
+        /// Zero-based table index (`hti`) being decoded when the bound
+        /// was exceeded.
+        hti: usize,
+    },
+    /// A §6.4.4 Huffman table accumulated a 33rd entry, violating the
+    /// step 1(d)i bound ("If the number of entries in table HTS[hti] is
+    /// already 32, stop. The stream is undecodable.").
+    HuffmanTableFull {
+        /// Zero-based table index (`hti`) that overflowed.
+        hti: usize,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -355,6 +378,14 @@ impl core::fmt::Display for Error {
             Error::QuantIndexOutOfRange { qi } => write!(
                 f,
                 "oxideav-theora: qi={qi} out of range 0..=63 (§6.4.3)"
+            ),
+            Error::HuffmanCodeTooLong { hti } => write!(
+                f,
+                "oxideav-theora: HTS[{hti}] code exceeded 32 bits (§6.4.4 step 1(b): undecodable)"
+            ),
+            Error::HuffmanTableFull { hti } => write!(
+                f,
+                "oxideav-theora: HTS[{hti}] exceeded 32 entries (§6.4.4 step 1(d)i: undecodable)"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -1396,6 +1427,254 @@ pub fn compute_quantization_matrix(
     }
 
     Ok(QuantizationMatrix { values })
+}
+
+/// Number of DCT-token Huffman tables in the setup header (§6.4.4
+/// output `HTS`): an 80-element array. The 80 tables are organised as
+/// 16 Huffman-table groups of 5 each (Table 7.42 / §7.7.2): one DC
+/// token table plus four AC token tables (split by coefficient
+/// position) per group.
+pub const NUM_HUFFMAN_TABLES: usize = 80;
+
+/// Maximum number of entries permitted in a single §6.4.4 Huffman
+/// table. The spec (§6.4.4) requires "no more than 32 entries in a
+/// single table"; combined with the fullness requirement this also
+/// bounds the maximum code length at 32 bits.
+pub const MAX_HUFFMAN_ENTRIES: usize = 32;
+
+/// A single `(code, token)` entry of a §6.4.4 DCT-token Huffman table.
+///
+/// `code` is the bit string `HBITS` read MSb-first, stored
+/// right-aligned in a `u32`; `len` is how many of those bits are
+/// significant (1..=32). `token` is the 5-bit DCT token value
+/// (`0..=31`) that this code decodes to. The code is therefore
+/// `code`'s low `len` bits, read most-significant first off the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HuffmanEntry {
+    /// The Huffman code bits (`HBITS`), right-aligned in a `u32`. Only
+    /// the low [`HuffmanEntry::len`] bits are meaningful.
+    pub code: u32,
+    /// Length of the code in bits (1..=32).
+    pub len: u8,
+    /// The DCT token value (`0..=31`) this code resolves to (§6.4.4
+    /// step 1(d)ii reads `TOKEN` as a 5-bit unsigned integer).
+    pub token: u8,
+}
+
+/// One DCT-token Huffman table (§6.4.4), built from the setup header's
+/// binary-tree description.
+///
+/// The table is stored both as the flat list of decoded `(code, len,
+/// token)` [`HuffmanEntry`] pairs (in the depth-first, left-before-
+/// right order the §6.4.4 recursion visits the leaves) and as a flat
+/// binary-tree node array suitable for driving a per-bit decode of a
+/// DCT-token stream. The tree representation is what §7.7.2's
+/// coefficient-token decode will walk; the entry list is retained for
+/// inspection and round-trip testing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HuffmanTable {
+    /// The decoded `(code, len, token)` leaves, in depth-first
+    /// left-before-right (`0` subtree before `1` subtree) order.
+    pub entries: Vec<HuffmanEntry>,
+    /// Flat binary tree. Index `0` is the root. Each [`HuffmanNode`] is
+    /// either an interior node carrying the child indices for a `0` and
+    /// a `1` bit, or a leaf carrying a token. Empty only for the
+    /// degenerate single-leaf-at-root table.
+    nodes: Vec<HuffmanNode>,
+}
+
+/// A node in a [`HuffmanTable`]'s flat binary tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HuffmanNode {
+    /// Interior node: indices into the node array for the `0` and `1`
+    /// children respectively.
+    Branch {
+        /// Child reached by reading a `0` bit.
+        zero: u32,
+        /// Child reached by reading a `1` bit.
+        one: u32,
+    },
+    /// Leaf node carrying a decoded DCT token value.
+    Leaf {
+        /// The 5-bit DCT token value (`0..=31`).
+        token: u8,
+    },
+}
+
+impl HuffmanTable {
+    /// Number of decoded leaves (token entries) in this table.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True if this table has no entries. (A conformant §6.4.4 table is
+    /// never empty — the tree always terminates in at least one leaf —
+    /// but the accessor is provided for completeness.)
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Look up the token for a given code. `code` holds the bit string
+    /// right-aligned in its low `len` bits (MSb of the code in bit
+    /// position `len - 1`). Returns `None` if no leaf matches that
+    /// exact `(code, len)`.
+    ///
+    /// This is the inverse of how the entries were inserted; it walks
+    /// the flat tree one bit at a time from the MSb of the code.
+    pub fn lookup(&self, code: u32, len: u8) -> Option<u8> {
+        // Degenerate single-leaf-at-root table: the root itself is the
+        // only leaf, reached by the empty (zero-length) code.
+        if self.nodes.len() == 1 {
+            if let HuffmanNode::Leaf { token } = self.nodes[0] {
+                return if len == 0 { Some(token) } else { None };
+            }
+        }
+        let mut idx = 0u32;
+        for i in (0..len).rev() {
+            let bit = (code >> i) & 1;
+            match self.nodes.get(idx as usize)? {
+                HuffmanNode::Branch { zero, one } => {
+                    idx = if bit == 0 { *zero } else { *one };
+                }
+                HuffmanNode::Leaf { .. } => return None, // code longer than a leaf path
+            }
+        }
+        match self.nodes.get(idx as usize)? {
+            HuffmanNode::Leaf { token } => Some(*token),
+            HuffmanNode::Branch { .. } => None, // code shorter than any leaf path
+        }
+    }
+}
+
+/// Decode the 80 DCT-token Huffman tables from the §6.4.4 setup-header
+/// payload carried by `bits`.
+///
+/// `bits` must start at the first bit of the §6.4.4 payload — i.e.
+/// immediately after the §6.4.2 quantization parameters within the
+/// setup-header body (§6.4.5 step 4 runs after step 3). Like
+/// [`decode_quantization_parameters`], this entry point decodes the
+/// payload in isolation so it can be exercised independently of the
+/// §6.4.1 procedure-body spec gap; once that gap closes,
+/// `parse_setup_header` will chain §6.4.1 → §6.4.2 → §6.4.4 on a
+/// shared bit reader.
+///
+/// Each of the 80 tables is described as a binary tree (§6.4.4): a
+/// `1`-bit `ISLEAF` flag at each node, followed by a 5-bit `TOKEN`
+/// value at every leaf. The tree is full (every node is either a leaf
+/// or has both children) and prefix-free by construction.
+///
+/// Returns:
+///
+/// * [`Error::TruncatedHeader`] if the bitstream runs out before a
+///   field is fully read.
+/// * [`Error::HuffmanCodeTooLong`] if a code path exceeds 32 bits
+///   without reaching a leaf (step 1(b)).
+/// * [`Error::HuffmanTableFull`] if a single table accumulates more
+///   than 32 entries (step 1(d)i).
+///
+/// The procedure transcribes the numbered steps of §6.4.4 of the Xiph
+/// Theora I Specification directly.
+pub fn decode_dct_token_huffman_tables(
+    bits: &[u8],
+) -> Result<Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>, Error> {
+    let mut r = BitReader::new(bits);
+    decode_huffman_tables_inner(&mut r)
+}
+
+/// Inner §6.4.4 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so a future `parse_setup_header` can chain
+/// it onto the same reader after §6.4.2 without re-aligning.
+fn decode_huffman_tables_inner(
+    r: &mut BitReader<'_>,
+) -> Result<Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>, Error> {
+    // `Box::new([..; 80])` cannot be built from a non-Copy element, so
+    // collect into a Vec and convert. Each table is built independently.
+    let mut tables: Vec<HuffmanTable> = Vec::with_capacity(NUM_HUFFMAN_TABLES);
+    for hti in 0..NUM_HUFFMAN_TABLES {
+        tables.push(decode_one_huffman_table(r, hti)?);
+    }
+    let boxed: Box<[HuffmanTable]> = tables.into_boxed_slice();
+    // The length is exactly NUM_HUFFMAN_TABLES by construction.
+    Ok(boxed
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("built exactly NUM_HUFFMAN_TABLES tables")))
+}
+
+/// Decode a single §6.4.4 Huffman table (one value of `hti`).
+///
+/// The spec phrases the per-table decode as a recursive procedure over
+/// the bit string `HBITS`. To avoid the stack-overflow risk the spec
+/// itself warns about for adversarial inputs, this is implemented with
+/// an explicit work stack instead of host recursion. Each stack frame
+/// carries the `HBITS` accumulated so far (`code` right-aligned in a
+/// `u32`, `len` bits long) and the index of the tree node being filled.
+fn decode_one_huffman_table(r: &mut BitReader<'_>, hti: usize) -> Result<HuffmanTable, Error> {
+    // The flat tree under construction. Node 0 is the root; it is
+    // pushed as a placeholder branch and rewritten in place once we
+    // learn whether it is a leaf or an interior node.
+    let mut nodes: Vec<HuffmanNode> = vec![HuffmanNode::Branch { zero: 0, one: 0 }];
+    let mut entries: Vec<HuffmanEntry> = Vec::new();
+
+    // Explicit DFS stack of "nodes still needing to be decoded". Each
+    // item is (node_index, code, len). We process the `0` subtree
+    // before the `1` subtree, matching the §6.4.4 step 1(e) order, by
+    // pushing `1` first then `0` (LIFO).
+    struct Frame {
+        node: usize,
+        code: u32,
+        len: u8,
+    }
+    let mut stack: Vec<Frame> = vec![Frame {
+        node: 0,
+        code: 0,
+        len: 0,
+    }];
+
+    while let Some(Frame { node, code, len }) = stack.pop() {
+        // Step 1(b): HBITS longer than 32 bits ⇒ undecodable.
+        if len > 32 {
+            return Err(Error::HuffmanCodeTooLong { hti });
+        }
+
+        // Step 1(c): read the ISLEAF flag.
+        let isleaf = r.read_bits(1, "ISLEAF")?;
+
+        if isleaf == 1 {
+            // Step 1(d)i: a full table cannot take another entry.
+            if entries.len() >= MAX_HUFFMAN_ENTRIES {
+                return Err(Error::HuffmanTableFull { hti });
+            }
+            // Step 1(d)ii: read the 5-bit TOKEN.
+            let token = r.read_bits(5, "TOKEN")? as u8;
+            // Step 1(d)iii: record (HBITS, TOKEN) as a leaf.
+            nodes[node] = HuffmanNode::Leaf { token };
+            entries.push(HuffmanEntry { code, len, token });
+        } else {
+            // Step 1(e): interior node. Allocate both children, wire
+            // them up, and schedule them (0 subtree before 1 subtree).
+            // `len + 1` for each child cannot itself exceed 33 here; the
+            // step 1(b) bound is re-checked when each child is popped.
+            let zero = nodes.len() as u32;
+            nodes.push(HuffmanNode::Branch { zero: 0, one: 0 });
+            let one = nodes.len() as u32;
+            nodes.push(HuffmanNode::Branch { zero: 0, one: 0 });
+            nodes[node] = HuffmanNode::Branch { zero, one };
+
+            // Push `1` first so `0` is popped (decoded) first.
+            stack.push(Frame {
+                node: one as usize,
+                code: (code << 1) | 1,
+                len: len + 1,
+            });
+            stack.push(Frame {
+                node: zero as usize,
+                code: code << 1,
+                len: len + 1,
+            });
+        }
+    }
+
+    Ok(HuffmanTable { entries, nodes })
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -3456,5 +3735,341 @@ mod tests {
         // Intra AC at qi=0: (ac[0]=500 * 16 // 100)*4 = (8000//100)*4
         //   = 80*4 = 320.
         assert_eq!(q0.values[1], 320);
+    }
+
+    // ----- §6.4.4 DCT Token Huffman Tables ----------------------------
+
+    /// Emit one §6.4.4 Huffman table into `w` from a list of
+    /// `(code, len, token)` triples. The list must describe a full,
+    /// prefix-free binary tree on the bit strings of `code` (i.e. for
+    /// every interior path either both children exist as leaves or as
+    /// further interior splits). Encoding walks the tree in depth-first
+    /// `0`-before-`1` order, emitting `0` at every interior node and
+    /// `1` + the 5-bit token at every leaf.
+    fn encode_huffman_table(w: &mut BitWriter, entries: &[(u32, u8, u8)]) {
+        // Build the same flat tree the decoder will construct, then
+        // walk it in pre-order.
+        #[derive(Clone, Copy)]
+        enum N {
+            Internal(usize, usize),
+            Leaf(u8),
+        }
+        let mut nodes: Vec<N> = vec![N::Internal(0, 0)];
+        // Helper to ensure a path exists; returns the final leaf slot.
+        fn ensure(nodes: &mut Vec<N>, code: u32, len: u8) -> usize {
+            let mut idx = 0;
+            for i in (0..len).rev() {
+                let bit = ((code >> i) & 1) as usize;
+                let (z, o) = match nodes[idx] {
+                    N::Internal(z, o) => (z, o),
+                    N::Leaf(_) => panic!("path collides with shorter leaf"),
+                };
+                let child = if bit == 0 { z } else { o };
+                if child == 0 {
+                    // Allocate a fresh child.
+                    let new = nodes.len();
+                    nodes.push(N::Internal(0, 0));
+                    let (nz, no) = match (bit, z, o) {
+                        (0, _, oo) => (new, oo),
+                        (_, zz, _) => (zz, new),
+                    };
+                    nodes[idx] = N::Internal(nz, no);
+                    idx = new;
+                } else {
+                    idx = child;
+                }
+            }
+            idx
+        }
+        for &(code, len, token) in entries {
+            let slot = ensure(&mut nodes, code, len);
+            assert!(
+                matches!(nodes[slot], N::Internal(0, 0)),
+                "duplicate code path"
+            );
+            nodes[slot] = N::Leaf(token);
+        }
+        // Pre-order walk: emit ISLEAF at every node, plus TOKEN at every
+        // leaf. Uses an explicit stack so we don't recurse in tests.
+        let mut stack = vec![0usize];
+        while let Some(node) = stack.pop() {
+            match nodes[node] {
+                N::Leaf(tok) => {
+                    w.put(1, 1);
+                    w.put(tok as u32, 5);
+                }
+                N::Internal(z, o) => {
+                    assert!(z != 0 && o != 0, "non-full tree: dangling internal node");
+                    w.put(0, 1);
+                    // Push `1` first so `0` is popped (emitted) first.
+                    stack.push(o);
+                    stack.push(z);
+                }
+            }
+        }
+    }
+
+    /// Trivial table: a single leaf at the root. The §6.4.4 procedure
+    /// reads ISLEAF=1 immediately and assigns the token at HBITS="".
+    /// (A conformant DCT-token decode would never use such a degenerate
+    /// table, but the spec allows it — multiple codes for the same
+    /// token, or a single-leaf tree, are both explicitly tolerated.)
+    fn write_trivial_table(w: &mut BitWriter, token: u8) {
+        encode_huffman_table(w, &[(0, 0, token)]);
+    }
+
+    #[test]
+    fn decode_huffman_table_trivial_single_leaf() {
+        // Build one trivial table for every hti slot.
+        let mut w = BitWriter::new();
+        for hti in 0..NUM_HUFFMAN_TABLES {
+            write_trivial_table(&mut w, (hti % 32) as u8);
+        }
+        let payload = w.finish();
+        let tables = decode_dct_token_huffman_tables(&payload).expect("valid payload decodes");
+
+        for hti in 0..NUM_HUFFMAN_TABLES {
+            assert_eq!(tables[hti].len(), 1, "hti={hti}: one entry");
+            let e = tables[hti].entries[0];
+            assert_eq!(e.code, 0);
+            assert_eq!(e.len, 0);
+            assert_eq!(e.token, (hti % 32) as u8);
+            // The degenerate single-leaf-at-root case: empty-code lookup
+            // returns the only token.
+            assert_eq!(tables[hti].lookup(0, 0), Some((hti % 32) as u8));
+            // A non-empty code on a single-leaf table never matches.
+            assert_eq!(tables[hti].lookup(0, 1), None);
+        }
+    }
+
+    /// A balanced 32-leaf table covering every token 0..=31 with a
+    /// 5-bit code equal to the token value.
+    fn balanced_32_table_entries() -> Vec<(u32, u8, u8)> {
+        (0..32u8).map(|t| (t as u32, 5, t)).collect()
+    }
+
+    #[test]
+    fn decode_huffman_table_balanced_32_leaves() {
+        // First table is the balanced 32-leaf one; remaining 79 are
+        // trivial single-leaf tables so we can focus the assertions.
+        let mut w = BitWriter::new();
+        encode_huffman_table(&mut w, &balanced_32_table_entries());
+        for _ in 1..NUM_HUFFMAN_TABLES {
+            write_trivial_table(&mut w, 0);
+        }
+        let payload = w.finish();
+        let tables = decode_dct_token_huffman_tables(&payload).unwrap();
+
+        assert_eq!(tables[0].len(), 32);
+        // Every (code=t, len=5) should look up token t.
+        for t in 0..32u8 {
+            assert_eq!(tables[0].lookup(t as u32, 5), Some(t));
+        }
+        // Codes at the wrong length never match.
+        assert_eq!(tables[0].lookup(0, 4), None);
+        assert_eq!(tables[0].lookup(0, 6), None);
+        // The depth-first emission order means the first leaf the
+        // decoder records is HBITS = 00000 = token 0.
+        assert_eq!(tables[0].entries[0].code, 0);
+        assert_eq!(tables[0].entries[0].len, 5);
+        // ... and the last is HBITS = 11111 = token 31.
+        assert_eq!(tables[0].entries.last().unwrap().code, 31);
+        assert_eq!(tables[0].entries.last().unwrap().len, 5);
+    }
+
+    #[test]
+    fn decode_huffman_table_variable_length_codes() {
+        // A small variable-length code:
+        //   "0"     -> token 7    (len 1)
+        //   "10"    -> token 5    (len 2)
+        //   "110"   -> token 3    (len 3)
+        //   "111"   -> token 1    (len 3)
+        let entries = vec![(0b0, 1, 7), (0b10, 2, 5), (0b110, 3, 3), (0b111, 3, 1)];
+        let mut w = BitWriter::new();
+        encode_huffman_table(&mut w, &entries);
+        for _ in 1..NUM_HUFFMAN_TABLES {
+            write_trivial_table(&mut w, 0);
+        }
+        let payload = w.finish();
+        let tables = decode_dct_token_huffman_tables(&payload).unwrap();
+
+        assert_eq!(tables[0].len(), 4);
+        assert_eq!(tables[0].lookup(0b0, 1), Some(7));
+        assert_eq!(tables[0].lookup(0b10, 2), Some(5));
+        assert_eq!(tables[0].lookup(0b110, 3), Some(3));
+        assert_eq!(tables[0].lookup(0b111, 3), Some(1));
+        // The depth-first emission visits leaves in order 7, 5, 3, 1.
+        let tokens: Vec<u8> = tables[0].entries.iter().map(|e| e.token).collect();
+        assert_eq!(tokens, vec![7, 5, 3, 1]);
+    }
+
+    #[test]
+    fn decode_huffman_table_all_80_independent() {
+        // Each table differs in size: hti k carries a (k%4)+1-leaf
+        // table covering 1, 2, 3, or 4 codes. This exercises the
+        // 80-table loop without bloating the payload.
+        let small_tables: [Vec<(u32, u8, u8)>; 4] = [
+            vec![(0, 0, 31)],                                             // 1 leaf
+            vec![(0, 1, 10), (1, 1, 20)],                                 // 2 leaves
+            vec![(0, 1, 0), (0b10, 2, 1), (0b11, 2, 2)],                  // 3 leaves
+            vec![(0b00, 2, 0), (0b01, 2, 1), (0b10, 2, 2), (0b11, 2, 3)], // 4 leaves
+        ];
+        let mut w = BitWriter::new();
+        for hti in 0..NUM_HUFFMAN_TABLES {
+            encode_huffman_table(&mut w, &small_tables[hti % 4]);
+        }
+        let payload = w.finish();
+        let tables = decode_dct_token_huffman_tables(&payload).unwrap();
+        for hti in 0..NUM_HUFFMAN_TABLES {
+            assert_eq!(tables[hti].len(), small_tables[hti % 4].len(), "hti={hti}");
+        }
+        // Confirm a leaf from the very last table to ensure we didn't
+        // truncate the 80-iteration loop early.
+        assert_eq!(
+            tables[NUM_HUFFMAN_TABLES - 1].lookup(
+                small_tables[(NUM_HUFFMAN_TABLES - 1) % 4][0].0,
+                small_tables[(NUM_HUFFMAN_TABLES - 1) % 4][0].1
+            ),
+            Some(small_tables[(NUM_HUFFMAN_TABLES - 1) % 4][0].2)
+        );
+    }
+
+    #[test]
+    fn decode_huffman_table_rejects_truncated_isleaf() {
+        // Empty payload: ISLEAF on hti=0 immediately runs out of bits.
+        let payload: Vec<u8> = Vec::new();
+        match decode_dct_token_huffman_tables(&payload) {
+            Err(Error::TruncatedHeader { field }) => assert_eq!(field, "ISLEAF"),
+            other => panic!("expected TruncatedHeader(ISLEAF), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_huffman_table_rejects_truncated_token() {
+        // Hand-craft a single-byte payload that consumes 8 bits exactly
+        // and leaves the §6.4.4 decoder mid-way through a TOKEN read.
+        //
+        // Bits (MSb first):
+        //   1            ISLEAF=1 at hti=0
+        //   00000        TOKEN=0   (hti=0 closes with one leaf)
+        //   0            ISLEAF=0 at hti=1 (interior at depth 0)
+        //   1            ISLEAF=1 on the left child (next must be TOKEN)
+        // Total = 8 bits → one byte; no second byte for the TOKEN read.
+        // Bit pattern: 1 00000 0 1 = 0b1000_0001.
+        let payload: [u8; 1] = [0b1000_0001];
+        match decode_dct_token_huffman_tables(&payload) {
+            Err(Error::TruncatedHeader { field }) => assert_eq!(field, "TOKEN"),
+            other => panic!("expected TruncatedHeader(TOKEN), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_huffman_table_rejects_code_longer_than_32_bits() {
+        // Build a degenerate left-spine tree of depth 33: 33 ISLEAF=0
+        // bits then a leaf. When the decoder pops the depth-33 frame,
+        // step 1(b) (len > 32) trips before reading ISLEAF.
+        //
+        // The tree must still be full, so we also need a leaf on every
+        // right child at depths 1..=33. Simplest valid shape: a chain
+        // of 33 left-internal nodes whose right children are all leaves
+        // emitting token 0, terminated by either a leaf or two leaves
+        // at depth 33. Because depth-33 frames trip step 1(b) before
+        // the body reads ISLEAF, the trailing leaf bits never get
+        // consumed — we just emit enough payload to make the failure
+        // happen first.
+        let mut w = BitWriter::new();
+        // Depth 0..=32: ISLEAF=0 (interior) followed by the right child
+        // emitted as ISLEAF=1 + token 0 (the `0` child is the recursion
+        // we re-emit). Doing 33 iterations puts the 33rd recursion at
+        // len=33 → trips step 1(b).
+        for _ in 0..33 {
+            w.put(0, 1); // ISLEAF=0 on the left-spine node
+            w.put(1, 1); // ISLEAF=1 on its right child (popped first)
+            w.put(0, 5); // TOKEN=0 for that right leaf
+        }
+        let payload = w.finish();
+        match decode_dct_token_huffman_tables(&payload) {
+            Err(Error::HuffmanCodeTooLong { hti }) => assert_eq!(hti, 0),
+            other => panic!("expected HuffmanCodeTooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_huffman_table_rejects_more_than_32_entries() {
+        // Synthesize a 33-leaf tree whose deepest path is well under
+        // 32 bits, so that step 1(d)i (table full) trips before step
+        // 1(b) (code too long):
+        //
+        //   root             (interior, ISLEAF=0)
+        //   ├── left         a 32-leaf balanced subtree (depth 5 from
+        //   │                here, depth 6 absolute) — all token 0
+        //   └── right        a single leaf (depth 1 absolute, token 0)
+        //                    — this is the 33rd leaf the decoder tries
+        //                    to insert, tripping the 32-entry cap.
+        //
+        // DFS (0-before-1) emission order: root ISLEAF=0, then the 32
+        // left-subtree leaves (each: 5 × ISLEAF=0 ramping down + a
+        // ISLEAF=1 + TOKEN=0 ... reconstructed by ascending out), then
+        // ISLEAF=1 + TOKEN=0 for the right child.
+        let mut w = BitWriter::new();
+        // Root interior.
+        w.put(0, 1);
+        // Left subtree: full balanced depth-5 tree of 32 leaves. The
+        // emit order for a full balanced tree at depth N is: N-1
+        // interior bits (0s) down to the leftmost leaf, then leaf
+        // emissions interleaved with interior re-emissions as we
+        // ascend. The simplest correct shape uses the `encode_huffman_table`
+        // helper.
+        encode_huffman_table(&mut w, &balanced_32_table_entries());
+        // Right subtree: a single leaf, which is the 33rd leaf overall.
+        w.put(1, 1);
+        w.put(0, 5);
+        let payload = w.finish();
+        match decode_dct_token_huffman_tables(&payload) {
+            Err(Error::HuffmanTableFull { hti }) => assert_eq!(hti, 0),
+            other => panic!("expected HuffmanTableFull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_huffman_table_truncation_in_later_table_reports_correct_field() {
+        // hti=0 is a trivial single-leaf table; hti=1's payload is
+        // truncated after the ISLEAF=0 bit. Confirms the loop advances
+        // hti and that errors flow up from any iteration.
+        let mut w = BitWriter::new();
+        write_trivial_table(&mut w, 5);
+        w.put(0, 1); // hti=1: ISLEAF=0 (interior)
+                     // The subsequent ISLEAF for the left child runs out of bits.
+        let payload = w.finish();
+        match decode_dct_token_huffman_tables(&payload) {
+            Err(Error::TruncatedHeader { field }) => assert_eq!(field, "ISLEAF"),
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn huffman_error_displays_render() {
+        let s = format!("{}", Error::HuffmanCodeTooLong { hti: 17 });
+        assert!(s.contains("HTS[17]"), "got: {s}");
+        assert!(s.contains("§6.4.4"), "got: {s}");
+        let s = format!("{}", Error::HuffmanTableFull { hti: 3 });
+        assert!(s.contains("HTS[3]"), "got: {s}");
+        assert!(s.contains("§6.4.4"), "got: {s}");
+    }
+
+    #[test]
+    fn huffman_table_lookup_rejects_unknown_codes() {
+        // Build a 4-entry table and confirm uncovered codes don't match.
+        let entries = vec![(0b00, 2, 1), (0b01, 2, 2), (0b10, 2, 3), (0b11, 2, 4)];
+        let mut w = BitWriter::new();
+        encode_huffman_table(&mut w, &entries);
+        for _ in 1..NUM_HUFFMAN_TABLES {
+            write_trivial_table(&mut w, 0);
+        }
+        let payload = w.finish();
+        let tables = decode_dct_token_huffman_tables(&payload).unwrap();
+        // Wrong length.
+        assert_eq!(tables[0].lookup(0, 1), None);
+        assert_eq!(tables[0].lookup(0, 3), None);
     }
 }

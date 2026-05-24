@@ -2,27 +2,36 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-05-22 (round 4 of clean-room rebuild)
+//! ## Status — 2026-05-24 (round 6 of clean-room rebuild)
 //!
 //! Round 1 landed the **identification header** parser per Theora I
 //! Specification §6.1 (common header) + §6.2 (identification header).
 //! Round 2 added the **comment header** parser per §6.3.
 //! Round 3 landed the **setup header packet entrypoint** per §6.4.5
 //! step 1 plus the **MSb-first bit reader** mandated by §5.2.
-//! Round 4 lands the **VP3 hardcoded scale / limit tables** from
+//! Round 4 landed the **VP3 hardcoded scale / limit tables** from
 //! Appendix B.2 + B.3 of the spec — `LFLIMS_VP3` (`[u8; 64]`,
 //! Appendix B.2), `ACSCALE_VP3` and `DCSCALE_VP3` (`[u16; 64]` each,
-//! Appendix B.3) — and reshapes [`TheoraSetupHeader`] to expose
+//! Appendix B.3) — and reshaped [`TheoraSetupHeader`] to expose
 //! [`TheoraSetupHeader::loop_filter_limits`] / `ac_scale` / `dc_scale`
 //! as plain `[u8; 64]` / `[u16; 64]` fields. The VP3 defaults
 //! constructor [`TheoraSetupHeader::vp3_defaults`] returns the
 //! Appendix-B-typed tables — usable directly to decode the
 //! `vp3-compat-decode` fixture's pre-3.2.0 bitstreams once the frame
-//! pipeline lands. Bitstream-version-3.2.0+ streams override the
-//! defaults via the §6.4.1 / §6.4.2 procedures the setup-header body
-//! decode consumes — that body is still blocked by the §6.4.1 spec
-//! gap (see below) and [`parse_setup_header`] continues to surface
-//! [`Error::SetupHeaderBodyNotImplemented`].
+//! pipeline lands. Round 5 landed the **§6.4.2 Quantization Parameters
+//! Decode** procedure as the standalone
+//! [`decode_quantization_parameters`] entry point. Round 6 lands the
+//! **§6.4.3 Computing a Quantization Matrix** procedure as
+//! [`compute_quantization_matrix`], which interpolates a 64-entry
+//! [`QuantizationMatrix`] for a `(qti, pli, qi)` selector from a
+//! [`QuantizationParameters`].
+//!
+//! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
+//! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
+//! consumes — that body is still blocked by the §6.4.1 spec gap (see
+//! below) and [`parse_setup_header`] continues to surface
+//! [`Error::SetupHeaderBodyNotImplemented`]. §6.4.3 is unblocked by
+//! that gap because it operates purely on the §6.4.2 outputs.
 //!
 //! * [`decode_identification_header`] returns a typed
 //!   [`TheoraIdentHeader`] describing every field declared in
@@ -36,8 +45,10 @@
 //! * [`TheoraSetupHeader::vp3_defaults`] constructs the Appendix B
 //!   VP3 fallback for streams that declare `version < 0x030200`
 //!   (alpha2 / VP3-compatibility decode, §B.1 first bullet).
-//!
-//! All other public entry points still return [`Error::NotImplemented`].
+//! * [`decode_quantization_parameters`] returns a typed
+//!   [`QuantizationParameters`] from a §6.4.2 setup-header payload.
+//! * [`compute_quantization_matrix`] interpolates a typed
+//!   [`QuantizationMatrix`] per §6.4.3 from those parameters.
 //!
 //! ## Clean-room provenance
 //!
@@ -204,6 +215,27 @@ pub enum Error {
         /// The accumulated `qi` value that overshot 63.
         qi: u32,
     },
+    /// A `qti` (quantization type index) argument to
+    /// [`compute_quantization_matrix`] was outside the `0..=1` range
+    /// mandated by Table 3.1 (§6.4.3 declares `qti` as a 1-bit field).
+    QuantTypeIndexOutOfRange {
+        /// The offending `qti` value.
+        qti: usize,
+    },
+    /// A `pli` (color-plane index) argument to
+    /// [`compute_quantization_matrix`] was outside the `0..=2` range
+    /// mandated by Table 2.1 (§6.4.3 declares `pli` as a 2-bit field).
+    QuantPlaneIndexOutOfRange {
+        /// The offending `pli` value.
+        pli: usize,
+    },
+    /// A `qi` (quantization index) argument to
+    /// [`compute_quantization_matrix`] was outside the `0..=63` range
+    /// (§6.4.3 declares `qi` as a 6-bit field).
+    QuantIndexOutOfRange {
+        /// The offending `qi` value.
+        qi: usize,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -311,6 +343,18 @@ impl core::fmt::Display for Error {
             Error::QuantRangeOverflow { qi } => write!(
                 f,
                 "oxideav-theora: quant-range sizes summed to qi={qi} > 63 (§6.4.2 step 7(a)ivI: undecodable)"
+            ),
+            Error::QuantTypeIndexOutOfRange { qti } => write!(
+                f,
+                "oxideav-theora: qti={qti} out of range 0..=1 (§6.4.3 / Table 3.1)"
+            ),
+            Error::QuantPlaneIndexOutOfRange { pli } => write!(
+                f,
+                "oxideav-theora: pli={pli} out of range 0..=2 (§6.4.3 / Table 2.1)"
+            ),
+            Error::QuantIndexOutOfRange { qi } => write!(
+                f,
+                "oxideav-theora: qi={qi} out of range 0..=63 (§6.4.3)"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -1197,6 +1241,161 @@ fn decode_quant_params_inner(r: &mut BitReader<'_>) -> Result<QuantizationParame
         quant_range_sizes,
         quant_range_base_matrix_indices,
     })
+}
+
+/// Minimum quantization value (`QMIN`) for a DCT coefficient, per
+/// Table 6.18 of the Theora I Specification (§6.4.3 step 6(b)).
+///
+/// The minimum depends on the quantization type (`qti`: `0` = intra,
+/// `1` = inter) and whether the coefficient is the DC term (`ci == 0`)
+/// or an AC term (`ci > 0`):
+///
+/// | `ci`  | `qti`     | `QMIN` |
+/// | ----- | --------- | ------ |
+/// | `0`   | 0 (Intra) | 16     |
+/// | `> 0` | 0 (Intra) | 8      |
+/// | `0`   | 1 (Inter) | 32     |
+/// | `> 0` | 1 (Inter) | 16     |
+#[inline]
+fn qmin_table(qti: usize, ci: usize) -> u32 {
+    match (qti, ci) {
+        (0, 0) => 16,
+        (0, _) => 8,
+        (1, 0) => 32,
+        (_, _) => 16,
+    }
+}
+
+/// A single quantization matrix in natural coefficient order, produced
+/// by [`compute_quantization_matrix`] (§6.4.3 output `QMAT`).
+///
+/// Each of the 64 entries is the quantizer for the DCT coefficient at
+/// the matching natural-order index (`ci = 0` is the DC term). Values
+/// are in the range `1..=4096`: §6.4.3 step 6(e) clamps every entry to
+/// `max(QMIN, min(..., 4096))`, and the per-coefficient `QMIN` (Table
+/// 6.18) is always `>= 8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuantizationMatrix {
+    /// The 64 quantizer values, indexed by natural-order coefficient
+    /// index `ci` (`0` = DC). Each is in `1..=4096`.
+    pub values: [u16; 64],
+}
+
+/// Compute a single quantization matrix for a given quantization type,
+/// color plane, and quantization index, per §6.4.3 ("Computing a
+/// Quantization Matrix") of the Theora I Specification.
+///
+/// This consumes the [`QuantizationParameters`] produced by
+/// [`decode_quantization_parameters`] (§6.4.2) and interpolates a
+/// 64-element quantization matrix for the `(qti, pli, qi)` selector.
+///
+/// * `qti` — quantization type index (Table 3.1): `0` = intra (DC- and
+///   AC-quantised keyframe blocks), `1` = inter. Must be `0..=1`.
+/// * `pli` — color-plane index (Table 2.1): `0` = luma, `1` = Cb,
+///   `2` = Cr. Must be `0..=2`. Selects which `(qti, pli)` quant-range
+///   row of the parameters is consulted.
+/// * `qi` — the quantization index `0..=63`. Selects the scale entry
+///   and locates the quant range that brackets it.
+///
+/// The procedure (§6.4.3 steps 1–6):
+///
+/// 1. Locate the quant range `qri` whose cumulative size bounds bracket
+///    `qi` (steps 1–3), giving the `[QISTART, QIEND]` end-points.
+/// 2. Linearly interpolate between the two base matrices at the range
+///    end-points (`bmi = QRBMIS[qri]`, `bmj = QRBMIS[qri + 1]`) for
+///    each coefficient (steps 4–6(a)). The interpolation rounds via
+///    the `//` operator with `QRSIZES[qri]` added to the numerator.
+/// 3. Scale each interpolated base value by `DCSCALE[qi]` (for the DC
+///    term) or `ACSCALE[qi]` (for AC terms), divide by 100, multiply by
+///    4 to match the DCT output scaling, and clamp to
+///    `max(QMIN, min(..., 4096))` (steps 6(b)–6(e)). `QMIN` comes from
+///    Table 6.18 ([`qmin_table`]).
+///
+/// All arithmetic uses non-negative operands, so the spec's `//`
+/// (integer division, rounding toward negative infinity for `a >= 0`)
+/// reduces to ordinary integer division.
+///
+/// Returns:
+///
+/// * [`Error::QuantTypeIndexOutOfRange`] if `qti > 1`.
+/// * [`Error::QuantPlaneIndexOutOfRange`] if `pli > 2`.
+/// * [`Error::QuantIndexOutOfRange`] if `qi > 63`.
+pub fn compute_quantization_matrix(
+    params: &QuantizationParameters,
+    qti: usize,
+    pli: usize,
+    qi: usize,
+) -> Result<QuantizationMatrix, Error> {
+    if qti > 1 {
+        return Err(Error::QuantTypeIndexOutOfRange { qti });
+    }
+    if pli > 2 {
+        return Err(Error::QuantPlaneIndexOutOfRange { pli });
+    }
+    if qi > 63 {
+        return Err(Error::QuantIndexOutOfRange { qi });
+    }
+
+    let sizes = &params.quant_range_sizes[qti][pli];
+    let bmis = &params.quant_range_base_matrix_indices[qti][pli];
+    let nqrs = params.num_quant_ranges[qti][pli] as usize;
+
+    // Steps 1–3: find the quant range qri whose cumulative size bounds
+    // bracket qi, accumulating QISTART (the cumulative sum up to qri)
+    // and QIEND (the cumulative sum through qri). The sum from 0 to -1
+    // is defined to be zero.
+    //
+    // The defined quant ranges partition [0, 63]; their sizes sum to
+    // exactly 63 (§6.4.2 step 7(a)ivH/I), so a qi in 0..=63 always
+    // lands in some range. We pick the first qri whose right end-point
+    // (QIEND) is >= qi; per step 1, when qi lies on a boundary either
+    // choice yields the same QMAT.
+    let qi = qi as u32;
+    let mut qri = 0usize;
+    let mut qistart = 0u32;
+    let mut qiend = sizes[0] as u32;
+    while qri + 1 < nqrs && qiend < qi {
+        qistart = qiend;
+        qiend += sizes[qri + 1] as u32;
+        qri += 1;
+    }
+
+    // Step 4 / 5: the base-matrix indices at the two range end-points.
+    let bmi = bmis[qri] as usize;
+    let bmj = bmis[qri + 1] as usize;
+    let bm_lo = &params.base_matrices[bmi];
+    let bm_hi = &params.base_matrices[bmj];
+
+    // Denominator for the step 6(a) interpolation: 2 * QRSIZES[qri].
+    // QRSIZES values are always >= 1 (§6.4.2 encodes them as value + 1),
+    // so this is always >= 2 — no division by zero.
+    let qrsize = sizes[qri] as u32;
+    let denom = 2 * qrsize;
+
+    let mut values = [0u16; 64];
+    // Step 6: for each coefficient ci in 0..=63.
+    for (ci, out) in values.iter_mut().enumerate() {
+        // 6(a): interpolate the base matrix value BM[ci].
+        let bm =
+            (2 * (qiend - qi) * bm_lo[ci] as u32 + 2 * (qi - qistart) * bm_hi[ci] as u32 + qrsize)
+                / denom;
+
+        // 6(b): minimum quantization value from Table 6.18.
+        let qmin = qmin_table(qti, ci);
+
+        // 6(c) / 6(d): DC vs AC scale.
+        let qscale = if ci == 0 {
+            params.dc_scale[qi as usize] as u32
+        } else {
+            params.ac_scale[qi as usize] as u32
+        };
+
+        // 6(e): QMAT[ci] = max(QMIN, min((QSCALE * BM // 100) * 4, 4096)).
+        let scaled = (qscale * bm / 100) * 4;
+        *out = qmin.max(scaled.min(4096)) as u16;
+    }
+
+    Ok(QuantizationMatrix { values })
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -2954,5 +3153,308 @@ mod tests {
         assert!(format!("{e1}").contains("NBMS=385"));
         assert!(format!("{e2}").contains("QRBMIS"));
         assert!(format!("{e3}").contains("qi=64"));
+    }
+
+    // ---- §6.4.3 Computing a Quantization Matrix ----------------------
+
+    /// Build a [`QuantizationParameters`] populated with a single
+    /// 63-wide quant range for every `(qti, pli)`, with base-matrix
+    /// endpoints `{bmi0, bmi1}`. The base-matrix table is supplied
+    /// directly. AC/DC scales are constants `ac`/`dc` at every qi.
+    ///
+    /// This bypasses the §6.4.2 bit decode entirely so the §6.4.3
+    /// procedure can be exercised against hand-computed expectations.
+    fn single_range_params(
+        base_matrices: Vec<[u8; 64]>,
+        bmi0: u16,
+        bmi1: u16,
+        ac: u16,
+        dc: u16,
+    ) -> QuantizationParameters {
+        let mut qrsizes = [[[0u8; 63]; 3]; 2];
+        let mut qrbmis = [[[0u16; 64]; 3]; 2];
+        for qti in 0..2 {
+            for pli in 0..3 {
+                qrsizes[qti][pli][0] = 63;
+                qrbmis[qti][pli][0] = bmi0;
+                qrbmis[qti][pli][1] = bmi1;
+            }
+        }
+        QuantizationParameters {
+            ac_scale: [ac; 64],
+            dc_scale: [dc; 64],
+            num_base_matrices: base_matrices.len() as u16,
+            base_matrices,
+            num_quant_ranges: [[1u8; 3]; 2],
+            quant_range_sizes: qrsizes,
+            quant_range_base_matrix_indices: qrbmis,
+        }
+    }
+
+    #[test]
+    fn compute_qmat_endpoints_pick_corner_base_matrices() {
+        // Single 63-wide range, endpoints bm0 (all 16) .. bm1 (all 100).
+        // qi=0 selects QISTART end -> BM == bm0; qi=63 selects QIEND end
+        // -> BM == bm1 (§6.4.3 steps 1-3 / 6(a)).
+        let params = single_range_params(vec![[16u8; 64], [100u8; 64]], 0, 1, 400, 200);
+
+        // qi=0, intra (qti=0), luma (pli=0): BM[ci]=16 everywhere.
+        //   DC (ci=0): (200*16//100)*4 = (3200//100)*4 = 32*4 = 128.
+        //   AC (ci>0): (400*16//100)*4 = (6400//100)*4 = 64*4 = 256.
+        let q0 = compute_quantization_matrix(&params, 0, 0, 0).unwrap();
+        assert_eq!(q0.values[0], 128, "qi=0 DC");
+        for &v in &q0.values[1..] {
+            assert_eq!(v, 256, "qi=0 AC");
+        }
+
+        // qi=63: BM[ci]=100 everywhere.
+        //   DC: (200*100//100)*4 = 200*4 = 800.
+        //   AC: (400*100//100)*4 = 400*4 = 1600.
+        let q63 = compute_quantization_matrix(&params, 0, 0, 63).unwrap();
+        assert_eq!(q63.values[0], 800, "qi=63 DC");
+        for &v in &q63.values[1..] {
+            assert_eq!(v, 1600, "qi=63 AC");
+        }
+    }
+
+    #[test]
+    fn compute_qmat_interpolates_within_a_range() {
+        // qi at the midpoint of a 63-wide range interpolates halfway
+        // between the two endpoint base matrices.
+        //   QISTART=0, QIEND=63, qrsize=63, denom=126.
+        //   At qi=31 with bm0=0, bm1=126:
+        //     BM = (2*(63-31)*0 + 2*(31-0)*126 + 63)//126
+        //        = (0 + 7812 + 63)//126 = 7875//126 = 62.
+        let params = single_range_params(vec![[0u8; 64], [126u8; 64]], 0, 1, 100, 100);
+        let q = compute_quantization_matrix(&params, 0, 0, 31).unwrap();
+        // BM = 62 everywhere.
+        //   DC (ci=0): (100*62//100)*4 = 62*4 = 248.
+        //   AC: same scale here -> also 248.
+        assert_eq!(q.values[0], 248);
+        for &v in &q.values[1..] {
+            assert_eq!(v, 248);
+        }
+    }
+
+    #[test]
+    fn compute_qmat_two_range_interpolation_and_boundary() {
+        // Two ranges: size 32 then 31 (sum 63). Base-matrix endpoints
+        // QRBMIS = [0, 1, 2]; bm0=0, bm1=64, bm2=128. Scale = 100 so
+        // QMAT[ci] == BM[ci]*4.
+        let base = vec![[0u8; 64], [64u8; 64], [128u8; 64]];
+        let mut qrsizes = [[[0u8; 63]; 3]; 2];
+        let mut qrbmis = [[[0u16; 64]; 3]; 2];
+        for qti in 0..2 {
+            for pli in 0..3 {
+                qrsizes[qti][pli][0] = 32;
+                qrsizes[qti][pli][1] = 31;
+                qrbmis[qti][pli][0] = 0;
+                qrbmis[qti][pli][1] = 1;
+                qrbmis[qti][pli][2] = 2;
+            }
+        }
+        let params = QuantizationParameters {
+            ac_scale: [100u16; 64],
+            dc_scale: [100u16; 64],
+            num_base_matrices: 3,
+            base_matrices: base,
+            num_quant_ranges: [[2u8; 3]; 2],
+            quant_range_sizes: qrsizes,
+            quant_range_base_matrix_indices: qrbmis,
+        };
+
+        // qi=16 in range 0 [0,32]: QISTART=0, QIEND=32, denom=64.
+        //   BM = (2*(32-16)*0 + 2*(16-0)*64 + 32)//64
+        //      = (0 + 2048 + 32)//64 = 2080//64 = 32.
+        //   QMAT = 32*4 = 128 (DC and AC, scale 100).
+        let q16 = compute_quantization_matrix(&params, 0, 0, 16).unwrap();
+        for &v in q16.values.iter() {
+            assert_eq!(v, 128, "qi=16 interpolation");
+        }
+
+        // qi=48 in range 1 [32,63]: QISTART=32, QIEND=63, qrsize=31,
+        // denom=62.
+        //   BM = (2*(63-48)*64 + 2*(48-32)*128 + 31)//62
+        //      = (1920 + 4096 + 31)//62 = 6047//62 = 97.
+        //   QMAT = 97*4 = 388.
+        let q48 = compute_quantization_matrix(&params, 0, 0, 48).unwrap();
+        for &v in q48.values.iter() {
+            assert_eq!(v, 388, "qi=48 interpolation");
+        }
+
+        // qi=32 on the boundary must agree no matter which range is
+        // chosen (§6.4.3 step 1 note). Our impl picks range 0:
+        //   BM = (2*(32-32)*0 + 2*(32-0)*64 + 32)//64
+        //      = (0 + 4096 + 32)//64 = 4128//64 = 64.
+        //   QMAT = 64*4 = 256.
+        // Manually computing via range 1 gives the same:
+        //   BM = (2*(63-32)*64 + 2*(32-32)*128 + 31)//62
+        //      = (3968 + 0 + 31)//62 = 3999//62 = 64.
+        let q32 = compute_quantization_matrix(&params, 0, 0, 32).unwrap();
+        for &v in q32.values.iter() {
+            assert_eq!(v, 256, "qi=32 boundary");
+        }
+    }
+
+    #[test]
+    fn compute_qmat_applies_qmin_floor_per_table_6_18() {
+        // Tiny scales drive the scaled value below QMIN so the floor
+        // (Table 6.18) wins. bm=16 everywhere; dc_scale=1, ac_scale=1.
+        //   scaled = (1*16//100)*4 = (0)*4 = 0.
+        let params = single_range_params(vec![[16u8; 64], [16u8; 64]], 0, 1, 1, 1);
+
+        // Intra (qti=0): DC floor=16, AC floor=8.
+        let intra = compute_quantization_matrix(&params, 0, 0, 0).unwrap();
+        assert_eq!(intra.values[0], 16, "intra DC floor");
+        for &v in &intra.values[1..] {
+            assert_eq!(v, 8, "intra AC floor");
+        }
+
+        // Inter (qti=1): DC floor=32, AC floor=16.
+        let inter = compute_quantization_matrix(&params, 1, 0, 0).unwrap();
+        assert_eq!(inter.values[0], 32, "inter DC floor");
+        for &v in &inter.values[1..] {
+            assert_eq!(v, 16, "inter AC floor");
+        }
+    }
+
+    #[test]
+    fn compute_qmat_clamps_at_4096_ceiling() {
+        // Large scale drives the product past 4096; step 6(e) clamps.
+        // bm=100 everywhere, scale=65535 (max).
+        //   scaled = (65535*100//100)*4 = 65535*4 = 262140 -> min 4096.
+        let params = single_range_params(vec![[100u8; 64], [100u8; 64]], 0, 1, 65535, 65535);
+        let q = compute_quantization_matrix(&params, 0, 0, 0).unwrap();
+        for &v in q.values.iter() {
+            assert_eq!(v, 4096, "4096 ceiling clamp");
+        }
+    }
+
+    #[test]
+    fn compute_qmat_qmin_table_matches_spec() {
+        // Direct check of Table 6.18 values for the four cells.
+        assert_eq!(qmin_table(0, 0), 16); // intra DC
+        assert_eq!(qmin_table(0, 1), 8); // intra AC
+        assert_eq!(qmin_table(0, 63), 8); // intra AC (last)
+        assert_eq!(qmin_table(1, 0), 32); // inter DC
+        assert_eq!(qmin_table(1, 1), 16); // inter AC
+        assert_eq!(qmin_table(1, 63), 16); // inter AC (last)
+    }
+
+    #[test]
+    fn compute_qmat_rejects_out_of_range_selectors() {
+        let params = single_range_params(vec![[16u8; 64], [16u8; 64]], 0, 1, 100, 100);
+        match compute_quantization_matrix(&params, 2, 0, 0) {
+            Err(Error::QuantTypeIndexOutOfRange { qti: 2 }) => {}
+            other => panic!("expected QuantTypeIndexOutOfRange(2), got {other:?}"),
+        }
+        match compute_quantization_matrix(&params, 0, 3, 0) {
+            Err(Error::QuantPlaneIndexOutOfRange { pli: 3 }) => {}
+            other => panic!("expected QuantPlaneIndexOutOfRange(3), got {other:?}"),
+        }
+        match compute_quantization_matrix(&params, 0, 0, 64) {
+            Err(Error::QuantIndexOutOfRange { qi: 64 }) => {}
+            other => panic!("expected QuantIndexOutOfRange(64), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_qmat_all_planes_and_types_are_independent() {
+        // Distinct base matrices per (qti, pli) confirm the selector
+        // wiring reaches the right quant-range row.
+        let base = vec![[10u8; 64], [20u8; 64], [30u8; 64], [40u8; 64]];
+        let mut qrsizes = [[[0u8; 63]; 3]; 2];
+        let mut qrbmis = [[[0u16; 64]; 3]; 2];
+        // (0,0): flat bm index 0; (0,1): bm 1; (0,2): bm 2; (1,*): bm 3.
+        let pick = [[0u16, 1, 2], [3u16, 3, 3]];
+        for qti in 0..2 {
+            for pli in 0..3 {
+                qrsizes[qti][pli][0] = 63;
+                qrbmis[qti][pli][0] = pick[qti][pli];
+                qrbmis[qti][pli][1] = pick[qti][pli];
+            }
+        }
+        let params = QuantizationParameters {
+            ac_scale: [100u16; 64],
+            dc_scale: [100u16; 64],
+            num_base_matrices: 4,
+            base_matrices: base,
+            num_quant_ranges: [[1u8; 3]; 2],
+            quant_range_sizes: qrsizes,
+            quant_range_base_matrix_indices: qrbmis,
+        };
+        // BM is flat at the picked matrix value; QMAT = bm*4 (scale 100),
+        // floored by Table 6.18.
+        let expect = |bm: u16| -> u16 { (bm * 4).max(8) };
+        assert_eq!(
+            compute_quantization_matrix(&params, 0, 0, 30)
+                .unwrap()
+                .values[1],
+            expect(10)
+        );
+        assert_eq!(
+            compute_quantization_matrix(&params, 0, 1, 30)
+                .unwrap()
+                .values[1],
+            expect(20)
+        );
+        assert_eq!(
+            compute_quantization_matrix(&params, 0, 2, 30)
+                .unwrap()
+                .values[1],
+            expect(30)
+        );
+        assert_eq!(
+            compute_quantization_matrix(&params, 1, 0, 30)
+                .unwrap()
+                .values[1],
+            expect(40)
+        );
+    }
+
+    #[test]
+    fn compute_qmat_chains_from_decoded_quant_params() {
+        // End-to-end: decode a synthesized §6.4.2 payload, then compute
+        // a §6.4.3 matrix from it. Uses the single-range payload shape
+        // from `decode_quant_params_minimal_single_range` (bm0=16,
+        // bm1=100, one 63-wide range with endpoints {0,1}).
+        let mut ac = [0u16; 64];
+        let mut dc = [0u16; 64];
+        for i in 0..64 {
+            ac[i] = (500 - i * 7) as u16;
+            dc[i] = (220 - i * 3) as u16;
+        }
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &ac, &dc);
+        let nbms = 2u32;
+        w.put(nbms - 1, 9);
+        let bmi_bits = test_ilog(nbms as i64 - 1);
+        for _ci in 0..64 {
+            w.put(16, 8);
+        }
+        for _ci in 0..64 {
+            w.put(100, 8);
+        }
+        for qti in 0..2 {
+            for pli in 0..3 {
+                if qti > 0 || pli > 0 {
+                    w.put(1, 1);
+                }
+                w.put(0, bmi_bits);
+                w.put(62, test_ilog(62));
+                w.put(1, bmi_bits);
+            }
+        }
+        let payload = w.finish();
+        let qp = decode_quantization_parameters(&payload).unwrap();
+
+        // qi=0 -> BM=16; qi=63 -> BM=100 (endpoint selection).
+        // Intra DC at qi=0: (dc[0]=220 * 16 // 100)*4 = (3520//100)*4
+        //   = 35*4 = 140.
+        let q0 = compute_quantization_matrix(&qp, 0, 0, 0).unwrap();
+        assert_eq!(q0.values[0], 140);
+        // Intra AC at qi=0: (ac[0]=500 * 16 // 100)*4 = (8000//100)*4
+        //   = 80*4 = 320.
+        assert_eq!(q0.values[1], 320);
     }
 }

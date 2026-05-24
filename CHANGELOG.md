@@ -6,6 +6,43 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§6.4.3 Computing a Quantization Matrix (2026-05-24, round 6).**
+  New public `compute_quantization_matrix(params: &QuantizationParameters,
+  qti: usize, pli: usize, qi: usize) -> Result<QuantizationMatrix, Error>`
+  transcribing the full §6.4.3 procedure of the Xiph Theora I
+  Specification ("Computing a Quantization Matrix"). It consumes the
+  §6.4.2 `QuantizationParameters` and interpolates a 64-element
+  natural-order quantization matrix for a `(qti, pli, qi)` selector:
+  * Steps 1–3: locate the quant range bracketing `qi`, deriving
+    `QISTART` / `QIEND` from the cumulative `QRSIZES` sums.
+  * Steps 4–5: pick the two end-point base-matrix indices `bmi` /
+    `bmj` from `QRBMIS`.
+  * Step 6(a): linearly interpolate `BM[ci]` between the two base
+    matrices using the spec's `//`-rounded formula.
+  * Steps 6(b)–6(e): apply the Table 6.18 `QMIN` floor, the DC
+    (`DCSCALE`) vs AC (`ACSCALE`) scale, the `//100` and `*4`
+    scaling, and the `max(QMIN, min(..., 4096))` clamp.
+
+  New typed `QuantizationMatrix { values: [u16; 64] }` output and a
+  crate-private `qmin_table` helper for Table 6.18. Three new `Error`
+  variants (`QuantTypeIndexOutOfRange` / `QuantPlaneIndexOutOfRange` /
+  `QuantIndexOutOfRange`) reject out-of-range `qti` / `pli` / `qi`
+  selectors, each with a `Display` arm.
+
+  9 new tests bring the total from 79 to 88: corner-base-matrix
+  selection at `qi=0` / `qi=63`, midpoint interpolation within a
+  single range, two-range interpolation plus a boundary-qi
+  consistency check, the Table 6.18 `QMIN` floors (intra + inter), the
+  4096 ceiling clamp, direct `qmin_table` values, out-of-range
+  selector rejects, per-`(qti, pli)` selector-wiring isolation, and an
+  end-to-end chain that decodes a synthesized §6.4.2 payload and feeds
+  it straight into `compute_quantization_matrix`.
+
+  All §6.4.3 arithmetic uses non-negative operands, so the spec's
+  `//` reduces to ordinary integer division. The §6.4.1 spec gap
+  (still open, docs-gap #944) does not block this section: §6.4.3
+  operates purely on the §6.4.2 outputs.
+
 * **§6.4.2 Quantization Parameters Decode (2026-05-24, round 5).**
   New public `decode_quantization_parameters(bits: &[u8]) ->
   Result<QuantizationParameters, Error>` transcribing the full §6.4.2

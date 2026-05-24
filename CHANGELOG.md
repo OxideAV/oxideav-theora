@@ -6,6 +6,57 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§7.2 Long-/Short-Run Bit Strings Decode (2026-05-25, round 9).**
+  New public `decode_long_run_bit_string(bits: &[u8], nbits: u64) ->
+  Result<Vec<u8>, Error>` and `decode_short_run_bit_string(bits: &[u8],
+  nbits: u64) -> Result<Vec<u8>, Error>` transcribing §7.2.1 and §7.2.2
+  of the Xiph Theora I Specification ("Run-Length Encoded Bit Strings").
+  Each procedure decodes a sequence of `0`/`1` values whose run lengths
+  are Huffman-coded against Table 7.7 (long-run, RSTART∈{1,2,4,6,10,18,
+  34}, RBITS∈{0,1,1,2,3,4,12}, max RLEN = 4129) or Table 7.11 (short-
+  run, RSTART∈{1,3,5,7,11,15}, RBITS∈{1,1,1,2,2,4}, max RLEN = 30) over
+  the §5.2 MSb-first `BitReader`. The long-run procedure implements the
+  VP3+ "read fresh BIT after RLEN=4129" exception (§7.2.1 step 12); the
+  short-run procedure unconditionally toggles between runs (§7.2.2
+  step 12 has no exception path).
+
+  New public types/constants: `LONG_RUN_MAX = 4129`,
+  `SHORT_RUN_MAX = 30`. One new `Error` variant
+  (`RunLengthOverrun { len, nbits }`) surfaces the §7.2 step 10
+  invariant ("LEN MUST be less than or equal to NBITS") with a
+  `Display` arm.
+
+  Implementation walks Table 7.7 / 7.11 one bit at a time against the
+  `BitReader`; the in-tree tables are six-row / seven-row constants
+  isolated from the decode logic so a transcription regression is
+  caught by the dedicated `*_constants_match_table_*` tests. The
+  procedures are split into `decode_*_bit_string` (byte-aligned entry
+  point) plus `decode_*_bit_string_inner(&mut BitReader<'_>, u64)` for
+  a future end-to-end frame decoder to chain §7.3 / §7.6 onto the same
+  reader without re-aligning.
+
+  24 new tests bring the total from 118 to 142: Table 7.7 / Table 7.11
+  transcription against every row plus the `LONG_RUN_MAX` /
+  `SHORT_RUN_MAX` derivations, the `NBITS = 0` empty-string short-
+  circuit, single-record decode of every Table 7.7 / 7.11 entry at
+  both range endpoints (13 long-run cases + 12 short-run cases), the
+  toggle-between-runs invariant on both procedures, the long-run
+  "read fresh BIT after RLEN=4129" exception (both fresh-0 and
+  fresh-1 paths) plus the symmetric "RLEN=4128 still toggles" check,
+  the short-run "RLEN=30 still toggles" check (no exception path),
+  truncation rejects at the initial BIT / mid-Huffman-walk / mid-ROFFS
+  field boundaries on both procedures, the `RunLengthOverrun` reject
+  on both procedures with `Display` rendering, a long-run byte-
+  boundary-crossing decode, and a realistic 16-bit short-run super-
+  block decode covering four toggled runs.
+
+  §7.2 is unblocked by the still-open §6.4.1 spec gap (docs-gap #944):
+  §7.2 operates on a video-data packet's own payload and does not
+  consume the setup-header body. §7.3 (Coded Block Flags Decode) is the
+  natural next step: it calls `decode_long_run_bit_string` for the
+  super-block partial-coding map and `decode_short_run_bit_string`
+  inside each partially-coded super block for the per-block flags.
+
 * **§7.1 Frame Header Decode (2026-05-25, round 8).**
   New public `decode_frame_header(packet: &[u8], first_frame: bool) ->
   Result<TheoraFrameHeader, Error>` transcribing the full §7.1

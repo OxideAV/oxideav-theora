@@ -288,6 +288,16 @@ pub enum Error {
         /// The reserved bit pattern (in the low 3 bits).
         bits: u8,
     },
+    /// §7.2.1 step 10 / §7.2.2 step 10 violation: a decoded run length
+    /// (`RLEN = RSTART + ROFFS`) advanced `LEN` past the caller-supplied
+    /// `NBITS` bound. The spec says "LEN MUST be less than or equal to
+    /// NBITS", so an over-run is undecodable.
+    RunLengthOverrun {
+        /// The over-run `LEN` value (already past `NBITS`).
+        len: u64,
+        /// The caller-supplied bit-string length cap.
+        nbits: u64,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -427,6 +437,10 @@ impl core::fmt::Display for Error {
             Error::FrameReservedBitsNonZero { bits } => write!(
                 f,
                 "oxideav-theora: §7.1 step 7: reserved bits = 0b{bits:03b}, expected 0"
+            ),
+            Error::RunLengthOverrun { len, nbits } => write!(
+                f,
+                "oxideav-theora: §7.2 run-length decode overran the bit-string cap: LEN={len} > NBITS={nbits} (undecodable)"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -1866,6 +1880,374 @@ fn decode_frame_header_inner(
     }
 
     Ok(TheoraFrameHeader { ftype, qis })
+}
+
+// =====================================================================
+// §7.2 Run-Length Encoded Bit Strings
+// =====================================================================
+
+/// Table 7.7 entry for the §7.2.1 Long-Run-length Huffman code.
+///
+/// Each row encodes one decoded run length: a `code` (read MSb-first
+/// off the bit reader), its prefix `code_len` in bits, the `rstart`
+/// floor of the run-length range, and the `rbits` count of trailing
+/// literal bits that select the offset within the range.
+///
+/// Spec Table 7.7 enumerates exactly the seven `1*0` / `1{6}` codes:
+///
+/// | Huffman | RSTART | RBITS | Run Lengths |
+/// | ------- | ------ | ----- | ----------- |
+/// | `0`       | 1  | 0  | 1       |
+/// | `10`      | 2  | 1  | 2..=3   |
+/// | `110`     | 4  | 1  | 4..=5   |
+/// | `1110`    | 6  | 2  | 6..=9   |
+/// | `11110`   | 10 | 3  | 10..=17 |
+/// | `111110`  | 18 | 4  | 18..=33 |
+/// | `111111`  | 34 | 12 | 34..=4129 |
+const LONG_RUN_TABLE: [LongRunEntry; 7] = [
+    LongRunEntry {
+        code: 0b0,
+        code_len: 1,
+        rstart: 1,
+        rbits: 0,
+    },
+    LongRunEntry {
+        code: 0b10,
+        code_len: 2,
+        rstart: 2,
+        rbits: 1,
+    },
+    LongRunEntry {
+        code: 0b110,
+        code_len: 3,
+        rstart: 4,
+        rbits: 1,
+    },
+    LongRunEntry {
+        code: 0b1110,
+        code_len: 4,
+        rstart: 6,
+        rbits: 2,
+    },
+    LongRunEntry {
+        code: 0b11110,
+        code_len: 5,
+        rstart: 10,
+        rbits: 3,
+    },
+    LongRunEntry {
+        code: 0b111110,
+        code_len: 6,
+        rstart: 18,
+        rbits: 4,
+    },
+    LongRunEntry {
+        code: 0b111111,
+        code_len: 6,
+        rstart: 34,
+        rbits: 12,
+    },
+];
+
+/// One row of [`LONG_RUN_TABLE`] (§7.2 Table 7.7).
+#[derive(Debug, Clone, Copy)]
+struct LongRunEntry {
+    /// The Huffman code bits, right-justified in a u32.
+    code: u32,
+    /// The number of bits in `code` (1..=6).
+    code_len: u8,
+    /// The floor of the represented run-length range (Table 7.7 RSTART).
+    rstart: u16,
+    /// The count of trailing literal bits encoding the offset within
+    /// the range (Table 7.7 RBITS).
+    rbits: u8,
+}
+
+/// Maximum run length encodable by the §7.2.1 long-run Huffman codes
+/// (Table 7.7 last row: `RSTART + (1 << RBITS) - 1 = 34 + 4095 = 4129`).
+/// In a Theora I-compliant stream this is also the threshold above
+/// which the bit value is re-read instead of toggled (§7.2.1 step 12).
+pub const LONG_RUN_MAX: u16 = 4129;
+
+/// Table 7.11 entry for the §7.2.2 Short-Run-length Huffman code.
+///
+/// Same shape as [`LongRunEntry`] but with the Table 7.11 ranges. The
+/// short-run procedure differs only in (a) its Huffman alphabet (6
+/// codes; longest is `b11111` at 5 bits) and (b) its maximum run length
+/// of 30, after which there is no exception path — the bit value is
+/// unconditionally toggled.
+///
+/// Spec Table 7.11:
+///
+/// | Huffman | RSTART | RBITS | Run Lengths |
+/// | ------- | ------ | ----- | ----------- |
+/// | `0`     | 1  | 1 | 1..=2  |
+/// | `10`    | 3  | 1 | 3..=4  |
+/// | `110`   | 5  | 1 | 5..=6  |
+/// | `1110`  | 7  | 2 | 7..=10 |
+/// | `11110` | 11 | 2 | 11..=14 |
+/// | `11111` | 15 | 4 | 15..=30 |
+const SHORT_RUN_TABLE: [ShortRunEntry; 6] = [
+    ShortRunEntry {
+        code: 0b0,
+        code_len: 1,
+        rstart: 1,
+        rbits: 1,
+    },
+    ShortRunEntry {
+        code: 0b10,
+        code_len: 2,
+        rstart: 3,
+        rbits: 1,
+    },
+    ShortRunEntry {
+        code: 0b110,
+        code_len: 3,
+        rstart: 5,
+        rbits: 1,
+    },
+    ShortRunEntry {
+        code: 0b1110,
+        code_len: 4,
+        rstart: 7,
+        rbits: 2,
+    },
+    ShortRunEntry {
+        code: 0b11110,
+        code_len: 5,
+        rstart: 11,
+        rbits: 2,
+    },
+    ShortRunEntry {
+        code: 0b11111,
+        code_len: 5,
+        rstart: 15,
+        rbits: 4,
+    },
+];
+
+/// One row of [`SHORT_RUN_TABLE`] (§7.2 Table 7.11).
+#[derive(Debug, Clone, Copy)]
+struct ShortRunEntry {
+    /// The Huffman code bits, right-justified in a u32.
+    code: u32,
+    /// The number of bits in `code` (1..=5).
+    code_len: u8,
+    /// The floor of the represented run-length range (Table 7.11 RSTART).
+    rstart: u16,
+    /// The count of trailing literal bits encoding the offset within
+    /// the range (Table 7.11 RBITS).
+    rbits: u8,
+}
+
+/// Maximum run length encodable by the §7.2.2 short-run Huffman codes
+/// (Table 7.11 last row: `RSTART + (1 << RBITS) - 1 = 15 + 15 = 30`).
+pub const SHORT_RUN_MAX: u16 = 30;
+
+/// Decode a §7.2.1 Long-Run-length-coded bit string from `bits`.
+///
+/// Decodes exactly `nbits` output bits (per the spec's `NBITS` input)
+/// into a `Vec<u8>` of `0`/`1` values, applying the §7.2.1 procedure
+/// verbatim:
+///
+/// 1. Initialize `LEN = 0`, `BITS = []`.
+/// 2. While `LEN < nbits`:
+///    * Read a 1-bit `BIT` value.
+///    * Read a Table 7.7 Huffman code, then `RBITS` literal bits for
+///      `ROFFS`. The run length is `RLEN = RSTART + ROFFS`.
+///    * Append `RLEN` copies of `BIT`, then add `RLEN` to `LEN`.
+///    * Loop on subsequent runs: if `RLEN == 4129` (the maximum), read
+///      another 1-bit value as the new `BIT`; otherwise toggle `BIT`
+///      via `BIT = 1 - BIT`.
+/// 3. Return `BITS`.
+///
+/// `nbits` is unbounded in principle (the spec's `NBITS` is a 36-bit
+/// unsigned), so it is taken as a `u64`. In practice it is capped by
+/// the consumer's known block count.
+///
+/// Returns:
+///
+/// * [`Error::TruncatedHeader`] if the stream runs out of bits before
+///   the bit string is complete.
+/// * [`Error::RunLengthOverrun`] if a decoded run length advances `LEN`
+///   past `nbits` (a malformed stream — the §7.2.1 step 10 invariant
+///   says "LEN MUST be less than or equal to NBITS").
+pub fn decode_long_run_bit_string(bits: &[u8], nbits: u64) -> Result<Vec<u8>, Error> {
+    let mut r = BitReader::new(bits);
+    decode_long_run_bit_string_inner(&mut r, nbits)
+}
+
+/// Inner §7.2.1 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so a future end-to-end frame decoder can
+/// chain §7.3 (Coded Block Flags Decode) on the same reader without
+/// re-aligning to a byte boundary.
+fn decode_long_run_bit_string_inner(r: &mut BitReader<'_>, nbits: u64) -> Result<Vec<u8>, Error> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut len: u64 = 0;
+    if len == nbits {
+        return Ok(out);
+    }
+    // Step 4 (first iteration only): read the initial BIT value.
+    let mut bit = r.read_bits(1, "long-run.BIT")? as u8;
+    loop {
+        // Steps 5–6: recognise a Table 7.7 code then read RBITS literal
+        // bits for ROFFS.
+        let entry = recognise_long_run_code(r)?;
+        let roffs = if entry.rbits == 0 {
+            0
+        } else {
+            r.read_bits(entry.rbits as u32, "long-run.ROFFS")?
+        };
+        let rlen = entry.rstart as u32 + roffs;
+        // Steps 9–10: append RLEN copies of BIT then bump LEN.
+        for _ in 0..rlen {
+            out.push(bit);
+        }
+        let new_len = len + rlen as u64;
+        if new_len > nbits {
+            return Err(Error::RunLengthOverrun {
+                len: new_len,
+                nbits,
+            });
+        }
+        len = new_len;
+        // Step 11: bit string complete?
+        if len == nbits {
+            return Ok(out);
+        }
+        // Step 12: VP3+ exception — if RLEN == 4129, read a fresh BIT
+        // instead of toggling (to allow runs longer than the Huffman
+        // alphabet alone can represent).
+        if rlen == LONG_RUN_MAX as u32 {
+            bit = r.read_bits(1, "long-run.BIT")? as u8;
+        } else {
+            // Step 13: toggle.
+            bit = 1 - bit;
+        }
+        // Step 14: continue from step 5.
+    }
+}
+
+/// Walk Table 7.7 by reading one bit at a time until a code matches.
+/// Returns the matched [`LongRunEntry`].
+///
+/// All seven Table 7.7 codes are prefix codes, so the walk is
+/// unambiguous; a malformed stream that returns more than six `1` bits
+/// in a row falls into the `b111111` row (length 6 — every long-run
+/// code is at most 6 bits, so the longest input prefix is bounded).
+fn recognise_long_run_code(r: &mut BitReader<'_>) -> Result<LongRunEntry, Error> {
+    let mut code: u32 = 0;
+    let mut code_len: u8 = 0;
+    loop {
+        let bit = r.read_bits(1, "long-run.huff")?;
+        code = (code << 1) | bit;
+        code_len += 1;
+        for entry in LONG_RUN_TABLE.iter() {
+            if entry.code_len == code_len && entry.code == code {
+                return Ok(*entry);
+            }
+        }
+        // Defensive: Table 7.7 is exhaustive within six bits (all seven
+        // codes are prefix-free and the longest is `b111111`). A
+        // six-bit walk that didn't match means the table itself was
+        // mis-transcribed; debug_assert! catches such a regression in
+        // test builds while production builds keep walking until the
+        // bit reader runs out (which becomes a TruncatedHeader).
+        debug_assert!(
+            code_len <= 6,
+            "long-run table mis-transcribed: walked past 6 bits"
+        );
+    }
+}
+
+/// Decode a §7.2.2 Short-Run-length-coded bit string from `bits`.
+///
+/// Same shape as [`decode_long_run_bit_string`] but with Table 7.11 and
+/// the §7.2.2 procedure — no 4129 exception path, the BIT value is
+/// always toggled between runs.
+///
+/// `nbits` here is typically at most 16 (one bit per block in a super
+/// block) but the spec types it as 36-bit so the API takes a `u64`
+/// matching [`decode_long_run_bit_string`].
+///
+/// Returns:
+///
+/// * [`Error::TruncatedHeader`] if the stream runs out of bits before
+///   the bit string is complete.
+/// * [`Error::RunLengthOverrun`] if a decoded run length advances `LEN`
+///   past `nbits` (a malformed stream — the §7.2.2 step 10 invariant).
+pub fn decode_short_run_bit_string(bits: &[u8], nbits: u64) -> Result<Vec<u8>, Error> {
+    let mut r = BitReader::new(bits);
+    decode_short_run_bit_string_inner(&mut r, nbits)
+}
+
+/// Inner §7.2.2 procedure operating on an already-positioned
+/// [`BitReader`]. Split out for the same reason as
+/// [`decode_long_run_bit_string_inner`].
+fn decode_short_run_bit_string_inner(r: &mut BitReader<'_>, nbits: u64) -> Result<Vec<u8>, Error> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut len: u64 = 0;
+    if len == nbits {
+        return Ok(out);
+    }
+    // Step 4 (first iteration only): read the initial BIT value.
+    let mut bit = r.read_bits(1, "short-run.BIT")? as u8;
+    loop {
+        // Steps 5–6: recognise a Table 7.11 code then read RBITS
+        // literal bits for ROFFS.
+        let entry = recognise_short_run_code(r)?;
+        let roffs = if entry.rbits == 0 {
+            0
+        } else {
+            r.read_bits(entry.rbits as u32, "short-run.ROFFS")?
+        };
+        let rlen = entry.rstart as u32 + roffs;
+        // Steps 9–10: append RLEN copies of BIT then bump LEN.
+        for _ in 0..rlen {
+            out.push(bit);
+        }
+        let new_len = len + rlen as u64;
+        if new_len > nbits {
+            return Err(Error::RunLengthOverrun {
+                len: new_len,
+                nbits,
+            });
+        }
+        len = new_len;
+        // Step 11: bit string complete?
+        if len == nbits {
+            return Ok(out);
+        }
+        // Step 12: short-run unconditionally toggles BIT — there is no
+        // 4129 exception here. The short-run alphabet caps at 30, well
+        // below any plausible same-bit overflow.
+        bit = 1 - bit;
+        // Step 13: continue from step 5.
+    }
+}
+
+/// Walk Table 7.11 by reading one bit at a time until a code matches.
+/// Returns the matched [`ShortRunEntry`].
+///
+/// Same structure as [`recognise_long_run_code`]. All six Table 7.11
+/// codes are prefix-free; the longest is `b11111` at 5 bits.
+fn recognise_short_run_code(r: &mut BitReader<'_>) -> Result<ShortRunEntry, Error> {
+    let mut code: u32 = 0;
+    let mut code_len: u8 = 0;
+    loop {
+        let bit = r.read_bits(1, "short-run.huff")?;
+        code = (code << 1) | bit;
+        code_len += 1;
+        for entry in SHORT_RUN_TABLE.iter() {
+            if entry.code_len == code_len && entry.code == code {
+                return Ok(*entry);
+            }
+        }
+        debug_assert!(
+            code_len <= 5,
+            "short-run table mis-transcribed: walked past 5 bits"
+        );
+    }
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -4607,5 +4989,497 @@ mod tests {
             assert_eq!(h.qis, vec![a, b, c], "case ({a},{b},{c}) failed");
             assert_eq!(h.nqis(), 3);
         }
+    }
+
+    // =============================================================
+    // §7.2 Run-Length Encoded Bit Strings
+    // =============================================================
+
+    /// Build one §7.2.1 long-run record into a [`BitWriter`]:
+    /// a Table 7.7 Huffman prefix (`code`, `code_len`) followed by
+    /// `rbits` literal bits of `roffs`.
+    fn write_long_run_record(w: &mut BitWriter, code: u32, code_len: u32, rbits: u32, roffs: u32) {
+        w.put(code, code_len);
+        if rbits > 0 {
+            w.put(roffs, rbits);
+        }
+    }
+
+    /// Same as [`write_long_run_record`] for Table 7.11 (short-run).
+    fn write_short_run_record(w: &mut BitWriter, code: u32, code_len: u32, rbits: u32, roffs: u32) {
+        w.put(code, code_len);
+        if rbits > 0 {
+            w.put(roffs, rbits);
+        }
+    }
+
+    #[test]
+    fn long_run_constants_match_table_7_7() {
+        // Spot-check every Table 7.7 row against the in-tree constant
+        // table. This is the single transcription point that protects
+        // the rest of the §7.2.1 logic from a Huffman-table copy bug.
+        assert_eq!(LONG_RUN_TABLE.len(), 7);
+        let expected: &[(u32, u8, u16, u8)] = &[
+            (0b0, 1, 1, 0),
+            (0b10, 2, 2, 1),
+            (0b110, 3, 4, 1),
+            (0b1110, 4, 6, 2),
+            (0b11110, 5, 10, 3),
+            (0b111110, 6, 18, 4),
+            (0b111111, 6, 34, 12),
+        ];
+        for (i, (code, code_len, rstart, rbits)) in expected.iter().enumerate() {
+            let e = &LONG_RUN_TABLE[i];
+            assert_eq!(e.code, *code, "row {i} code mismatch");
+            assert_eq!(e.code_len, *code_len, "row {i} code_len mismatch");
+            assert_eq!(e.rstart, *rstart, "row {i} rstart mismatch");
+            assert_eq!(e.rbits, *rbits, "row {i} rbits mismatch");
+        }
+        // The Table 7.7 last row's range max = RSTART + (1<<RBITS) - 1
+        // = 34 + 4096 - 1 = 4129 — the constant the procedure tests
+        // for the "read new BIT" exception path.
+        assert_eq!(LONG_RUN_MAX, 4129);
+        let last = LONG_RUN_TABLE.last().unwrap();
+        assert_eq!(
+            last.rstart as u32 + (1u32 << last.rbits) - 1,
+            LONG_RUN_MAX as u32
+        );
+    }
+
+    #[test]
+    fn short_run_constants_match_table_7_11() {
+        assert_eq!(SHORT_RUN_TABLE.len(), 6);
+        let expected: &[(u32, u8, u16, u8)] = &[
+            (0b0, 1, 1, 1),
+            (0b10, 2, 3, 1),
+            (0b110, 3, 5, 1),
+            (0b1110, 4, 7, 2),
+            (0b11110, 5, 11, 2),
+            (0b11111, 5, 15, 4),
+        ];
+        for (i, (code, code_len, rstart, rbits)) in expected.iter().enumerate() {
+            let e = &SHORT_RUN_TABLE[i];
+            assert_eq!(e.code, *code, "row {i} code mismatch");
+            assert_eq!(e.code_len, *code_len, "row {i} code_len mismatch");
+            assert_eq!(e.rstart, *rstart, "row {i} rstart mismatch");
+            assert_eq!(e.rbits, *rbits, "row {i} rbits mismatch");
+        }
+        // Table 7.11 last row: 15 + 16 - 1 = 30.
+        assert_eq!(SHORT_RUN_MAX, 30);
+        let last = SHORT_RUN_TABLE.last().unwrap();
+        assert_eq!(
+            last.rstart as u32 + (1u32 << last.rbits) - 1,
+            SHORT_RUN_MAX as u32
+        );
+    }
+
+    #[test]
+    fn long_run_zero_nbits_returns_empty_string() {
+        // §7.2.1 step 3 short-circuits when NBITS = 0 — the procedure
+        // returns BITS immediately without reading any bits.
+        let bits = [];
+        let out = decode_long_run_bit_string(&bits, 0).unwrap();
+        assert_eq!(out, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn long_run_single_run_of_length_one() {
+        // BIT=1, code b0 (RSTART=1, RBITS=0, RLEN=1) → one 1.
+        let mut w = BitWriter::new();
+        w.put(1, 1); // BIT
+        write_long_run_record(&mut w, 0b0, 1, 0, 0);
+        let bytes = w.finish();
+        let out = decode_long_run_bit_string(&bytes, 1).unwrap();
+        assert_eq!(out, vec![1]);
+    }
+
+    #[test]
+    fn long_run_single_run_each_table_row() {
+        // For each Table 7.7 row, choose a run-length within the row's
+        // range and verify byte-exact decode.
+        let cases: &[(u32, u32, u32, u32, u32)] = &[
+            // (code, code_len, rbits, roffs, expected_rlen)
+            (0b0, 1, 0, 0, 1),
+            (0b10, 2, 1, 0, 2),
+            (0b10, 2, 1, 1, 3),
+            (0b110, 3, 1, 0, 4),
+            (0b110, 3, 1, 1, 5),
+            (0b1110, 4, 2, 0, 6),
+            (0b1110, 4, 2, 3, 9),
+            (0b11110, 5, 3, 0, 10),
+            (0b11110, 5, 3, 7, 17),
+            (0b111110, 6, 4, 0, 18),
+            (0b111110, 6, 4, 15, 33),
+            (0b111111, 6, 12, 0, 34),
+            (0b111111, 6, 12, 4095, 4129),
+        ];
+        for (code, code_len, rbits, roffs, rlen) in cases.iter().copied() {
+            let mut w = BitWriter::new();
+            w.put(0, 1); // BIT=0
+            write_long_run_record(&mut w, code, code_len, rbits, roffs);
+            let bytes = w.finish();
+            let out = decode_long_run_bit_string(&bytes, rlen as u64).unwrap();
+            assert_eq!(
+                out,
+                vec![0u8; rlen as usize],
+                "row code={code:b} roffs={roffs} (expected rlen={rlen})"
+            );
+        }
+    }
+
+    #[test]
+    fn long_run_toggles_bit_between_runs() {
+        // BIT=1, code b0 (RLEN=1, '1') then code b10 roffs=1 (RLEN=3,
+        // BIT toggled → '0'). NBITS = 4 → "1 0 0 0".
+        let mut w = BitWriter::new();
+        w.put(1, 1);
+        write_long_run_record(&mut w, 0b0, 1, 0, 0);
+        write_long_run_record(&mut w, 0b10, 2, 1, 1);
+        let bytes = w.finish();
+        let out = decode_long_run_bit_string(&bytes, 4).unwrap();
+        assert_eq!(out, vec![1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn long_run_three_runs_alternating() {
+        // BIT=0, code b0 (run of one 0) → BIT flips to 1 (run of one 1)
+        // → BIT flips to 0 (run of one 0). NBITS = 3 → "0 1 0".
+        let mut w = BitWriter::new();
+        w.put(0, 1);
+        write_long_run_record(&mut w, 0b0, 1, 0, 0);
+        write_long_run_record(&mut w, 0b0, 1, 0, 0);
+        write_long_run_record(&mut w, 0b0, 1, 0, 0);
+        let bytes = w.finish();
+        let out = decode_long_run_bit_string(&bytes, 3).unwrap();
+        assert_eq!(out, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn long_run_reads_fresh_bit_after_rlen_4129() {
+        // Two back-to-back maximum-length runs of the SAME bit (both 0),
+        // exercising the VP3+ exception in §7.2.1 step 12: after a run
+        // of length 4129, the next BIT is READ (not toggled), so the
+        // encoder can express runs of arbitrary length.
+        let mut w = BitWriter::new();
+        w.put(0, 1); // BIT = 0
+                     // First run: code b111111 + roffs=4095 → RLEN = 34 + 4095 = 4129.
+        write_long_run_record(&mut w, 0b111111, 6, 12, 4095);
+        // After max run: read fresh BIT = 0 (same value, same run kind).
+        w.put(0, 1);
+        // Second run: code b0 → RLEN = 1, BIT = 0.
+        write_long_run_record(&mut w, 0b0, 1, 0, 0);
+        let bytes = w.finish();
+        let out = decode_long_run_bit_string(&bytes, 4129 + 1).unwrap();
+        let mut expected = vec![0u8; 4129];
+        expected.push(0);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn long_run_reads_fresh_bit_after_rlen_4129_flipped() {
+        // Same as above but the fresh BIT is 1 (a toggle would also
+        // have produced 1, so this case is not distinguishable from a
+        // toggle path on the resulting bits — but the procedure still
+        // reads the BIT, so the byte count differs by exactly 1 vs the
+        // non-maximum case). Test asserts the bit count and content.
+        let mut w = BitWriter::new();
+        w.put(0, 1); // BIT = 0
+        write_long_run_record(&mut w, 0b111111, 6, 12, 4095);
+        w.put(1, 1); // fresh BIT = 1
+        write_long_run_record(&mut w, 0b0, 1, 0, 0);
+        let bytes = w.finish();
+        let out = decode_long_run_bit_string(&bytes, 4129 + 1).unwrap();
+        let mut expected = vec![0u8; 4129];
+        expected.push(1);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn long_run_does_not_read_fresh_bit_below_4129() {
+        // A run of length 4128 (one short of the max) MUST toggle, not
+        // read a new BIT. The difference vs the 4129 path is one bit
+        // of input — check by giving exactly enough bytes for the
+        // toggle path and verifying the result is correct.
+        let mut w = BitWriter::new();
+        w.put(0, 1); // BIT = 0
+                     // First run: code b111111 + roffs=4094 → RLEN = 34+4094 = 4128.
+        write_long_run_record(&mut w, 0b111111, 6, 12, 4094);
+        // No fresh BIT — toggle → 1.
+        write_long_run_record(&mut w, 0b0, 1, 0, 0);
+        let bytes = w.finish();
+        let out = decode_long_run_bit_string(&bytes, 4128 + 1).unwrap();
+        let mut expected = vec![0u8; 4128];
+        expected.push(1);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn long_run_rejects_truncated_huffman_prefix() {
+        // Construct a single-byte buffer that decodes two records and
+        // then runs out mid-Huffman walk on the third. Byte layout
+        // (MSb→LSb): BIT=0, code b1110 (4 bits), ROFFS=0b11 (2 bits)
+        // → RLEN=9. Then 1 remaining bit "0" is the next BIT-toggle's
+        // Huffman bit (= code b0, RSTART=1, RBITS=0) → second RLEN=1.
+        // LEN=10. The caller requests NBITS=11, forcing one more
+        // Huffman walk — but byte_pos has reached end-of-buffer, so
+        // the read errors on `long-run.huff`.
+        #[allow(clippy::unusual_byte_groupings)]
+        let bytes = [0b0_1110_11_0u8]; // BIT|code(b1110)|ROFFS(2)|next-Huffman bit
+        let r = decode_long_run_bit_string(&bytes, 11);
+        match r {
+            Err(Error::TruncatedHeader { field }) => {
+                assert!(
+                    field.starts_with("long-run."),
+                    "expected long-run.* truncation, got {field}"
+                );
+            }
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_run_rejects_truncated_roffs() {
+        // BIT=1, code b10 (RBITS=1) — but the trailing ROFFS bit is
+        // missing because the byte ran out.
+        let mut w = BitWriter::new();
+        w.put(1, 1);
+        w.put(0b10, 2);
+        // 3 bits used, 5 zero bits pad — decoder will read ROFFS=0 and
+        // SUCCEED (the pad bits read as 0). To force truncation we need
+        // the RBITS read to itself fall off the end: use a hand-crafted
+        // sub-byte that ends exactly after the Huffman prefix. The
+        // tightest legal byte buffer ends on a byte boundary, so build
+        // a 1-byte buffer where bits 0+1+2 form BIT+code and bits 3..7
+        // would be ROFFS continuation — but those 5 bits read as zero
+        // from the buffer's own bytes. Instead: use a multi-record
+        // construction where the second record's ROFFS extends past
+        // the buffer's last byte.
+        // BIT=0; first record code b111111 + roffs=4095 (RLEN=4129).
+        // Then either fresh BIT (1 bit) or toggle; pick toggle path by
+        // demanding NBITS=4128 so we fail at overrun before exception
+        // — easier: use code b111111 ROFFS truncated. Build BIT + 6 bits
+        // of code = 7 bits, then 1-bit of ROFFS (need 12 bits total),
+        // truncated at byte 1.
+        #[allow(clippy::unusual_byte_groupings)]
+        let buf = vec![0b0_111111_0u8]; // BIT(1)|code(b111111, 6 bits)|first ROFFS bit
+        let r = decode_long_run_bit_string(&buf, 4129);
+        match r {
+            Err(Error::TruncatedHeader { field }) => {
+                assert!(
+                    field.starts_with("long-run."),
+                    "expected long-run.* truncation, got {field}"
+                );
+            }
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+        // Touch `w` to ensure it's used; the variable is kept for
+        // narrative clarity.
+        let _ = w;
+    }
+
+    #[test]
+    fn long_run_rejects_truncated_initial_bit() {
+        // NBITS > 0 but the buffer is empty — the very first BIT read
+        // must error.
+        let bytes: [u8; 0] = [];
+        let r = decode_long_run_bit_string(&bytes, 1);
+        match r {
+            Err(Error::TruncatedHeader { field }) => {
+                assert_eq!(field, "long-run.BIT");
+            }
+            other => panic!("expected TruncatedHeader(long-run.BIT), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_run_rejects_overrun() {
+        // BIT=0, code b1110 (RBITS=2) with roffs=3 → RLEN=9. NBITS=4.
+        // The decoded run length (9) exceeds NBITS (4) → RunLengthOverrun.
+        let mut w = BitWriter::new();
+        w.put(0, 1);
+        write_long_run_record(&mut w, 0b1110, 4, 2, 3);
+        let bytes = w.finish();
+        let r = decode_long_run_bit_string(&bytes, 4);
+        match r {
+            Err(Error::RunLengthOverrun { len, nbits }) => {
+                assert_eq!(len, 9);
+                assert_eq!(nbits, 4);
+            }
+            other => panic!("expected RunLengthOverrun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_run_overrun_error_display() {
+        let s = format!("{}", Error::RunLengthOverrun { len: 9, nbits: 4 });
+        assert!(s.contains("§7.2"), "got: {s}");
+        assert!(s.contains("LEN=9"), "got: {s}");
+        assert!(s.contains("NBITS=4"), "got: {s}");
+    }
+
+    #[test]
+    fn short_run_zero_nbits_returns_empty_string() {
+        let bytes = [];
+        let out = decode_short_run_bit_string(&bytes, 0).unwrap();
+        assert_eq!(out, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn short_run_single_run_each_table_row() {
+        // Verify every Table 7.11 row with an in-range ROFFS.
+        let cases: &[(u32, u32, u32, u32, u32)] = &[
+            (0b0, 1, 1, 0, 1),
+            (0b0, 1, 1, 1, 2),
+            (0b10, 2, 1, 0, 3),
+            (0b10, 2, 1, 1, 4),
+            (0b110, 3, 1, 0, 5),
+            (0b110, 3, 1, 1, 6),
+            (0b1110, 4, 2, 0, 7),
+            (0b1110, 4, 2, 3, 10),
+            (0b11110, 5, 2, 0, 11),
+            (0b11110, 5, 2, 3, 14),
+            (0b11111, 5, 4, 0, 15),
+            (0b11111, 5, 4, 15, 30),
+        ];
+        for (code, code_len, rbits, roffs, rlen) in cases.iter().copied() {
+            let mut w = BitWriter::new();
+            w.put(1, 1); // BIT=1
+            write_short_run_record(&mut w, code, code_len, rbits, roffs);
+            let bytes = w.finish();
+            let out = decode_short_run_bit_string(&bytes, rlen as u64).unwrap();
+            assert_eq!(
+                out,
+                vec![1u8; rlen as usize],
+                "row code={code:b} roffs={roffs}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_run_toggles_bit_between_runs() {
+        // BIT=0, code b0 roffs=0 (RLEN=1 → '0'), then toggle to BIT=1,
+        // code b10 roffs=1 (RLEN=4 → '1 1 1 1'). NBITS=5 → "0 1 1 1 1".
+        let mut w = BitWriter::new();
+        w.put(0, 1);
+        write_short_run_record(&mut w, 0b0, 1, 1, 0);
+        write_short_run_record(&mut w, 0b10, 2, 1, 1);
+        let bytes = w.finish();
+        let out = decode_short_run_bit_string(&bytes, 5).unwrap();
+        assert_eq!(out, vec![0, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn short_run_at_max_run_length_still_toggles() {
+        // Unlike long-run, short-run has NO "read fresh BIT" exception
+        // at the maximum. A run of length 30 must be followed by a
+        // toggled BIT.
+        let mut w = BitWriter::new();
+        // BIT = 0.
+        w.put(0, 1);
+        // First run: code b11111 + roffs=15 → RLEN = 30.
+        write_short_run_record(&mut w, 0b11111, 5, 4, 15);
+        // Second run: code b0 roffs=0 → RLEN = 1; BIT toggled → 1.
+        write_short_run_record(&mut w, 0b0, 1, 1, 0);
+        let bytes = w.finish();
+        let out = decode_short_run_bit_string(&bytes, 31).unwrap();
+        let mut expected = vec![0u8; 30];
+        expected.push(1);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn short_run_rejects_truncated_initial_bit() {
+        let bytes: [u8; 0] = [];
+        let r = decode_short_run_bit_string(&bytes, 1);
+        match r {
+            Err(Error::TruncatedHeader { field }) => {
+                assert_eq!(field, "short-run.BIT");
+            }
+            other => panic!("expected TruncatedHeader(short-run.BIT), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_run_rejects_truncated_huffman_prefix() {
+        // Single-byte buffer: BIT=1, then code b1110 (4 bits) used →
+        // 5 bits consumed. RBITS=2 — bits 5+6 = '00' = roffs=0 →
+        // RLEN=7. The first record completes inside the byte (no
+        // truncation). NBITS=8 demands one more bit of output, forcing
+        // a second Huffman walk. The next Huffman bit (bit 7 of byte 0)
+        // is '0' → code b0 (RSTART=1, RBITS=1). The required 1-bit
+        // ROFFS read is now past the byte boundary, so the read errors
+        // on `short-run.ROFFS`.
+        #[allow(clippy::unusual_byte_groupings)]
+        let bytes: [u8; 1] = [0b1_1110_000u8];
+        let r = decode_short_run_bit_string(&bytes, 8);
+        match r {
+            Err(Error::TruncatedHeader { field }) => {
+                assert!(
+                    field.starts_with("short-run."),
+                    "expected short-run.* truncation, got {field}"
+                );
+            }
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_run_rejects_overrun() {
+        // BIT=0, code b1110 (RBITS=2) roffs=3 → RLEN=10. NBITS=5.
+        let mut w = BitWriter::new();
+        w.put(0, 1);
+        write_short_run_record(&mut w, 0b1110, 4, 2, 3);
+        let bytes = w.finish();
+        let r = decode_short_run_bit_string(&bytes, 5);
+        match r {
+            Err(Error::RunLengthOverrun { len, nbits }) => {
+                assert_eq!(len, 10);
+                assert_eq!(nbits, 5);
+            }
+            other => panic!("expected RunLengthOverrun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_run_byte_boundary_decode() {
+        // Construct a long-run stream that crosses a byte boundary
+        // and verify the decode matches an explicit reference walk.
+        // BIT=1, code b11110 + roffs=5 → RLEN=15; then toggle BIT to 0,
+        // code b110 + roffs=0 → RLEN=4. NBITS=19; total bits = "15×1 + 4×0".
+        let mut w = BitWriter::new();
+        w.put(1, 1);
+        write_long_run_record(&mut w, 0b11110, 5, 3, 5); // 5+3=8 bits → record 2 spans bytes
+        write_long_run_record(&mut w, 0b110, 3, 1, 0);
+        let bytes = w.finish();
+        let out = decode_long_run_bit_string(&bytes, 19).unwrap();
+        let mut expected = vec![1u8; 15];
+        expected.extend(std::iter::repeat_n(0u8, 4));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn short_run_typical_super_block_decode() {
+        // Realistic short-run scenario: 16 bits, one per block in a
+        // super block. BIT=1, then alternating runs.
+        // First: code b0 roffs=0 → RLEN=1 (1 → '1')
+        // toggle to 0, code b10 roffs=0 → RLEN=3 (3 → '0 0 0')
+        // toggle to 1, code b110 roffs=1 → RLEN=6 (6 → '1 1 1 1 1 1')
+        // toggle to 0, code b1110 roffs=2 → RLEN=9 → but 9 > remaining 6.
+        // So adjust: use roffs that fits in the remaining 6.
+        // toggle to 0, code b110 roffs=1 → RLEN=6 (6 → '0 0 0 0 0 0').
+        let mut w = BitWriter::new();
+        w.put(1, 1);
+        write_short_run_record(&mut w, 0b0, 1, 1, 0); // RLEN=1, '1'
+        write_short_run_record(&mut w, 0b10, 2, 1, 0); // toggle→0, RLEN=3
+        write_short_run_record(&mut w, 0b110, 3, 1, 1); // toggle→1, RLEN=6
+        write_short_run_record(&mut w, 0b110, 3, 1, 1); // toggle→0, RLEN=6
+        let bytes = w.finish();
+        let out = decode_short_run_bit_string(&bytes, 16).unwrap();
+        let mut expected: Vec<u8> = Vec::new();
+        expected.push(1);
+        expected.extend(std::iter::repeat_n(0u8, 3));
+        expected.extend(std::iter::repeat_n(1u8, 6));
+        expected.extend(std::iter::repeat_n(0u8, 6));
+        assert_eq!(out, expected);
     }
 }

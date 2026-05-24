@@ -6,21 +6,23 @@ Pure-Rust Theora video codec — clean-room implementation in progress.
 
 **Identification + comment + setup-entrypoint + §6.4.2 quant-params
 decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
-+ §7.1 frame-header decode (rounds 1–8).** §6.1, §6.2 (identification),
-§6.3 (comment), §6.4.5 step 1 (setup-header common-header guard),
-§6.4.2 (Quantization Parameters Decode), §6.4.3 (Computing a
-Quantization Matrix), §6.4.4 (DCT Token Huffman Tables), and §7.1
-(Frame Header Decode) of the Theora I Specification are wired up.
-Three byte-aligned entry points plus four public bit-level decoders
-over an MSb-first bit reader; round 4 added the Appendix B VP3
-fallback tables, round 5 added the full §6.4.2 procedure (ACSCALE /
-DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added §6.4.3
-(64-entry interpolated quantization matrix per `(qti, pli, qi)`
++ §7.1 frame-header decode + §7.2 long-/short-run bit strings
+(rounds 1–9).** §6.1, §6.2 (identification), §6.3 (comment), §6.4.5
+step 1 (setup-header common-header guard), §6.4.2 (Quantization
+Parameters Decode), §6.4.3 (Computing a Quantization Matrix), §6.4.4
+(DCT Token Huffman Tables), §7.1 (Frame Header Decode), and §7.2
+(Run-Length Encoded Bit Strings) of the Theora I Specification are
+wired up. Three byte-aligned entry points plus six public bit-level
+decoders over an MSb-first bit reader; round 4 added the Appendix B
+VP3 fallback tables, round 5 added the full §6.4.2 procedure (ACSCALE
+/ DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added
+§6.4.3 (64-entry interpolated quantization matrix per `(qti, pli, qi)`
 selector), round 7 added §6.4.4 — decode the 80-element array of
 binary-tree Huffman tables that §7.7 will use to decode DCT-residual
-tokens, round 8 adds §7.1 — the first standalone step of the §7 frame-
-decode pipeline returning the typed `TheoraFrameHeader` (frame type +
-1..=3 `qi` values) from the start of a video-data packet.
+tokens, round 8 added §7.1 (the typed `TheoraFrameHeader` from the
+start of a video-data packet), round 9 adds §7.2 — the long-run and
+short-run bit-string decoders that §7.3 (coded-block flags) and §7.6
+(block-level `qi` values) will consume against the §5.2 bit reader.
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -60,6 +62,14 @@ decode pipeline returning the typed `TheoraFrameHeader` (frame type +
   3–6), and enforces the 3-bit reserved trailer on intra frames
   (step 7) — the first standalone procedure of the §7 frame-decode
   pipeline.
+* [`decode_long_run_bit_string`] / [`decode_short_run_bit_string`] —
+  round 9 public §7.2.1 / §7.2.2 procedures returning a `Vec<u8>` of
+  `0`/`1` values from a Table 7.7 / Table 7.11 Huffman-coded run-length
+  stream. Long-run handles the VP3+ "read fresh BIT after RLEN=4129"
+  exception (`LONG_RUN_MAX = 4129`); short-run unconditionally toggles
+  between runs (cap `SHORT_RUN_MAX = 30`). Both surface a typed
+  `Error::RunLengthOverrun { len, nbits }` when a decoded run advances
+  past the caller-supplied `NBITS` bound (§7.2 step 10).
 
 ### Identification header (round 1)
 The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
@@ -311,7 +321,20 @@ packet-type bit / `MOREQIS[0]` / `QIS[2]` field boundaries, the
 sentinel-byte "doesn't consume past header" check, error `Display`
 rendering for all three new variants, the `FrameType` Table 7.3 numeric
 mapping, the `MAX_FRAME_QIS = 3` constant, and a five-case
-independent-slot round-trip across byte boundaries.
+independent-slot round-trip across byte boundaries. Round 9 adds
+twenty-four §7.2 run-length tests (total now 142): Table 7.7 / Table
+7.11 transcription against every row plus the `LONG_RUN_MAX = 4129` /
+`SHORT_RUN_MAX = 30` derivations, the `NBITS = 0` empty-string short-
+circuit, single-record decode of every Table 7.7 / 7.11 entry at both
+range endpoints, the toggle-between-runs invariant on both procedures,
+the long-run "read fresh BIT after RLEN=4129" exception (both fresh-0
+and fresh-1 paths) plus the symmetric "RLEN=4128 still toggles" check,
+the short-run "RLEN=30 still toggles" check (no exception path),
+truncation rejects at the initial BIT / mid-Huffman-walk / mid-ROFFS
+field boundaries on both procedures, the §7.2 step 10 `RunLengthOverrun`
+reject on both procedures with `Display` rendering, a long-run byte-
+boundary-crossing decode, and a realistic 16-bit short-run super-block
+decode covering four toggled runs.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

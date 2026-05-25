@@ -31,7 +31,15 @@
 //! procedure as [`decode_frame_header`], returning a typed
 //! [`TheoraFrameHeader`] (frame type + `NQIS`-element `qi` list) from
 //! the first bits of any video-data packet — the first standalone step
-//! of the §7 frame-decode pipeline.
+//! of the §7 frame-decode pipeline. Round 9 lands the **§7.2.1 Long-Run
+//! Bit Strings** and **§7.2.2 Short-Run Bit Strings** decoders as
+//! [`decode_long_run_bit_string`] / [`decode_short_run_bit_string`].
+//! Round 10 lands the **§7.3 Coded Block Flags Decode** procedure as
+//! [`decode_coded_block_flags`], returning the per-block `BCODED` array
+//! by chaining one §7.2.1 long-run decode (partially-coded super-block
+//! map), one §7.2.1 long-run decode (fully-coded super-block map over
+//! the non-partially-coded subset), and one §7.2.2 short-run decode
+//! (per-block bits inside partially-coded super blocks).
 //!
 //! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
 //! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
@@ -64,6 +72,14 @@
 //!   ([`FrameType`] + 1..=3 `qi` values) from the start of a video-data
 //!   packet per §7.1, the first standalone step of the §7 frame-decode
 //!   pipeline.
+//! * [`decode_long_run_bit_string`] / [`decode_short_run_bit_string`]
+//!   return a `Vec<u8>` of `0`/`1` flag bits decoded from the §7.2.1
+//!   long-run / §7.2.2 short-run Huffman streams that §7.3 / §7.6
+//!   chain on top of the §5.2 bit reader.
+//! * [`decode_coded_block_flags`] returns the per-block `BCODED` flag
+//!   array per §7.3, consuming `SBPCODED` (§7.2.1) + `SBFCODED` (§7.2.1)
+//!   plus a per-block §7.2.2 short-run stream and walking the caller-
+//!   supplied block-to-super-block mapping.
 //!
 //! ## Clean-room provenance
 //!
@@ -298,6 +314,28 @@ pub enum Error {
         /// The caller-supplied bit-string length cap.
         nbits: u64,
     },
+    /// The `block_to_super_block` mapping passed to
+    /// [`decode_coded_block_flags`] has a different length than the
+    /// `nbs` argument. The §7.3 inter path needs to know which super
+    /// block contains each block; the two arguments must agree.
+    BlockSuperBlockMapLenMismatch {
+        /// `block_to_super_block.len()`.
+        map_len: usize,
+        /// The caller-supplied `nbs`.
+        nbs: usize,
+    },
+    /// An entry in the `block_to_super_block` mapping passed to
+    /// [`decode_coded_block_flags`] referenced a super-block index that
+    /// is `>= nsbs`. §7.3 step 2(i)i looks up `SBPCODED[sbi]` /
+    /// `SBFCODED[sbi]` so the index must be in range.
+    BlockSuperBlockIndexOutOfRange {
+        /// Zero-based block index where the bad mapping was found.
+        bi: usize,
+        /// The offending super-block index.
+        sbi: u32,
+        /// The caller-supplied `nsbs`.
+        nsbs: u32,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -441,6 +479,14 @@ impl core::fmt::Display for Error {
             Error::RunLengthOverrun { len, nbits } => write!(
                 f,
                 "oxideav-theora: §7.2 run-length decode overran the bit-string cap: LEN={len} > NBITS={nbits} (undecodable)"
+            ),
+            Error::BlockSuperBlockMapLenMismatch { map_len, nbs } => write!(
+                f,
+                "oxideav-theora: §7.3 block-to-super-block map length {map_len} != nbs {nbs}"
+            ),
+            Error::BlockSuperBlockIndexOutOfRange { bi, sbi, nsbs } => write!(
+                f,
+                "oxideav-theora: §7.3 block-to-super-block map: block {bi} → sbi {sbi} >= nsbs {nsbs}"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -2248,6 +2294,153 @@ fn recognise_short_run_code(r: &mut BitReader<'_>) -> Result<ShortRunEntry, Erro
             "short-run table mis-transcribed: walked past 5 bits"
         );
     }
+}
+
+// =====================================================================
+// §7.3 Coded Block Flags Decode
+// =====================================================================
+
+/// Decode the `BCODED` per-block coded-flags array per §7.3 of the Xiph
+/// Theora I Specification ("Coded Block Flags Decode").
+///
+/// Given a frame's type, super-block count `NSBS`, and the per-block
+/// mapping `block_to_super_block` (length `NBS`, each entry a super-block
+/// index in `0..nsbs`), returns an `NBS`-element `Vec<u8>` of `0`/`1`
+/// flags marking each block coded or not coded.
+///
+/// For an intra frame (§7.3 step 1) every flag is set to `1` and `packet`
+/// is not consumed. For an inter frame (§7.3 step 2) the procedure:
+///
+/// 1. Decodes a length-`NSBS` `SBPCODED` (partially-coded-super-block)
+///    bit string via [`decode_long_run_bit_string`] (step 2(b)–(c)).
+/// 2. Decodes a length-`(number of zero-valued SBPCODED entries)`
+///    `SBFCODED` (fully-coded-super-block) bit string via
+///    [`decode_long_run_bit_string`] (step 2(d)–(f)).
+/// 3. Decodes a length-`(total block count across SBPCODED==1 super
+///    blocks)` per-block bit string via [`decode_short_run_bit_string`]
+///    (step 2(g)–(h)).
+/// 4. For each block in coded order (step 2(i)), assigns
+///    `BCODED[bi] = SBFCODED[sbi]` when `SBPCODED[sbi]` is `0`, or
+///    consumes the next per-block bit from the §7.2.2 string when
+///    `SBPCODED[sbi]` is `1`.
+///
+/// The block-to-super-block mapping is supplied by the caller because
+/// computing it requires the §2 super-block scan order, which a
+/// later round will land alongside §7.4 / §7.6.
+///
+/// `packet` is the full frame-data packet payload (or any slice
+/// positioned at the byte-aligned start of the §7.3 bit stream). The
+/// `packet` byte-aligned variant is provided for unit-test convenience;
+/// an end-to-end decoder will call [`decode_coded_block_flags_inner`]
+/// on a [`BitReader`] already positioned past the §7.1 / §7.2 prefix.
+///
+/// Returns:
+///
+/// * [`Error::BlockSuperBlockMapLenMismatch`] if
+///   `block_to_super_block.len() != nbs`.
+/// * [`Error::BlockSuperBlockIndexOutOfRange`] if any entry in
+///   `block_to_super_block` is `>= nsbs`.
+/// * [`Error::TruncatedHeader`] / [`Error::RunLengthOverrun`] when the
+///   underlying §7.2 long- or short-run decode rejects.
+pub fn decode_coded_block_flags(
+    packet: &[u8],
+    ftype: FrameType,
+    nsbs: u32,
+    nbs: u32,
+    block_to_super_block: &[u32],
+) -> Result<Vec<u8>, Error> {
+    let mut r = BitReader::new(packet);
+    decode_coded_block_flags_inner(&mut r, ftype, nsbs, nbs, block_to_super_block)
+}
+
+/// Inner §7.3 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so an end-to-end frame decoder can chain
+/// §7.1 → §7.2 → §7.3 on the same reader without re-aligning to a byte
+/// boundary.
+pub(crate) fn decode_coded_block_flags_inner(
+    r: &mut BitReader<'_>,
+    ftype: FrameType,
+    nsbs: u32,
+    nbs: u32,
+    block_to_super_block: &[u32],
+) -> Result<Vec<u8>, Error> {
+    // Argument sanity checks. §7.3 step 2(i)i looks up
+    // SBPCODED[sbi] / SBFCODED[sbi], so the caller-supplied mapping
+    // must match NBS in length and reference only legal sbi values.
+    let nbs_us = nbs as usize;
+    if block_to_super_block.len() != nbs_us {
+        return Err(Error::BlockSuperBlockMapLenMismatch {
+            map_len: block_to_super_block.len(),
+            nbs: nbs_us,
+        });
+    }
+    for (bi, &sbi) in block_to_super_block.iter().enumerate() {
+        if sbi >= nsbs {
+            return Err(Error::BlockSuperBlockIndexOutOfRange { bi, sbi, nsbs });
+        }
+    }
+
+    // Step 1: intra frames are trivial — every block is coded.
+    if ftype == FrameType::Intra {
+        return Ok(vec![1u8; nbs_us]);
+    }
+
+    // Step 2(a)–(c): decode SBPCODED (one bit per super block).
+    let sbpcoded = decode_long_run_bit_string_inner(r, nsbs as u64)?;
+    debug_assert_eq!(sbpcoded.len(), nsbs as usize);
+
+    // Step 2(d): NBITS = count of super blocks with SBPCODED[sbi] == 0.
+    let nbits_fcoded: u64 = sbpcoded.iter().filter(|&&b| b == 0).count() as u64;
+
+    // Step 2(e)–(f): decode SBFCODED, one bit per non-partially-coded
+    // super block. The decoded bit string is consumed in sbi order,
+    // skipping super blocks whose SBPCODED entry was 1.
+    let sbfcoded_stream = decode_long_run_bit_string_inner(r, nbits_fcoded)?;
+    debug_assert_eq!(sbfcoded_stream.len(), nbits_fcoded as usize);
+    let mut sbfcoded: Vec<u8> = vec![0u8; nsbs as usize];
+    let mut cursor: usize = 0;
+    for (sbi, &spc) in sbpcoded.iter().enumerate() {
+        if spc == 0 {
+            sbfcoded[sbi] = sbfcoded_stream[cursor];
+            cursor += 1;
+        }
+    }
+    debug_assert_eq!(cursor as u64, nbits_fcoded);
+
+    // Step 2(g): count blocks belonging to super blocks where
+    // SBPCODED[sbi] == 1. This is a tally over the
+    // block_to_super_block mapping, NOT 16 × (partially-coded count) —
+    // edge super blocks can carry fewer than 16 blocks.
+    let nbits_blocks: u64 = block_to_super_block
+        .iter()
+        .filter(|&&sbi| sbpcoded[sbi as usize] == 1)
+        .count() as u64;
+
+    // Step 2(h): decode the per-block bit string for partially-coded
+    // super blocks via the §7.2.2 short-run procedure.
+    let block_stream = decode_short_run_bit_string_inner(r, nbits_blocks)?;
+    debug_assert_eq!(block_stream.len(), nbits_blocks as usize);
+
+    // Step 2(i): walk the blocks in coded order. Blocks inside fully /
+    // not-coded super blocks inherit SBFCODED[sbi]; blocks inside
+    // partially-coded super blocks consume one bit from the §7.2.2
+    // string.
+    let mut bcoded: Vec<u8> = Vec::with_capacity(nbs_us);
+    let mut block_cursor: usize = 0;
+    for &sbi in block_to_super_block.iter() {
+        let sbi_us = sbi as usize;
+        if sbpcoded[sbi_us] == 0 {
+            // Step 2(i)ii.
+            bcoded.push(sbfcoded[sbi_us]);
+        } else {
+            // Step 2(i)iii.
+            bcoded.push(block_stream[block_cursor]);
+            block_cursor += 1;
+        }
+    }
+    debug_assert_eq!(block_cursor as u64, nbits_blocks);
+    debug_assert_eq!(bcoded.len(), nbs_us);
+    Ok(bcoded)
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -5480,6 +5673,415 @@ mod tests {
         expected.extend(std::iter::repeat_n(0u8, 3));
         expected.extend(std::iter::repeat_n(1u8, 6));
         expected.extend(std::iter::repeat_n(0u8, 6));
+        assert_eq!(out, expected);
+    }
+
+    // -------------------------------------------------------------
+    // §7.3 Coded Block Flags Decode tests
+    // -------------------------------------------------------------
+
+    /// Build a Theora-§7.2.1 long-run bit string encoding `bits` (a
+    /// sequence of `0`/`1` values), starting with the supplied initial
+    /// `BIT` value and toggling between runs (no 4129-exception path is
+    /// exercised here — this helper is for short test inputs).
+    ///
+    /// Used by the §7.3 tests to synthesize the partially-coded /
+    /// fully-coded super-block bit strings. The encoding is the
+    /// inverse of `decode_long_run_bit_string` and so a round-trip
+    /// `decode(encode(bits)) == bits` holds.
+    fn encode_long_run_runs(w: &mut BitWriter, bits: &[u8]) {
+        if bits.is_empty() {
+            return;
+        }
+        // Initial BIT.
+        let mut bit = bits[0];
+        w.put(bit as u32, 1);
+        let mut i = 0;
+        while i < bits.len() {
+            // Compute the length of the current run (all `bit`).
+            let mut run = 0usize;
+            while i + run < bits.len() && bits[i + run] == bit {
+                run += 1;
+            }
+            // Select the largest Table 7.7 entry whose RSTART <= run and
+            // run < RSTART + (1 << RBITS). Walk the table top down so
+            // we pick the entry with the highest RSTART that still
+            // covers `run`.
+            let mut chosen: Option<&LongRunEntry> = None;
+            for entry in LONG_RUN_TABLE.iter().rev() {
+                let rs = entry.rstart as usize;
+                let cap = rs + (1usize << entry.rbits) - 1;
+                if run >= rs && run <= cap {
+                    chosen = Some(entry);
+                    break;
+                }
+            }
+            let entry = chosen.expect("run length within Table 7.7 range");
+            let roffs = (run - entry.rstart as usize) as u32;
+            w.put(entry.code, entry.code_len as u32);
+            if entry.rbits > 0 {
+                w.put(roffs, entry.rbits as u32);
+            }
+            i += run;
+            if i < bits.len() {
+                // Toggle (the test helper never exercises the 4129 path).
+                bit = 1 - bit;
+            }
+        }
+    }
+
+    /// Same as `encode_long_run_runs` but against Table 7.11 for the
+    /// §7.2.2 short-run procedure (used by §7.3 step 2(h) per-block
+    /// bit string).
+    fn encode_short_run_runs(w: &mut BitWriter, bits: &[u8]) {
+        if bits.is_empty() {
+            return;
+        }
+        let mut bit = bits[0];
+        w.put(bit as u32, 1);
+        let mut i = 0;
+        while i < bits.len() {
+            let mut run = 0usize;
+            while i + run < bits.len() && bits[i + run] == bit {
+                run += 1;
+            }
+            let mut chosen: Option<&ShortRunEntry> = None;
+            for entry in SHORT_RUN_TABLE.iter().rev() {
+                let rs = entry.rstart as usize;
+                let cap = rs + (1usize << entry.rbits) - 1;
+                if run >= rs && run <= cap {
+                    chosen = Some(entry);
+                    break;
+                }
+            }
+            let entry = chosen.expect("run length within Table 7.11 range");
+            let roffs = (run - entry.rstart as usize) as u32;
+            w.put(entry.code, entry.code_len as u32);
+            if entry.rbits > 0 {
+                w.put(roffs, entry.rbits as u32);
+            }
+            i += run;
+            if i < bits.len() {
+                bit = 1 - bit;
+            }
+        }
+    }
+
+    /// Encoder round-trip sanity: decoding what the long-run helper
+    /// emits returns the original bits.
+    #[test]
+    fn coded_block_flags_long_run_encoder_roundtrip() {
+        let cases: &[&[u8]] = &[
+            &[1u8; 1],
+            &[0u8; 1],
+            &[1, 0, 1, 0, 1, 0, 1],
+            &[0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0],
+            &[1; 18],
+            &[0; 34],
+        ];
+        for case in cases {
+            let mut w = BitWriter::new();
+            encode_long_run_runs(&mut w, case);
+            let bytes = w.finish();
+            let out = decode_long_run_bit_string(&bytes, case.len() as u64).unwrap();
+            assert_eq!(out.as_slice(), *case, "long-run roundtrip case {case:?}");
+        }
+    }
+
+    /// Encoder round-trip sanity for the short-run helper.
+    #[test]
+    fn coded_block_flags_short_run_encoder_roundtrip() {
+        let cases: &[&[u8]] = &[
+            &[1u8; 1],
+            &[0u8; 1],
+            &[1, 0, 1, 0, 1, 0, 1, 0],
+            &[0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1],
+            &[1; 16],
+            &[0; 30],
+        ];
+        for case in cases {
+            let mut w = BitWriter::new();
+            encode_short_run_runs(&mut w, case);
+            let bytes = w.finish();
+            let out = decode_short_run_bit_string(&bytes, case.len() as u64).unwrap();
+            assert_eq!(out.as_slice(), *case, "short-run roundtrip case {case:?}");
+        }
+    }
+
+    #[test]
+    fn coded_block_flags_intra_marks_all_coded() {
+        // §7.3 step 1: every block coded; packet is not consumed.
+        // Mapping is irrelevant for the intra path beyond length checks.
+        let nbs = 24u32;
+        let nsbs = 3u32;
+        // Trivial mapping: 8 blocks per super block, 3 super blocks.
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let out = decode_coded_block_flags(&[], FrameType::Intra, nsbs, nbs, &map).unwrap();
+        assert_eq!(out, vec![1u8; nbs as usize]);
+    }
+
+    #[test]
+    fn coded_block_flags_intra_rejects_bad_map_length() {
+        // §7.3 input-validation: mapping length must equal NBS.
+        let nbs = 24u32;
+        let nsbs = 3u32;
+        let bad_map: Vec<u32> = vec![0; (nbs - 1) as usize];
+        let err = decode_coded_block_flags(&[], FrameType::Intra, nsbs, nbs, &bad_map).unwrap_err();
+        assert_eq!(
+            err,
+            Error::BlockSuperBlockMapLenMismatch {
+                map_len: 23,
+                nbs: 24
+            }
+        );
+    }
+
+    #[test]
+    fn coded_block_flags_inter_rejects_oob_super_block_index() {
+        // §7.3 input-validation: every map entry must be < NSBS.
+        let nbs = 4u32;
+        let nsbs = 2u32;
+        let map: Vec<u32> = vec![0, 1, 2, 0]; // block 2 → sbi 2 ≥ nsbs=2.
+        let err = decode_coded_block_flags(&[], FrameType::Inter, nsbs, nbs, &map).unwrap_err();
+        assert_eq!(
+            err,
+            Error::BlockSuperBlockIndexOutOfRange {
+                bi: 2,
+                sbi: 2,
+                nsbs: 2
+            }
+        );
+    }
+
+    #[test]
+    fn coded_block_flags_inter_all_super_blocks_not_coded() {
+        // §7.3 step 2: every super block has SBPCODED=0 (not partially
+        // coded), and every SBFCODED bit is 0 → every block is 0.
+        // 3 super blocks, 8 blocks per super block → NBS=24.
+        let nsbs = 3u32;
+        let nbs = 24u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mut w = BitWriter::new();
+        // SBPCODED bits = [0, 0, 0] (3-bit run-length stream).
+        encode_long_run_runs(&mut w, &[0, 0, 0]);
+        // SBFCODED bits = [0, 0, 0] (NBITS=3, since every SBPCODED is 0).
+        encode_long_run_runs(&mut w, &[0, 0, 0]);
+        // No per-block bit string (no partially-coded super blocks).
+        let bytes = w.finish();
+        let out = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
+        assert_eq!(out, vec![0u8; 24]);
+    }
+
+    #[test]
+    fn coded_block_flags_inter_all_super_blocks_fully_coded() {
+        // Every super block fully coded → SBPCODED=0, SBFCODED=1; no
+        // per-block stream needed.
+        let nsbs = 2u32;
+        let nbs = 16u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mut w = BitWriter::new();
+        encode_long_run_runs(&mut w, &[0, 0]);
+        encode_long_run_runs(&mut w, &[1, 1]);
+        let bytes = w.finish();
+        let out = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
+        assert_eq!(out, vec![1u8; 16]);
+    }
+
+    #[test]
+    fn coded_block_flags_inter_mixed_super_block_states() {
+        // SBPCODED = [1, 0, 0]   (sb 0 partially coded; sb 1, 2 not).
+        // SBFCODED for non-partial sb1=1, sb2=0 → ['1','0'].
+        // sb0 has 4 blocks (NBITS=4 for the §7.2.2 per-block stream).
+        // Per-block bits inside sb0 = [1, 0, 1, 0].
+        // Mapping: 4 blocks per super block → NBS=12.
+        // Expected BCODED:
+        //  bi 0..3 (sb0, partial) → [1, 0, 1, 0]
+        //  bi 4..7 (sb1, SBFCODED=1) → [1, 1, 1, 1]
+        //  bi 8..11 (sb2, SBFCODED=0) → [0, 0, 0, 0]
+        let nsbs = 3u32;
+        let nbs = 12u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 4).collect();
+        let mut w = BitWriter::new();
+        encode_long_run_runs(&mut w, &[1, 0, 0]);
+        encode_long_run_runs(&mut w, &[1, 0]);
+        encode_short_run_runs(&mut w, &[1, 0, 1, 0]);
+        let bytes = w.finish();
+        let out = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
+        let expected: Vec<u8> = vec![1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn coded_block_flags_inter_partial_edge_super_block_has_fewer_than_16_blocks() {
+        // §7.3 step 2(g) note: super blocks at frame edge can have fewer
+        // than 16 blocks. Synthesize NSBS=2 with sb0=16 blocks, sb1=5
+        // blocks (an edge super block). Both partially coded.
+        // NBITS for the short-run stream = 16 + 5 = 21 (not 32).
+        let nsbs = 2u32;
+        let nbs = 21u32;
+        let mut map: Vec<u32> = Vec::with_capacity(21);
+        map.resize(16, 0u32);
+        map.resize(16 + 5, 1u32);
+        // Per-block bits: alternating then trailing 1s.
+        let blocks: Vec<u8> = vec![
+            1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, // sb0 (16 blocks)
+            1, 1, 1, 1, 1, // sb1 (5 blocks)
+        ];
+        let mut w = BitWriter::new();
+        encode_long_run_runs(&mut w, &[1, 1]); // SBPCODED = [1, 1].
+                                               // SBFCODED stream is empty (no SBPCODED==0 entries) so encode
+                                               // nothing.
+        encode_short_run_runs(&mut w, &blocks);
+        let bytes = w.finish();
+        let out = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
+        assert_eq!(out, blocks);
+    }
+
+    #[test]
+    fn coded_block_flags_inter_empty_no_super_blocks() {
+        // Edge case: NSBS = 0 and NBS = 0. Every long-run / short-run
+        // decode is a no-op, BCODED is empty.
+        let out = decode_coded_block_flags(&[], FrameType::Inter, 0, 0, &[]).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn coded_block_flags_inter_truncated_in_sbpcoded() {
+        // Force §7.2.1 truncation while decoding the first SBPCODED
+        // long-run. Provide a packet with too few bits.
+        let nsbs = 16u32; // need at least 16 SBPCODED bits worth of run-length records
+        let nbs = 16u32;
+        let map: Vec<u32> = (0..nbs).collect();
+        let bytes = [0x00u8]; // 1 byte only: initial BIT=0 + code=0 (RLEN=1) repeats - far short of 16.
+        let err = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap_err();
+        match err {
+            Error::TruncatedHeader { .. } => (),
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coded_block_flags_error_display_map_length() {
+        // Display arm coverage for the new error variant.
+        let e = Error::BlockSuperBlockMapLenMismatch { map_len: 5, nbs: 7 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.3"), "got: {s}");
+        assert!(s.contains("map length 5"), "got: {s}");
+        assert!(s.contains("nbs 7"), "got: {s}");
+    }
+
+    #[test]
+    fn coded_block_flags_error_display_oob_index() {
+        let e = Error::BlockSuperBlockIndexOutOfRange {
+            bi: 4,
+            sbi: 10,
+            nsbs: 7,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.3"), "got: {s}");
+        assert!(s.contains("block 4"), "got: {s}");
+        assert!(s.contains("sbi 10"), "got: {s}");
+        assert!(s.contains("nsbs 7"), "got: {s}");
+    }
+
+    #[test]
+    fn coded_block_flags_inter_intra_arms_independent() {
+        // Intra arm completely ignores the packet; inter arm against
+        // the same map produces a different result given a valid §7.3
+        // payload. Demonstrates the two FTYPE paths take disjoint
+        // routes.
+        let nsbs = 2u32;
+        let nbs = 16u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let intra = decode_coded_block_flags(&[], FrameType::Intra, nsbs, nbs, &map).unwrap();
+        assert_eq!(intra, vec![1u8; 16]);
+
+        let mut w = BitWriter::new();
+        encode_long_run_runs(&mut w, &[0, 0]);
+        encode_long_run_runs(&mut w, &[0, 0]);
+        let bytes = w.finish();
+        let inter = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
+        assert_eq!(inter, vec![0u8; 16]);
+        assert_ne!(intra, inter);
+    }
+
+    #[test]
+    fn coded_block_flags_inter_inner_chains_on_shared_reader() {
+        // Confirm the crate-private `decode_coded_block_flags_inner`
+        // can be driven from a BitReader that is already partly
+        // consumed — the chaining pattern an end-to-end frame decoder
+        // will use to walk §7.1 → §7.2 → §7.3 on a single reader.
+        let nsbs = 2u32;
+        let nbs = 16u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mut w = BitWriter::new();
+        // Prefix: 4 unrelated bits to be skipped on the shared reader.
+        w.put(0b1010, 4);
+        encode_long_run_runs(&mut w, &[0, 0]);
+        encode_long_run_runs(&mut w, &[1, 0]);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        // Consume the 4-bit prefix the way §7.1 would consume the frame
+        // header.
+        let prefix = r.read_bits(4, "test.prefix").unwrap();
+        assert_eq!(prefix, 0b1010);
+        let out =
+            decode_coded_block_flags_inner(&mut r, FrameType::Inter, nsbs, nbs, &map).unwrap();
+        // Expected: sb0 fully coded → [1; 8]; sb1 not coded → [0; 8].
+        let mut expected = vec![1u8; 8];
+        expected.extend(std::iter::repeat_n(0u8, 8));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn coded_block_flags_inter_partial_with_uncoded_block_subset() {
+        // Single super block, partially coded. Per-block bits
+        // [1, 0, 0, 1, 1, 0, 1, 0] (8 blocks). Verifies the §7.2.2
+        // per-block stream is consumed in coded-order one bit at a
+        // time.
+        let nsbs = 1u32;
+        let nbs = 8u32;
+        let map: Vec<u32> = vec![0u32; nbs as usize];
+        let blocks: Vec<u8> = vec![1, 0, 0, 1, 1, 0, 1, 0];
+        let mut w = BitWriter::new();
+        encode_long_run_runs(&mut w, &[1]); // SBPCODED = [1].
+                                            // SBFCODED stream is empty.
+        encode_short_run_runs(&mut w, &blocks);
+        let bytes = w.finish();
+        let out = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
+        assert_eq!(out, blocks);
+    }
+
+    #[test]
+    fn coded_block_flags_inter_non_coded_order_mapping() {
+        // §7.3 step 2(i)i: "the index of the super block containing
+        // block bi". Map need not be monotone in bi (in real Theora,
+        // the §2.4 super-block scan interleaves blocks from different
+        // super blocks). Exercise an interleaved mapping to ensure
+        // the procedure walks the map literally rather than assuming
+        // contiguous super-block runs.
+        let nsbs = 2u32;
+        let nbs = 8u32;
+        // Interleave: block 0 → sb0, block 1 → sb1, block 2 → sb0, …
+        let map: Vec<u32> = (0..nbs).map(|bi| bi % 2).collect();
+        let mut w = BitWriter::new();
+        // SBPCODED = [1, 0]   (sb0 partial; sb1 not).
+        encode_long_run_runs(&mut w, &[1, 0]);
+        // SBFCODED for the single non-partial sb1 = [1].
+        encode_long_run_runs(&mut w, &[1]);
+        // Per-block bits for sb0 (4 blocks: bi 0, 2, 4, 6) = [0, 1, 0, 1].
+        encode_short_run_runs(&mut w, &[0, 1, 0, 1]);
+        let bytes = w.finish();
+        let out = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
+        // Expected: bi 0 (sb0, partial) → 0
+        //           bi 1 (sb1, SBFCODED=1) → 1
+        //           bi 2 (sb0, partial) → 1
+        //           bi 3 (sb1, SBFCODED=1) → 1
+        //           bi 4 (sb0, partial) → 0
+        //           bi 5 (sb1, SBFCODED=1) → 1
+        //           bi 6 (sb0, partial) → 1
+        //           bi 7 (sb1, SBFCODED=1) → 1
+        let expected = vec![0, 1, 1, 1, 0, 1, 1, 1];
         assert_eq!(out, expected);
     }
 }

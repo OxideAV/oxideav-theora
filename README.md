@@ -6,23 +6,29 @@ Pure-Rust Theora video codec — clean-room implementation in progress.
 
 **Identification + comment + setup-entrypoint + §6.4.2 quant-params
 decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
-+ §7.1 frame-header decode + §7.2 long-/short-run bit strings
-(rounds 1–9).** §6.1, §6.2 (identification), §6.3 (comment), §6.4.5
-step 1 (setup-header common-header guard), §6.4.2 (Quantization
-Parameters Decode), §6.4.3 (Computing a Quantization Matrix), §6.4.4
-(DCT Token Huffman Tables), §7.1 (Frame Header Decode), and §7.2
-(Run-Length Encoded Bit Strings) of the Theora I Specification are
-wired up. Three byte-aligned entry points plus six public bit-level
-decoders over an MSb-first bit reader; round 4 added the Appendix B
-VP3 fallback tables, round 5 added the full §6.4.2 procedure (ACSCALE
-/ DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added
-§6.4.3 (64-entry interpolated quantization matrix per `(qti, pli, qi)`
-selector), round 7 added §6.4.4 — decode the 80-element array of
-binary-tree Huffman tables that §7.7 will use to decode DCT-residual
-tokens, round 8 added §7.1 (the typed `TheoraFrameHeader` from the
-start of a video-data packet), round 9 adds §7.2 — the long-run and
-short-run bit-string decoders that §7.3 (coded-block flags) and §7.6
-(block-level `qi` values) will consume against the §5.2 bit reader.
++ §7.1 frame-header decode + §7.2 long-/short-run bit strings + §7.3
+coded-block-flags decode (rounds 1–10).** §6.1, §6.2 (identification),
+§6.3 (comment), §6.4.5 step 1 (setup-header common-header guard),
+§6.4.2 (Quantization Parameters Decode), §6.4.3 (Computing a
+Quantization Matrix), §6.4.4 (DCT Token Huffman Tables), §7.1 (Frame
+Header Decode), §7.2 (Run-Length Encoded Bit Strings), and §7.3
+(Coded Block Flags Decode) of the Theora I Specification are wired up.
+Three byte-aligned entry points plus seven public bit-level decoders
+over an MSb-first bit reader; round 4 added the Appendix B VP3 fallback
+tables, round 5 added the full §6.4.2 procedure (ACSCALE / DCSCALE /
+NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added §6.4.3 (64-entry
+interpolated quantization matrix per `(qti, pli, qi)` selector), round
+7 added §6.4.4 — decode the 80-element array of binary-tree Huffman
+tables that §7.7 will use to decode DCT-residual tokens, round 8 added
+§7.1 (the typed `TheoraFrameHeader` from the start of a video-data
+packet), round 9 added §7.2 — the long-run and short-run bit-string
+decoders that §7.3 (coded-block flags) and §7.6 (block-level `qi`
+values) consume against the §5.2 bit reader, round 10 adds §7.3 — the
+per-block `BCODED` array decoder that chains a partially-coded
+super-block §7.2.1 long-run map, a fully-coded super-block §7.2.1
+long-run map (over the non-partially-coded subset), and a per-block
+§7.2.2 short-run stream against a caller-supplied block-to-super-block
+mapping.
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -70,6 +76,21 @@ short-run bit-string decoders that §7.3 (coded-block flags) and §7.6
   between runs (cap `SHORT_RUN_MAX = 30`). Both surface a typed
   `Error::RunLengthOverrun { len, nbits }` when a decoded run advances
   past the caller-supplied `NBITS` bound (§7.2 step 10).
+* [`decode_coded_block_flags`] — round 10 public §7.3 procedure
+  returning an `NBS`-element `Vec<u8>` of `0`/`1` `BCODED` flags
+  marking which blocks are coded. Intra frames short-circuit step 1
+  (every block coded; packet not consumed); inter frames execute the
+  §7.3 step 2 chain: one §7.2.1 long-run pass for `SBPCODED`
+  (`NBITS = NSBS`), one §7.2.1 long-run pass for `SBFCODED`
+  (`NBITS = #{sbi: SBPCODED[sbi]=0}`), then one §7.2.2 short-run pass
+  for the per-block bits inside partially-coded super blocks
+  (`NBITS = sum of block counts where SBPCODED[sbi]=1`, edge super
+  blocks contribute < 16 blocks). Caller supplies
+  `block_to_super_block: &[u32]` of length `NBS`; two new typed errors
+  (`BlockSuperBlockMapLenMismatch`, `BlockSuperBlockIndexOutOfRange`)
+  reject malformed mappings. The shared-reader chaining contract is
+  preserved via a crate-private `decode_coded_block_flags_inner` that
+  drives an already-positioned `BitReader`.
 
 ### Identification header (round 1)
 The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
@@ -322,7 +343,7 @@ sentinel-byte "doesn't consume past header" check, error `Display`
 rendering for all three new variants, the `FrameType` Table 7.3 numeric
 mapping, the `MAX_FRAME_QIS = 3` constant, and a five-case
 independent-slot round-trip across byte boundaries. Round 9 adds
-twenty-four §7.2 run-length tests (total now 142): Table 7.7 / Table
+twenty-four §7.2 run-length tests (total then 142): Table 7.7 / Table
 7.11 transcription against every row plus the `LONG_RUN_MAX = 4129` /
 `SHORT_RUN_MAX = 30` derivations, the `NBITS = 0` empty-string short-
 circuit, single-record decode of every Table 7.7 / 7.11 entry at both
@@ -334,7 +355,20 @@ truncation rejects at the initial BIT / mid-Huffman-walk / mid-ROFFS
 field boundaries on both procedures, the §7.2 step 10 `RunLengthOverrun`
 reject on both procedures with `Display` rendering, a long-run byte-
 boundary-crossing decode, and a realistic 16-bit short-run super-block
-decode covering four toggled runs.
+decode covering four toggled runs. Round 10 adds seventeen §7.3
+coded-block-flags tests (total now 159): long-run / short-run encoder
+round-trip helpers (sanity-checking the test fixtures), intra short-
+circuit (every block coded; packet not consumed), the two input-
+validation rejects (`BlockSuperBlockMapLenMismatch`,
+`BlockSuperBlockIndexOutOfRange`) with `Display` rendering, inter all-
+super-blocks-not-coded, inter all-super-blocks-fully-coded, inter
+mixed-super-block-states with both `SBFCODED` and per-block paths
+exercised, the edge-super-block-with-fewer-than-16-blocks tally check
+(§7.3 step 2(g) note), the empty NSBS=0 short-circuit, mid-`SBPCODED`
+truncation rejection, intra-vs-inter arm independence, the shared-
+`BitReader` chaining contract via `decode_coded_block_flags_inner`,
+a single-partially-coded-super-block uncoded-block-subset case, and
+an interleaved (non-monotone) `block_to_super_block` mapping case.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

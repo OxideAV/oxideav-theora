@@ -6,6 +6,69 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§7.3 Coded Block Flags Decode (2026-05-25, round 10).**
+  New public `decode_coded_block_flags(packet: &[u8], ftype: FrameType,
+  nsbs: u32, nbs: u32, block_to_super_block: &[u32]) ->
+  Result<Vec<u8>, Error>` transcribing the full §7.3 procedure of the
+  Xiph Theora I Specification ("Coded Block Flags Decode"). Returns the
+  per-block `BCODED` array of `0`/`1` flags marking which blocks are
+  coded.
+
+  Intra frames short-circuit step 1: every block is marked coded and
+  the packet payload is not consumed. Inter frames execute the step 2
+  chain on the §5.2 MSb-first `BitReader`:
+
+  * Step 2(a)–(c): decode `SBPCODED` (length `NSBS`) via the §7.2.1
+    long-run procedure — bits flag which super blocks are partially
+    coded.
+  * Step 2(d)–(f): decode `SBFCODED` via the §7.2.1 long-run procedure
+    over the non-partially-coded subset (`NBITS = #{sbi:
+    SBPCODED[sbi]=0}`), then distribute the bits into the
+    `SBFCODED[sbi]` slots whose `SBPCODED[sbi]` is zero.
+  * Step 2(g)–(h): tally the `block_to_super_block` mapping for blocks
+    inside partially-coded super blocks (edge super blocks contribute
+    fewer than 16 blocks, per the spec's own note) and decode the
+    resulting `NBITS`-bit string via the §7.2.2 short-run procedure.
+  * Step 2(i): for each block in coded order, inherit `BCODED[bi] =
+    SBFCODED[sbi]` when `SBPCODED[sbi]=0`, or consume the next bit from
+    the step 2(h) string when `SBPCODED[sbi]=1`.
+
+  Two new `Error` variants reject malformed inputs:
+  `BlockSuperBlockMapLenMismatch { map_len, nbs }` when the supplied
+  mapping length disagrees with `nbs`, and
+  `BlockSuperBlockIndexOutOfRange { bi, sbi, nsbs }` when the mapping
+  references a super-block index `>= nsbs`. Both carry `Display` arms
+  citing §7.3 for diagnostics.
+
+  The procedure is split into `decode_coded_block_flags` (byte-aligned
+  entry point) plus `decode_coded_block_flags_inner(&mut BitReader<'_>,
+  …)` (crate-private) so a future end-to-end frame decoder can chain
+  §7.1 → §7.2 → §7.3 on a shared reader without re-aligning to a byte
+  boundary.
+
+  17 new tests bring the total from 142 to 159: long-run / short-run
+  encoder round-trip helpers (sanity-checking the test fixtures), intra
+  short-circuit (every block coded; packet not consumed), the two input-
+  validation rejects (`BlockSuperBlockMapLenMismatch`,
+  `BlockSuperBlockIndexOutOfRange`) with `Display` rendering, inter
+  all-super-blocks-not-coded, inter all-super-blocks-fully-coded, inter
+  mixed-super-block-states with both `SBFCODED` and per-block paths
+  exercised, the edge-super-block-with-fewer-than-16-blocks tally check
+  (§7.3 step 2(g) note), the empty `NSBS = 0` short-circuit, mid-
+  `SBPCODED` truncation rejection, intra-vs-inter arm independence, the
+  shared-`BitReader` chaining contract via
+  `decode_coded_block_flags_inner`, a single-partially-coded-super-block
+  uncoded-block-subset case, and an interleaved (non-monotone)
+  `block_to_super_block` mapping case.
+
+  §7.3 is unblocked by the still-open §6.4.1 spec gap (docs-gap #944):
+  §7.3 operates on a video-data packet's own payload and does not
+  consume the setup-header body. The block-to-super-block mapping is
+  taken as a caller-supplied argument because computing it requires the
+  §2 super-block scan order; a later round will land the scan-order
+  helper alongside §7.4 (Macro Block Coding Modes) and §7.6 (Block-
+  Level `qi` Decode).
+
 * **§7.2 Long-/Short-Run Bit Strings Decode (2026-05-25, round 9).**
   New public `decode_long_run_bit_string(bits: &[u8], nbits: u64) ->
   Result<Vec<u8>, Error>` and `decode_short_run_bit_string(bits: &[u8],

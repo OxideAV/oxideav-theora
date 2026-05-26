@@ -39,7 +39,14 @@
 //! by chaining one §7.2.1 long-run decode (partially-coded super-block
 //! map), one §7.2.1 long-run decode (fully-coded super-block map over
 //! the non-partially-coded subset), and one §7.2.2 short-run decode
-//! (per-block bits inside partially-coded super blocks).
+//! (per-block bits inside partially-coded super blocks). Round 12
+//! lands the **§7.5 Motion Vectors** procedures as
+//! [`decode_single_motion_vector`] (§7.5.1 — MVMODE=0 Table 7.23
+//! Huffman or MVMODE=1 5+1-bit fixed-length) and
+//! [`decode_macroblock_motion_vectors`] (§7.5.2 — per-macroblock MV
+//! decode driven by `MBMODES`, with `LAST1`/`LAST2` tracking, four-MV
+//! INTER_MV_FOUR mode, and PF=0/2/4 chroma averaging via the spec's
+//! `round()` ties-away-from-zero).
 //!
 //! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
 //! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
@@ -367,6 +374,83 @@ pub enum Error {
     /// can only happen if `BitReader::read_bits` returned an unexpected
     /// value, but the variant is kept defensive.
     UnknownMacroBlockModeCode,
+    /// The `mbmodes` slice passed to [`decode_macroblock_motion_vectors`]
+    /// has a different length than the `nmbs` argument. §7.5.2 step 3
+    /// iterates `mbi` from 0 to `NMBS−1` indexing both `MBMODES[mbi]`
+    /// and the per-mb luma-block mapping; the two arguments must agree.
+    MotionVectorMbModesLenMismatch {
+        /// `mbmodes.len()`.
+        modes_len: usize,
+        /// The caller-supplied `nmbs`.
+        nmbs: usize,
+    },
+    /// The `macro_block_to_luma_blocks` mapping passed to
+    /// [`decode_macroblock_motion_vectors`] has a different length than
+    /// the `nmbs` argument. §7.5.2 step 3(a)i selects four luma indices
+    /// per macro block from this mapping.
+    MotionVectorLumaMapLenMismatch {
+        /// `macro_block_to_luma_blocks.len()`.
+        map_len: usize,
+        /// The caller-supplied `nmbs`.
+        nmbs: usize,
+    },
+    /// An entry in the `macro_block_to_luma_blocks` mapping passed to
+    /// [`decode_macroblock_motion_vectors`] referenced a luma-block
+    /// index that is `>= nbs`. §7.5.2 step 3(a)ii reads `BCODED[A]`
+    /// (and similarly for B, C, D), so the index must be in range.
+    MotionVectorLumaBlockIndexOutOfRange {
+        /// Zero-based macro-block index where the bad mapping was found.
+        mbi: usize,
+        /// Slot 0..=3 within the macro block (A, B, C, D in §7.5.2
+        /// raster order).
+        slot: usize,
+        /// The offending luma-block index.
+        bi: u32,
+        /// The caller-supplied `nbs`.
+        nbs: u32,
+    },
+    /// An entry in one of the chroma-block mappings supplied to
+    /// [`decode_macroblock_motion_vectors`] referenced a block index
+    /// that is `>= nbs`. §7.5.2 step 3(a)x..3(a)xii write `MVECTS[E]`
+    /// / `MVECTS[F]` / … for the chroma planes, so the index must be
+    /// in range.
+    MotionVectorChromaBlockIndexOutOfRange {
+        /// Zero-based macro-block index where the bad mapping was found.
+        mbi: usize,
+        /// Slot within the macro block (0..=1 for 4:2:0, 0..=3 for
+        /// 4:2:2, 0..=7 for 4:4:4 — the per-plane raster slot per
+        /// §7.5.2's letters E, F, G, H (Cb) and I, J, K, L (Cr)).
+        slot: usize,
+        /// The offending chroma-block index.
+        bi: u32,
+        /// The caller-supplied `nbs`.
+        nbs: u32,
+    },
+    /// A chroma-block mapping passed to
+    /// [`decode_macroblock_motion_vectors`] had the wrong length for
+    /// the pixel format. PF=0 (4:2:0) needs 1 block per plane per
+    /// macro block; PF=2 (4:2:2) needs 2; PF=3 (4:4:4) needs 4. The
+    /// outer slice must be `nmbs` long, the inner per the format.
+    MotionVectorChromaMapLenMismatch {
+        /// Which chroma plane was offending (0 = Cb, 1 = Cr).
+        plane: u8,
+        /// `chroma_map[plane].len()` (or `0` if the outer is wrong).
+        map_len: usize,
+        /// The expected length (typically `nmbs`).
+        expected: usize,
+    },
+    /// A chroma per-macroblock entry had the wrong inner length for
+    /// the declared pixel format. PF=0 → 1; PF=2 → 2; PF=3 → 4.
+    MotionVectorChromaMacroBlockSlotLenMismatch {
+        /// Zero-based macro-block index.
+        mbi: usize,
+        /// Which chroma plane (0 = Cb, 1 = Cr).
+        plane: u8,
+        /// The actual inner slice length.
+        got: usize,
+        /// The expected inner length for the declared pixel format.
+        expected: usize,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -535,6 +619,49 @@ impl core::fmt::Display for Error {
             Error::UnknownMacroBlockModeCode => write!(
                 f,
                 "oxideav-theora: §7.4 unrecognised Table 7.19 Huffman prefix (Scheme 1..=6)"
+            ),
+            Error::MotionVectorMbModesLenMismatch { modes_len, nmbs } => write!(
+                f,
+                "oxideav-theora: §7.5.2 mbmodes length {modes_len} != nmbs {nmbs}"
+            ),
+            Error::MotionVectorLumaMapLenMismatch { map_len, nmbs } => write!(
+                f,
+                "oxideav-theora: §7.5.2 luma-block map length {map_len} != nmbs {nmbs}"
+            ),
+            Error::MotionVectorLumaBlockIndexOutOfRange {
+                mbi,
+                slot,
+                bi,
+                nbs,
+            } => write!(
+                f,
+                "oxideav-theora: §7.5.2 mb {mbi} slot {slot} → bi {bi} >= nbs {nbs}"
+            ),
+            Error::MotionVectorChromaBlockIndexOutOfRange {
+                mbi,
+                slot,
+                bi,
+                nbs,
+            } => write!(
+                f,
+                "oxideav-theora: §7.5.2 chroma mb {mbi} slot {slot} → bi {bi} >= nbs {nbs}"
+            ),
+            Error::MotionVectorChromaMapLenMismatch {
+                plane,
+                map_len,
+                expected,
+            } => write!(
+                f,
+                "oxideav-theora: §7.5.2 chroma plane {plane} map length {map_len} != expected {expected}"
+            ),
+            Error::MotionVectorChromaMacroBlockSlotLenMismatch {
+                mbi,
+                plane,
+                got,
+                expected,
+            } => write!(
+                f,
+                "oxideav-theora: §7.5.2 chroma mb {mbi} plane {plane} inner length {got} != expected {expected}"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -2760,6 +2887,538 @@ pub(crate) fn decode_macroblock_modes_inner(
     }
     debug_assert_eq!(mbmodes.len(), nmbs_us);
     Ok(mbmodes)
+}
+
+// ============================================================================
+// §7.5  Motion Vectors
+// ============================================================================
+
+/// A single motion vector per §7.5 of the Xiph Theora I Specification.
+///
+/// Each component lies in the half-pixel range `-31..=31` (luma plane),
+/// per the "Each component can take on integer values from −31 . . . 31,
+/// inclusive, at half-pixel resolution" paragraph in §7.5.1. The value
+/// itself is stored as the *signed integer* that came off the wire
+/// before any half-pixel / quarter-pixel scaling — interpretation as
+/// pixels is the §7.9.1 prediction step's concern, not this layer's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MotionVector {
+    /// X component (`MVX`). Signed, range `-31..=31`.
+    pub x: i8,
+    /// Y component (`MVY`). Signed, range `-31..=31`.
+    pub y: i8,
+}
+
+impl MotionVector {
+    /// Convenience constructor.
+    pub fn new(x: i8, y: i8) -> Self {
+        Self { x, y }
+    }
+
+    /// The all-zero default vector. §7.5.2 uses this for uncoded
+    /// blocks (step 3(a)iii / 3(a)v / 3(a)vii / 3(a)ix), for
+    /// `INTER_NOMV` / `INTER_GOLDEN_NOMV` / `INTRA` (step 3(f)), and
+    /// for `LAST1` / `LAST2` initial state (step 1).
+    pub const ZERO: MotionVector = MotionVector { x: 0, y: 0 };
+}
+
+/// Look-up table for Table 7.23 of the Theora I Specification (§7.5.1
+/// MVMODE=0 Huffman codes for motion-vector components).
+///
+/// Indexed by the recognised code (already shifted so the MSb is bit
+/// `len-1`). Yields `(value, length)` only for the spec-listed codes;
+/// every other code is left as `(0, 0)` and rejected at lookup time.
+///
+/// Table 7.23 maps:
+///
+/// | code length | code prefix | values |
+/// | ----------- | ----------- | ------ |
+/// | 3 | `b000` | `0` |
+/// | 3 | `b001`, `b010` | `+1`, `-1` |
+/// | 4 | `b0110`, `b0111` | `+2`, `-2` |
+/// | 4 | `b1000`, `b1001` | `+3`, `-3` |
+/// | 6 | `b101000`..`b101111` | `±4`..`±7` |
+/// | 7 | `b1100000`..`b1101111` | `±8`..`±15` |
+/// | 8 | `b11100000`..`b11111111` | `±16`..`±31` |
+///
+/// In every range an even tail bit picks the positive value and an
+/// odd tail bit picks the negative.
+///
+/// Returns `Some((value, len))` for the longest match starting at the
+/// reader's current position, after consuming exactly `len` bits.
+/// Returns `Err` on truncation. Returns `Ok(None)` only when the read
+/// bits could not be matched at any length (defensive — the table is
+/// complete for 3..=8 bits so this never fires on a valid prefix).
+fn recognise_mv_huffman(r: &mut BitReader<'_>) -> Result<i8, Error> {
+    // The table is small enough to drive with a hand-written DFA: read
+    // up to 8 bits, branching at each step based on the prefix. The
+    // structure follows Table 7.23 verbatim.
+    //
+    // Step 1: read 3 bits — every Table 7.23 code starts with one of
+    // `b000` / `b001` / `b010` / `b011x` / `b100x` / `b101xxx` /
+    // `b110xxxx` / `b111xxxxx`.
+    let b3 = r.read_bits(3, "MV_huffman")? as u8;
+    match b3 {
+        // b000 → value 0 (3 bits)
+        0b000 => Ok(0),
+        // b001 → value +1 (3 bits)
+        0b001 => Ok(1),
+        // b010 → value -1 (3 bits)
+        0b010 => Ok(-1),
+        // b011x → +2 / -2 (4 bits)
+        0b011 => {
+            let t = r.read_bits(1, "MV_huffman")? as u8;
+            if t == 0 {
+                Ok(2)
+            } else {
+                Ok(-2)
+            }
+        }
+        // b100x → +3 / -3 (4 bits)
+        0b100 => {
+            let t = r.read_bits(1, "MV_huffman")? as u8;
+            if t == 0 {
+                Ok(3)
+            } else {
+                Ok(-3)
+            }
+        }
+        // b101xxx → ±4..±7 (6 bits). Three more bits decode the
+        // (magnitude − 4) bucket plus sign:
+        //   b101 000 → +4   b101 001 → -4
+        //   b101 010 → +5   b101 011 → -5
+        //   b101 100 → +6   b101 101 → -6
+        //   b101 110 → +7   b101 111 → -7
+        0b101 => {
+            let tail = r.read_bits(3, "MV_huffman")? as u8;
+            let mag = 4 + ((tail >> 1) & 0b11) as i8;
+            let sign = tail & 1;
+            Ok(if sign == 0 { mag } else { -mag })
+        }
+        // b110xxxx → ±8..±15 (7 bits). Four more bits: high 3 = bucket,
+        // low 1 = sign.
+        0b110 => {
+            let tail = r.read_bits(4, "MV_huffman")? as u8;
+            let mag = 8 + ((tail >> 1) & 0b111) as i8;
+            let sign = tail & 1;
+            Ok(if sign == 0 { mag } else { -mag })
+        }
+        // b111xxxxx → ±16..±31 (8 bits). Five more bits: high 4 =
+        // bucket, low 1 = sign.
+        0b111 => {
+            let tail = r.read_bits(5, "MV_huffman")? as u8;
+            let mag = 16 + ((tail >> 1) & 0b1111) as i8;
+            let sign = tail & 1;
+            Ok(if sign == 0 { mag } else { -mag })
+        }
+        // `read_bits(3)` cannot return values outside 0..=7.
+        _ => unreachable!("read_bits(3) returned > 7"),
+    }
+}
+
+/// Decode a single motion vector per §7.5.1 of the Xiph Theora I
+/// Specification ("Motion Vector Decode").
+///
+/// `mvmode` is the single-bit per-frame MV decoding selector from
+/// §7.5.2 step 2 (`0` = Huffman per Table 7.23; `1` = fixed-length
+/// 5-bit magnitude + 1-bit sign per component). The procedure returns
+/// the typed `(MVX, MVY)` pair as a [`MotionVector`].
+///
+/// For `mvmode == 1` the spec mandates the sign bit be read even when
+/// magnitude is zero ("for compatibility with VP3, a sign bit is read
+/// even if the magnitude read is zero") — the implementation matches.
+pub fn decode_single_motion_vector(bits: &[u8], mvmode: u8) -> Result<MotionVector, Error> {
+    let mut r = BitReader::new(bits);
+    decode_single_motion_vector_inner(&mut r, mvmode)
+}
+
+/// Inner §7.5.1 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so a frame walker can chain §7.4 → §7.5
+/// on the same reader.
+pub(crate) fn decode_single_motion_vector_inner(
+    r: &mut BitReader<'_>,
+    mvmode: u8,
+) -> Result<MotionVector, Error> {
+    if mvmode == 0 {
+        // Step 1: walk Table 7.23 for both components in turn.
+        let mvx = recognise_mv_huffman(r)?;
+        let mvy = recognise_mv_huffman(r)?;
+        Ok(MotionVector { x: mvx, y: mvy })
+    } else {
+        // Step 2: 5-bit magnitude + 1-bit sign for each component.
+        let mut mvx = r.read_bits(5, "MVX_magnitude")? as i8;
+        let signx = r.read_bits(1, "MVX_sign")? as u8;
+        if signx == 1 {
+            mvx = -mvx;
+        }
+        let mut mvy = r.read_bits(5, "MVY_magnitude")? as i8;
+        let signy = r.read_bits(1, "MVY_sign")? as u8;
+        if signy == 1 {
+            mvy = -mvy;
+        }
+        Ok(MotionVector { x: mvx, y: mvy })
+    }
+}
+
+/// Per-macroblock chroma-block layout supplied to
+/// [`decode_macroblock_motion_vectors`].
+///
+/// The §7.5.2 procedure writes chroma MVs at indices `E, F, G, H`
+/// (Cb) and `I, J, K, L` (Cr) — the exact count and ordering depend
+/// on `PF`:
+///
+/// * `PF=0` (4:2:0): 1 Cb block + 1 Cr block per macro block. The
+///   per-MB inner slice has length 1 (just `E` for Cb, just `F` for
+///   Cr — using the spec's letters; we collapse to one index per
+///   plane per macroblock).
+/// * `PF=2` (4:2:2): 2 Cb blocks + 2 Cr blocks per macroblock (E, F
+///   for Cb in bottom/top order; G, H for Cr in bottom/top order —
+///   collapsed to two indices per plane per macroblock).
+/// * `PF=3` (4:4:4): 4 Cb + 4 Cr per macroblock, raster A, B, C, D
+///   order (E, F, G, H for Cb; I, J, K, L for Cr).
+///
+/// The caller passes one outer slice per plane: `cb_map.len() ==
+/// cr_map.len() == nmbs`. Per-MB inner slices have length 1, 2, or 4
+/// depending on `pf`.
+#[derive(Debug, Clone, Copy)]
+pub struct ChromaBlockLayout<'a> {
+    /// Cb-plane per-macroblock block indices.
+    pub cb: &'a [&'a [u32]],
+    /// Cr-plane per-macroblock block indices.
+    pub cr: &'a [&'a [u32]],
+}
+
+/// Round-to-nearest with ties away from zero, per the Theora spec's
+/// `round(a)` definition. Operates on integer numerator and divisor.
+///
+/// For positive `a / b` this returns `floor(a/b + 1/2)`; for negative
+/// it returns `ceil(a/b - 1/2)` — which is the "away from zero on the
+/// halfway tie" behaviour the spec asks for.
+#[inline]
+fn round_div(num: i32, den: i32) -> i32 {
+    debug_assert!(den > 0, "round_div with non-positive denominator");
+    if num >= 0 {
+        (num + den / 2) / den
+    } else {
+        -(((-num) + den / 2) / den)
+    }
+}
+
+/// Decode the per-block `MVECTS` array for a frame per §7.5.2 of the
+/// Xiph Theora I Specification ("Macro Block Motion Vector Decode").
+///
+/// Inputs:
+///
+/// * `packet` — the byte-aligned start of the §7.5.2 bit stream (in a
+///   real frame walk, a [`BitReader`] already positioned past §7.4 is
+///   used via [`decode_macroblock_motion_vectors_inner`]).
+/// * `ftype` — the frame type. Intra frames short-circuit: no motion
+///   vectors are stored and no bits are consumed (§7.5 opening
+///   sentence).
+/// * `pf` — pixel format. Determines the chroma averaging in §7.5.2
+///   step 3(a)x..3(a)xii.
+/// * `nbs` — total block count in the frame (Tables 6.5 / 6.6).
+/// * `nmbs` — total macro-block count.
+/// * `bcoded` — the per-block `BCODED` array from §7.3 (length `nbs`).
+/// * `mbmodes` — the per-mb `MBMODES` array from §7.4 (length `nmbs`).
+/// * `luma_map` — per-mb four-element [A, B, C, D] luma-block-index
+///   slice in raster order (lower-left, lower-right, upper-left,
+///   upper-right). Length `nmbs`.
+/// * `chroma_map` — see [`ChromaBlockLayout`]. Per-plane outer length
+///   `nmbs`; inner length `1` for PF=0, `2` for PF=2, `4` for PF=3.
+///
+/// Output: an `NBS`-element `Vec<MotionVector>` with the (0, 0) default
+/// for blocks that don't receive an MV from this procedure (uncoded
+/// blocks in INTER_MV_FOUR macroblocks, blocks in NOMV / INTRA /
+/// GOLDEN_NOMV macroblocks, and every block in an intra frame).
+///
+/// Returns:
+///
+/// * [`Error::MotionVectorMbModesLenMismatch`] /
+///   [`Error::MotionVectorLumaMapLenMismatch`] /
+///   [`Error::MotionVectorChromaMapLenMismatch`] for shape mismatches.
+/// * [`Error::MotionVectorLumaBlockIndexOutOfRange`] /
+///   [`Error::MotionVectorChromaBlockIndexOutOfRange`] for OOB indices.
+/// * [`Error::MotionVectorChromaMacroBlockSlotLenMismatch`] for chroma
+///   per-MB inner slices of the wrong length for the declared `pf`.
+/// * [`Error::TruncatedHeader`] when the underlying bit reader is
+///   exhausted before a field is fully read.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_macroblock_motion_vectors(
+    packet: &[u8],
+    ftype: FrameType,
+    pf: PixelFormat,
+    nbs: u32,
+    nmbs: u32,
+    bcoded: &[u8],
+    mbmodes: &[MacroBlockMode],
+    luma_map: &[[u32; 4]],
+    chroma_map: ChromaBlockLayout<'_>,
+) -> Result<Vec<MotionVector>, Error> {
+    let mut r = BitReader::new(packet);
+    decode_macroblock_motion_vectors_inner(
+        &mut r, ftype, pf, nbs, nmbs, bcoded, mbmodes, luma_map, chroma_map,
+    )
+}
+
+/// Inner §7.5.2 procedure operating on an already-positioned
+/// [`BitReader`]. See [`decode_macroblock_motion_vectors`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_macroblock_motion_vectors_inner(
+    r: &mut BitReader<'_>,
+    ftype: FrameType,
+    pf: PixelFormat,
+    nbs: u32,
+    nmbs: u32,
+    bcoded: &[u8],
+    mbmodes: &[MacroBlockMode],
+    luma_map: &[[u32; 4]],
+    chroma_map: ChromaBlockLayout<'_>,
+) -> Result<Vec<MotionVector>, Error> {
+    let nmbs_us = nmbs as usize;
+    let nbs_us = nbs as usize;
+
+    // Sanity-check argument shapes early.
+    if mbmodes.len() != nmbs_us {
+        return Err(Error::MotionVectorMbModesLenMismatch {
+            modes_len: mbmodes.len(),
+            nmbs: nmbs_us,
+        });
+    }
+    if luma_map.len() != nmbs_us {
+        return Err(Error::MotionVectorLumaMapLenMismatch {
+            map_len: luma_map.len(),
+            nmbs: nmbs_us,
+        });
+    }
+    if chroma_map.cb.len() != nmbs_us {
+        return Err(Error::MotionVectorChromaMapLenMismatch {
+            plane: 0,
+            map_len: chroma_map.cb.len(),
+            expected: nmbs_us,
+        });
+    }
+    if chroma_map.cr.len() != nmbs_us {
+        return Err(Error::MotionVectorChromaMapLenMismatch {
+            plane: 1,
+            map_len: chroma_map.cr.len(),
+            expected: nmbs_us,
+        });
+    }
+    let chroma_inner_expected = match pf {
+        PixelFormat::Yuv420 => 1,
+        PixelFormat::Yuv422 => 2,
+        PixelFormat::Yuv444 => 4,
+    };
+    for (mbi, (cb_slot, cr_slot)) in chroma_map.cb.iter().zip(chroma_map.cr.iter()).enumerate() {
+        if cb_slot.len() != chroma_inner_expected {
+            return Err(Error::MotionVectorChromaMacroBlockSlotLenMismatch {
+                mbi,
+                plane: 0,
+                got: cb_slot.len(),
+                expected: chroma_inner_expected,
+            });
+        }
+        if cr_slot.len() != chroma_inner_expected {
+            return Err(Error::MotionVectorChromaMacroBlockSlotLenMismatch {
+                mbi,
+                plane: 1,
+                got: cr_slot.len(),
+                expected: chroma_inner_expected,
+            });
+        }
+        for (slot, &bi) in cb_slot.iter().enumerate() {
+            if bi >= nbs {
+                return Err(Error::MotionVectorChromaBlockIndexOutOfRange { mbi, slot, bi, nbs });
+            }
+        }
+        for (slot, &bi) in cr_slot.iter().enumerate() {
+            if bi >= nbs {
+                return Err(Error::MotionVectorChromaBlockIndexOutOfRange { mbi, slot, bi, nbs });
+            }
+        }
+    }
+    for (mbi, group) in luma_map.iter().enumerate() {
+        for (slot, &bi) in group.iter().enumerate() {
+            if bi >= nbs {
+                return Err(Error::MotionVectorLumaBlockIndexOutOfRange { mbi, slot, bi, nbs });
+            }
+        }
+    }
+
+    // §7.5 opening sentence: intra frames carry no motion vectors,
+    // and §7.5.2's procedure is skipped wholesale. We still allocate
+    // the output array so callers can index uniformly.
+    if ftype == FrameType::Intra {
+        return Ok(vec![MotionVector::ZERO; nbs_us]);
+    }
+
+    // §7.5.2 step 1: LAST1 = LAST2 = (0, 0).
+    let mut last1 = MotionVector::ZERO;
+    let mut last2 = MotionVector::ZERO;
+
+    // §7.5.2 step 2: read MVMODE (1 bit) — "Note that this value is
+    // read even if no macro blocks require a motion vector to be
+    // decoded."
+    let mvmode = r.read_bits(1, "MVMODE")? as u8;
+
+    let mut mvects = vec![MotionVector::ZERO; nbs_us];
+
+    // §7.5.2 step 3: walk macro blocks in coded order.
+    for mbi in 0..nmbs_us {
+        let mode = mbmodes[mbi];
+        let abcd = luma_map[mbi];
+
+        // Single-MV value to propagate to every coded block in step
+        // 3(g). Set by every match arm except `InterMvFour`, which
+        // uses its own per-block writes above and `continue`s past
+        // step 3(g).
+        let mv_for_blocks: Option<MotionVector>;
+
+        match mode {
+            MacroBlockMode::InterMvFour => {
+                // Step 3(a): four per-luma-block MVs, sourced from
+                // BCODED in raster order. Uncoded blocks get (0, 0).
+                let mut per_block: [MotionVector; 4] = [MotionVector::ZERO; 4];
+                let mut last_coded_mv = MotionVector::ZERO;
+                let mut had_any_coded = false;
+                for (slot, &bi) in abcd.iter().enumerate() {
+                    if bcoded[bi as usize] == 1 {
+                        let mv = decode_single_motion_vector_inner(r, mvmode)?;
+                        per_block[slot] = mv;
+                        last_coded_mv = mv;
+                        had_any_coded = true;
+                    }
+                    // else: per_block[slot] stays (0, 0)
+                }
+                // Step 3(a)ii..ix have been executed (interleaved with
+                // the BCODED test above). Now assign to MVECTS.
+                for (slot, &bi) in abcd.iter().enumerate() {
+                    mvects[bi as usize] = per_block[slot];
+                }
+
+                // Step 3(a)x..xii: chroma averaging.
+                let a = per_block[0];
+                let b = per_block[1];
+                let c = per_block[2];
+                let d = per_block[3];
+                match pf {
+                    PixelFormat::Yuv420 => {
+                        let ex = round_div(a.x as i32 + b.x as i32 + c.x as i32 + d.x as i32, 4);
+                        let ey = round_div(a.y as i32 + b.y as i32 + c.y as i32 + d.y as i32, 4);
+                        let chroma_mv = MotionVector {
+                            x: ex as i8,
+                            y: ey as i8,
+                        };
+                        let e_bi = chroma_map.cb[mbi][0];
+                        let f_bi = chroma_map.cr[mbi][0];
+                        mvects[e_bi as usize] = chroma_mv;
+                        mvects[f_bi as usize] = chroma_mv;
+                    }
+                    PixelFormat::Yuv422 => {
+                        // E/G (bottom): avg(A, B); F/H (top): avg(C, D).
+                        let bot = MotionVector {
+                            x: round_div(a.x as i32 + b.x as i32, 2) as i8,
+                            y: round_div(a.y as i32 + b.y as i32, 2) as i8,
+                        };
+                        let top = MotionVector {
+                            x: round_div(c.x as i32 + d.x as i32, 2) as i8,
+                            y: round_div(c.y as i32 + d.y as i32, 2) as i8,
+                        };
+                        let cb_slot = chroma_map.cb[mbi];
+                        let cr_slot = chroma_map.cr[mbi];
+                        mvects[cb_slot[0] as usize] = bot; // E
+                        mvects[cb_slot[1] as usize] = top; // F
+                        mvects[cr_slot[0] as usize] = bot; // G
+                        mvects[cr_slot[1] as usize] = top; // H
+                    }
+                    PixelFormat::Yuv444 => {
+                        // E,I=A; F,J=B; G,K=C; H,L=D.
+                        let cb_slot = chroma_map.cb[mbi];
+                        let cr_slot = chroma_map.cr[mbi];
+                        mvects[cb_slot[0] as usize] = a;
+                        mvects[cb_slot[1] as usize] = b;
+                        mvects[cb_slot[2] as usize] = c;
+                        mvects[cb_slot[3] as usize] = d;
+                        mvects[cr_slot[0] as usize] = a;
+                        mvects[cr_slot[1] as usize] = b;
+                        mvects[cr_slot[2] as usize] = c;
+                        mvects[cr_slot[3] as usize] = d;
+                    }
+                }
+
+                // Step 3(a)xiii / xiv: update LAST2/LAST1. "There must
+                // always be at least one [coded luma block], since
+                // macro blocks with no coded luma blocks must use mode
+                // 0: INTER_NOMV."
+                if had_any_coded {
+                    last2 = last1;
+                    last1 = last_coded_mv;
+                }
+                // Step 3(g) does NOT apply to INTER_MV_FOUR ("If
+                // MBMODES[mbi] is not 7").
+                continue;
+            }
+            MacroBlockMode::InterGoldenMv => {
+                // Step 3(b): decode one MV, no LAST update.
+                let mv = decode_single_motion_vector_inner(r, mvmode)?;
+                mv_for_blocks = Some(mv);
+            }
+            MacroBlockMode::InterMvLast2 => {
+                // Step 3(c): (MVX, MVY) = LAST2; LAST2 = LAST1; LAST1 = (MVX, MVY).
+                // Equivalent to swapping LAST1 and LAST2 and emitting
+                // the new value of LAST1 (= old LAST2).
+                std::mem::swap(&mut last1, &mut last2);
+                mv_for_blocks = Some(last1);
+            }
+            MacroBlockMode::InterMvLast => {
+                // Step 3(d): (MVX, MVY) = LAST1.
+                mv_for_blocks = Some(last1);
+            }
+            MacroBlockMode::InterMv => {
+                // Step 3(e): decode one MV; LAST2 = LAST1; LAST1 = (MVX, MVY).
+                let mv = decode_single_motion_vector_inner(r, mvmode)?;
+                last2 = last1;
+                last1 = mv;
+                mv_for_blocks = Some(mv);
+            }
+            MacroBlockMode::InterGoldenNoMv | MacroBlockMode::Intra | MacroBlockMode::InterNoMv => {
+                // Step 3(f): assign zero.
+                mv_for_blocks = Some(MotionVector::ZERO);
+            }
+        }
+
+        // Step 3(g): for non-INTER_MV_FOUR modes, propagate to every
+        // CODED block bi in the macro block. "Coded blocks" here
+        // includes luma + chroma; the spec wording "each coded block
+        // bi in macro block mbi" is interpreted per the surrounding
+        // block layout (the §7.5 prose immediately preceding step 3
+        // says "every block in all the color planes are assigned the
+        // same motion vector" for these modes). We mirror that:
+        // iterate luma A,B,C,D and the format-appropriate chroma
+        // slots, writing the MV wherever BCODED says the block is
+        // coded.
+        if let Some(mv) = mv_for_blocks {
+            for &bi in abcd.iter() {
+                if bcoded[bi as usize] == 1 {
+                    mvects[bi as usize] = mv;
+                }
+            }
+            for &bi in chroma_map.cb[mbi].iter() {
+                if bcoded[bi as usize] == 1 {
+                    mvects[bi as usize] = mv;
+                }
+            }
+            for &bi in chroma_map.cr[mbi].iter() {
+                if bcoded[bi as usize] == 1 {
+                    mvects[bi as usize] = mv;
+                }
+            }
+        }
+    }
+
+    debug_assert_eq!(mvects.len(), nbs_us);
+    Ok(mvects)
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -6970,5 +7629,1016 @@ mod tests {
                 .unwrap();
             assert_eq!(out.len(), 1);
         }
+    }
+
+    // ========================================================================
+    // §7.5 Motion Vectors tests (round 12)
+    // ========================================================================
+
+    /// Encode a single MV component into `w` using the MVMODE=0
+    /// (Table 7.23) Huffman alphabet. Mirrors `recognise_mv_huffman`'s
+    /// table; used to synthesize test bit-streams without touching the
+    /// production code path.
+    fn write_mv_huffman_component(w: &mut BitWriter, value: i8) {
+        match value {
+            0 => w.put(0b000, 3),
+            1 => w.put(0b001, 3),
+            -1 => w.put(0b010, 3),
+            2 => w.put(0b0110, 4),
+            -2 => w.put(0b0111, 4),
+            3 => w.put(0b1000, 4),
+            -3 => w.put(0b1001, 4),
+            v if (4..=7).contains(&v) => {
+                let mag = v.unsigned_abs() as u32;
+                let bucket = mag - 4;
+                // Prefix b101 (3 bits) << 3, then 2-bit bucket << 1, then sign bit 0.
+                let code = (0b101 << 3) | (bucket << 1);
+                w.put(code, 6);
+            }
+            v if (-7..=-4).contains(&v) => {
+                let mag = v.unsigned_abs() as u32;
+                let bucket = mag - 4;
+                let code = (0b101 << 3) | (bucket << 1) | 1;
+                w.put(code, 6);
+            }
+            v if (8..=15).contains(&v) => {
+                let mag = v.unsigned_abs() as u32;
+                let bucket = mag - 8;
+                // Prefix b110 (3 bits) << 4, then 3-bit bucket << 1, then sign bit 0.
+                let code = (0b110 << 4) | (bucket << 1);
+                w.put(code, 7);
+            }
+            v if (-15..=-8).contains(&v) => {
+                let mag = v.unsigned_abs() as u32;
+                let bucket = mag - 8;
+                let code = (0b110 << 4) | (bucket << 1) | 1;
+                w.put(code, 7);
+            }
+            v if (16..=31).contains(&v) => {
+                let mag = v.unsigned_abs() as u32;
+                let bucket = mag - 16;
+                // Prefix b111 (3 bits) << 5, then 4-bit bucket << 1, then sign bit 0.
+                let code = (0b111 << 5) | (bucket << 1);
+                w.put(code, 8);
+            }
+            v if (-31..=-16).contains(&v) => {
+                let mag = v.unsigned_abs() as u32;
+                let bucket = mag - 16;
+                let code = (0b111 << 5) | (bucket << 1) | 1;
+                w.put(code, 8);
+            }
+            _ => panic!("MV component {value} out of Table 7.23 range"),
+        }
+    }
+
+    /// Encode a single MV under MVMODE=1 (5-bit magnitude + 1-bit
+    /// sign per component, with the sign bit always read even when
+    /// magnitude is zero).
+    fn write_mv_fixed_component(w: &mut BitWriter, value: i8) {
+        let mag = value.unsigned_abs() as u32;
+        let sign = if value < 0 { 1 } else { 0 };
+        w.put(mag, 5);
+        w.put(sign, 1);
+    }
+
+    #[test]
+    fn mv_huffman_table_7_23_round_trip_all_values() {
+        // §7.5.1 step 1 always decodes both MVX and MVY, so we encode
+        // each value as the MVX with a fixed MVY=0 to exercise every
+        // Table 7.23 entry as MVX in turn.
+        for v in -31i8..=31 {
+            let mut w = BitWriter::new();
+            write_mv_huffman_component(&mut w, v);
+            write_mv_huffman_component(&mut w, 0);
+            let bytes = w.finish();
+            let mv = decode_single_motion_vector(&bytes, 0).unwrap();
+            assert_eq!(mv.x, v, "decode of value {v} failed (MVX)");
+            assert_eq!(mv.y, 0);
+            // Also exercise sequential reads with paired sign.
+            let mut w2 = BitWriter::new();
+            write_mv_huffman_component(&mut w2, v);
+            write_mv_huffman_component(&mut w2, -v);
+            let bytes2 = w2.finish();
+            let mv2 = decode_single_motion_vector(&bytes2, 0).unwrap();
+            assert_eq!(mv2.x, v, "decode pair MVX={v}");
+            assert_eq!(mv2.y, -v, "decode pair MVY=-{v}");
+        }
+    }
+
+    #[test]
+    fn mv_fixed_length_mvmode_1_round_trip() {
+        // Includes both representations of zero: +0 (sign=0) and -0
+        // (sign=1) — §7.5.1 step 2(c) negates only when the sign is 1,
+        // so -0 should decode as 0 (Rust's i8 negation: 0 == -0).
+        for v in -31i8..=31 {
+            let mut w = BitWriter::new();
+            write_mv_fixed_component(&mut w, v);
+            write_mv_fixed_component(&mut w, -v);
+            let bytes = w.finish();
+            let mv = decode_single_motion_vector(&bytes, 1).unwrap();
+            assert_eq!(mv.x, v, "MVX={v}");
+            assert_eq!(mv.y, -v, "MVY=-{v}");
+        }
+    }
+
+    #[test]
+    fn mv_mvmode_1_sign_bit_read_even_when_magnitude_zero() {
+        // Per §7.5.1: "for compatibility with VP3, a sign bit is read
+        // even if the magnitude read is zero". A second component
+        // payload must follow the sign bit to confirm the reader
+        // advanced one bit past the magnitude.
+        let mut w = BitWriter::new();
+        // MVX: magnitude=0, sign=1 → -0 == 0
+        w.put(0, 5);
+        w.put(1, 1);
+        // MVY: magnitude=5, sign=0 → 5
+        w.put(5, 5);
+        w.put(0, 1);
+        let bytes = w.finish();
+        let mv = decode_single_motion_vector(&bytes, 1).unwrap();
+        assert_eq!(mv.x, 0);
+        assert_eq!(mv.y, 5);
+    }
+
+    #[test]
+    fn mv_huffman_truncated_returns_truncated_header() {
+        // 3-bit lookup needs 3 bits.
+        let bytes = vec![0b10100000u8];
+        // First component reads 6 bits (b101000 → +4). Second
+        // component needs 3 bits but the byte is exhausted at bit 2.
+        let err = decode_single_motion_vector(&bytes, 0).unwrap_err();
+        assert!(matches!(err, Error::TruncatedHeader { .. }));
+    }
+
+    #[test]
+    fn mv_fixed_truncated_returns_truncated_header() {
+        // Only 1 byte = 8 bits, but MVMODE=1 needs 12 bits per vector.
+        let bytes = vec![0xFFu8];
+        let err = decode_single_motion_vector(&bytes, 1).unwrap_err();
+        assert!(matches!(err, Error::TruncatedHeader { .. }));
+    }
+
+    /// Build a uniform layout: NMBS macro blocks each with 4 luma
+    /// blocks in raster order [4*mbi, 4*mbi+1, 4*mbi+2, 4*mbi+3] plus
+    /// per-format chroma blocks placed after the luma region. Returns
+    /// `(nbs, luma_map, cb_outer, cr_outer)`.
+    #[allow(clippy::type_complexity)]
+    fn build_uniform_layout(
+        nmbs: u32,
+        pf: PixelFormat,
+    ) -> (u32, Vec<[u32; 4]>, Vec<Vec<u32>>, Vec<Vec<u32>>) {
+        let luma_count = nmbs * 4;
+        let chroma_per_mb: u32 = match pf {
+            PixelFormat::Yuv420 => 1,
+            PixelFormat::Yuv422 => 2,
+            PixelFormat::Yuv444 => 4,
+        };
+        let cb_count = nmbs * chroma_per_mb;
+        let cr_count = nmbs * chroma_per_mb;
+        let nbs = luma_count + cb_count + cr_count;
+        let luma_map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| [mbi * 4, mbi * 4 + 1, mbi * 4 + 2, mbi * 4 + 3])
+            .collect();
+        let cb_base = luma_count;
+        let cr_base = luma_count + cb_count;
+        let cb_outer: Vec<Vec<u32>> = (0..nmbs)
+            .map(|mbi| {
+                (0..chroma_per_mb)
+                    .map(|k| cb_base + mbi * chroma_per_mb + k)
+                    .collect()
+            })
+            .collect();
+        let cr_outer: Vec<Vec<u32>> = (0..nmbs)
+            .map(|mbi| {
+                (0..chroma_per_mb)
+                    .map(|k| cr_base + mbi * chroma_per_mb + k)
+                    .collect()
+            })
+            .collect();
+        (nbs, luma_map, cb_outer, cr_outer)
+    }
+
+    /// Convert a `Vec<Vec<u32>>` into a `Vec<&[u32]>` so it can be
+    /// passed to `ChromaBlockLayout`.
+    fn slice_outer(outer: &[Vec<u32>]) -> Vec<&[u32]> {
+        outer.iter().map(|v| v.as_slice()).collect()
+    }
+
+    #[test]
+    fn mv_intra_frame_short_circuits_all_zero_no_bits_consumed() {
+        // Intra frame: all MVs are (0, 0) and the packet is not consumed.
+        let nmbs = 3u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::Intra; nmbs as usize];
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let layout = ChromaBlockLayout { cb: &cb, cr: &cr };
+        // Pass an empty packet — no bits should be read.
+        let out = decode_macroblock_motion_vectors(
+            &[],
+            FrameType::Intra,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            layout,
+        )
+        .unwrap();
+        assert_eq!(out.len(), nbs as usize);
+        assert!(out.iter().all(|mv| *mv == MotionVector::ZERO));
+    }
+
+    #[test]
+    fn mv_inter_nomv_reads_mvmode_bit_then_zero_vectors() {
+        // Inter frame with all macro blocks in INTER_NOMV: only the
+        // 1-bit MVMODE field is read. Every block gets (0, 0).
+        let nmbs = 2u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterNoMv; nmbs as usize];
+
+        let mut w = BitWriter::new();
+        w.put(0, 1); // MVMODE=0
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        assert!(out.iter().all(|mv| *mv == MotionVector::ZERO));
+    }
+
+    #[test]
+    fn mv_inter_mv_decodes_and_propagates_to_blocks() {
+        // One macroblock in INTER_MV. The single decoded MV propagates
+        // to every coded luma + chroma block; LAST1 takes that value.
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterMv];
+
+        let mut w = BitWriter::new();
+        w.put(0, 1); // MVMODE=0 (Huffman)
+        write_mv_huffman_component(&mut w, 5);
+        write_mv_huffman_component(&mut w, -3);
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        let expected = MotionVector::new(5, -3);
+        for (bi, mv) in out.iter().enumerate() {
+            assert_eq!(*mv, expected, "bi={bi}");
+        }
+    }
+
+    #[test]
+    fn mv_inter_mv_last_chain() {
+        // Two macroblocks: MB0 = INTER_MV (decode (7, 1)); MB1 =
+        // INTER_MV_LAST (reuse LAST1). Both should end up with (7, 1).
+        let nmbs = 2u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterMv, MacroBlockMode::InterMvLast];
+
+        let mut w = BitWriter::new();
+        w.put(0, 1); // MVMODE=0
+        write_mv_huffman_component(&mut w, 7);
+        write_mv_huffman_component(&mut w, 1);
+        // No MV decoded for MB1.
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        let expected = MotionVector::new(7, 1);
+        for (bi, mv) in out.iter().enumerate() {
+            assert_eq!(*mv, expected, "bi={bi}");
+        }
+    }
+
+    #[test]
+    fn mv_inter_mv_last2_swaps_through_lasts() {
+        // Three macroblocks: INTER_MV (a), INTER_MV (b), INTER_MV_LAST2.
+        // After mb0: LAST1=a, LAST2=0.
+        // After mb1: LAST1=b, LAST2=a.
+        // mb2 INTER_MV_LAST2 reads LAST2 (=a); then LAST2=LAST1=b,
+        //   LAST1=a.
+        // So MVs are (a, b, a).
+        let nmbs = 3u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![
+            MacroBlockMode::InterMv,
+            MacroBlockMode::InterMv,
+            MacroBlockMode::InterMvLast2,
+        ];
+
+        let a = MotionVector::new(2, -2);
+        let b = MotionVector::new(-5, 6);
+        let mut w = BitWriter::new();
+        w.put(0, 1); // MVMODE=0
+        write_mv_huffman_component(&mut w, a.x);
+        write_mv_huffman_component(&mut w, a.y);
+        write_mv_huffman_component(&mut w, b.x);
+        write_mv_huffman_component(&mut w, b.y);
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        // Check the first luma block of each MB.
+        assert_eq!(out[luma[0][0] as usize], a, "mb0");
+        assert_eq!(out[luma[1][0] as usize], b, "mb1");
+        assert_eq!(out[luma[2][0] as usize], a, "mb2 (=LAST2 was a)");
+    }
+
+    #[test]
+    fn mv_inter_golden_mv_does_not_update_lasts() {
+        // INTER_GOLDEN_MV decodes an MV but does NOT update
+        // LAST1/LAST2 (step 3(b) of §7.5.2). Test by sandwiching it
+        // between two INTER_MV macroblocks and verifying the second
+        // INTER_MV's MV ends up as LAST1, with the GOLDEN_MV value
+        // visible only on that macroblock's own blocks.
+        let nmbs = 3u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![
+            MacroBlockMode::InterMv,
+            MacroBlockMode::InterGoldenMv,
+            MacroBlockMode::InterMvLast, // should read LAST1 == mb0's MV
+        ];
+
+        let a = MotionVector::new(4, 4);
+        let g = MotionVector::new(-10, 10);
+        let mut w = BitWriter::new();
+        w.put(0, 1); // MVMODE=0
+                     // mb0: INTER_MV
+        write_mv_huffman_component(&mut w, a.x);
+        write_mv_huffman_component(&mut w, a.y);
+        // mb1: INTER_GOLDEN_MV
+        write_mv_huffman_component(&mut w, g.x);
+        write_mv_huffman_component(&mut w, g.y);
+        // mb2: INTER_MV_LAST — no bits.
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        assert_eq!(out[luma[0][0] as usize], a, "mb0");
+        assert_eq!(out[luma[1][0] as usize], g, "mb1 GOLDEN MV");
+        assert_eq!(out[luma[2][0] as usize], a, "mb2 LAST1 still == a");
+    }
+
+    #[test]
+    fn mv_inter_mv_four_yuv420_chroma_averaging() {
+        // One INTER_MV_FOUR macroblock, 4:2:0. All four luma blocks
+        // coded; chroma E/F gets the round((A+B+C+D)/4) average.
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterMvFour];
+
+        // Pick four luma MVs whose averages are not divisible by 4 to
+        // exercise rounding away from zero.
+        let mv_a = MotionVector::new(1, -1);
+        let mv_b = MotionVector::new(2, -1);
+        let mv_c = MotionVector::new(2, 0);
+        let mv_d = MotionVector::new(2, 0);
+        // sumX=7 → 7/4 = 1.75 → round = 2; sumY=-2 → -2/4 = -0.5 → round = -1 (away from 0).
+
+        let mut w = BitWriter::new();
+        w.put(0, 1); // MVMODE=0
+        write_mv_huffman_component(&mut w, mv_a.x);
+        write_mv_huffman_component(&mut w, mv_a.y);
+        write_mv_huffman_component(&mut w, mv_b.x);
+        write_mv_huffman_component(&mut w, mv_b.y);
+        write_mv_huffman_component(&mut w, mv_c.x);
+        write_mv_huffman_component(&mut w, mv_c.y);
+        write_mv_huffman_component(&mut w, mv_d.x);
+        write_mv_huffman_component(&mut w, mv_d.y);
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        assert_eq!(out[luma[0][0] as usize], mv_a);
+        assert_eq!(out[luma[0][1] as usize], mv_b);
+        assert_eq!(out[luma[0][2] as usize], mv_c);
+        assert_eq!(out[luma[0][3] as usize], mv_d);
+        let chroma_expected = MotionVector::new(2, -1);
+        assert_eq!(out[cb_o[0][0] as usize], chroma_expected);
+        assert_eq!(out[cr_o[0][0] as usize], chroma_expected);
+    }
+
+    #[test]
+    fn mv_inter_mv_four_uncoded_luma_uses_zero_for_chroma_average() {
+        // Per §7.5.2 step 3(a)iii: uncoded luma blocks contribute
+        // (0, 0) to the chroma average. Coded blocks A=B=C=(3,-3),
+        // D uncoded → chroma avg = round((3+3+3+0)/4, (-3-3-3+0)/4)
+        // = round(9/4, -9/4) = (2, -2).
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let mut bcoded = vec![1u8; nbs as usize];
+        bcoded[luma[0][3] as usize] = 0; // D uncoded
+        let mbmodes = vec![MacroBlockMode::InterMvFour];
+
+        let mut w = BitWriter::new();
+        w.put(0, 1); // MVMODE=0
+        for _ in 0..3 {
+            write_mv_huffman_component(&mut w, 3);
+            write_mv_huffman_component(&mut w, -3);
+        }
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        // D's MVECTS entry: §7.5.2 step 3(a)ix assigns (0, 0).
+        assert_eq!(out[luma[0][3] as usize], MotionVector::ZERO);
+        // Chroma = round((3+3+3+0)/4, (-3-3-3+0)/4) = (round(2.25), round(-2.25)) = (2, -2).
+        let chroma_expected = MotionVector::new(2, -2);
+        assert_eq!(out[cb_o[0][0] as usize], chroma_expected);
+        assert_eq!(out[cr_o[0][0] as usize], chroma_expected);
+    }
+
+    #[test]
+    fn mv_inter_mv_four_yuv422_chroma_averaging() {
+        // 4:2:2: E (Cb bottom) = avg(A, B); F (Cb top) = avg(C, D).
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv422);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterMvFour];
+
+        let mv_a = MotionVector::new(1, 1);
+        let mv_b = MotionVector::new(2, 2);
+        let mv_c = MotionVector::new(-3, 3);
+        let mv_d = MotionVector::new(-4, 4);
+        // avg(A,B) = round(1.5, 1.5) = (2, 2)
+        // avg(C,D) = round(-3.5, 3.5) = (-4, 4) (away from zero)
+
+        let mut w = BitWriter::new();
+        w.put(0, 1);
+        for mv in [mv_a, mv_b, mv_c, mv_d] {
+            write_mv_huffman_component(&mut w, mv.x);
+            write_mv_huffman_component(&mut w, mv.y);
+        }
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv422,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        let bot = MotionVector::new(2, 2);
+        let top = MotionVector::new(-4, 4);
+        assert_eq!(out[cb_o[0][0] as usize], bot, "E");
+        assert_eq!(out[cb_o[0][1] as usize], top, "F");
+        assert_eq!(out[cr_o[0][0] as usize], bot, "G");
+        assert_eq!(out[cr_o[0][1] as usize], top, "H");
+    }
+
+    #[test]
+    fn mv_inter_mv_four_yuv444_chroma_copies_luma() {
+        // 4:4:4: chroma blocks get the luma MVs directly.
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv444);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterMvFour];
+
+        let mvs = [
+            MotionVector::new(1, 1),
+            MotionVector::new(2, 2),
+            MotionVector::new(3, 3),
+            MotionVector::new(4, 4),
+        ];
+        let mut w = BitWriter::new();
+        w.put(0, 1);
+        for mv in mvs.iter() {
+            write_mv_huffman_component(&mut w, mv.x);
+            write_mv_huffman_component(&mut w, mv.y);
+        }
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv444,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        for k in 0..4 {
+            assert_eq!(out[cb_o[0][k] as usize], mvs[k], "E/F/G/H k={k}");
+            assert_eq!(out[cr_o[0][k] as usize], mvs[k], "I/J/K/L k={k}");
+        }
+    }
+
+    #[test]
+    fn mv_inter_mv_four_updates_last1_to_last_coded_block() {
+        // INTER_MV_FOUR's step 3(a)xiv assigns LAST1 the value of the
+        // last coded luma block in raster order (A→B→C→D). With D
+        // coded, LAST1 = D's MV; a following INTER_MV_LAST macroblock
+        // should reuse D's MV.
+        let nmbs = 2u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterMvFour, MacroBlockMode::InterMvLast];
+
+        let mvs = [
+            MotionVector::new(1, 0),
+            MotionVector::new(2, 0),
+            MotionVector::new(3, 0),
+            MotionVector::new(4, 0),
+        ];
+        let mut w = BitWriter::new();
+        w.put(0, 1);
+        for mv in mvs.iter() {
+            write_mv_huffman_component(&mut w, mv.x);
+            write_mv_huffman_component(&mut w, mv.y);
+        }
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        // mb1 INTER_MV_LAST should propagate D=(4, 0) (LAST1 after mb0).
+        assert_eq!(out[luma[1][0] as usize], MotionVector::new(4, 0));
+    }
+
+    #[test]
+    fn mv_round_div_matches_spec_examples() {
+        // §spec round(a) with ties away from zero.
+        assert_eq!(round_div(7, 4), 2); // 1.75 → 2
+        assert_eq!(round_div(-7, 4), -2); // -1.75 → -2
+        assert_eq!(round_div(6, 4), 2); // 1.5 → 2 (tie away from 0)
+        assert_eq!(round_div(-6, 4), -2); // -1.5 → -2 (tie away from 0)
+        assert_eq!(round_div(0, 4), 0);
+        assert_eq!(round_div(2, 4), 1); // 0.5 → 1
+        assert_eq!(round_div(-2, 4), -1); // -0.5 → -1
+        assert_eq!(round_div(3, 2), 2); // 1.5 → 2
+        assert_eq!(round_div(-3, 2), -2); // -1.5 → -2
+    }
+
+    #[test]
+    fn mv_rejects_mbmodes_length_mismatch() {
+        let nmbs = 2u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterNoMv]; // length 1, nmbs=2
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let err = decode_macroblock_motion_vectors(
+            &[0u8],
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MotionVectorMbModesLenMismatch {
+                modes_len: 1,
+                nmbs: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn mv_rejects_luma_map_length_mismatch() {
+        let nmbs = 2u32;
+        let (nbs, _luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterNoMv; nmbs as usize];
+        let bad_luma: Vec<[u32; 4]> = vec![[0, 1, 2, 3]]; // length 1
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let err = decode_macroblock_motion_vectors(
+            &[0u8],
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &bad_luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MotionVectorLumaMapLenMismatch {
+                map_len: 1,
+                nmbs: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn mv_rejects_luma_index_out_of_range() {
+        let nmbs = 1u32;
+        let nbs = 4u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterMv];
+        let luma: Vec<[u32; 4]> = vec![[0, 1, 2, 4]]; // 4 >= nbs
+        let cb_o: Vec<Vec<u32>> = vec![vec![0]];
+        let cr_o: Vec<Vec<u32>> = vec![vec![0]];
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let err = decode_macroblock_motion_vectors(
+            &[0u8],
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MotionVectorLumaBlockIndexOutOfRange {
+                mbi: 0,
+                slot: 3,
+                bi: 4,
+                nbs: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn mv_rejects_chroma_map_length_mismatch() {
+        let nmbs = 2u32;
+        let (nbs, luma, _cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterNoMv; nmbs as usize];
+        let cb_o_bad: Vec<Vec<u32>> = vec![vec![8]]; // length 1, nmbs=2
+        let cb = slice_outer(&cb_o_bad);
+        let cr = slice_outer(&cr_o);
+        let err = decode_macroblock_motion_vectors(
+            &[0u8],
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MotionVectorChromaMapLenMismatch {
+                plane: 0,
+                map_len: 1,
+                expected: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn mv_rejects_chroma_inner_slot_length_mismatch_for_pf() {
+        // PF=0 expects inner length 1; pass a length-2 inner.
+        let nmbs = 1u32;
+        let (nbs, luma, _cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterNoMv];
+        let cb_o_bad: Vec<Vec<u32>> = vec![vec![4, 5]]; // length 2 for PF=0
+        let cb = slice_outer(&cb_o_bad);
+        let cr = slice_outer(&cr_o);
+        let err = decode_macroblock_motion_vectors(
+            &[0u8],
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MotionVectorChromaMacroBlockSlotLenMismatch {
+                mbi: 0,
+                plane: 0,
+                got: 2,
+                expected: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn mv_rejects_chroma_index_out_of_range() {
+        let nmbs = 1u32;
+        let nbs = 4u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterNoMv];
+        let luma: Vec<[u32; 4]> = vec![[0, 1, 2, 3]];
+        let cb_o: Vec<Vec<u32>> = vec![vec![4]]; // OOB
+        let cr_o: Vec<Vec<u32>> = vec![vec![0]];
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let err = decode_macroblock_motion_vectors(
+            &[0u8],
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MotionVectorChromaBlockIndexOutOfRange {
+                mbi: 0,
+                slot: 0,
+                bi: 4,
+                nbs: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn mv_truncation_at_mvmode_bit_is_reported() {
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterNoMv];
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let err = decode_macroblock_motion_vectors(
+            &[], // empty: MVMODE bit cannot be read
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::TruncatedHeader { field: "MVMODE" }));
+    }
+
+    #[test]
+    fn mv_error_displays_render() {
+        let e1 = Error::MotionVectorMbModesLenMismatch {
+            modes_len: 3,
+            nmbs: 5,
+        };
+        let e2 = Error::MotionVectorLumaMapLenMismatch {
+            map_len: 1,
+            nmbs: 2,
+        };
+        let e3 = Error::MotionVectorLumaBlockIndexOutOfRange {
+            mbi: 7,
+            slot: 2,
+            bi: 99,
+            nbs: 64,
+        };
+        let e4 = Error::MotionVectorChromaBlockIndexOutOfRange {
+            mbi: 3,
+            slot: 0,
+            bi: 50,
+            nbs: 48,
+        };
+        let e5 = Error::MotionVectorChromaMapLenMismatch {
+            plane: 1,
+            map_len: 0,
+            expected: 8,
+        };
+        let e6 = Error::MotionVectorChromaMacroBlockSlotLenMismatch {
+            mbi: 4,
+            plane: 0,
+            got: 2,
+            expected: 4,
+        };
+        for e in [e1, e2, e3, e4, e5, e6] {
+            let s = format!("{e}");
+            assert!(s.contains("oxideav-theora"));
+            assert!(s.contains("§7.5.2"));
+        }
+    }
+
+    #[test]
+    fn mv_inner_chains_on_shared_reader() {
+        // After §7.5.2 finishes, a sentinel byte appended to the
+        // packet must still be readable via the shared reader. This
+        // confirms the procedure stops at the right bit position.
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::InterMv];
+
+        let mut w = BitWriter::new();
+        w.put(0, 1); // MVMODE=0
+        write_mv_huffman_component(&mut w, 1); // 3 bits
+        write_mv_huffman_component(&mut w, 1); // 3 bits
+                                               // Total = 7 bits. Pad one bit to align to byte and emit 0xAB.
+        w.put(0, 1); // pad to byte boundary
+        w.put(0xAB, 8);
+        let bytes = w.finish();
+
+        let mut r = BitReader::new(&bytes);
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let _out = decode_macroblock_motion_vectors_inner(
+            &mut r,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        // Consume the pad bit, then read the 0xAB sentinel.
+        let _pad = r.read_bits(1, "pad").unwrap();
+        let sentinel = r.read_bits(8, "sentinel").unwrap();
+        assert_eq!(sentinel, 0xAB);
+    }
+
+    #[test]
+    fn mv_intra_does_not_consume_bits() {
+        // An intra frame must not consume the MVMODE bit (or anything
+        // else). Use a packet whose first bit is 1 so we'd notice a
+        // spurious read.
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let bcoded = vec![1u8; nbs as usize];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let packet = vec![0xFFu8];
+
+        let mut r = BitReader::new(&packet);
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let _ = decode_macroblock_motion_vectors_inner(
+            &mut r,
+            FrameType::Intra,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        // No bits consumed.
+        let next = r.read_bits(8, "sentinel").unwrap();
+        assert_eq!(next, 0xFF);
+    }
+
+    #[test]
+    fn mv_uncoded_luma_in_non_four_mode_does_not_overwrite_chroma() {
+        // Step 3(g) iterates "each coded block bi". Uncoded blocks
+        // (BCODED[bi]==0) should retain their (0, 0) default even when
+        // the macroblock has an MV (e.g. INTER_MV with some chroma
+        // uncoded).
+        let nmbs = 1u32;
+        let (nbs, luma, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let mut bcoded = vec![1u8; nbs as usize];
+        // Mark the chroma Cb block uncoded.
+        bcoded[cb_o[0][0] as usize] = 0;
+        let mbmodes = vec![MacroBlockMode::InterMv];
+
+        let mut w = BitWriter::new();
+        w.put(0, 1);
+        write_mv_huffman_component(&mut w, 6);
+        write_mv_huffman_component(&mut w, -6);
+        let bytes = w.finish();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let out = decode_macroblock_motion_vectors(
+            &bytes,
+            FrameType::Inter,
+            PixelFormat::Yuv420,
+            nbs,
+            nmbs,
+            &bcoded,
+            &mbmodes,
+            &luma,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        // Coded luma: propagated.
+        for k in 0..4 {
+            assert_eq!(out[luma[0][k] as usize], MotionVector::new(6, -6));
+        }
+        // Uncoded Cb: still zero.
+        assert_eq!(out[cb_o[0][0] as usize], MotionVector::ZERO);
+        // Coded Cr: propagated.
+        assert_eq!(out[cr_o[0][0] as usize], MotionVector::new(6, -6));
     }
 }

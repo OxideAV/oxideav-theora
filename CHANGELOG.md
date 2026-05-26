@@ -6,6 +6,62 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§7.5 Motion Vectors (2026-05-27, round 12).** New public
+  `decode_single_motion_vector(bits, mvmode) -> Result<MotionVector,
+  Error>` transcribing §7.5.1 of the Xiph Theora I Specification
+  ("Motion Vector Decode") and
+  `decode_macroblock_motion_vectors(packet, ftype, pf, nbs, nmbs,
+  bcoded, mbmodes, luma_map, chroma_map) ->
+  Result<Vec<MotionVector>, Error>` transcribing §7.5.2 ("Macro Block
+  Motion Vector Decode") on top of the §5.2 MSb-first `BitReader`.
+
+  `decode_single_motion_vector` implements both MV decoding methods
+  §7.5.1 allows: `MVMODE=0` resolves a 3..=8-bit Huffman code per
+  Table 7.23 (signed values `-31..=31`); `MVMODE=1` reads a 5-bit
+  unsigned magnitude + 1-bit sign per component, with the sign bit
+  always read even when the magnitude is zero (the VP3-compat
+  invariant called out in §7.5.1).
+
+  `decode_macroblock_motion_vectors` implements §7.5.2 in full: intra
+  short-circuit (every entry `MotionVector::ZERO`, no MVMODE bit
+  consumed), `LAST1`/`LAST2` initialisation (step 1), MVMODE read
+  (step 2), and step 3 dispatch on `MBMODES[mbi]` —
+  `INTER_MV_FOUR` (four per-coded-luma MVs + uncoded-luma (0, 0) +
+  PF=0/2/4 chroma averaging via spec `round(...)` with ties away
+  from zero + `LAST1` update from last *coded* luma),
+  `INTER_GOLDEN_MV` (decode-without-LAST-update), `INTER_MV_LAST2`
+  (rotate `LAST1`/`LAST2`), `INTER_MV_LAST` (reuse `LAST1`),
+  `INTER_MV` (decode + LAST update), and the NOMV/INTRA fallback
+  (emit zero). Step 3(g) propagates the single MV to every coded
+  block (luma + chroma) for non-`INTER_MV_FOUR` macroblocks.
+
+  New public types: `MotionVector { x: i8, y: i8 }` (with
+  `MotionVector::ZERO`) and `ChromaBlockLayout { cb, cr }`. Six new
+  typed errors reject malformed inputs:
+  `MotionVectorMbModesLenMismatch`, `MotionVectorLumaMapLenMismatch`,
+  `MotionVectorLumaBlockIndexOutOfRange`,
+  `MotionVectorChromaBlockIndexOutOfRange`,
+  `MotionVectorChromaMapLenMismatch`,
+  `MotionVectorChromaMacroBlockSlotLenMismatch`.
+
+  Twenty-eight new tests cover: Table 7.23 round-trip across every
+  value in `-31..=31`, MVMODE=1 round-trip + the read-sign-on-
+  magnitude-zero invariant, MV reader truncation rejects for both
+  modes, intra short-circuit (empty packet decodes), INTER_NOMV only
+  consumes the MVMODE bit, INTER_MV decode + propagate, INTER_MV_LAST
+  chain, INTER_MV_LAST2 3-way rotation, INTER_GOLDEN_MV does NOT
+  update LASTs, all three chroma-averaging formulas (PF=0/2/4 — `round()`
+  ties away from zero exercised explicitly), INTER_MV_FOUR with
+  uncoded luma → chroma averaging uses (0, 0), INTER_MV_FOUR's `LAST1`
+  update from the last coded luma block, all six input-validation
+  rejects with `Display` rendering, truncation at MVMODE, the
+  shared-`BitReader` chaining contract via
+  `decode_macroblock_motion_vectors_inner`, intra-frame consumes-no-
+  bits assertion, uncoded chroma block in step 3(g) keeps its
+  (0, 0) default, and a `round_div`-against-spec check covering
+  tie-away-from-zero. Brings the unit-test total to **207**
+  (previously 179).
+
 * **§7.4 Macro Block Coding Modes (2026-05-27, round 11).** New public
   `decode_macroblock_modes(packet, ftype, nmbs, nbs, bcoded,
   macro_block_to_luma_blocks) -> Result<Vec<MacroBlockMode>, Error>`

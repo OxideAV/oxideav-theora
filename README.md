@@ -7,13 +7,16 @@ Pure-Rust Theora video codec — clean-room implementation in progress.
 **Identification + comment + setup-entrypoint + §6.4.2 quant-params
 decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
 + §7.1 frame-header decode + §7.2 long-/short-run bit strings + §7.3
-coded-block-flags decode + §7.4 macro-block coding modes (rounds 1–11).**
+coded-block-flags decode + §7.4 macro-block coding modes + §7.5
+motion-vector decode (rounds 1–12).**
 §6.1, §6.2 (identification), §6.3 (comment), §6.4.5 step 1
 (setup-header common-header guard), §6.4.2 (Quantization Parameters
 Decode), §6.4.3 (Computing a Quantization Matrix), §6.4.4 (DCT Token
 Huffman Tables), §7.1 (Frame Header Decode), §7.2 (Run-Length Encoded
-Bit Strings), §7.3 (Coded Block Flags Decode), and §7.4 (Macro Block
-Coding Modes) of the Theora I Specification are wired up. Three
+Bit Strings), §7.3 (Coded Block Flags Decode), §7.4 (Macro Block
+Coding Modes), §7.5.1 (single Motion Vector decode), and §7.5.2 (per-
+macro-block Motion Vector decode) of the Theora I Specification are
+wired up. Three
 byte-aligned entry points plus eight public bit-level decoders over
 an MSb-first bit reader; round 4 added the Appendix B VP3 fallback
 tables, round 5 added the full §6.4.2 procedure (ACSCALE / DCSCALE /
@@ -118,6 +121,29 @@ alphabets, the on-wire MSCHEME=0 alphabet, and the MSCHEME=7 direct
   `UnknownMacroBlockModeCode`) reject malformed inputs. The shared-
   reader chaining contract is preserved via a crate-private
   `decode_macroblock_modes_inner`.
+* [`decode_single_motion_vector`] / [`decode_macroblock_motion_vectors`]
+  — round 12 public §7.5.1 / §7.5.2 procedures returning a single
+  [`MotionVector`] or an `NBS`-element `Vec<MotionVector>` of per-
+  block motion vectors. §7.5.1 supports both MVMODE=0 (Table 7.23
+  3..=8-bit Huffman codes for signed values `-31..=31`) and MVMODE=1
+  (5-bit unsigned magnitude + 1-bit sign per component, with the
+  sign bit always read even when magnitude is zero — VP3 compat).
+  §7.5.2 short-circuits intra frames (no MVMODE bit consumed; every
+  output (0, 0)); inter frames execute step 1 (`LAST1 = LAST2 =
+  (0, 0)`), step 2 (1-bit MVMODE always read), and step 3 dispatch
+  on `MBMODES[mbi]`: `INTER_MV_FOUR` (per-coded-luma MVs with
+  uncoded-luma (0, 0) + PF=0/2/4 chroma averaging via the spec's
+  `round()` ties-away-from-zero + `LAST1` update from last coded
+  luma), `INTER_GOLDEN_MV` (decode without LAST update), `INTER_MV_
+  LAST2` (rotate LAST1/LAST2), `INTER_MV_LAST` (reuse LAST1),
+  `INTER_MV` (decode + LAST update), and the NOMV/INTRA fallback
+  (emit zero). Caller supplies `luma_map: &[[u32; 4]]` of length
+  `NMBS` (raster A, B, C, D per macroblock) and
+  [`ChromaBlockLayout`] (per-plane outer length `NMBS`; inner length
+  `1` for PF=0, `2` for PF=2, `4` for PF=3). Six new typed errors
+  reject malformed inputs. The shared-reader chaining contract is
+  preserved via a crate-private
+  `decode_macroblock_motion_vectors_inner`.
 
 ### Identification header (round 1)
 The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
@@ -413,7 +439,35 @@ rejects, the `b1111110` / `b1111111` 7-bit-prefix disambiguation
 via `decode_macroblock_modes_inner`, error-`Display` rendering, an
 explicit no-bits-consumed assertion for fully-uncoded inter frames,
 the `nmbs=0` short-circuit, and a defensive coverage walk across all
-eight MSCHEME values.
+eight MSCHEME values. Round 12 adds twenty-eight §7.5 motion-vector
+tests (total now 207): Table 7.23 round-trip across every value in
+`-31..=31` (both as a standalone MVX with MVY=0 and as paired (v, -v)
+components), MVMODE=1 5+1-bit round-trip with the sign-on-magnitude-
+zero invariant exercised explicitly, MV reader truncation rejects on
+both MVMODE paths, intra-frame short-circuit (empty packet decodes;
+no MV bits read), INTER_NOMV-only inter consumes only the MVMODE
+bit, INTER_MV decode-and-propagate to every coded block, INTER_MV_
+LAST chain reuses LAST1, INTER_MV_LAST2 3-way rotation through
+LAST1/LAST2, INTER_GOLDEN_MV decodes one MV without touching the
+LASTs, all three chroma-averaging formulas (PF=0 with non-divisible-
+by-4 sums to exercise `round()` ties; PF=2 bottom/top halves with
+`round()` ties on both signs; PF=4 direct copy), INTER_MV_FOUR with
+one uncoded luma → chroma averaging uses (0, 0) for that slot,
+INTER_MV_FOUR's `LAST1` update from the last *coded* luma block (D
+in raster order) feeding a following INTER_MV_LAST, all six input-
+validation rejects (`MotionVectorMbModesLenMismatch` /
+`MotionVectorLumaMapLenMismatch` /
+`MotionVectorLumaBlockIndexOutOfRange` /
+`MotionVectorChromaMapLenMismatch` /
+`MotionVectorChromaMacroBlockSlotLenMismatch` /
+`MotionVectorChromaBlockIndexOutOfRange`) with `Display` rendering,
+truncation at the MVMODE bit, the shared-`BitReader` chaining
+contract via `decode_macroblock_motion_vectors_inner` (followed by a
+sentinel byte read on the same reader), an explicit "intra consumes
+no bits" packet-reread, an uncoded chroma block in step 3(g) keeps
+its (0, 0) default while coded blocks get the MV, and a `round_div`-
+matches-spec check (1.5/-1.5/2.5/-2.5 all tie away from zero per the
+§ Notation `round(a)` definition).
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

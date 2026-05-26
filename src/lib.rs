@@ -336,6 +336,37 @@ pub enum Error {
         /// The caller-supplied `nsbs`.
         nsbs: u32,
     },
+    /// The `macro_block_to_luma_blocks` mapping passed to
+    /// [`decode_macroblock_modes`] has a different length than the
+    /// `nmbs` argument. §7.4 step 2(d)i looks up the four luma-block
+    /// `bi` values for macro block `mbi`; the two arguments must agree.
+    MacroBlockLumaMapLenMismatch {
+        /// `macro_block_to_luma_blocks.len()`.
+        map_len: usize,
+        /// The caller-supplied `nmbs`.
+        nmbs: usize,
+    },
+    /// An entry in the `macro_block_to_luma_blocks` mapping passed to
+    /// [`decode_macroblock_modes`] referenced a luma-block index that
+    /// is `>= nbs`. §7.4 step 2(d)i.A reads `BCODED[bi]` so the index
+    /// must be in range.
+    MacroBlockLumaBlockIndexOutOfRange {
+        /// Zero-based macro-block index where the bad mapping was found.
+        mbi: usize,
+        /// Slot 0..=3 within the macro block (A, B, C, D in §7.5.2
+        /// raster order).
+        slot: usize,
+        /// The offending luma-block index.
+        bi: u32,
+        /// The caller-supplied `nbs`.
+        nbs: u32,
+    },
+    /// While decoding a §7.4 macro-block mode under Schemes 1..=6 the
+    /// Huffman code-prefix walk advanced past the longest legal code
+    /// (`b1111111`) without recognising any entry of Table 7.19. This
+    /// can only happen if `BitReader::read_bits` returned an unexpected
+    /// value, but the variant is kept defensive.
+    UnknownMacroBlockModeCode,
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -487,6 +518,23 @@ impl core::fmt::Display for Error {
             Error::BlockSuperBlockIndexOutOfRange { bi, sbi, nsbs } => write!(
                 f,
                 "oxideav-theora: §7.3 block-to-super-block map: block {bi} → sbi {sbi} >= nsbs {nsbs}"
+            ),
+            Error::MacroBlockLumaMapLenMismatch { map_len, nmbs } => write!(
+                f,
+                "oxideav-theora: §7.4 macro-block-to-luma-blocks map length {map_len} != nmbs {nmbs}"
+            ),
+            Error::MacroBlockLumaBlockIndexOutOfRange {
+                mbi,
+                slot,
+                bi,
+                nbs,
+            } => write!(
+                f,
+                "oxideav-theora: §7.4 mb {mbi} slot {slot} → bi {bi} >= nbs {nbs}"
+            ),
+            Error::UnknownMacroBlockModeCode => write!(
+                f,
+                "oxideav-theora: §7.4 unrecognised Table 7.19 Huffman prefix (Scheme 1..=6)"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -2441,6 +2489,277 @@ pub(crate) fn decode_coded_block_flags_inner(
     debug_assert_eq!(block_cursor as u64, nbits_blocks);
     debug_assert_eq!(bcoded.len(), nbs_us);
     Ok(bcoded)
+}
+
+// =====================================================================
+// §7.4 Macro Block Coding Modes
+// =====================================================================
+
+/// One of the eight macro-block coding modes from Table 7.18 of the Xiph
+/// Theora I Specification.
+///
+/// In an intra frame every macro block is `INTRA`; in an inter frame any
+/// of these eight values may appear. The variant discriminant equals the
+/// `Index` column of Table 7.18 — `from_index` / `to_index` round-trip
+/// for any value in `0..=7`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroBlockMode {
+    /// Index 0 — inter prediction from the previous reference frame
+    /// with a zero motion vector.
+    InterNoMv,
+    /// Index 1 — intra-coded macro block. Used for every macro block in
+    /// an intra frame.
+    Intra,
+    /// Index 2 — inter prediction with an explicit motion vector.
+    InterMv,
+    /// Index 3 — inter prediction reusing the last-decoded macro
+    /// block's motion vector.
+    InterMvLast,
+    /// Index 4 — inter prediction reusing the second-to-last macro
+    /// block's motion vector.
+    InterMvLast2,
+    /// Index 5 — inter prediction from the golden frame with a zero
+    /// motion vector.
+    InterGoldenNoMv,
+    /// Index 6 — inter prediction from the golden frame with an
+    /// explicit motion vector.
+    InterGoldenMv,
+    /// Index 7 — INTER_MV_FOUR: four independently coded luma motion
+    /// vectors per macro block.
+    InterMvFour,
+}
+
+impl MacroBlockMode {
+    /// Numeric index per Table 7.18.
+    pub fn to_index(self) -> u8 {
+        match self {
+            MacroBlockMode::InterNoMv => 0,
+            MacroBlockMode::Intra => 1,
+            MacroBlockMode::InterMv => 2,
+            MacroBlockMode::InterMvLast => 3,
+            MacroBlockMode::InterMvLast2 => 4,
+            MacroBlockMode::InterGoldenNoMv => 5,
+            MacroBlockMode::InterGoldenMv => 6,
+            MacroBlockMode::InterMvFour => 7,
+        }
+    }
+
+    /// Inverse of [`MacroBlockMode::to_index`]. Returns `None` for
+    /// values outside `0..=7`.
+    pub fn from_index(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => MacroBlockMode::InterNoMv,
+            1 => MacroBlockMode::Intra,
+            2 => MacroBlockMode::InterMv,
+            3 => MacroBlockMode::InterMvLast,
+            4 => MacroBlockMode::InterMvLast2,
+            5 => MacroBlockMode::InterGoldenNoMv,
+            6 => MacroBlockMode::InterGoldenMv,
+            7 => MacroBlockMode::InterMvFour,
+            _ => return None,
+        })
+    }
+}
+
+/// The fixed mode alphabets for Table 7.19 Schemes 1..=6.
+///
+/// Each row is indexed by `mi` (the rank of the recognised Huffman
+/// code, with `mi=0` for `b0`, `mi=1` for `b10`, …, `mi=7` for
+/// `b1111111`). Cell value is the `MBMODES` value assigned to that
+/// `mi`. Scheme 0 reads its alphabet from the bitstream (§7.4 step
+/// 2(b)) and Scheme 7 codes the mode directly as a 3-bit integer (§7.4
+/// step 2(d)i.B); neither is represented in this table.
+const MALPHABETS_SCHEMES_1_TO_6: [[u8; 8]; 6] = [
+    // Scheme 1: 3 4 2 0 1 5 6 7
+    [3, 4, 2, 0, 1, 5, 6, 7],
+    // Scheme 2: 3 4 0 2 1 5 6 7
+    [3, 4, 0, 2, 1, 5, 6, 7],
+    // Scheme 3: 3 2 4 0 1 5 6 7
+    [3, 2, 4, 0, 1, 5, 6, 7],
+    // Scheme 4: 3 2 0 4 1 5 6 7
+    [3, 2, 0, 4, 1, 5, 6, 7],
+    // Scheme 5: 0 3 4 2 1 5 6 7
+    [0, 3, 4, 2, 1, 5, 6, 7],
+    // Scheme 6: 0 5 3 4 2 1 6 7
+    [0, 5, 3, 4, 2, 1, 6, 7],
+];
+
+/// Decode the Table 7.19 Huffman prefix (`b0`, `b10`, …, `b1111111`)
+/// against an MSb-first bit reader and return the resulting `mi` index
+/// in `0..=7`.
+///
+/// Table 7.19 codes are unary-with-cap-at-7-bits:
+///
+/// ```text
+/// mi  code         length
+/// 0   b0           1
+/// 1   b10          2
+/// 2   b110         3
+/// 3   b1110        4
+/// 4   b11110       5
+/// 5   b111110      6
+/// 6   b1111110     7
+/// 7   b1111111     7
+/// ```
+///
+/// The procedure reads up to six `1` bits looking for a `0` terminator
+/// (recognised codes `b0` / `b10` / … / `b111110` mapping to `mi=0..=5`).
+/// If a seventh bit must be read, its value disambiguates `b1111110`
+/// (`mi=6`) from `b1111111` (`mi=7`); both codes are 7 bits long.
+fn read_table_7_19_mi(r: &mut BitReader<'_>) -> Result<u8, Error> {
+    for mi in 0u8..=5 {
+        let bit = r.read_bits(1, "MBMODES_huffman_code")?;
+        if bit == 0 {
+            return Ok(mi);
+        }
+    }
+    // Six `1` bits already consumed — the seventh bit decides between
+    // `b1111110` (mi=6) and `b1111111` (mi=7).
+    let tail = r.read_bits(1, "MBMODES_huffman_code")?;
+    if tail == 0 {
+        Ok(6)
+    } else {
+        Ok(7)
+    }
+}
+
+/// Decode the `MBMODES` per-macro-block coding-mode array per §7.4 of
+/// the Xiph Theora I Specification ("Macro Block Coding Modes").
+///
+/// Given a frame's type, macro-block count `NMBS`, block count `NBS`,
+/// the per-block `BCODED` array from §7.3, and the per-macro-block
+/// `macro_block_to_luma_blocks` mapping (length `NMBS`, each entry the
+/// four coded-order luma-block indices A, B, C, D of one macro block
+/// per §7.5.2), returns an `NMBS`-element `Vec<MacroBlockMode>`.
+///
+/// For an intra frame (§7.4 step 1) every entry is
+/// [`MacroBlockMode::Intra`] and `packet` is not consumed. For an inter
+/// frame (§7.4 step 2) the procedure:
+///
+/// 1. Reads a 3-bit `MSCHEME` (step 2(a)).
+/// 2. Builds the `MALPHABET[0..8]` table: from the bitstream when
+///    `MSCHEME` is 0 (step 2(b)), from Table 7.19's fixed columns when
+///    `MSCHEME` is 1..=6 (step 2(c)), or sentinel-ignored when
+///    `MSCHEME` is 7 (modes are coded directly in step 2(d)i.B).
+/// 3. For each macro block `mbi` in coded order (step 2(d)):
+///    * If at least one of its four luma blocks has `BCODED[bi] == 1`,
+///      reads a Huffman-coded mode (`MSCHEME != 7`) or a 3-bit direct
+///      mode (`MSCHEME == 7`) per step 2(d)i.A / 2(d)i.B.
+///    * Otherwise assigns [`MacroBlockMode::InterNoMv`] per step
+///      2(d)ii (no on-wire mode bits are read).
+///
+/// `packet` is the full frame-data packet payload (or any slice
+/// positioned at the byte-aligned start of the §7.4 bit stream). For a
+/// full §7 frame walk the caller drives [`decode_macroblock_modes_inner`]
+/// on a [`BitReader`] already positioned past §7.1 / §7.2 / §7.3.
+///
+/// Returns:
+///
+/// * [`Error::MacroBlockLumaMapLenMismatch`] if
+///   `macro_block_to_luma_blocks.len() != nmbs`.
+/// * [`Error::MacroBlockLumaBlockIndexOutOfRange`] if any luma-block
+///   index is `>= nbs`.
+/// * [`Error::TruncatedHeader`] when the underlying bit reader is
+///   exhausted before a field is fully read.
+pub fn decode_macroblock_modes(
+    packet: &[u8],
+    ftype: FrameType,
+    nmbs: u32,
+    nbs: u32,
+    bcoded: &[u8],
+    macro_block_to_luma_blocks: &[[u32; 4]],
+) -> Result<Vec<MacroBlockMode>, Error> {
+    let mut r = BitReader::new(packet);
+    decode_macroblock_modes_inner(&mut r, ftype, nmbs, nbs, bcoded, macro_block_to_luma_blocks)
+}
+
+/// Inner §7.4 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so an end-to-end frame decoder can chain
+/// §7.1 → §7.2 → §7.3 → §7.4 on the same reader without re-aligning to
+/// a byte boundary.
+pub(crate) fn decode_macroblock_modes_inner(
+    r: &mut BitReader<'_>,
+    ftype: FrameType,
+    nmbs: u32,
+    nbs: u32,
+    bcoded: &[u8],
+    macro_block_to_luma_blocks: &[[u32; 4]],
+) -> Result<Vec<MacroBlockMode>, Error> {
+    // Argument sanity checks. §7.4 step 2(d)i.A reads BCODED[bi] for
+    // each of a macro block's four luma blocks, so the caller-supplied
+    // mapping must match NMBS in length and reference only legal bi
+    // values.
+    let nmbs_us = nmbs as usize;
+    if macro_block_to_luma_blocks.len() != nmbs_us {
+        return Err(Error::MacroBlockLumaMapLenMismatch {
+            map_len: macro_block_to_luma_blocks.len(),
+            nmbs: nmbs_us,
+        });
+    }
+    for (mbi, group) in macro_block_to_luma_blocks.iter().enumerate() {
+        for (slot, &bi) in group.iter().enumerate() {
+            if bi >= nbs {
+                return Err(Error::MacroBlockLumaBlockIndexOutOfRange { mbi, slot, bi, nbs });
+            }
+        }
+    }
+
+    // Step 1: intra frames assign every macro block INTRA, no bits read.
+    if ftype == FrameType::Intra {
+        return Ok(vec![MacroBlockMode::Intra; nmbs_us]);
+    }
+
+    // Step 2(a): read MSCHEME (3-bit unsigned).
+    let mscheme = r.read_bits(3, "MSCHEME")? as u8;
+
+    // Build the MALPHABET[0..8] table per step 2(b) / 2(c). For
+    // MSCHEME=7 the alphabet is unused; we leave it as a default sentinel.
+    let mut malphabet: [u8; 8] = [0; 8];
+    if mscheme == 0 {
+        // Step 2(b): for each MODE in 0..=7, read 3-bit mi and assign
+        // MALPHABET[mi] = MODE. This is a permutation of 0..=7 on the
+        // wire; the spec does not say what to do if an mi value collides,
+        // so we transcribe the loop literally (a later collision simply
+        // overwrites the earlier one — both ends of the encoder/decoder
+        // must agree on the permutation by construction).
+        for mode in 0u8..8 {
+            let mi = r.read_bits(3, "MALPHABET_mi")? as usize;
+            malphabet[mi] = mode;
+        }
+    } else if mscheme <= 6 {
+        // Step 2(c): copy the appropriate Table 7.19 column.
+        malphabet = MALPHABETS_SCHEMES_1_TO_6[(mscheme - 1) as usize];
+    }
+    // mscheme == 7: malphabet stays default; step 2(d)i.B reads the
+    // mode directly, bypassing it.
+
+    // Step 2(d): walk macro blocks in coded order and emit MBMODES[mbi].
+    let mut mbmodes: Vec<MacroBlockMode> = Vec::with_capacity(nmbs_us);
+    for luma_group in macro_block_to_luma_blocks.iter() {
+        // Step 2(d)i: does any luma block of this macro block have
+        // BCODED[bi] == 1?
+        let any_luma_coded = luma_group.iter().any(|&bi| bcoded[bi as usize] == 1);
+
+        let mode_val: u8 = if any_luma_coded {
+            if mscheme == 7 {
+                // Step 2(d)i.B: read MBMODES[mbi] directly as 3 bits.
+                r.read_bits(3, "MBMODES_direct")? as u8
+            } else {
+                // Step 2(d)i.A: walk Table 7.19's Huffman prefix to
+                // recover mi, then look up MALPHABET[mi].
+                let mi = read_table_7_19_mi(r)?;
+                malphabet[mi as usize]
+            }
+        } else {
+            // Step 2(d)ii: no luma blocks coded → INTER_NOMV (0).
+            0u8
+        };
+
+        let mode = MacroBlockMode::from_index(mode_val).ok_or(Error::UnknownMacroBlockModeCode)?;
+        mbmodes.push(mode);
+    }
+    debug_assert_eq!(mbmodes.len(), nmbs_us);
+    Ok(mbmodes)
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -6083,5 +6402,573 @@ mod tests {
         //           bi 7 (sb1, SBFCODED=1) → 1
         let expected = vec![0, 1, 1, 1, 0, 1, 1, 1];
         assert_eq!(out, expected);
+    }
+
+    // -----------------------------------------------------------------
+    // §7.4 Macro Block Coding Modes
+    // -----------------------------------------------------------------
+
+    /// Append the Table 7.19 Huffman code for `mi` (in `0..=7`) to the
+    /// MSb-first writer `w`. Mirrors `read_table_7_19_mi` and is used to
+    /// synthesize §7.4 test fixtures bit-exactly.
+    fn write_mb_mode_code(w: &mut BitWriter, mi: u8) {
+        match mi {
+            0 => w.put(0b0, 1),
+            1 => w.put(0b10, 2),
+            2 => w.put(0b110, 3),
+            3 => w.put(0b1110, 4),
+            4 => w.put(0b11110, 5),
+            5 => w.put(0b111110, 6),
+            6 => w.put(0b1111110, 7),
+            7 => w.put(0b1111111, 7),
+            _ => panic!("mi {mi} out of range for Table 7.19"),
+        }
+    }
+
+    #[test]
+    fn macroblock_mode_table_7_18_index_round_trip() {
+        // Table 7.18: 0=INTER_NOMV, 1=INTRA, 2=INTER_MV, 3=INTER_MV_LAST,
+        // 4=INTER_MV_LAST2, 5=INTER_GOLDEN_NOMV, 6=INTER_GOLDEN_MV,
+        // 7=INTER_MV_FOUR.
+        for v in 0u8..=7 {
+            let m = MacroBlockMode::from_index(v).unwrap();
+            assert_eq!(m.to_index(), v, "round-trip failed for index {v}");
+        }
+        assert_eq!(
+            MacroBlockMode::from_index(0).unwrap(),
+            MacroBlockMode::InterNoMv
+        );
+        assert_eq!(
+            MacroBlockMode::from_index(1).unwrap(),
+            MacroBlockMode::Intra
+        );
+        assert_eq!(
+            MacroBlockMode::from_index(2).unwrap(),
+            MacroBlockMode::InterMv
+        );
+        assert_eq!(
+            MacroBlockMode::from_index(3).unwrap(),
+            MacroBlockMode::InterMvLast
+        );
+        assert_eq!(
+            MacroBlockMode::from_index(4).unwrap(),
+            MacroBlockMode::InterMvLast2
+        );
+        assert_eq!(
+            MacroBlockMode::from_index(5).unwrap(),
+            MacroBlockMode::InterGoldenNoMv
+        );
+        assert_eq!(
+            MacroBlockMode::from_index(6).unwrap(),
+            MacroBlockMode::InterGoldenMv
+        );
+        assert_eq!(
+            MacroBlockMode::from_index(7).unwrap(),
+            MacroBlockMode::InterMvFour
+        );
+        assert_eq!(MacroBlockMode::from_index(8), None);
+    }
+
+    #[test]
+    fn macroblock_modes_intra_marks_all_intra() {
+        // §7.4 step 1: every macro block is INTRA. No bits consumed.
+        let nmbs = 4u32;
+        let nbs = 16u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| {
+                let base = mbi * 4;
+                [base, base + 1, base + 2, base + 3]
+            })
+            .collect();
+        let out = decode_macroblock_modes(&[], FrameType::Intra, nmbs, nbs, &bcoded, &map).unwrap();
+        assert_eq!(out.len(), nmbs as usize);
+        for m in &out {
+            assert_eq!(*m, MacroBlockMode::Intra);
+        }
+    }
+
+    #[test]
+    fn macroblock_modes_intra_rejects_bad_map_length() {
+        let nmbs = 2u32;
+        let nbs = 4u32;
+        let bcoded = vec![1u8; nbs as usize];
+        // Map too short — error must be raised even on intra (the input
+        // validation runs unconditionally).
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3]];
+        let err =
+            decode_macroblock_modes(&[], FrameType::Intra, nmbs, nbs, &bcoded, &map).unwrap_err();
+        assert_eq!(
+            err,
+            Error::MacroBlockLumaMapLenMismatch {
+                map_len: 1,
+                nmbs: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_rejects_oob_luma_block_index() {
+        let nmbs = 1u32;
+        let nbs = 4u32;
+        let bcoded = vec![1u8; nbs as usize];
+        // Slot 2 (third entry) carries an OOB luma index.
+        let map: Vec<[u32; 4]> = vec![[0, 1, 99, 3]];
+        let err =
+            decode_macroblock_modes(&[], FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap_err();
+        assert_eq!(
+            err,
+            Error::MacroBlockLumaBlockIndexOutOfRange {
+                mbi: 0,
+                slot: 2,
+                bi: 99,
+                nbs: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_inter_scheme_7_direct_three_bit_modes() {
+        // §7.4 step 2(d)i.B: MSCHEME=7 codes each mode directly as 3
+        // bits. Set up 4 macro blocks all with at least one coded luma
+        // block; emit modes 0, 3, 5, 7 verbatim.
+        let nmbs = 4u32;
+        let nbs = 16u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| {
+                let base = mbi * 4;
+                [base, base + 1, base + 2, base + 3]
+            })
+            .collect();
+        let mut w = BitWriter::new();
+        w.put(7, 3); // MSCHEME = 7
+        w.put(0, 3); // INTER_NOMV
+        w.put(3, 3); // INTER_MV_LAST
+        w.put(5, 3); // INTER_GOLDEN_NOMV
+        w.put(7, 3); // INTER_MV_FOUR
+        let bytes = w.finish();
+        let out =
+            decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                MacroBlockMode::InterNoMv,
+                MacroBlockMode::InterMvLast,
+                MacroBlockMode::InterGoldenNoMv,
+                MacroBlockMode::InterMvFour,
+            ]
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_inter_scheme_1_through_6_table_7_19_mapping() {
+        // Walk each Scheme 1..=6 column of Table 7.19. For every column
+        // emit mi=0..=7 and confirm the decoded mode matches the
+        // tabulated MALPHABET[mi].
+        let nmbs = 8u32;
+        let nbs = 32u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| {
+                let base = mbi * 4;
+                [base, base + 1, base + 2, base + 3]
+            })
+            .collect();
+        let table = [
+            [3u8, 4, 2, 0, 1, 5, 6, 7],
+            [3, 4, 0, 2, 1, 5, 6, 7],
+            [3, 2, 4, 0, 1, 5, 6, 7],
+            [3, 2, 0, 4, 1, 5, 6, 7],
+            [0, 3, 4, 2, 1, 5, 6, 7],
+            [0, 5, 3, 4, 2, 1, 6, 7],
+        ];
+        for (scheme_idx, expected_alphabet) in table.iter().enumerate() {
+            let mscheme = (scheme_idx as u32) + 1;
+            let mut w = BitWriter::new();
+            w.put(mscheme, 3);
+            // Emit each mi value 0..=7 in order.
+            for mi in 0u8..8 {
+                write_mb_mode_code(&mut w, mi);
+            }
+            let bytes = w.finish();
+            let out = decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map)
+                .unwrap();
+            for (mi, mode) in out.iter().enumerate() {
+                let expected_index = expected_alphabet[mi];
+                assert_eq!(
+                    mode.to_index(),
+                    expected_index,
+                    "Scheme {mscheme} mi={mi}: got mode {:?} (index {}), expected index {expected_index}",
+                    mode,
+                    mode.to_index(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macroblock_modes_inter_scheme_0_reads_alphabet_from_bitstream() {
+        // §7.4 step 2(b): MSCHEME=0 reads 8 3-bit mi values then assigns
+        // MALPHABET[mi] = MODE in MODE order. Construct an explicit
+        // permutation and verify each mi index recovers its assigned mode.
+        let nmbs = 8u32;
+        let nbs = 32u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| {
+                let base = mbi * 4;
+                [base, base + 1, base + 2, base + 3]
+            })
+            .collect();
+        // Permutation: MODE 0 → mi 7, 1 → mi 6, …, 7 → mi 0. Then
+        // MALPHABET = [7, 6, 5, 4, 3, 2, 1, 0].
+        let mode_to_mi = [7u8, 6, 5, 4, 3, 2, 1, 0];
+        let mut w = BitWriter::new();
+        w.put(0, 3); // MSCHEME = 0
+        for mode in 0u8..8 {
+            w.put(mode_to_mi[mode as usize] as u32, 3); // mi for this MODE
+        }
+        // Emit mi=0..=7 and expect MALPHABET[mi] = the MODE whose mi was 0..7.
+        for mi in 0u8..8 {
+            write_mb_mode_code(&mut w, mi);
+        }
+        let bytes = w.finish();
+        let out =
+            decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap();
+        // MALPHABET[mi] = MODE such that mode_to_mi[MODE] = mi
+        for mi in 0u8..8 {
+            let expected_mode = mode_to_mi.iter().position(|&m| m == mi).unwrap() as u8;
+            assert_eq!(
+                out[mi as usize].to_index(),
+                expected_mode,
+                "MSCHEME=0 mi {mi}: got index {}, expected {expected_mode}",
+                out[mi as usize].to_index(),
+            );
+        }
+    }
+
+    #[test]
+    fn macroblock_modes_inter_uncoded_luma_assigns_inter_nomv() {
+        // §7.4 step 2(d)ii: if no luma block in macro block mbi has
+        // BCODED == 1, MBMODES[mbi] := INTER_NOMV and NO bits are read.
+        // Construct a frame with mbi=1 fully uncoded (no luma BCODED
+        // bits set) and mbi=0, 2 coded. The on-wire stream then carries
+        // only TWO Huffman codes (for mbi 0 and 2), not three.
+        let nmbs = 3u32;
+        let nbs = 12u32; // 3 mbs × 4 luma each
+        let mut bcoded = vec![1u8; nbs as usize];
+        // Clear all 4 luma bits of mb 1.
+        for slot in 0..4 {
+            bcoded[(4 + slot) as usize] = 0;
+        }
+        let map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| {
+                let base = mbi * 4;
+                [base, base + 1, base + 2, base + 3]
+            })
+            .collect();
+        // Use Scheme 7 (direct) so the wire-format is easy to count.
+        let mut w = BitWriter::new();
+        w.put(7, 3); // MSCHEME = 7
+        w.put(2, 3); // MBMODES[0] = INTER_MV (2)
+                     // No bits emitted for MBMODES[1] — step 2(d)ii.
+        w.put(6, 3); // MBMODES[2] = INTER_GOLDEN_MV (6)
+        let bytes = w.finish();
+        let out =
+            decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                MacroBlockMode::InterMv,
+                MacroBlockMode::InterNoMv,
+                MacroBlockMode::InterGoldenMv,
+            ]
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_inter_partial_coded_luma_still_decodes_mode() {
+        // §7.4 step 2(d)i: ANY luma BCODED == 1 triggers a mode read.
+        // Exercise a macro block with exactly one of its four luma
+        // blocks coded.
+        let nmbs = 1u32;
+        let nbs = 4u32;
+        // Only slot 3 (D, upper-right) is coded.
+        let bcoded = vec![0u8, 0, 0, 1];
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3]];
+        let mut w = BitWriter::new();
+        w.put(7, 3); // MSCHEME = 7
+        w.put(4, 3); // INTER_MV_LAST2 (4)
+        let bytes = w.finish();
+        let out =
+            decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap();
+        assert_eq!(out, vec![MacroBlockMode::InterMvLast2]);
+    }
+
+    #[test]
+    fn macroblock_modes_inter_rejects_truncated_at_mscheme() {
+        // Inter frame with empty packet — should fail to read MSCHEME.
+        let nmbs = 1u32;
+        let nbs = 4u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3]];
+        let err =
+            decode_macroblock_modes(&[], FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap_err();
+        assert_eq!(err, Error::TruncatedHeader { field: "MSCHEME" });
+    }
+
+    #[test]
+    fn macroblock_modes_inter_rejects_truncated_at_alphabet() {
+        // MSCHEME = 0, then 8 × 3 mi bits = 24 bits of alphabet, total
+        // 27 bits. Provide only 3 bytes (24 bits) so MSCHEME (3 bits) +
+        // 7 mi values (21 bits) fit but the 8th mi (the last 3 bits) is
+        // unavailable.
+        let nmbs = 1u32;
+        let nbs = 4u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3]];
+        let mut w = BitWriter::new();
+        w.put(0, 3); // MSCHEME = 0
+        for _ in 0..7 {
+            w.put(0, 3); // 21 bits of alphabet, total 24 bits = 3 bytes
+        }
+        let bytes = w.finish();
+        assert_eq!(bytes.len(), 3, "expected exactly 24 bits = 3 bytes");
+        let err = decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::TruncatedHeader {
+                field: "MALPHABET_mi"
+            }
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_inter_rejects_truncated_huffman_walk() {
+        // Construct a one-byte buffer holding MSCHEME=1 (3 bits) followed
+        // by five `1` bits. The Huffman walk needs at least six bits to
+        // disambiguate `b1111110` / `b1111111`; the 9th bit lives in a
+        // byte that does not exist.
+        let nmbs = 1u32;
+        let nbs = 4u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3]];
+        let mut w = BitWriter::new();
+        w.put(1, 3); // MSCHEME = 1
+        for _ in 0..5 {
+            w.put(1, 1); // five `1` bits inside the first byte
+        }
+        // First byte is 0b00111111 = 0x3f.
+        let bytes = w.finish();
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], 0x3f);
+        let err = decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::TruncatedHeader {
+                field: "MBMODES_huffman_code"
+            }
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_inter_rejects_truncated_direct_three_bit() {
+        // MSCHEME = 7, then truncate the buffer to a single byte holding
+        // only the MSCHEME field and 5 padding bits, then ask for one
+        // mb with 4 luma-coded blocks so a 3-bit direct mode would be
+        // read — but we structure the second mb's read to fall off the
+        // end.
+        let nmbs = 2u32;
+        let nbs = 8u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3], [4, 5, 6, 7]];
+        // Stream: MSCHEME=7 (3 bits) + mb0 mode (3 bits) + only 2 bits
+        // of mb1 mode (truncated). 8 bits in one byte exactly.
+        let mut w = BitWriter::new();
+        w.put(7, 3); // MSCHEME = 7
+        w.put(0, 3); // mb0 mode = INTER_NOMV
+        w.put(0, 2); // first 2 bits of mb1 mode
+                     // Byte fills exactly, no further bytes.
+        let bytes = w.finish();
+        assert_eq!(bytes.len(), 1);
+        let err = decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::TruncatedHeader {
+                field: "MBMODES_direct"
+            }
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_inter_six_seven_disambiguation() {
+        // The `b1111110` / `b1111111` codes differ only in their final
+        // bit. Verify both round-trip correctly.
+        let nmbs = 2u32;
+        let nbs = 8u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3], [4, 5, 6, 7]];
+        // Use Scheme 1 where MALPHABET[6]=6 and MALPHABET[7]=7.
+        let mut w = BitWriter::new();
+        w.put(1, 3); // MSCHEME = 1
+        write_mb_mode_code(&mut w, 6); // mi=6 → mode 6
+        write_mb_mode_code(&mut w, 7); // mi=7 → mode 7
+        let bytes = w.finish();
+        let out =
+            decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap();
+        assert_eq!(
+            out,
+            vec![MacroBlockMode::InterGoldenMv, MacroBlockMode::InterMvFour,]
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_inter_inner_chains_on_shared_reader() {
+        // Confirm the crate-private `decode_macroblock_modes_inner` can
+        // be driven from a BitReader already partly consumed — the
+        // chaining pattern an end-to-end frame decoder will use to walk
+        // §7.1 → §7.2 → §7.3 → §7.4 on a single reader.
+        let nmbs = 2u32;
+        let nbs = 8u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3], [4, 5, 6, 7]];
+        let mut w = BitWriter::new();
+        // Prefix: 5 unrelated bits to skip on the shared reader.
+        w.put(0b10110, 5);
+        // MSCHEME = 7, modes 1 (INTRA) and 5 (INTER_GOLDEN_NOMV).
+        w.put(7, 3);
+        w.put(1, 3);
+        w.put(5, 3);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let prefix = r.read_bits(5, "test.prefix").unwrap();
+        assert_eq!(prefix, 0b10110);
+        let out = decode_macroblock_modes_inner(&mut r, FrameType::Inter, nmbs, nbs, &bcoded, &map)
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![MacroBlockMode::Intra, MacroBlockMode::InterGoldenNoMv,]
+        );
+    }
+
+    #[test]
+    fn macroblock_modes_error_displays_render() {
+        let e = Error::MacroBlockLumaMapLenMismatch {
+            map_len: 3,
+            nmbs: 4,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.4"));
+        assert!(s.contains("3"));
+        assert!(s.contains("4"));
+
+        let e = Error::MacroBlockLumaBlockIndexOutOfRange {
+            mbi: 7,
+            slot: 2,
+            bi: 99,
+            nbs: 40,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.4"));
+        assert!(s.contains("7"));
+        assert!(s.contains("99"));
+        assert!(s.contains("40"));
+
+        let e = Error::UnknownMacroBlockModeCode;
+        let s = format!("{e}");
+        assert!(s.contains("§7.4"));
+    }
+
+    #[test]
+    fn macroblock_modes_inter_does_not_consume_bits_for_uncoded_mb() {
+        // Concrete bit-budget assertion: with all 3 mbs uncoded, the
+        // procedure consumes only the 3 MSCHEME bits (no per-mb codes).
+        let nmbs = 3u32;
+        let nbs = 12u32;
+        let bcoded = vec![0u8; nbs as usize];
+        let map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| {
+                let base = mbi * 4;
+                [base, base + 1, base + 2, base + 3]
+            })
+            .collect();
+        // Even though MSCHEME could be anything, only the 3 bits should
+        // be read. Provide just one byte with MSCHEME in the top 3 bits.
+        let mut w = BitWriter::new();
+        w.put(1, 3); // MSCHEME = 1 (Huffman) — but no codes follow.
+                     // Pad the byte with zeros; if any per-mb decode bit is read, the
+                     // result would be polluted.
+        w.put(0, 5);
+        let bytes = w.finish();
+        let out =
+            decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap();
+        assert_eq!(out, vec![MacroBlockMode::InterNoMv; nmbs as usize]);
+    }
+
+    #[test]
+    fn macroblock_modes_intra_does_not_consume_packet() {
+        // §7.4 step 1 reads nothing. An empty packet must still decode.
+        let nmbs = 16u32;
+        let nbs = 64u32;
+        let bcoded = vec![0u8; nbs as usize]; // doesn't matter
+        let map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| {
+                let base = mbi * 4;
+                [base, base + 1, base + 2, base + 3]
+            })
+            .collect();
+        let out = decode_macroblock_modes(&[], FrameType::Intra, nmbs, nbs, &bcoded, &map).unwrap();
+        assert_eq!(out.len(), nmbs as usize);
+        assert!(out.iter().all(|m| *m == MacroBlockMode::Intra));
+    }
+
+    #[test]
+    fn macroblock_modes_inter_zero_nmbs_short_circuits() {
+        // Degenerate edge case: 0 macro blocks. MSCHEME is still read
+        // per §7.4 step 2(a) but the per-mb loop is empty.
+        let nmbs = 0u32;
+        let nbs = 0u32;
+        let bcoded: Vec<u8> = vec![];
+        let map: Vec<[u32; 4]> = vec![];
+        let mut w = BitWriter::new();
+        w.put(7, 3); // MSCHEME = 7 (any value works; alphabet unused)
+        let bytes = w.finish();
+        let out =
+            decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn macroblock_modes_inter_unknown_scheme_code_uses_default_alphabet() {
+        // §7.4 step 2(c) only enumerates schemes 1..=6 with fixed
+        // alphabets. We treat schemes 2..=6 via Table 7.19 and 0/7 via
+        // their dedicated rules. Defensive: the impl rejects nothing
+        // for MSCHEME values outside 0..=7 because MSCHEME is a 3-bit
+        // field (range 0..=7); any of the eight values is legal.
+        // This test confirms each of the eight MSCHEME values decodes
+        // a single-mb stream without error.
+        let nmbs = 1u32;
+        let nbs = 4u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = vec![[0, 1, 2, 3]];
+        for mscheme in 0u32..=7 {
+            let mut w = BitWriter::new();
+            w.put(mscheme, 3);
+            // Provide enough bits to decode one MBMODES entry under any
+            // scheme: 24 bits is safely above the max (Scheme 0 needs
+            // 24 alphabet bits + up to 7 code bits = 31; Scheme 7 needs
+            // 3 bits; Scheme 1..=6 needs up to 7 bits).
+            for _ in 0..5 {
+                w.put(0, 8);
+            }
+            let bytes = w.finish();
+            let out = decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map)
+                .unwrap();
+            assert_eq!(out.len(), 1);
+        }
     }
 }

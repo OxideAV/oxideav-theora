@@ -6,6 +6,74 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§7.4 Macro Block Coding Modes (2026-05-27, round 11).** New public
+  `decode_macroblock_modes(packet, ftype, nmbs, nbs, bcoded,
+  macro_block_to_luma_blocks) -> Result<Vec<MacroBlockMode>, Error>`
+  transcribing the full §7.4 procedure of the Xiph Theora I
+  Specification ("Macro Block Coding Modes"). Returns the per-macro-
+  block `MBMODES` array as typed [`MacroBlockMode`] variants matching
+  Table 7.18 (`InterNoMv`, `Intra`, `InterMv`, `InterMvLast`,
+  `InterMvLast2`, `InterGoldenNoMv`, `InterGoldenMv`, `InterMvFour`).
+  `MacroBlockMode::to_index` / `from_index` round-trip with the on-
+  wire `Index` column.
+
+  Intra frames short-circuit step 1: every macro block is `INTRA` and
+  the packet payload is not consumed. Inter frames execute the step 2
+  chain on the §5.2 MSb-first `BitReader`:
+
+  * Step 2(a): read the 3-bit `MSCHEME`.
+  * Step 2(b): if `MSCHEME=0`, read eight 3-bit `mi` values and
+    populate `MALPHABET[mi] = MODE` in `MODE`-order (the on-wire
+    permutation defines the alphabet).
+  * Step 2(c): if `MSCHEME` is `1..=6`, set `MALPHABET` to the
+    corresponding column of Table 7.19 (the six fixed alphabets
+    encoded as `MALPHABETS_SCHEMES_1_TO_6`).
+  * Step 2(d): for each macro block in coded order:
+    * If at least one of its four luma blocks (caller-supplied
+      `macro_block_to_luma_blocks[mbi]` of length 4) has
+      `BCODED[bi]=1`, decode `MBMODES[mbi]` by either reading a
+      Huffman-coded `mi` (Schemes 0..=6, see Table 7.19) and looking
+      up `MALPHABET[mi]`, or by reading three bits directly (Scheme
+      7).
+    * Otherwise assign `MBMODES[mbi] = INTER_NOMV` and read no bits.
+
+  Three new `Error` variants reject malformed inputs:
+  `MacroBlockLumaMapLenMismatch { map_len, nmbs }` when the supplied
+  mapping length disagrees with `nmbs`,
+  `MacroBlockLumaBlockIndexOutOfRange { mbi, slot, bi, nbs }` when the
+  mapping references a luma-block index `>= nbs`, and
+  `UnknownMacroBlockModeCode` (defensive — unreachable for any
+  conforming bitstream). All three carry `Display` arms describing
+  the violating §7.4 step.
+
+  The Huffman walk over Table 7.19 (`b0` / `b10` / … / `b1111111`) is
+  decoded by `read_table_7_19_mi` as a unary-with-cap: up to six bits
+  of unary, then a seventh disambiguation bit splitting `b1111110`
+  (`mi=6`) and `b1111111` (`mi=7`). The seventh bit truncation is
+  surfaced as `TruncatedHeader { field: "MBMODES_huffman_code" }`.
+
+  As with §7.3, a crate-private `decode_macroblock_modes_inner` drives
+  the procedure on an already-positioned `BitReader`, enabling an
+  end-to-end frame decoder to chain §7.1 → §7.2 → §7.3 → §7.4 on a
+  single reader without re-aligning to a byte boundary.
+
+  Twenty new tests cover: the 0..=7 round-trip on `MacroBlockMode`,
+  the intra short-circuit (no packet consumed), the two input-
+  validation rejects, Scheme 7's 3-bit direct mode read for all four
+  output modes, every Scheme 1..=6 column of Table 7.19 walked
+  `mi=0..=7`, Scheme 0's on-wire alphabet permutation, the
+  partially-coded luma macro block read path, the uncoded-luma
+  `INTER_NOMV` step 2(d)ii path with zero bits read, MSCHEME / alphabet
+  / Huffman-walk / direct-mode truncation rejects, the `b1111110` /
+  `b1111111` disambiguation (Scheme 1 mi=6 vs mi=7), the shared-
+  `BitReader` chaining contract, error-`Display` rendering, the no-
+  bits-consumed path for fully-uncoded inter frames, and the
+  `nmbs=0` degenerate edge case.
+
+  §6.4.1 LFLIMS body is still blocked, but §7.4 — like every other
+  procedure landed since round 5 — runs independently of the gap and
+  can be exercised standalone.
+
 * **§7.3 Coded Block Flags Decode (2026-05-25, round 10).**
   New public `decode_coded_block_flags(packet: &[u8], ftype: FrameType,
   nsbs: u32, nbs: u32, block_to_super_block: &[u32]) ->

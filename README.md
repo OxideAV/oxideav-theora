@@ -2,19 +2,20 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-25
+## Status — 2026-05-27
 
 **Identification + comment + setup-entrypoint + §6.4.2 quant-params
 decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
 + §7.1 frame-header decode + §7.2 long-/short-run bit strings + §7.3
-coded-block-flags decode (rounds 1–10).** §6.1, §6.2 (identification),
-§6.3 (comment), §6.4.5 step 1 (setup-header common-header guard),
-§6.4.2 (Quantization Parameters Decode), §6.4.3 (Computing a
-Quantization Matrix), §6.4.4 (DCT Token Huffman Tables), §7.1 (Frame
-Header Decode), §7.2 (Run-Length Encoded Bit Strings), and §7.3
-(Coded Block Flags Decode) of the Theora I Specification are wired up.
-Three byte-aligned entry points plus seven public bit-level decoders
-over an MSb-first bit reader; round 4 added the Appendix B VP3 fallback
+coded-block-flags decode + §7.4 macro-block coding modes (rounds 1–11).**
+§6.1, §6.2 (identification), §6.3 (comment), §6.4.5 step 1
+(setup-header common-header guard), §6.4.2 (Quantization Parameters
+Decode), §6.4.3 (Computing a Quantization Matrix), §6.4.4 (DCT Token
+Huffman Tables), §7.1 (Frame Header Decode), §7.2 (Run-Length Encoded
+Bit Strings), §7.3 (Coded Block Flags Decode), and §7.4 (Macro Block
+Coding Modes) of the Theora I Specification are wired up. Three
+byte-aligned entry points plus eight public bit-level decoders over
+an MSb-first bit reader; round 4 added the Appendix B VP3 fallback
 tables, round 5 added the full §6.4.2 procedure (ACSCALE / DCSCALE /
 NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added §6.4.3 (64-entry
 interpolated quantization matrix per `(qti, pli, qi)` selector), round
@@ -23,12 +24,17 @@ tables that §7.7 will use to decode DCT-residual tokens, round 8 added
 §7.1 (the typed `TheoraFrameHeader` from the start of a video-data
 packet), round 9 added §7.2 — the long-run and short-run bit-string
 decoders that §7.3 (coded-block flags) and §7.6 (block-level `qi`
-values) consume against the §5.2 bit reader, round 10 adds §7.3 — the
+values) consume against the §5.2 bit reader, round 10 added §7.3 — the
 per-block `BCODED` array decoder that chains a partially-coded
 super-block §7.2.1 long-run map, a fully-coded super-block §7.2.1
 long-run map (over the non-partially-coded subset), and a per-block
 §7.2.2 short-run stream against a caller-supplied block-to-super-block
-mapping.
+mapping, round 11 adds §7.4 — the per-macro-block `MBMODES` array
+decoder consuming `BCODED` plus a caller-supplied
+macro-block-to-luma-blocks mapping, demultiplexing all eight Table
+7.18 modes through Schemes 0..=7 (Table 7.19's six fixed Huffman
+alphabets, the on-wire MSCHEME=0 alphabet, and the MSCHEME=7 direct
+3-bit encoding).
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -91,6 +97,27 @@ mapping.
   reject malformed mappings. The shared-reader chaining contract is
   preserved via a crate-private `decode_coded_block_flags_inner` that
   drives an already-positioned `BitReader`.
+* [`decode_macroblock_modes`] — round 11 public §7.4 procedure
+  returning an `NMBS`-element `Vec<MacroBlockMode>` of per-macro-block
+  coding modes (Table 7.18: `InterNoMv`, `Intra`, `InterMv`,
+  `InterMvLast`, `InterMvLast2`, `InterGoldenNoMv`, `InterGoldenMv`,
+  `InterMvFour`). Intra frames short-circuit step 1 (every mb =
+  INTRA; packet not consumed). Inter frames read a 3-bit `MSCHEME`,
+  build `MALPHABET` either from the bitstream (Scheme 0; eight 3-bit
+  `mi` values defining the permutation `MALPHABET[mi] = MODE`) or
+  from one of the six fixed columns of Table 7.19 (Schemes 1..=6), or
+  bypass the alphabet altogether for Scheme 7's direct 3-bit mode
+  encoding. For each macro block in coded order, if at least one
+  luma block in the caller-supplied
+  `macro_block_to_luma_blocks: &[[u32; 4]]` (length `NMBS`) has
+  `BCODED[bi] == 1`, the procedure decodes a Huffman-coded mode
+  (Schemes 0..=6, Table 7.19's unary-with-cap-at-7-bits prefix) or a
+  3-bit direct value (Scheme 7); otherwise step 2(d)ii assigns
+  `INTER_NOMV` and reads no bits. Three new typed errors
+  (`MacroBlockLumaMapLenMismatch`, `MacroBlockLumaBlockIndexOutOfRange`,
+  `UnknownMacroBlockModeCode`) reject malformed inputs. The shared-
+  reader chaining contract is preserved via a crate-private
+  `decode_macroblock_modes_inner`.
 
 ### Identification header (round 1)
 The typed `TheoraIdentHeader` exposes every field from Figure 6.2:
@@ -369,6 +396,24 @@ truncation rejection, intra-vs-inter arm independence, the shared-
 `BitReader` chaining contract via `decode_coded_block_flags_inner`,
 a single-partially-coded-super-block uncoded-block-subset case, and
 an interleaved (non-monotone) `block_to_super_block` mapping case.
+Round 11 adds twenty §7.4 macro-block-coding-modes tests (total now
+179): the `MacroBlockMode::from_index` / `to_index` round-trip across
+the eight Table 7.18 values plus the `None` rejection for `8`, the
+intra short-circuit (every mb = `INTRA`; empty packet decodes), the
+two input-validation rejects (`MacroBlockLumaMapLenMismatch`,
+`MacroBlockLumaBlockIndexOutOfRange`), Scheme 7's direct 3-bit mode
+read across four modes, every Scheme 1..=6 column of Table 7.19
+walked `mi=0..=7`, Scheme 0's on-wire alphabet permutation with
+inverse-recovery checks across all eight `mi` slots, the
+partially-coded-luma trigger path (single luma block coded forces a
+mode read), the all-luma-uncoded step 2(d)ii path with NO mode bits
+read, MSCHEME / MALPHABET / Huffman-walk / direct-mode truncation
+rejects, the `b1111110` / `b1111111` 7-bit-prefix disambiguation
+(Scheme 1, `mi=6` vs `mi=7`), the shared-`BitReader` chaining contract
+via `decode_macroblock_modes_inner`, error-`Display` rendering, an
+explicit no-bits-consumed assertion for fully-uncoded inter frames,
+the `nmbs=0` short-circuit, and a defensive coverage walk across all
+eight MSCHEME values.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

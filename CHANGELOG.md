@@ -6,6 +6,66 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§7.6 Block-Level *qi* Decode (2026-05-27, round 13).** New public
+  `decode_block_level_qi(packet: &[u8], nbs: u32, bcoded: &[u8],
+  nqis: usize) -> Result<Vec<u8>, Error>` transcribing the full §7.6
+  procedure of the Xiph Theora I Specification ("Block-Level *qi*
+  Decode"). Returns the per-block `QIIS` array — `QIIS[bi]` indexes
+  into the frame's `qi` value list (the 1..=3 values
+  `decode_frame_header` returns in [`TheoraFrameHeader::qis`]) and
+  drives AC dequantization of block `bi`.
+
+  Per §7.6 the procedure assigns `QIIS[bi] = 0` for every block (step
+  1) then makes `NQIS − 1` passes through the list of coded blocks
+  (step 2; outer loop `qii` from 0 to `NQIS − 2`). Pass `qii` tallies
+  `NBITS = #{bi : BCODED[bi] != 0 AND QIIS[bi] == qii}` (step 2(a)),
+  decodes an `NBITS`-bit long-run bit string via the §7.2.1 procedure
+  (step 2(b)), and for each matching block in coded order (ascending
+  `bi`) adds the next consumed bit to `QIIS[bi]` (step 2(c)) — bit 0
+  keeps the block at `qii`, bit 1 promotes it to `qii + 1` for the
+  next pass's tally.
+
+  VP3-compatibility short-circuit: `NQIS == 1` evaluates the outer
+  loop as `0..=−1`, i.e. zero passes, so no bits are read and every
+  returned `QIIS[bi]` is `0`. This is the only path Theora streams
+  whose `decode_frame_header` returned `nqis() == 1` exercise — and is
+  the only path `version < 0x030200` streams can take per §B.1 (VP3
+  frame headers carry exactly one `qi` value).
+
+  Two new `Error` variants reject malformed inputs:
+  `BlockLevelQiBcodedLenMismatch { bcoded_len, nbs }` when the
+  supplied `bcoded` slice length disagrees with `nbs`, and
+  `BlockLevelQiNqisOutOfRange { nqis }` when `nqis` is outside the
+  `1..=MAX_FRAME_QIS` (= 3) range mandated by §7.1 step 6. Both carry
+  `Display` arms citing §7.6.
+
+  The procedure is split into `decode_block_level_qi` (byte-aligned
+  entry point) plus `decode_block_level_qi_inner(&mut BitReader<'_>,
+  …)` (crate-private) so a future end-to-end frame decoder can chain
+  §7.1 → §7.2 → §7.3 → §7.4 → §7.5 → §7.6 on a shared reader without
+  re-aligning to a byte boundary. §7.6 is unblocked by the still-open
+  §6.4.1 spec gap (docs-gap #944): §7.6 operates on a video-data
+  packet's own payload and does not consume the setup-header body.
+
+  Fifteen new tests bring the total from 207 to 222: the VP3-compat
+  `NQIS=1` short-circuit (no bits consumed, verified via a sentinel
+  byte read off the same reader), `NQIS=2` happy path assigning per-
+  coded-block bits in ascending-`bi` order with uncoded blocks staying
+  at 0, `NQIS=3` two-pass chain where pass 1's `NBITS` is restricted
+  to blocks promoted out of pass 0, an interleaved `NQIS=3` case
+  confirming coded-order iteration is by ascending `bi` (not by
+  `bcoded` slice order), the `NQIS=3` second-pass-empty path (sentinel
+  byte verifies no extra bits read), the `NBS=0` short-circuit on
+  `NQIS=1` and `NQIS=3`, the all-blocks-uncoded path (sentinel byte
+  verifies 16 bits intact), both input-validation rejects
+  (`BlockLevelQiBcodedLenMismatch`, `BlockLevelQiNqisOutOfRange` for
+  `nqis=0` and `nqis=4`) with `Display` rendering, truncation in
+  pass 0 and pass 1 surfacing as `TruncatedHeader` from the §7.2.1
+  layer, the shared-`BitReader` chaining contract via
+  `decode_block_level_qi_inner` (followed by twelve sentinel bits
+  read off the same reader), and a multi-run long-run round-trip that
+  crosses two RSTART=10 long-run records.
+
 * **§7.5 Motion Vectors (2026-05-27, round 12).** New public
   `decode_single_motion_vector(bits, mvmode) -> Result<MotionVector,
   Error>` transcribing §7.5.1 of the Xiph Theora I Specification

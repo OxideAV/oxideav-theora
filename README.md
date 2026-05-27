@@ -8,15 +8,15 @@ Pure-Rust Theora video codec — clean-room implementation in progress.
 decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
 + §7.1 frame-header decode + §7.2 long-/short-run bit strings + §7.3
 coded-block-flags decode + §7.4 macro-block coding modes + §7.5
-motion-vector decode (rounds 1–12).**
+motion-vector decode + §7.6 block-level qi decode (rounds 1–13).**
 §6.1, §6.2 (identification), §6.3 (comment), §6.4.5 step 1
 (setup-header common-header guard), §6.4.2 (Quantization Parameters
 Decode), §6.4.3 (Computing a Quantization Matrix), §6.4.4 (DCT Token
 Huffman Tables), §7.1 (Frame Header Decode), §7.2 (Run-Length Encoded
 Bit Strings), §7.3 (Coded Block Flags Decode), §7.4 (Macro Block
-Coding Modes), §7.5.1 (single Motion Vector decode), and §7.5.2 (per-
-macro-block Motion Vector decode) of the Theora I Specification are
-wired up. Three
+Coding Modes), §7.5.1 (single Motion Vector decode), §7.5.2 (per-
+macro-block Motion Vector decode), and §7.6 (Block-Level *qi* Decode)
+of the Theora I Specification are wired up. Three
 byte-aligned entry points plus eight public bit-level decoders over
 an MSb-first bit reader; round 4 added the Appendix B VP3 fallback
 tables, round 5 added the full §6.4.2 procedure (ACSCALE / DCSCALE /
@@ -37,7 +37,10 @@ decoder consuming `BCODED` plus a caller-supplied
 macro-block-to-luma-blocks mapping, demultiplexing all eight Table
 7.18 modes through Schemes 0..=7 (Table 7.19's six fixed Huffman
 alphabets, the on-wire MSCHEME=0 alphabet, and the MSCHEME=7 direct
-3-bit encoding).
+3-bit encoding), and round 13 adds §7.6 — the per-block `QIIS` array
+decoder chaining `NQIS − 1` §7.2.1 long-run passes over the per-block
+subset of still-`qii`-tied coded blocks (VP3-compat `NQIS == 1`
+short-circuit consumes zero bits and returns all-zero `QIIS`).
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -121,6 +124,20 @@ alphabets, the on-wire MSCHEME=0 alphabet, and the MSCHEME=7 direct
   `UnknownMacroBlockModeCode`) reject malformed inputs. The shared-
   reader chaining contract is preserved via a crate-private
   `decode_macroblock_modes_inner`.
+* [`decode_block_level_qi`] — round 13 public §7.6 procedure returning
+  an `NBS`-element `Vec<u8>` of per-block `QIIS` values (each in
+  `0..NQIS`). For `NQIS == 1` the procedure short-circuits the spec's
+  empty main loop and returns all-zero `QIIS` without reading any bits
+  (VP3-compatibility path; the spec note in §7.6 explicitly observes
+  this). For `NQIS == 2` or `NQIS == 3` it executes `NQIS − 1`
+  §7.2.1 long-run passes — each pass's length is the number of coded
+  blocks (`BCODED[bi] != 0`) still tied at the current `qii`, each
+  decoded bit is *added* to that block's `QIIS[bi]` (0 keeps the block,
+  1 promotes it into the second group the next pass sees). Two new
+  typed errors (`BlockLevelQiBcodedLenMismatch`,
+  `BlockLevelQiNqisOutOfRange`) reject malformed inputs. The shared-
+  reader chaining contract is preserved via a crate-private
+  `decode_block_level_qi_inner`.
 * [`decode_single_motion_vector`] / [`decode_macroblock_motion_vectors`]
   — round 12 public §7.5.1 / §7.5.2 procedures returning a single
   [`MotionVector`] or an `NBS`-element `Vec<MotionVector>` of per-
@@ -467,7 +484,24 @@ sentinel byte read on the same reader), an explicit "intra consumes
 no bits" packet-reread, an uncoded chroma block in step 3(g) keeps
 its (0, 0) default while coded blocks get the MV, and a `round_div`-
 matches-spec check (1.5/-1.5/2.5/-2.5 all tie away from zero per the
-§ Notation `round(a)` definition).
+§ Notation `round(a)` definition). Round 13 adds fifteen §7.6
+block-level-`qi` tests (total now 222): VP3-compat `NQIS=1`
+short-circuit (no bits consumed; sentinel-byte reread verifies
+position), `NQIS=2` happy path assigning per-coded-block bits in
+ascending-`bi` order with uncoded blocks staying at 0, `NQIS=3`
+two-pass chain where pass 1's NBITS is restricted to blocks promoted
+out of pass 0, an interleaved `NQIS=3` case confirming coded-order
+iteration, the `NQIS=3` second-pass-empty path (sentinel-byte
+verifies no extra bits read), the `NBS=0` short-circuit on both
+`NQIS=1` and `NQIS=3`, the all-blocks-uncoded path
+(sentinel-byte verifies 16 bits intact), both input-validation
+rejects (`BlockLevelQiBcodedLenMismatch`,
+`BlockLevelQiNqisOutOfRange` for `nqis=0` and `nqis=4`) with
+`Display` rendering, truncation mid-pass-0 and mid-pass-1 surfacing
+as `TruncatedHeader` from the §7.2.1 layer, the shared-`BitReader`
+chaining contract via `decode_block_level_qi_inner` (followed by
+twelve sentinel bits read off the same reader), and a multi-run
+long-run round-trip that crosses two RSTART=10 long-run records.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

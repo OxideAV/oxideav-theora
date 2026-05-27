@@ -46,7 +46,12 @@
 //! [`decode_macroblock_motion_vectors`] (§7.5.2 — per-macroblock MV
 //! decode driven by `MBMODES`, with `LAST1`/`LAST2` tracking, four-MV
 //! INTER_MV_FOUR mode, and PF=0/2/4 chroma averaging via the spec's
-//! `round()` ties-away-from-zero).
+//! `round()` ties-away-from-zero). Round 13 lands the **§7.6 Block-
+//! Level qi Decode** procedure as [`decode_block_level_qi`], chaining
+//! `NQIS − 1` §7.2.1 long-run passes over the per-block subset of
+//! still-`qii`-tied coded blocks to produce the per-block `QIIS`
+//! array that drives AC dequantization. Independent of the §6.4.1
+//! spec gap.
 //!
 //! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
 //! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
@@ -87,6 +92,11 @@
 //!   array per §7.3, consuming `SBPCODED` (§7.2.1) + `SBFCODED` (§7.2.1)
 //!   plus a per-block §7.2.2 short-run stream and walking the caller-
 //!   supplied block-to-super-block mapping.
+//! * [`decode_block_level_qi`] returns the per-block `QIIS` array per
+//!   §7.6, chaining `NQIS − 1` §7.2.1 long-run passes over the per-
+//!   block subset of still-`qii`-tied coded blocks. The VP3-compat
+//!   `NQIS == 1` short-circuit consumes zero bits and returns all-zero
+//!   `QIIS`.
 //!
 //! ## Clean-room provenance
 //!
@@ -451,6 +461,24 @@ pub enum Error {
         /// The expected inner length for the declared pixel format.
         expected: usize,
     },
+    /// The `bcoded` slice passed to [`decode_block_level_qi`] has a
+    /// different length than the `nbs` argument. §7.6 step 2(a) tallies
+    /// blocks where `BCODED[bi]` is non-zero; the two arguments must
+    /// agree in length.
+    BlockLevelQiBcodedLenMismatch {
+        /// `bcoded.len()`.
+        bcoded_len: usize,
+        /// The caller-supplied `nbs`.
+        nbs: usize,
+    },
+    /// The `nqis` argument to [`decode_block_level_qi`] was outside the
+    /// `1..=3` range. §7.1 step 6 constrains `NQIS` (the number of `qi`
+    /// values defined for the frame) to that range, and §7.6 takes the
+    /// frame's `NQIS` as input.
+    BlockLevelQiNqisOutOfRange {
+        /// The offending `nqis` value.
+        nqis: usize,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -662,6 +690,14 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-theora: §7.5.2 chroma mb {mbi} plane {plane} inner length {got} != expected {expected}"
+            ),
+            Error::BlockLevelQiBcodedLenMismatch { bcoded_len, nbs } => write!(
+                f,
+                "oxideav-theora: §7.6 bcoded length {bcoded_len} != nbs {nbs}"
+            ),
+            Error::BlockLevelQiNqisOutOfRange { nqis } => write!(
+                f,
+                "oxideav-theora: §7.6 NQIS={nqis} out of range 1..=3"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -3419,6 +3455,123 @@ pub(crate) fn decode_macroblock_motion_vectors_inner(
 
     debug_assert_eq!(mvects.len(), nbs_us);
     Ok(mvects)
+}
+
+// =====================================================================
+// §7.6 Block-Level qi Decode
+// =====================================================================
+
+/// Decode the per-block `QIIS` array from a video-data packet per
+/// §7.6 ("Block-Level *qi* Decode") of the Xiph Theora I Specification.
+///
+/// `QIIS[bi]` is an index into the frame's `qi` value list (the 1..=3
+/// values `decode_frame_header` returns in [`TheoraFrameHeader::qis`]).
+/// For each block `bi`, `QIIS[bi]` selects which of those `qi` values
+/// drives the block's AC dequantization (DC dequantization always uses
+/// the first `qi` value to avoid interfering with DC prediction; the
+/// spec's §7.6 preamble explains the asymmetry).
+///
+/// Per §7.6 the procedure makes `NQIS − 1` passes through the list of
+/// *coded* blocks. Pass number `qii` (running 0..=NQIS−2) decodes one
+/// §7.2.1 long-run bit string whose length equals the count of blocks
+/// `bi` such that `BCODED[bi] != 0` and `QIIS[bi] == qii`; each bit then
+/// either keeps the block at `qii` (bit value 0) or promotes it to
+/// `qii + 1` (bit value 1). Subsequent passes therefore see only blocks
+/// that were promoted out of every earlier pass — exactly the "second
+/// group" split the spec describes.
+///
+/// VP3-compatibility short-circuit: when `NQIS == 1` the main loop
+/// iterates `0..=−1` (i.e. zero times), no bits are read, and every
+/// returned `QIIS[bi]` is `0`. The VP3 spec §B.1 has the same property
+/// because pre-3.2.0 frame headers can only carry one `qi`.
+///
+/// `packet` is the full frame-data packet payload (or any slice
+/// positioned at the byte-aligned start of the §7.6 bit stream). The
+/// byte-aligned variant is provided for unit-test convenience; an end-
+/// to-end decoder will call [`decode_block_level_qi_inner`] on a
+/// [`BitReader`] already positioned past the §7.1 / §7.2 / §7.3 / §7.4 /
+/// §7.5 prefix.
+///
+/// Returns:
+///
+/// * [`Error::BlockLevelQiBcodedLenMismatch`] if `bcoded.len() != nbs`.
+/// * [`Error::BlockLevelQiNqisOutOfRange`] if `nqis` is not in `1..=3`.
+/// * [`Error::TruncatedHeader`] / [`Error::RunLengthOverrun`] when the
+///   underlying §7.2.1 long-run decode rejects.
+pub fn decode_block_level_qi(
+    packet: &[u8],
+    nbs: u32,
+    bcoded: &[u8],
+    nqis: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut r = BitReader::new(packet);
+    decode_block_level_qi_inner(&mut r, nbs, bcoded, nqis)
+}
+
+/// Inner §7.6 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so an end-to-end frame decoder can chain
+/// §7.1 → §7.2 → §7.3 → §7.4 → §7.5 → §7.6 on the same reader without
+/// re-aligning to a byte boundary.
+pub(crate) fn decode_block_level_qi_inner(
+    r: &mut BitReader<'_>,
+    nbs: u32,
+    bcoded: &[u8],
+    nqis: usize,
+) -> Result<Vec<u8>, Error> {
+    // Argument validation. §7.6 step 2(a)–(c) reads `BCODED[bi]` for
+    // every block 0..NBS, and `nqis` controls the main loop bound
+    // (§7.1 step 6 restricts NQIS to 1..=3).
+    let nbs_us = nbs as usize;
+    if bcoded.len() != nbs_us {
+        return Err(Error::BlockLevelQiBcodedLenMismatch {
+            bcoded_len: bcoded.len(),
+            nbs: nbs_us,
+        });
+    }
+    if !(1..=MAX_FRAME_QIS).contains(&nqis) {
+        return Err(Error::BlockLevelQiNqisOutOfRange { nqis });
+    }
+
+    // Step 1: assign QIIS[bi] = 0 for every block.
+    let mut qiis: Vec<u8> = vec![0u8; nbs_us];
+
+    // Step 2: outer loop `qii` from 0 to NQIS−2. When NQIS == 1 the
+    // range is empty (the VP3-compat short-circuit) and no bits are
+    // read.
+    for qii in 0..(nqis.saturating_sub(1)) {
+        // Step 2(a): tally blocks whose current QIIS matches qii and
+        // whose BCODED is non-zero. Only those blocks participate in
+        // this pass's bit string.
+        let qii_u8 = qii as u8;
+        let nbits: u64 = bcoded
+            .iter()
+            .zip(qiis.iter())
+            .filter(|(&bc, &q)| bc != 0 && q == qii_u8)
+            .count() as u64;
+
+        // Step 2(b): decode the NBITS-bit string via the §7.2.1 long-
+        // run procedure. Routed through the shared-reader inner so we
+        // do not re-align to a byte boundary.
+        let bits = decode_long_run_bit_string_inner(r, nbits)?;
+        debug_assert_eq!(bits.len() as u64, nbits);
+
+        // Step 2(c): consume one bit per matching block, in coded order
+        // (i.e. ascending `bi`). Each consumed bit is *added* to
+        // QIIS[bi]: 0 keeps the block at the current qii; 1 promotes it
+        // to qii + 1, putting it in the "second group" the next pass
+        // operates on.
+        let mut cursor: usize = 0;
+        for (&bc, q) in bcoded.iter().zip(qiis.iter_mut()) {
+            if bc != 0 && *q == qii_u8 {
+                *q += bits[cursor];
+                cursor += 1;
+            }
+        }
+        debug_assert_eq!(cursor as u64, nbits);
+    }
+
+    debug_assert_eq!(qiis.len(), nbs_us);
+    Ok(qiis)
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -8640,5 +8793,268 @@ mod tests {
         assert_eq!(out[cb_o[0][0] as usize], MotionVector::ZERO);
         // Coded Cr: propagated.
         assert_eq!(out[cr_o[0][0] as usize], MotionVector::new(6, -6));
+    }
+
+    // =================================================================
+    // §7.6 Block-Level qi Decode tests
+    // =================================================================
+
+    /// VP3 fallback path (NQIS=1): the outer loop is empty, no bits
+    /// are read, and every QIIS[bi] is 0.
+    #[test]
+    fn block_level_qi_nqis_1_short_circuits_no_bits_consumed() {
+        let bcoded = vec![1u8, 1, 0, 1, 0];
+        // Sentinel byte that MUST NOT be consumed.
+        let packet = [0xffu8; 4];
+        let qiis =
+            decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 1).expect("nqis=1 path");
+        assert_eq!(qiis, vec![0, 0, 0, 0, 0]);
+
+        // Confirm via the inner that the reader did not consume any
+        // bits (read one bit and assert it's the MSb of the first
+        // sentinel byte).
+        let mut r = BitReader::new(&packet);
+        let _ = decode_block_level_qi_inner(&mut r, bcoded.len() as u32, &bcoded, 1).unwrap();
+        let b = r.read_bits(1, "sentinel").unwrap();
+        assert_eq!(b, 1, "no bits should have been consumed");
+    }
+
+    /// NQIS=2 happy path: one long-run pass; coded blocks get bits,
+    /// uncoded blocks stay at 0.
+    #[test]
+    fn block_level_qi_nqis_2_assigns_per_coded_block() {
+        // bi=0 coded; bi=1 uncoded; bi=2 coded; bi=3 coded; bi=4
+        // uncoded; bi=5 coded.
+        let bcoded = vec![1u8, 0, 1, 1, 0, 1];
+        // Pass 0: NBITS = 4 coded blocks. Choose the per-coded-block
+        // bits in coded order to be [0, 1, 0, 1] → final QIIS values
+        // for the coded blocks are [0, 1, 0, 1] (uncoded keep 0).
+        let mut w = BitWriter::new();
+        encode_long_run_runs(&mut w, &[0, 1, 0, 1]);
+        let packet = w.finish();
+        let qiis = decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 2).unwrap();
+        // bi index ......... 0  1  2  3  4  5
+        // coded? ........... y  n  y  y  n  y
+        // pass-0 bit ....... 0     1  0     1
+        assert_eq!(qiis, vec![0, 0, 1, 0, 0, 1]);
+    }
+
+    /// NQIS=3 happy path: two long-run passes, the second restricted
+    /// to blocks promoted out of the first.
+    #[test]
+    fn block_level_qi_nqis_3_chains_two_passes() {
+        // 6 coded blocks.
+        let bcoded = vec![1u8; 6];
+        let mut w = BitWriter::new();
+        // Pass 0: NBITS = 6. Bits in coded order: [0, 1, 0, 1, 1, 0].
+        // After pass 0, QIIS = [0, 1, 0, 1, 1, 0].
+        encode_long_run_runs(&mut w, &[0, 1, 0, 1, 1, 0]);
+        // Pass 1: NBITS = #{bi : BCODED=1 AND QIIS==1} = 3 (bi=1, 3, 4).
+        // Bits in coded order of those 3 blocks: [1, 0, 1].
+        // After pass 1, QIIS[1] += 1 = 2, QIIS[3] += 0 = 1, QIIS[4] += 1 = 2.
+        encode_long_run_runs(&mut w, &[1, 0, 1]);
+        let packet = w.finish();
+        let qiis = decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 3).unwrap();
+        // Final: bi=0 → 0, bi=1 → 2, bi=2 → 0, bi=3 → 1, bi=4 → 2, bi=5 → 0
+        assert_eq!(qiis, vec![0, 2, 0, 1, 2, 0]);
+    }
+
+    /// Step 2(a) only counts coded blocks: an uncoded block's QIIS
+    /// stays at 0 even if the pass-0 long-run string skips over it.
+    #[test]
+    fn block_level_qi_uncoded_blocks_stay_at_zero() {
+        // bi 0 1 2 3 4 5 6 7
+        //    y n y n y n y n  (every other one coded)
+        let bcoded = vec![1u8, 0, 1, 0, 1, 0, 1, 0];
+        // Pass 0: NBITS = 4 (only the four coded blocks).
+        let mut w = BitWriter::new();
+        encode_long_run_runs(&mut w, &[1, 1, 1, 1]);
+        let packet = w.finish();
+        let qiis = decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 2).unwrap();
+        // All four coded promoted to 1; all four uncoded stay at 0.
+        assert_eq!(qiis, vec![1, 0, 1, 0, 1, 0, 1, 0]);
+    }
+
+    /// NQIS=3 where the first pass leaves NO blocks at qii=1 → the
+    /// second pass has NBITS=0 and consumes no bits.
+    #[test]
+    fn block_level_qi_nqis_3_second_pass_can_be_empty() {
+        let bcoded = vec![1u8; 4];
+        let mut w = BitWriter::new();
+        // Pass 0: all four bits zero → every coded block stays at 0.
+        encode_long_run_runs(&mut w, &[0, 0, 0, 0]);
+        // Pass 1: NBITS = #{BCODED=1 AND QIIS==1} = 0 → no encoding.
+        // Append a sentinel byte to verify no bits get consumed.
+        let mut packet = w.finish();
+        packet.push(0xaa);
+        let qiis = decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 3).unwrap();
+        assert_eq!(qiis, vec![0, 0, 0, 0]);
+    }
+
+    /// nbs=0 (no blocks): every pass tallies NBITS=0 and no bits are
+    /// consumed regardless of nqis.
+    #[test]
+    fn block_level_qi_zero_nbs_short_circuits() {
+        let qiis = decode_block_level_qi(&[], 0, &[], 1).unwrap();
+        assert_eq!(qiis, Vec::<u8>::new());
+        let qiis = decode_block_level_qi(&[], 0, &[], 3).unwrap();
+        assert_eq!(qiis, Vec::<u8>::new());
+    }
+
+    /// Bcoded length mismatch error.
+    #[test]
+    fn block_level_qi_rejects_bcoded_length_mismatch() {
+        let err = decode_block_level_qi(&[], 4, &[1, 1, 1], 1).unwrap_err();
+        assert_eq!(
+            err,
+            Error::BlockLevelQiBcodedLenMismatch {
+                bcoded_len: 3,
+                nbs: 4,
+            }
+        );
+    }
+
+    /// nqis out-of-range rejects (both 0 and >MAX).
+    #[test]
+    fn block_level_qi_rejects_nqis_out_of_range() {
+        let err = decode_block_level_qi(&[], 0, &[], 0).unwrap_err();
+        assert_eq!(err, Error::BlockLevelQiNqisOutOfRange { nqis: 0 });
+        let err = decode_block_level_qi(&[], 0, &[], 4).unwrap_err();
+        assert_eq!(err, Error::BlockLevelQiNqisOutOfRange { nqis: 4 });
+    }
+
+    /// Truncation mid-pass-0 long-run surfaces as a TruncatedHeader
+    /// from the §7.2.1 layer.
+    #[test]
+    fn block_level_qi_truncation_in_pass_0_is_reported() {
+        let bcoded = vec![1u8; 4];
+        // Empty packet → the very first BIT read by §7.2.1 must fail.
+        let err = decode_block_level_qi(&[], bcoded.len() as u32, &bcoded, 2).unwrap_err();
+        match err {
+            Error::TruncatedHeader { field: _ } => {}
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    /// Truncation mid-pass-1 long-run (pass-0 fully decoded; pass-1
+    /// runs out) also surfaces.
+    #[test]
+    fn block_level_qi_truncation_in_pass_1_is_reported() {
+        let bcoded = vec![1u8; 4];
+        let mut w = BitWriter::new();
+        // Pass 0: full 4-bit string that promotes every block to 1.
+        encode_long_run_runs(&mut w, &[1, 1, 1, 1]);
+        // Intentionally do NOT encode pass 1. The §7.2.1 inner reads
+        // BIT (and then walks RLEN) — the first read fails.
+        let packet = w.finish();
+        let err = decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 3).unwrap_err();
+        match err {
+            Error::TruncatedHeader { field: _ } => {}
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    /// Shared-reader chaining contract: after `decode_block_level_qi_inner`
+    /// returns, the same BitReader is still positioned correctly so the
+    /// caller can keep reading downstream.
+    #[test]
+    fn block_level_qi_inner_chains_on_shared_reader() {
+        let bcoded = vec![1u8; 4];
+        let mut w = BitWriter::new();
+        // Pass 0 only, NQIS=2, all bits zero.
+        encode_long_run_runs(&mut w, &[0, 0, 0, 0]);
+        // Sentinel pattern that should land on the next bit boundary.
+        // Append seven 1-bits then five 0-bits = 12 bits.
+        for _ in 0..7 {
+            w.put(1, 1);
+        }
+        for _ in 0..5 {
+            w.put(0, 1);
+        }
+        let packet = w.finish();
+        let mut r = BitReader::new(&packet);
+        let qiis = decode_block_level_qi_inner(&mut r, bcoded.len() as u32, &bcoded, 2).unwrap();
+        assert_eq!(qiis, vec![0, 0, 0, 0]);
+        // Now read 12 more bits — should be seven 1s then five 0s.
+        let after = r.read_bits(12, "sentinel").unwrap();
+        // Bits in order: 1111111 00000 → 0b1111_1110_0000 = 0xfe0
+        assert_eq!(after, 0b1111_1110_0000);
+    }
+
+    /// Error::Display rendering for the two new variants.
+    #[test]
+    fn block_level_qi_error_displays_render() {
+        let s = format!(
+            "{}",
+            Error::BlockLevelQiBcodedLenMismatch {
+                bcoded_len: 7,
+                nbs: 5,
+            }
+        );
+        assert!(s.contains("§7.6"));
+        assert!(s.contains("bcoded length 7"));
+        assert!(s.contains("nbs 5"));
+
+        let s = format!("{}", Error::BlockLevelQiNqisOutOfRange { nqis: 9 });
+        assert!(s.contains("§7.6"));
+        assert!(s.contains("NQIS=9"));
+        assert!(s.contains("1..=3"));
+    }
+
+    /// NQIS=3 where pass 1's bit-tally is fed by an interleaved
+    /// pattern: confirm that coded order (ascending `bi`) is the
+    /// iteration order, not the order of bcoded entries.
+    #[test]
+    fn block_level_qi_nqis_3_iterates_in_coded_order() {
+        // bcoded: y n y y y n y n  → 5 coded blocks
+        let bcoded = vec![1u8, 0, 1, 1, 1, 0, 1, 0];
+        let mut w = BitWriter::new();
+        // Pass 0 over 5 coded blocks (bi = 0,2,3,4,6) with bits
+        // [1, 0, 1, 0, 1] → QIIS[0,2,3,4,6] = [1, 0, 1, 0, 1].
+        encode_long_run_runs(&mut w, &[1, 0, 1, 0, 1]);
+        // Pass 1 NBITS = #{BCODED=1 AND QIIS==1} = 3 (bi=0, 3, 6) in
+        // coded order. Bits [0, 1, 0] → QIIS[0]+=0=1, QIIS[3]+=1=2,
+        // QIIS[6]+=0=1.
+        encode_long_run_runs(&mut w, &[0, 1, 0]);
+        let packet = w.finish();
+        let qiis = decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 3).unwrap();
+        assert_eq!(qiis, vec![1, 0, 0, 2, 0, 0, 1, 0]);
+    }
+
+    /// All blocks uncoded: every pass sees NBITS=0 even when NQIS=3.
+    #[test]
+    fn block_level_qi_all_uncoded_consumes_no_bits() {
+        let bcoded = vec![0u8; 5];
+        // No bits encoded; a sentinel byte verifies nothing is consumed.
+        let packet = [0xffu8; 2];
+        let mut r = BitReader::new(&packet);
+        let qiis = decode_block_level_qi_inner(&mut r, bcoded.len() as u32, &bcoded, 3).unwrap();
+        assert_eq!(qiis, vec![0, 0, 0, 0, 0]);
+        // 16 sentinel bits should still be intact.
+        let v = r.read_bits(16, "sentinel").unwrap();
+        assert_eq!(v, 0xffff);
+    }
+
+    /// Realistic mix at NQIS=2 spanning the long-run RSTART boundaries
+    /// (RSTART=10 covers run lengths 10..=17). Confirms a multi-run
+    /// long-run encoding survives the round-trip through §7.6.
+    #[test]
+    fn block_level_qi_long_run_multi_run_round_trip() {
+        // 24 coded blocks.
+        let bcoded = vec![1u8; 24];
+        let mut w = BitWriter::new();
+        // Pass 0: 10 zeros then 14 ones (two long-run records,
+        // RSTART=10 chosen for both).
+        let pass0: Vec<u8> = std::iter::repeat(0)
+            .take(10)
+            .chain(std::iter::repeat(1).take(14))
+            .collect();
+        encode_long_run_runs(&mut w, &pass0);
+        let packet = w.finish();
+        let qiis = decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 2).unwrap();
+        // The first 10 stay at 0; the remaining 14 promote to 1.
+        let mut expected = vec![0u8; 10];
+        expected.extend(std::iter::repeat(1).take(14));
+        assert_eq!(qiis, expected);
     }
 }

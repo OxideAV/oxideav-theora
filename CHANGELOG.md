@@ -26,6 +26,47 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§6.4.1 Loop Filter Limit Table Decode (2026-05-29, round 15).**
+  New public
+  `decode_loop_filter_limit_table(bits: &[u8]) -> Result<[u8; 64], Error>`
+  transcribing the full §6.4.1 procedure of the Xiph Theora I
+  Specification ("Loop Filter Limit Table Decode"). The published
+  `Theora.pdf` omits the section's numbered decode steps — the text
+  jumps from "It is decoded as follows:" directly to "VP3
+  Compatibility" / §6.4.2. The procedure body is recovered from the
+  spec's own LaTeX source, staged into the repo at
+  `docs/video/theora/theora-6.4.1-lflims.md`.
+
+  The procedure is two steps: (1) read a 3-bit unsigned integer as
+  `NBITS`; (2) for each `qi` in 0..=63, read an `NBITS`-bit unsigned
+  integer as `LFLIMS[qi]`. Total bits consumed: `3 + 64 * NBITS`.
+  `NBITS` is shared across all 64 entries — read once before the
+  loop. There is no per-value clamping — the 7-bit output width
+  matches the `NBITS ≤ 7` ceiling declared by the variable table.
+
+  The crate-private `decode_lflims_inner` operates on an
+  already-positioned `BitReader` so that a future
+  `parse_setup_header` can chain §6.4.1 → §6.4.2 → §6.4.4 on a
+  single shared reader without re-aligning at byte boundaries —
+  matching the existing pattern of `decode_quant_params_inner` and
+  `decode_huffman_tables_inner`.
+
+  Seven new unit tests (total now 245) cover the `NBITS = 0` corner
+  case (all-zero output, 3 bits consumed), the Appendix B.2 VP3
+  table round-trip at `NBITS = 5`, the `NBITS = 7` ceiling
+  exercising the full 7-bit output width, every entry pinned at
+  `127 = 2^7 − 1`, mid-payload truncation reporting `LFLIMS`, empty-
+  payload truncation reporting `LFLIMS NBITS`, and the shared-
+  `BitReader` chaining contract via `decode_lflims_inner`. A
+  `pack_msb_first` test helper packs `(value, nbits)` slot lists
+  MSb-first to mirror the `BitReader` decoding.
+
+  `parse_setup_header` continues to surface
+  `Error::SetupHeaderBodyNotImplemented` because the chained
+  §6.4.1 → §6.4.2 → §6.4.4 body decode on a shared bit reader is
+  still pending; each section is now available as a standalone
+  entry point that can be exercised independently.
+
 * **§7.7.1 EOB Token Decode (2026-05-29, round 14).** New public
   `decode_eob_token(packet: &[u8], token: u8, nbs: u32, bi: u32,
   ti: u8, tis: &mut [u8], ncoeffs: &mut [u8],

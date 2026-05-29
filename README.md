@@ -4,17 +4,18 @@ Pure-Rust Theora video codec — clean-room implementation in progress.
 
 ## Status — 2026-05-29
 
-**Identification + comment + setup-entrypoint + §6.4.2 quant-params
-decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
-+ §7.1 frame-header decode + §7.2 long-/short-run bit strings + §7.3
-coded-block-flags decode + §7.4 macro-block coding modes + §7.5
-motion-vector decode + §7.6 block-level qi decode + §7.7.1 EOB token
-decode (rounds 1–14).** §6.1, §6.2 (identification), §6.3 (comment),
-§6.4.5 step 1 (setup-header common-header guard), §6.4.2 (Quantization
-Parameters Decode), §6.4.3 (Computing a Quantization Matrix), §6.4.4
-(DCT Token Huffman Tables), §7.1 (Frame Header Decode), §7.2 (Run-
-Length Encoded Bit Strings), §7.3 (Coded Block Flags Decode), §7.4
-(Macro Block Coding Modes), §7.5.1 (single Motion Vector decode),
+**Identification + comment + setup-entrypoint + §6.4.1 loop-filter
+limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
+§6.4.4 DCT-token Huffman tables + §7.1 frame-header decode + §7.2
+long-/short-run bit strings + §7.3 coded-block-flags decode + §7.4
+macro-block coding modes + §7.5 motion-vector decode + §7.6 block-level
+qi decode + §7.7.1 EOB token decode (rounds 1–15).** §6.1, §6.2
+(identification), §6.3 (comment), §6.4.5 step 1 (setup-header
+common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
+(Quantization Parameters Decode), §6.4.3 (Computing a Quantization
+Matrix), §6.4.4 (DCT Token Huffman Tables), §7.1 (Frame Header Decode),
+§7.2 (Run-Length Encoded Bit Strings), §7.3 (Coded Block Flags Decode),
+§7.4 (Macro Block Coding Modes), §7.5.1 (single Motion Vector decode),
 §7.5.2 (per-macro-block Motion Vector decode), §7.6 (Block-Level *qi*
 Decode), and §7.7.1 (EOB Token Decode) of the Theora I Specification
 are wired up. Three
@@ -57,7 +58,17 @@ state arrays and returning the residual `EOBS` run length.
 * [`parse_setup_header`] — round 3 entrypoint validating §6.4.5
   step 1 (the `0x82`+"theora" common-header guard). Returns
   `Error::SetupHeaderBodyNotImplemented` after the common header
-  passes — see "§6.4.1 spec gap" below.
+  passes — see "§6.4.1 recovered procedure body (round 15)" below
+  for what now unblocks the §6.4.5 step 2 piece and what still
+  blocks the chained end-to-end body decode.
+* [`decode_loop_filter_limit_table`] — round 15 public §6.4.1
+  procedure returning a 64-element `[u8; 64]` `LFLIMS` table.
+  Reads a 3-bit `NBITS` followed by 64 `NBITS`-bit unsigned values
+  (one per `qi` in 0..=63). The procedure body is recovered from
+  `docs/video/theora/theora-6.4.1-lflims.md` (the published
+  `Theora.pdf` omits the numbered steps). Closes the §6.4.5 step 2
+  spec-gap; the chained `parse_setup_header` body decode still
+  needs §6.4.1 → §6.4.2 → §6.4.4 wired on a shared bit reader.
 * `TheoraSetupHeader::vp3_defaults` — round 4 constructor returning
   the Appendix-B-typed `LFLIMS` / `ACSCALE` / `DCSCALE` fallback
   applicable to `version < 0x030200` streams.
@@ -238,18 +249,20 @@ under `docs/video/theora/fixtures/` carries
 (`vendor="Lavf62.13.102"`, `comments=[("encoder", "Lavc62.30.100
 libtheora")]`).
 
-### Setup header (rounds 3 + 4 + 5)
+### Setup header (rounds 3 + 4 + 5 + 15)
 [`parse_setup_header`] implements only §6.4.5 step 1: it validates
 the 7-byte common header (`0x82` + ASCII `"theora"`) and returns
 [`Error::SetupHeaderBodyNotImplemented`] once the preamble checks
-out. The end-to-end body decode — which begins with `LFLIMS`
-(§6.4.1) per §6.4.5 step 2 — stays blocked on the §6.4.1 spec gap.
+out. Round 15 added the §6.4.5 step 2 standalone entry point
+[`decode_loop_filter_limit_table`] (see "§6.4.1 recovered procedure
+body (round 15)" below); the chained end-to-end body decode that
+drives §6.4.1 → §6.4.2 → §6.4.4 against a single shared `BitReader`
+inside `parse_setup_header` is still pending.
 
 Round 5 lands the §6.4.2 (Quantization Parameters Decode) procedure
 as a standalone public entry point so it can be exercised
-independently of the §6.4.1 gap (§6.4.5 step 3 follows step 2; once
-§6.4.1 is recovered, `parse_setup_header` will chain the two on a
-shared bit reader):
+independently of the §6.4.1 spec rendering issue (§6.4.5 step 3
+follows step 2 in the chained decode):
 
 ```rust
 pub fn decode_quantization_parameters(bits: &[u8])
@@ -373,25 +386,54 @@ A crate-private MSb-first [`BitReader`] implementing §5.2 remains
 held private (used by the §6.4.1 / §6.4.2 procedures once their
 bodies land).
 
-### §6.4.1 spec gap
+### §6.4.1 recovered procedure body (round 15)
 
 The spec PDF as published does not contain the numbered procedure
 steps for §6.4.1 (Loop Filter Limit Table Decode). Page 50 ends
 with "It is decoded as follows:" and page 51 begins immediately
 with "VP3 Compatibility" / §6.4.2 — the steps that should bridge
-the two pages are absent from the PDF stream we have. The
-guardrails prohibit guessing where a spec gap exists, so the
-end-to-end `parse_setup_header` body decode (§6.4.5 step 2 onward,
-on a shared bit reader) remains blocked. With §6.4.4 landed in round
-7, every other section the setup-header body chains through (§6.4.2 /
-§6.4.3 / §6.4.4) is implemented as a standalone entry point that can
-be exercised independently; only §6.4.1 still blocks the chained
-end-to-end body decode.
+the two pages are absent from the PDF stream we have.
 
-Round 4 mitigates the blockage for VP3-compatible bitstreams via
-`vp3_defaults()`. `version >= 0x030200` streams continue to require
-the §6.4.1 / §6.4.2 procedures and remain blocked until the docs
-collaborator recovers the missing procedure body.
+Round 15 closes that gap using
+`docs/video/theora/theora-6.4.1-lflims.md`, which transcribes the
+recovered two-step procedure from the spec's own LaTeX source. The
+new public [`decode_loop_filter_limit_table`] entry point exposes
+the §6.4.1 decode against a §5.2-style MSb-first `BitReader`:
+
+```rust
+pub fn decode_loop_filter_limit_table(bits: &[u8])
+    -> Result<[u8; 64], Error>;
+```
+
+The recovered procedure is straightforward:
+
+1. Read a 3-bit unsigned integer as `NBITS`.
+2. For each consecutive `qi` from 0 to 63 inclusive, read an
+   `NBITS`-bit unsigned integer as `LFLIMS[qi]`.
+
+Total bits consumed: `3 + 64 * NBITS`. `NBITS` is shared across all
+64 entries (read once before the loop). There is no per-value
+clamping — the 7-bit output width matches the `NBITS ≤ 7` ceiling.
+The §7.10 loop filter consumes `LFLIMS[qi0]` as the deblocking
+limit value `L`.
+
+What now works end-to-end via three standalone entry points:
+
+* §6.4.5 step 1 — `parse_setup_header` common-header guard.
+* §6.4.5 step 2 — [`decode_loop_filter_limit_table`] (round 15).
+* §6.4.5 step 3 — [`decode_quantization_parameters`] (round 5).
+* §6.4.5 step 4 — [`decode_dct_token_huffman_tables`] (round 7).
+
+What remains: a chained `parse_setup_header` body decode that drives
+§6.4.1 → §6.4.2 → §6.4.4 on a single shared `BitReader` so the
+sub-byte continuation between sections is honoured (the standalone
+entry points each take a byte-aligned slice). The crate-private
+`decode_lflims_inner` already implements the shared-reader contract,
+matching `decode_quant_params_inner` and `decode_huffman_tables_inner`.
+
+Round 4 already mitigates the gap for VP3-compatible bitstreams via
+`vp3_defaults()` — `version < 0x030200` streams do not carry a
+transmitted `LFLIMS` table, per Appendix B.1.
 
 118 unit tests cover happy-path parses on all three header types,
 every spec-mandated reject path on each, the optional
@@ -547,6 +589,21 @@ a sentinel byte read off the same reader), and `Display` rendering
 for every new error variant carrying `§7.7.1` plus the offending
 quantity.
 
+Round 15 adds seven §6.4.1 loop-filter-limit tests (total now 245):
+the `NBITS = 0` corner case (every entry forced to 0, only 3 bits
+consumed), the Appendix B.2 VP3 table round-trip at `NBITS = 5`
+(maximum entry 30 < 2^5 − 1), a synthesized payload at the
+`NBITS = 7` ceiling that exercises the full 7-bit output width via
+`qi`-derived expected values, every entry at the `127 = 2^7 − 1`
+maximum value, a 24-byte truncated payload at `NBITS = 3` reporting
+the `LFLIMS` field, a zero-byte payload reporting the `LFLIMS NBITS`
+field, and the shared-`BitReader` chaining contract via
+`decode_lflims_inner` (a 5-bit mid-byte tail then an 8-bit sentinel
+byte read off the same reader after the 195-bit §6.4.1 payload).
+A `pack_msb_first` test helper packs `(value, nbits)` slot lists
+MSb-first to mirror the `BitReader` decoding without a real setup-
+header fixture.
+
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually
 decode a frame.
@@ -554,9 +611,11 @@ decode a frame.
 ## Clean-room sources
 
 Only the Xiph Theora I Specification
-(`docs/video/theora/Theora.pdf`) and the fixture corpus under
-`docs/video/theora/fixtures/` are consulted. No libtheora, no
-FFmpeg `vp3.c`, no theora-rs.
+(`docs/video/theora/Theora.pdf`), the staged §6.4.1 procedure body
+at `docs/video/theora/theora-6.4.1-lflims.md` (transcribed from the
+spec's own LaTeX source for the section the published PDF omits),
+and the fixture corpus under `docs/video/theora/fixtures/` are
+consulted. No libtheora, no FFmpeg `vp3.c`, no theora-rs.
 
 Black-box `ffmpeg` and `theoradec` binary invocations are allowed
 as opaque validators.

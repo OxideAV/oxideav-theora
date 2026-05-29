@@ -111,30 +111,49 @@
 //!   driver. Reads 0 / 2 / 3 / 4 / 12 bits of extra payload depending
 //!   on the token; token 6 with a zero 12-bit payload becomes the
 //!   "all remaining coded blocks" sentinel.
+//! * [`decode_loop_filter_limit_table`] returns the 64-element
+//!   per-stream `LFLIMS` table per §6.4.1 — the first sub-procedure of
+//!   the setup-header body decode. Reads a 3-bit `NBITS` followed by
+//!   64 `NBITS`-bit unsigned values, one per `qi` (round 15, unblocked
+//!   by the §6.4.1 procedure-body staging at
+//!   `docs/video/theora/theora-6.4.1-lflims.md`).
 //!
 //! ## Clean-room provenance
 //!
 //! Source material limited to `docs/video/theora/Theora.pdf` (Xiph
-//! Theora I Specification) and the fixture corpus under
-//! `docs/video/theora/fixtures/`. No libtheora, no FFmpeg vp3.c, no
-//! theora-rs.
+//! Theora I Specification), the spec's own LaTeX source as transcribed
+//! into `docs/video/theora/theora-6.4.1-lflims.md` (the staged §6.4.1
+//! procedure body that the published PDF omits), and the fixture corpus
+//! under `docs/video/theora/fixtures/`. No libtheora, no FFmpeg vp3.c,
+//! no theora-rs.
 //!
-//! ## Known spec gap — §6.4.1 procedure body
+//! ## §6.4.1 — recovered procedure body (round 15)
 //!
-//! The §6.4.1 Loop Filter Limit Table Decode section in
+//! The §6.4.1 Loop Filter Limit Table Decode section in the published
 //! `Theora.pdf` declares its inputs/outputs (`LFLIMS`: 64-element 7-bit
-//! array; `NBITS`: 3-bit) and ends with the sentence "It is decoded as
-//! follows:" — but the numbered procedure steps that should follow are
-//! **absent** from the PDF as published. The next page begins
-//! immediately with "VP3 Compatibility" / §6.4.2. Round 4 therefore
-//! continues to defer the bitstream `LFLIMS` decode (the
-//! `parse_setup_header` body path) and ships the Appendix-B-typed VP3
-//! fallback table as a workaround for `version < 0x030200` streams.
-//! For `version >= 0x030200` streams a per-stream LFLIMS is mandated
-//! by §6.4.1; until the docs collaborator recovers the numbered
-//! procedure body, the per-stream decode remains blocked.
-//! See [`Error::SetupHeaderBodyNotImplemented`] for the entrypoint's
-//! delegation behaviour.
+//! array; `NBITS`: 3-bit) and ends with "It is decoded as follows:" —
+//! but the numbered procedure steps that should follow do not render
+//! in the PDF. The text jumps directly to "VP3 Compatibility" / §6.4.2.
+//!
+//! Round 15 closes that gap using the spec's own LaTeX source
+//! transcribed into `docs/video/theora/theora-6.4.1-lflims.md`. The
+//! recovered two-step procedure is:
+//!
+//! 1. Read a 3-bit unsigned integer as `NBITS`.
+//! 2. For each consecutive `qi` from 0 to 63 inclusive, read an
+//!    `NBITS`-bit unsigned integer as `LFLIMS[qi]`.
+//!
+//! Total bits consumed: `3 + 64 * NBITS`. `NBITS` is shared across
+//! all 64 entries — it is read once, not per-`qi`. There is no
+//! per-value clamping; the §7.10 loop filter consumes `LFLIMS[qi0]`
+//! as `L` directly.
+//!
+//! The standalone [`decode_loop_filter_limit_table`] entry point
+//! exposes this; [`parse_setup_header`] still surfaces
+//! [`Error::SetupHeaderBodyNotImplemented`] because the body decode
+//! continues into §6.4.2 / §6.4.3 / §6.4.4 (which are already
+//! implemented as standalone entry points but not yet chained on a
+//! shared bit reader).
 
 #![warn(missing_debug_implementations)]
 #![deny(unsafe_code)]
@@ -1478,6 +1497,89 @@ pub fn parse_setup_header(packet: &[u8]) -> Result<TheoraSetupHeader, Error> {
     // callers route on the unparsed / fallback / parsed distinction
     // once a later round closes the gap.
     Err(Error::SetupHeaderBodyNotImplemented)
+}
+
+/// Decode the loop-filter limit table from the §6.4.1 setup-header
+/// payload carried by `bits`.
+///
+/// `bits` must start at the first bit of the §6.4.1 payload — i.e.
+/// the first bit of the setup-header body immediately following the
+/// `0x82`+"theora" common header (per §6.4.5 step 2). The returned
+/// 64-element `LFLIMS` table is indexed by `qi` (the quantization
+/// index, `0..=63`); entry `LFLIMS[qi0]` becomes the loop-filter
+/// limit value `L` consumed by §7.10 ("Loop Filtering") when the
+/// frame's primary `qi` is `qi0`.
+///
+/// The procedure transcribes the numbered steps of §6.4.1 of the
+/// Xiph Theora I Specification:
+///
+/// 1. Read a 3-bit unsigned integer as `NBITS`.
+/// 2. For each consecutive `qi` from 0 to 63 inclusive, read an
+///    `NBITS`-bit unsigned integer as `LFLIMS[qi]`.
+///
+/// The total bit cost is `3 + 64 * NBITS`. `NBITS` is shared across
+/// all 64 entries (read once before the loop, not per-entry). There
+/// is no per-value clamping in §6.4.1 itself — each entry is the raw
+/// `NBITS`-bit unsigned value, which fits the 7-bit output width
+/// because `NBITS` is bounded above by 7.
+///
+/// The §6.4.1 procedure body is **not** rendered in the published
+/// `Theora.pdf`; the staging file
+/// `docs/video/theora/theora-6.4.1-lflims.md` supplies the numbered
+/// steps transcribed from the spec's own LaTeX source. See the
+/// crate-level "§6.4.1 — recovered procedure body (round 15)"
+/// section for the full quote.
+///
+/// # Errors
+///
+/// * [`Error::TruncatedHeader`] if the bitstream runs out before the
+///   `3 + 64 * NBITS` bits the procedure consumes have been read.
+///
+/// # VP3-compatible streams
+///
+/// Streams that declare `version < 0x030200` do not carry a
+/// transmitted `LFLIMS` table; per §B.1 they use the Appendix B.2
+/// hardcoded values exposed as [`LFLIMS_VP3`]. Use
+/// [`TheoraSetupHeader::vp3_defaults`] to construct a setup header
+/// for those streams without invoking this function.
+///
+/// # Examples
+///
+/// ```no_run
+/// use oxideav_theora::decode_loop_filter_limit_table;
+/// // `payload` here is the §6.4.1 bit-payload starting immediately
+/// // after the setup-header common header (`0x82`+"theora").
+/// # let payload: &[u8] = &[];
+/// let lflims: [u8; 64] = decode_loop_filter_limit_table(payload)?;
+/// # Ok::<(), oxideav_theora::Error>(())
+/// ```
+pub fn decode_loop_filter_limit_table(bits: &[u8]) -> Result<[u8; 64], Error> {
+    let mut r = BitReader::new(bits);
+    decode_lflims_inner(&mut r)
+}
+
+/// Inner §6.4.1 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so a future `parse_setup_header` can chain
+/// §6.4.1 → §6.4.2 → §6.4.4 on the same underlying bit reader without
+/// re-aligning at byte boundaries.
+fn decode_lflims_inner(r: &mut BitReader<'_>) -> Result<[u8; 64], Error> {
+    // §6.4.1 step 1: read 3-bit NBITS. The spec's variable table
+    // declares NBITS as 3 bits unsigned (range 0..=7), and the
+    // 7-bit-wide `LFLIMS` output array matches that upper bound.
+    let nbits = r.read_bits(3, "LFLIMS NBITS")?;
+
+    // §6.4.1 step 2: for qi = 0..=63, read LFLIMS[qi] as an
+    // NBITS-bit unsigned integer. NBITS is shared across all 64
+    // entries (step 1 reads it once before the loop).
+    //
+    // The narrowing cast to `u8` is exact: `nbits <= 7`, so each
+    // `read_bits` return value is at most `2^7 - 1 = 127`, which
+    // fits the 7-bit output width declared by §6.4.1's output table.
+    let mut lflims = [0u8; 64];
+    for slot in lflims.iter_mut() {
+        *slot = r.read_bits(nbits, "LFLIMS")? as u8;
+    }
+    Ok(lflims)
 }
 
 /// `ilog(a)` per the spec's Notation and Conventions section: the
@@ -9653,5 +9755,170 @@ mod tests {
         assert_eq!(eobs, 4);
         // Only block 3 was pinned by this call.
         assert_eq!(tis, vec![64, 64, 64, 64, 0, 0, 0, 0]);
+    }
+
+    // ---------------------------------------------------------------
+    // §6.4.1 Loop Filter Limit Table Decode tests.
+    //
+    // Spec body recovered in `docs/video/theora/theora-6.4.1-lflims.md`
+    // from the spec's own LaTeX source. The procedure reads `NBITS`
+    // (3 bits) once, then for each `qi` in 0..=63 reads `LFLIMS[qi]`
+    // as an `NBITS`-bit unsigned integer.
+    //
+    // The fixtures below construct §6.4.1 payloads bit-by-bit using
+    // the same MSb-first packing the `BitReader` consumes (most
+    // significant bit of byte 0 first). This avoids needing a live
+    // setup-header payload and exercises the decoder against
+    // synthetic inputs whose expected output is by construction.
+    // ---------------------------------------------------------------
+
+    /// Helper: pack `(value, nbits)` slots MSb-first into the smallest
+    /// `Vec<u8>` that fits, zero-padding the final byte's tail bits.
+    fn pack_msb_first(slots: &[(u32, u32)]) -> Vec<u8> {
+        let total_bits: u32 = slots.iter().map(|(_, n)| n).sum();
+        let total_bytes = total_bits.div_ceil(8) as usize;
+        let mut out = vec![0u8; total_bytes];
+        let mut bit_cursor: usize = 0;
+        for &(value, nbits) in slots {
+            for i in (0..nbits).rev() {
+                let bit = (value >> i) & 1;
+                let byte_idx = bit_cursor / 8;
+                let bit_idx = 7 - (bit_cursor % 8);
+                out[byte_idx] |= (bit as u8) << bit_idx;
+                bit_cursor += 1;
+            }
+        }
+        out
+    }
+
+    /// NBITS=0 is a corner case the spec body permits: the read is
+    /// zero-bit-wide per entry, so every `LFLIMS[qi]` is forced to 0.
+    /// Total bit cost = 3 + 64*0 = 3 bits. The next 5 bits of byte 0
+    /// are free for whatever §6.4.2 wants to do with them.
+    #[test]
+    fn lflims_nbits_zero_yields_all_zeros() {
+        // Single byte: NBITS=0 in the top 3 bits, then 5 don't-care
+        // bits set to 1 to make sure they are not consumed.
+        let packet = [0b000_11111];
+        let lflims = decode_loop_filter_limit_table(&packet).unwrap();
+        assert_eq!(lflims, [0u8; 64]);
+    }
+
+    /// NBITS=5 (5-bit values) suffices to encode the Appendix B.2 VP3
+    /// hardcoded LFLIMS table — its maximum entry is 30, well below
+    /// 2^5 - 1 = 31. The decoded table must match `LFLIMS_VP3` byte
+    /// for byte; this confirms both the §6.4.1 transcription and the
+    /// Appendix B.2 table at the same time.
+    #[test]
+    fn lflims_nbits_5_roundtrips_vp3_table() {
+        // NBITS=5 then 64 × 5-bit values from LFLIMS_VP3.
+        let mut slots: Vec<(u32, u32)> = vec![(5, 3)];
+        for &v in LFLIMS_VP3.iter() {
+            slots.push((v as u32, 5));
+        }
+        let packet = pack_msb_first(&slots);
+        let lflims = decode_loop_filter_limit_table(&packet).unwrap();
+        assert_eq!(lflims, LFLIMS_VP3);
+    }
+
+    /// NBITS=7 covers the full 7-bit output width declared by §6.4.1.
+    /// Round-tripping a table that uses the full 0..=127 range
+    /// confirms the decoder does not narrow or clamp.
+    #[test]
+    fn lflims_nbits_7_roundtrips_full_range() {
+        // Construct a synthetic table with `qi` as the value
+        // (0..=63), then bump some entries to >63 to exercise the
+        // top half of the 7-bit range.
+        let mut expected = [0u8; 64];
+        for (qi, slot) in expected.iter_mut().enumerate() {
+            *slot = ((qi * 2) as u8) & 0x7f; // 0, 2, ... up to 126.
+        }
+        let mut slots: Vec<(u32, u32)> = vec![(7, 3)];
+        for &v in expected.iter() {
+            slots.push((v as u32, 7));
+        }
+        let packet = pack_msb_first(&slots);
+        let lflims = decode_loop_filter_limit_table(&packet).unwrap();
+        assert_eq!(lflims, expected);
+    }
+
+    /// Total bit cost: a NBITS=3 payload reads `3 + 64*3 = 195` bits,
+    /// which spans 25 bytes (the last 5 bits of byte 24 are unused).
+    /// A 24-byte buffer is therefore insufficient and must surface
+    /// the truncation error the shared `BitReader` raises.
+    #[test]
+    fn lflims_truncated_payload_errors() {
+        // 195 bits would need 25 bytes; give 24 with NBITS=3 packed.
+        let mut slots: Vec<(u32, u32)> = vec![(3, 3)];
+        for _ in 0..64 {
+            slots.push((5, 3));
+        }
+        let mut packet = pack_msb_first(&slots);
+        packet.truncate(24);
+        let err = decode_loop_filter_limit_table(&packet).unwrap_err();
+        assert!(
+            matches!(err, Error::TruncatedHeader { field: "LFLIMS" }),
+            "got: {err:?}"
+        );
+    }
+
+    /// Truncation while reading `NBITS` itself (an empty payload)
+    /// reports the `LFLIMS NBITS` field so the failure pinpoints the
+    /// step-1 read rather than the step-2 loop.
+    #[test]
+    fn lflims_truncated_at_nbits_errors() {
+        let packet: [u8; 0] = [];
+        let err = decode_loop_filter_limit_table(&packet).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::TruncatedHeader {
+                    field: "LFLIMS NBITS"
+                }
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// The shared-`BitReader` chaining contract for §6.4.1: after the
+    /// inner procedure returns, the next read picks up exactly where
+    /// the procedure left off. This is what lets a future
+    /// `parse_setup_header` chain §6.4.1 → §6.4.2 → §6.4.4 on the
+    /// same reader without re-aligning at byte boundaries.
+    #[test]
+    fn lflims_inner_leaves_reader_at_correct_offset() {
+        // NBITS=3 → reads 3 + 64*3 = 195 bits.
+        let mut slots: Vec<(u32, u32)> = vec![(3, 3)];
+        for _ in 0..64 {
+            slots.push((1, 3));
+        }
+        // Add a 5-bit tail in byte 24 (bits 4..=0) and a sentinel
+        // byte to verify both partial-byte and next-byte continuation.
+        slots.push((0b10110, 5));
+        slots.push((0xab, 8));
+        let packet = pack_msb_first(&slots);
+        let mut r = BitReader::new(&packet);
+        let lflims = decode_lflims_inner(&mut r).unwrap();
+        assert_eq!(lflims, [1u8; 64]);
+        // Reader is now mid-byte 24 at bit-position 4 (zero-indexed
+        // from the MSb). Read the 5-bit tail then the sentinel.
+        let tail = r.read_bits(5, "tail").unwrap();
+        assert_eq!(tail, 0b10110);
+        let sentinel = r.read_bits(8, "sentinel").unwrap();
+        assert_eq!(sentinel, 0xab);
+    }
+
+    /// All entries reach the 7-bit ceiling (`2^7 - 1 = 127`) when
+    /// NBITS=7 — the maximum addressable value the §6.4.1 output
+    /// table allows. Confirms no upper-bound truncation.
+    #[test]
+    fn lflims_nbits_7_all_max_value() {
+        let mut slots: Vec<(u32, u32)> = vec![(7, 3)];
+        for _ in 0..64 {
+            slots.push((127, 7));
+        }
+        let packet = pack_msb_first(&slots);
+        let lflims = decode_loop_filter_limit_table(&packet).unwrap();
+        assert_eq!(lflims, [127u8; 64]);
     }
 }

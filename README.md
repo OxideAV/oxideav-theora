@@ -2,21 +2,22 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-27
+## Status — 2026-05-29
 
 **Identification + comment + setup-entrypoint + §6.4.2 quant-params
 decode + §6.4.3 quant-matrix compute + §6.4.4 DCT-token Huffman tables
 + §7.1 frame-header decode + §7.2 long-/short-run bit strings + §7.3
 coded-block-flags decode + §7.4 macro-block coding modes + §7.5
-motion-vector decode + §7.6 block-level qi decode (rounds 1–13).**
-§6.1, §6.2 (identification), §6.3 (comment), §6.4.5 step 1
-(setup-header common-header guard), §6.4.2 (Quantization Parameters
-Decode), §6.4.3 (Computing a Quantization Matrix), §6.4.4 (DCT Token
-Huffman Tables), §7.1 (Frame Header Decode), §7.2 (Run-Length Encoded
-Bit Strings), §7.3 (Coded Block Flags Decode), §7.4 (Macro Block
-Coding Modes), §7.5.1 (single Motion Vector decode), §7.5.2 (per-
-macro-block Motion Vector decode), and §7.6 (Block-Level *qi* Decode)
-of the Theora I Specification are wired up. Three
+motion-vector decode + §7.6 block-level qi decode + §7.7.1 EOB token
+decode (rounds 1–14).** §6.1, §6.2 (identification), §6.3 (comment),
+§6.4.5 step 1 (setup-header common-header guard), §6.4.2 (Quantization
+Parameters Decode), §6.4.3 (Computing a Quantization Matrix), §6.4.4
+(DCT Token Huffman Tables), §7.1 (Frame Header Decode), §7.2 (Run-
+Length Encoded Bit Strings), §7.3 (Coded Block Flags Decode), §7.4
+(Macro Block Coding Modes), §7.5.1 (single Motion Vector decode),
+§7.5.2 (per-macro-block Motion Vector decode), §7.6 (Block-Level *qi*
+Decode), and §7.7.1 (EOB Token Decode) of the Theora I Specification
+are wired up. Three
 byte-aligned entry points plus eight public bit-level decoders over
 an MSb-first bit reader; round 4 added the Appendix B VP3 fallback
 tables, round 5 added the full §6.4.2 procedure (ACSCALE / DCSCALE /
@@ -37,10 +38,13 @@ decoder consuming `BCODED` plus a caller-supplied
 macro-block-to-luma-blocks mapping, demultiplexing all eight Table
 7.18 modes through Schemes 0..=7 (Table 7.19's six fixed Huffman
 alphabets, the on-wire MSCHEME=0 alphabet, and the MSCHEME=7 direct
-3-bit encoding), and round 13 adds §7.6 — the per-block `QIIS` array
+3-bit encoding), round 13 adds §7.6 — the per-block `QIIS` array
 decoder chaining `NQIS − 1` §7.2.1 long-run passes over the per-block
 subset of still-`qii`-tied coded blocks (VP3-compat `NQIS == 1`
-short-circuit consumes zero bits and returns all-zero `QIIS`).
+short-circuit consumes zero bits and returns all-zero `QIIS`), and
+round 14 adds §7.7.1 — the EOB token applicator decoding one of the
+Table 7.33 EOB tokens against per-block `TIS`/`NCOEFFS`/`COEFFS`
+state arrays and returning the residual `EOBS` run length.
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -138,6 +142,25 @@ short-circuit consumes zero bits and returns all-zero `QIIS`).
   `BlockLevelQiNqisOutOfRange`) reject malformed inputs. The shared-
   reader chaining contract is preserved via a crate-private
   `decode_block_level_qi_inner`.
+* [`decode_eob_token`] — round 14 public §7.7.1 procedure consuming
+  one of the seven Table 7.33 EOB tokens (`token: u8` in `0..=6`),
+  reading the matching 0 / 2 / 3 / 4 / 12-bit extra-bits payload, and
+  applying the per-block state mutation: step 8 zero-fills
+  `coeffs[bi][ti..=63]`, step 9 captures `ncoeffs[bi] = tis[bi]`, step
+  10 pins `tis[bi] = 64`, and the return value is the post-step-11
+  residual `EOBS` run length (i.e. the number of *additional* blocks
+  the current EOB run will close at the start of subsequent §7.7
+  passes). Token-6 zero-payload special case (§7.7.1 step 7(b)):
+  `EOBS` becomes the count of blocks `bj` with `tis[bj] < 64`
+  *including* the current block, matching the spec's "the size of the
+  remaining coded blocks" wording. Four new typed errors
+  (`EobTokenOutOfRange` for `token > 6`,
+  `EobTokenBlockIndexOutOfRange` for `bi >= nbs`,
+  `EobTokenIndexOutOfRange` for `ti > 63`, and
+  `EobTokenStateLenMismatch` with an `EobTokenStateSlice` discriminant
+  for `tis`/`ncoeffs`/`coeffs` length mismatch) reject malformed
+  inputs. The shared-reader chaining contract is preserved via a
+  crate-private `decode_eob_token_inner`.
 * [`decode_single_motion_vector`] / [`decode_macroblock_motion_vectors`]
   — round 12 public §7.5.1 / §7.5.2 procedures returning a single
   [`MotionVector`] or an `NBS`-element `Vec<MotionVector>` of per-
@@ -502,6 +525,27 @@ as `TruncatedHeader` from the §7.2.1 layer, the shared-`BitReader`
 chaining contract via `decode_block_level_qi_inner` (followed by
 twelve sentinel bits read off the same reader), and a multi-run
 long-run round-trip that crosses two RSTART=10 long-run records.
+Round 14 adds sixteen §7.7.1 EOB-token-decode tests (total now 238):
+the constant-run TOKEN=0/1/2 paths consume no bits (empty packet
+decodes; step-8 zero-fill of `coeffs[bi][ti..=63]`, step-9 capture
+of `ncoeffs[bi]`, step-10 pin of `tis[bi] = 64`, all verified
+against sentinel values), the TOKEN=3 two-bit payload across all
+four values (0..=3), TOKEN=4 three-bit payload across all eight
+(0..=7), TOKEN=5 four-bit payload across all sixteen (0..=15),
+TOKEN=6 with a non-zero 12-bit payload returning the literal,
+TOKEN=6 with a zero payload falling into the "all remaining coded
+blocks" sentinel (including the current block in the tally;
+excluded pinned-block case verified separately), token-out-of-
+range rejects across `7..=20`, `bi >= nbs` rejects, `ti > 63`
+rejects across `64..=127`, all three state-slice length-mismatch
+rejects (`Tis` / `Ncoeffs` / `Coeffs`), truncation rejection on
+each of TOKEN=3..=6's extra-bits payload reads with no-partial-
+state assertions, the ti=0 full-block zero-fill case, the
+step-9-captures-pre-call-TIS invariant, the shared-`BitReader`
+chaining contract via `decode_eob_token_inner` (six tail bits then
+a sentinel byte read off the same reader), and `Display` rendering
+for every new error variant carrying `§7.7.1` plus the offending
+quantity.
 
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually

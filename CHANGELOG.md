@@ -6,6 +6,35 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+* **§7.7.1 EOB Token Decode (2026-05-29, round 14).** New public
+  `decode_eob_token(packet: &[u8], token: u8, nbs: u32, bi: u32,
+  ti: u8, tis: &mut [u8], ncoeffs: &mut [u8],
+  coeffs: &mut [[i16; 64]]) -> Result<u64, Error>` transcribing the
+  full §7.7.1 procedure of the Xiph Theora I Specification ("EOB
+  Token Decode"). Consumes one of the seven EOB-token values
+  (Table 7.33 tokens 0..=6), reads the matching 0 / 2 / 3 / 4 / 12-
+  bit extra-bits payload, ends the current block by zero-filling
+  `COEFFS[bi][ti..=63]` (step 8), captures the block's pre-call
+  coefficient count in `NCOEFFS[bi]` (step 9), pins `TIS[bi]` to
+  `64` (step 10), and returns the residual `EOBS` run length after
+  the step-11 decrement.
+
+  Token-6 zero-payload sentinel (§7.7.1 step 7(b)): when the 12-bit
+  payload reads zero, `EOBS` becomes the count of blocks `bj` such
+  that `TIS[bj] < 64` *including* the current block (because step 10
+  has not yet pinned it) — matching the spec's "the size of the
+  remaining coded blocks" wording.
+
+  Four new `Error` variants reject malformed inputs:
+  `EobTokenOutOfRange { token }` for `token > 6` (tokens 7..=31 are
+  §7.7.2 coefficient tokens, not handled here);
+  `EobTokenBlockIndexOutOfRange { bi, nbs }` for `bi >= nbs`;
+  `EobTokenIndexOutOfRange { ti }` for `ti > 63`; and
+  `EobTokenStateLenMismatch { which, got, nbs }` (with a new
+  `EobTokenStateSlice` discriminant) when any of `tis` / `ncoeffs` /
+  `coeffs` has a length other than `nbs`. All four carry `Display`
+  arms citing §7.7.1.
+
 * **§7.6 Block-Level *qi* Decode (2026-05-27, round 13).** New public
   `decode_block_level_qi(packet: &[u8], nbs: u32, bcoded: &[u8],
   nqis: usize) -> Result<Vec<u8>, Error>` transcribing the full §7.6

@@ -50,8 +50,16 @@
 //! Level qi Decode** procedure as [`decode_block_level_qi`], chaining
 //! `NQIS − 1` §7.2.1 long-run passes over the per-block subset of
 //! still-`qii`-tied coded blocks to produce the per-block `QIIS`
-//! array that drives AC dequantization. Independent of the §6.4.1
-//! spec gap.
+//! array that drives AC dequantization. Round 14 lands the
+//! **§7.7.1 EOB Token Decode** procedure as [`decode_eob_token`], the
+//! first sub-procedure of the §7.7 DCT-coefficient walk: it consumes
+//! one of the 0..=6 EOB tokens (Table 7.33), reads the matching
+//! 0/2/3/4/12-bit extra-bits payload, ends the current block by
+//! zero-filling `COEFFS[bi][ti..=63]`, captures the block's
+//! coefficient count in `NCOEFFS[bi]`, pins `TIS[bi]` to `64`, and
+//! returns the residual EOBS run length the §7.7.3 driver will use
+//! to free-skip subsequent blocks. Independent of the §6.4.1 spec
+//! gap.
 //!
 //! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
 //! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
@@ -97,6 +105,12 @@
 //!   block subset of still-`qii`-tied coded blocks. The VP3-compat
 //!   `NQIS == 1` short-circuit consumes zero bits and returns all-zero
 //!   `QIIS`.
+//! * [`decode_eob_token`] applies one §7.7.1 EOB token (Table 7.33
+//!   tokens 0..=6) to the per-block state arrays `TIS` / `NCOEFFS` /
+//!   `COEFFS`, returning the residual EOBS run length for the §7.7.3
+//!   driver. Reads 0 / 2 / 3 / 4 / 12 bits of extra payload depending
+//!   on the token; token 6 with a zero 12-bit payload becomes the
+//!   "all remaining coded blocks" sentinel.
 //!
 //! ## Clean-room provenance
 //!
@@ -479,9 +493,57 @@ pub enum Error {
         /// The offending `nqis` value.
         nqis: usize,
     },
+    /// The `token` argument to [`decode_eob_token`] was outside the
+    /// `0..=6` range mandated by §7.7.1 ("This must be in the range
+    /// 0 . . . 6"). EOB tokens occupy values 0..=6 of the DCT-token
+    /// alphabet (Table 7.33).
+    EobTokenOutOfRange {
+        /// The offending `token` value.
+        token: u8,
+    },
+    /// The `bi` argument to [`decode_eob_token`] was `>= nbs`, so the
+    /// state arrays cannot be indexed safely. §7.7 / §7.7.1 work
+    /// per-block in coded order; the caller must keep `bi < NBS`.
+    EobTokenBlockIndexOutOfRange {
+        /// The offending `bi` value.
+        bi: u32,
+        /// The `nbs` length the state arrays were sized to.
+        nbs: u32,
+    },
+    /// The `ti` argument to [`decode_eob_token`] was `> 63`, so the
+    /// zero-fill in §7.7.1 step 8 (`COEFFS[bi][tj] = 0` for `ti..=63`)
+    /// would skip valid token indices. §7.7's zig-zag walk runs
+    /// `0..=63`; values outside that range have no meaning.
+    EobTokenIndexOutOfRange {
+        /// The offending `ti` value.
+        ti: u8,
+    },
+    /// One of the state slices passed to [`decode_eob_token`] had a
+    /// length other than the agreed `nbs`. §7.7.1 indexes `TIS[bi]`,
+    /// `NCOEFFS[bi]`, and `COEFFS[bi]`; all three must be `nbs` long.
+    EobTokenStateLenMismatch {
+        /// Which state slice failed the length check.
+        which: EobTokenStateSlice,
+        /// The slice's actual length.
+        got: usize,
+        /// `nbs`.
+        nbs: usize,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
+}
+
+/// Identifies which §7.7.1 state slice failed an
+/// [`Error::EobTokenStateLenMismatch`] check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EobTokenStateSlice {
+    /// `TIS` — per-block current token index.
+    Tis,
+    /// `NCOEFFS` — per-block coefficient count.
+    Ncoeffs,
+    /// `COEFFS` — per-block 64-entry coefficient array.
+    Coeffs,
 }
 
 /// Identifies which UTF-8 vector in the comment header triggered an
@@ -698,6 +760,22 @@ impl core::fmt::Display for Error {
             Error::BlockLevelQiNqisOutOfRange { nqis } => write!(
                 f,
                 "oxideav-theora: §7.6 NQIS={nqis} out of range 1..=3"
+            ),
+            Error::EobTokenOutOfRange { token } => write!(
+                f,
+                "oxideav-theora: §7.7.1 TOKEN={token} out of range 0..=6"
+            ),
+            Error::EobTokenBlockIndexOutOfRange { bi, nbs } => write!(
+                f,
+                "oxideav-theora: §7.7.1 bi={bi} >= nbs={nbs}"
+            ),
+            Error::EobTokenIndexOutOfRange { ti } => write!(
+                f,
+                "oxideav-theora: §7.7.1 ti={ti} > 63 (zig-zag indices are 0..=63)"
+            ),
+            Error::EobTokenStateLenMismatch { which, got, nbs } => write!(
+                f,
+                "oxideav-theora: §7.7.1 state slice {which:?} length {got} != nbs {nbs}"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -3572,6 +3650,188 @@ pub(crate) fn decode_block_level_qi_inner(
 
     debug_assert_eq!(qiis.len(), nbs_us);
     Ok(qiis)
+}
+
+// =====================================================================
+// §7.7.1 EOB Token Decode
+// =====================================================================
+
+/// Decode an EOB (end-of-block) token per §7.7.1 ("EOB Token Decode")
+/// of the Xiph Theora I Specification.
+///
+/// EOB tokens are values `0..=6` of the §7.7 DCT-token alphabet
+/// (Table 7.33). Each one signals that the *remainder* of one or more
+/// blocks contains only zeros: token 0 ends a single block; tokens 1
+/// through 6 carry an "EOB run" extending the zero-fill across that
+/// many additional blocks. The procedure short-circuits §7.7's zig-zag
+/// walk for each ended block by zero-filling its `COEFFS[bi][ti..=63]`
+/// tail, recording its coefficient count, and pinning `TIS[bi]` to 64.
+///
+/// Inputs:
+///
+/// * `token` — the decoded token value (must satisfy §7.7.1's
+///   `0..=6` range). Tokens outside this range belong to §7.7.2
+///   (coefficient tokens) and are not handled here.
+/// * `nbs` — total block count in the frame (Table 6.5 / 6.6), the
+///   length the three state slices must share.
+/// * `bi` — coded-order index of the block whose tail is being
+///   ended (the current §7.7 pass's "current block").
+/// * `ti` — current token index inside that block (§7.7's outer
+///   zig-zag-order loop variable). Must be `0..=63`.
+/// * `tis` — `NBS`-element array of per-block current token indices.
+///   Read by step 9 (assign `NCOEFFS[bi] = TIS[bi]`), written by step
+///   10 (assign `TIS[bi] = 64`) and inspected by step 7(b) to count
+///   already-completed blocks.
+/// * `ncoeffs` — `NBS`-element array of per-block coefficient counts.
+///   Written by step 9.
+/// * `coeffs` — `NBS × 64` array of quantized DCT coefficients in
+///   zig-zag order. Step 8 zero-fills `coeffs[bi][ti..=63]`.
+///
+/// Output: the procedure's `EOBS` value *after* the step-11
+/// decrement — i.e. the *remaining* length of the current EOB run
+/// after this call ends one block. A return value of zero means the
+/// current EOB run has ended and the next §7.7 pass picks a fresh
+/// token; a non-zero return value means the next `EOBS` calls into
+/// §7.7 will skip token decode and instead use this same procedure
+/// (with `token` short-circuited; see §7.7.3) to end additional
+/// blocks for free.
+///
+/// Step 7(b) (the "token 6 with payload 0" special case) is given the
+/// spec's "all remaining blocks" interpretation: when token 6's 12-bit
+/// payload reads as zero, EOBS becomes the count of blocks `bj` with
+/// `TIS[bj] < 64` — *including the current `bi`*, which still has
+/// `TIS[bi] < 64` at this point because step 10 has not yet run. The
+/// VP3-compat note at the end of §7.7.1 documents that VP3 encoders
+/// never emit this special case, but compliant decoders accept it.
+///
+/// Returns:
+///
+/// * [`Error::EobTokenOutOfRange`] when `token > 6`.
+/// * [`Error::EobTokenBlockIndexOutOfRange`] when `bi >= nbs`.
+/// * [`Error::EobTokenIndexOutOfRange`] when `ti > 63`.
+/// * [`Error::EobTokenStateLenMismatch`] when any of `tis` / `ncoeffs`
+///   / `coeffs` does not have exactly `nbs` entries.
+/// * [`Error::TruncatedHeader`] when the underlying bit reader is
+///   exhausted before TOKEN 3..=6's extra-bits payload is fully read.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_eob_token(
+    packet: &[u8],
+    token: u8,
+    nbs: u32,
+    bi: u32,
+    ti: u8,
+    tis: &mut [u8],
+    ncoeffs: &mut [u8],
+    coeffs: &mut [[i16; 64]],
+) -> Result<u64, Error> {
+    let mut r = BitReader::new(packet);
+    decode_eob_token_inner(&mut r, token, nbs, bi, ti, tis, ncoeffs, coeffs)
+}
+
+/// Inner §7.7.1 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so the §7.7.3 driver — once it lands — can
+/// chain §7.6 → §7.7 on the same reader without re-aligning to a byte
+/// boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_eob_token_inner(
+    r: &mut BitReader<'_>,
+    token: u8,
+    nbs: u32,
+    bi: u32,
+    ti: u8,
+    tis: &mut [u8],
+    ncoeffs: &mut [u8],
+    coeffs: &mut [[i16; 64]],
+) -> Result<u64, Error> {
+    // Argument validation. §7.7.1's declared input ranges fail closed
+    // here so a future §7.7.3 driver bug doesn't silently overflow
+    // the state arrays.
+    if token > 6 {
+        return Err(Error::EobTokenOutOfRange { token });
+    }
+    if bi >= nbs {
+        return Err(Error::EobTokenBlockIndexOutOfRange { bi, nbs });
+    }
+    if ti > 63 {
+        return Err(Error::EobTokenIndexOutOfRange { ti });
+    }
+    let nbs_us = nbs as usize;
+    if tis.len() != nbs_us {
+        return Err(Error::EobTokenStateLenMismatch {
+            which: EobTokenStateSlice::Tis,
+            got: tis.len(),
+            nbs: nbs_us,
+        });
+    }
+    if ncoeffs.len() != nbs_us {
+        return Err(Error::EobTokenStateLenMismatch {
+            which: EobTokenStateSlice::Ncoeffs,
+            got: ncoeffs.len(),
+            nbs: nbs_us,
+        });
+    }
+    if coeffs.len() != nbs_us {
+        return Err(Error::EobTokenStateLenMismatch {
+            which: EobTokenStateSlice::Coeffs,
+            got: coeffs.len(),
+            nbs: nbs_us,
+        });
+    }
+
+    // Steps 1..=7: decode EOBS from TOKEN.
+    let mut eobs: u64 = match token {
+        // Step 1: TOKEN=0 → run of 1.
+        0 => 1,
+        // Step 2: TOKEN=1 → run of 2.
+        1 => 2,
+        // Step 3: TOKEN=2 → run of 3.
+        2 => 3,
+        // Step 4: TOKEN=3 → 2-bit extra-bits payload, range 4..=7.
+        3 => r.read_bits(2, "§7.7.1 EOBS (TOKEN=3)")? as u64 + 4,
+        // Step 5: TOKEN=4 → 3-bit payload, range 8..=15.
+        4 => r.read_bits(3, "§7.7.1 EOBS (TOKEN=4)")? as u64 + 8,
+        // Step 6: TOKEN=5 → 4-bit payload, range 16..=31.
+        5 => r.read_bits(4, "§7.7.1 EOBS (TOKEN=5)")? as u64 + 16,
+        // Step 7: TOKEN=6 → 12-bit payload, range 1..=4095 *or* the
+        //   "all remaining blocks" sentinel when payload reads zero.
+        6 => {
+            let payload = r.read_bits(12, "§7.7.1 EOBS (TOKEN=6)")? as u64;
+            if payload == 0 {
+                // Step 7(b): count blocks bj such that TIS[bj] < 64.
+                // The current block's TIS is still <64 at this point
+                // (step 10 has not run yet) so it is included in the
+                // tally — which matches the spec's "the size of the
+                // remaining coded blocks" wording.
+                tis.iter().filter(|&&t| t < 64).count() as u64
+            } else {
+                payload
+            }
+        }
+        // The `token > 6` rejection above forecloses every other arm.
+        _ => unreachable!("token range was clamped to 0..=6"),
+    };
+
+    // Step 8: zero-fill COEFFS[bi][ti..=63]. Done as a slice fill so a
+    // mistranscribed bound trips a single off-by-one rather than a
+    // pile of subtly-wrong tail values.
+    let bi_us = bi as usize;
+    let ti_us = ti as usize;
+    coeffs[bi_us][ti_us..64].fill(0);
+
+    // Step 9: NCOEFFS[bi] = TIS[bi]. Records how many coefficients
+    // were ever written for this block (the spec uses this in §7.8 to
+    // skip uninitialised-tail blocks during DC prediction).
+    ncoeffs[bi_us] = tis[bi_us];
+
+    // Step 10: TIS[bi] = 64. Pins this block out of subsequent §7.7
+    // passes — any token index past 63 means the block is "done".
+    tis[bi_us] = 64;
+
+    // Step 11: EOBS -= 1. The procedure's return value is the count
+    // of *additional* blocks the current EOB run will still close at
+    // the start of subsequent §7.7 passes.
+    eobs -= 1;
+    Ok(eobs)
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -9056,5 +9316,342 @@ mod tests {
         let mut expected = vec![0u8; 10];
         expected.extend(std::iter::repeat(1).take(14));
         assert_eq!(qiis, expected);
+    }
+
+    // =================================================================
+    // §7.7.1 EOB Token Decode tests
+    // =================================================================
+
+    /// Build a fresh `(tis, ncoeffs, coeffs)` tuple sized for `nbs`
+    /// blocks, with sentinel values that make later "untouched" /
+    /// "zero-filled" assertions unambiguous.
+    fn fresh_eob_state(nbs: usize) -> (Vec<u8>, Vec<u8>, Vec<[i16; 64]>) {
+        let tis = vec![0u8; nbs];
+        // NCOEFFS sentinel is 0xff so the procedure's step-9 write is
+        // detectable even when TIS[bi] happens to be 0.
+        let ncoeffs = vec![0xffu8; nbs];
+        // COEFFS sentinel is -777 (not zero) so step 8's zero-fill is
+        // distinguishable from "no write happened".
+        let coeffs = vec![[-777i16; 64]; nbs];
+        (tis, ncoeffs, coeffs)
+    }
+
+    /// Token 0..=2 ride §7.7.1 steps 1..=3: EOBS is a fixed
+    /// 1/2/3, no extra bits are read.
+    #[test]
+    fn eob_token_constant_runs_consume_no_bits() {
+        for (token, expected_run) in [(0u8, 1u64), (1, 2), (2, 3)] {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(4);
+            // Empty packet — the procedure must not read any bits.
+            let eobs =
+                decode_eob_token(&[], token, 4, 2, 5, &mut tis, &mut ncoeffs, &mut coeffs).unwrap();
+            // Step 11: EOBS -= 1.
+            assert_eq!(eobs, expected_run - 1);
+            // Step 8: COEFFS[2][5..=63] zeroed; [0..5] untouched (still
+            // sentinel).
+            for (ti, &v) in coeffs[2].iter().enumerate().take(5) {
+                assert_eq!(v, -777, "ti={ti}");
+            }
+            for (ti_off, &v) in coeffs[2][5..64].iter().enumerate() {
+                let ti = 5 + ti_off;
+                assert_eq!(v, 0, "ti={ti}");
+            }
+            // Other blocks untouched.
+            for bi in [0, 1, 3] {
+                assert_eq!(coeffs[bi], [-777i16; 64]);
+                assert_eq!(ncoeffs[bi], 0xff);
+                assert_eq!(tis[bi], 0);
+            }
+            // Step 9: NCOEFFS[bi] = TIS[bi] (which was 0 at entry).
+            assert_eq!(ncoeffs[2], 0);
+            // Step 10: TIS[bi] = 64.
+            assert_eq!(tis[2], 64);
+        }
+    }
+
+    /// Token 3 reads a 2-bit payload then adds 4. The four values it
+    /// can produce are 4, 5, 6, 7 (then minus the step-11 decrement).
+    #[test]
+    fn eob_token_3_two_bit_payload_round_trip() {
+        for payload in 0u32..4 {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(2);
+            // Pack the 2-bit payload as the most significant bits of one
+            // byte (the MSb-first §5.2 reader consumes the MSb first).
+            let byte = ((payload & 0b11) << 6) as u8;
+            let packet = [byte];
+            let eobs = decode_eob_token(&packet, 3, 2, 0, 63, &mut tis, &mut ncoeffs, &mut coeffs)
+                .unwrap();
+            assert_eq!(eobs, payload as u64 + 4 - 1, "payload={payload}");
+            // Step 8 at ti=63 zero-fills exactly one coefficient.
+            assert_eq!(coeffs[0][63], 0);
+            for (ti, &v) in coeffs[0].iter().enumerate().take(63) {
+                assert_eq!(v, -777, "ti={ti}");
+            }
+        }
+    }
+
+    /// Token 4 reads a 3-bit payload then adds 8 → range 8..=15.
+    #[test]
+    fn eob_token_4_three_bit_payload_round_trip() {
+        for payload in 0u32..8 {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(1);
+            let byte = ((payload & 0b111) << 5) as u8;
+            let packet = [byte];
+            let eobs =
+                decode_eob_token(&packet, 4, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs).unwrap();
+            assert_eq!(eobs, payload as u64 + 8 - 1, "payload={payload}");
+        }
+    }
+
+    /// Token 5 reads a 4-bit payload then adds 16 → range 16..=31.
+    #[test]
+    fn eob_token_5_four_bit_payload_round_trip() {
+        for payload in 0u32..16 {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(1);
+            let byte = ((payload & 0b1111) << 4) as u8;
+            let packet = [byte];
+            let eobs =
+                decode_eob_token(&packet, 5, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs).unwrap();
+            assert_eq!(eobs, payload as u64 + 16 - 1, "payload={payload}");
+        }
+    }
+
+    /// Token 6 with a non-zero payload returns the payload verbatim
+    /// (modulo step 11's decrement); range 1..=4095.
+    #[test]
+    fn eob_token_6_non_zero_payload_returns_literal() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(1);
+        // Payload = 0b1010_1010_1010 = 2730.
+        let packet = [0b1010_1010, 0b1010_0000];
+        let eobs =
+            decode_eob_token(&packet, 6, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs).unwrap();
+        assert_eq!(eobs, 2730 - 1);
+    }
+
+    /// Token 6 with a *zero* 12-bit payload triggers the §7.7.1 step
+    /// 7(b) sentinel: EOBS becomes the count of blocks bj with
+    /// TIS[bj] < 64, *including the current block* (TIS[bi] is still <
+    /// 64 at this point because step 10 has not yet run).
+    #[test]
+    fn eob_token_6_zero_payload_counts_remaining_blocks() {
+        // 5 blocks: blocks 0..=3 still have TIS < 64; block 4 has
+        // already been pinned (TIS=64 from a prior pass).
+        let mut tis = vec![0u8, 0, 0, 0, 64];
+        let mut ncoeffs = vec![0xffu8; 5];
+        let mut coeffs = vec![[-777i16; 64]; 5];
+        // Zero 12-bit payload.
+        let packet = [0u8, 0];
+        let eobs =
+            decode_eob_token(&packet, 6, 5, 1, 10, &mut tis, &mut ncoeffs, &mut coeffs).unwrap();
+        // 4 blocks have TIS < 64 entering the call → EOBS = 4; step 11
+        // decrements to 3.
+        assert_eq!(eobs, 3);
+        // Step 10 ran AFTER the count, pinning block 1.
+        assert_eq!(tis, vec![0, 64, 0, 0, 64]);
+    }
+
+    /// Token-out-of-range rejection: every value 7..=255 must reject.
+    #[test]
+    fn eob_token_rejects_token_above_six() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(1);
+        for token in 7u8..=20 {
+            let r = decode_eob_token(&[], token, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs);
+            assert_eq!(r, Err(Error::EobTokenOutOfRange { token }), "token={token}");
+        }
+    }
+
+    /// `bi` out of range rejection.
+    #[test]
+    fn eob_token_rejects_bi_equal_or_greater_than_nbs() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(4);
+        let r = decode_eob_token(&[], 0, 4, 4, 0, &mut tis, &mut ncoeffs, &mut coeffs);
+        assert_eq!(
+            r,
+            Err(Error::EobTokenBlockIndexOutOfRange { bi: 4, nbs: 4 })
+        );
+        let r = decode_eob_token(&[], 0, 4, 99, 0, &mut tis, &mut ncoeffs, &mut coeffs);
+        assert_eq!(
+            r,
+            Err(Error::EobTokenBlockIndexOutOfRange { bi: 99, nbs: 4 })
+        );
+    }
+
+    /// `ti` out of range rejection.
+    #[test]
+    fn eob_token_rejects_ti_above_63() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(1);
+        for ti in 64u8..=127 {
+            let r = decode_eob_token(&[], 0, 1, 0, ti, &mut tis, &mut ncoeffs, &mut coeffs);
+            assert_eq!(r, Err(Error::EobTokenIndexOutOfRange { ti }), "ti={ti}");
+        }
+    }
+
+    /// State-slice length mismatch rejections, one per slice.
+    #[test]
+    fn eob_token_rejects_state_length_mismatch() {
+        // TIS too short.
+        {
+            let mut tis = vec![0u8; 3];
+            let mut ncoeffs = vec![0u8; 4];
+            let mut coeffs = vec![[0i16; 64]; 4];
+            let r = decode_eob_token(&[], 0, 4, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs);
+            assert_eq!(
+                r,
+                Err(Error::EobTokenStateLenMismatch {
+                    which: EobTokenStateSlice::Tis,
+                    got: 3,
+                    nbs: 4
+                })
+            );
+        }
+        // NCOEFFS too short.
+        {
+            let mut tis = vec![0u8; 4];
+            let mut ncoeffs = vec![0u8; 2];
+            let mut coeffs = vec![[0i16; 64]; 4];
+            let r = decode_eob_token(&[], 0, 4, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs);
+            assert_eq!(
+                r,
+                Err(Error::EobTokenStateLenMismatch {
+                    which: EobTokenStateSlice::Ncoeffs,
+                    got: 2,
+                    nbs: 4
+                })
+            );
+        }
+        // COEFFS too short.
+        {
+            let mut tis = vec![0u8; 4];
+            let mut ncoeffs = vec![0u8; 4];
+            let mut coeffs = vec![[0i16; 64]; 1];
+            let r = decode_eob_token(&[], 0, 4, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs);
+            assert_eq!(
+                r,
+                Err(Error::EobTokenStateLenMismatch {
+                    which: EobTokenStateSlice::Coeffs,
+                    got: 1,
+                    nbs: 4
+                })
+            );
+        }
+    }
+
+    /// Truncation surfaces from the extra-bits paths on each of tokens
+    /// 3, 4, 5, 6.
+    #[test]
+    fn eob_token_truncation_on_extra_bits() {
+        for token in 3u8..=6 {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(1);
+            // Empty packet → the very first extra-bits read fails.
+            let r = decode_eob_token(&[], token, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs);
+            match r {
+                Err(Error::TruncatedHeader { .. }) => {}
+                other => panic!("token={token} expected TruncatedHeader, got {other:?}"),
+            }
+            // No partial state should land: TIS is still 0 (step 10
+            // has not run) and COEFFS is still sentinel.
+            assert_eq!(tis[0], 0);
+            assert_eq!(coeffs[0], [-777i16; 64]);
+        }
+    }
+
+    /// Step-8 boundary check: ti=0 zero-fills the full block.
+    #[test]
+    fn eob_token_zero_fills_from_ti_zero() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(2);
+        let eobs = decode_eob_token(&[], 0, 2, 1, 0, &mut tis, &mut ncoeffs, &mut coeffs).unwrap();
+        assert_eq!(eobs, 0);
+        // Every coefficient of block 1 is zero-filled.
+        assert_eq!(coeffs[1], [0i16; 64]);
+        // Block 0 untouched.
+        assert_eq!(coeffs[0], [-777i16; 64]);
+    }
+
+    /// Step-9 captures the pre-call TIS value, not the post-step-10
+    /// pinned 64. Exercised by pre-seeding TIS[bi] with a non-zero
+    /// value before the call.
+    #[test]
+    fn eob_token_step9_captures_pre_call_tis() {
+        let mut tis = vec![0u8, 17];
+        let mut ncoeffs = vec![0xffu8; 2];
+        let mut coeffs = vec![[-777i16; 64]; 2];
+        let _ = decode_eob_token(&[], 0, 2, 1, 20, &mut tis, &mut ncoeffs, &mut coeffs).unwrap();
+        // §7.7.1 step 9: NCOEFFS[bi] = TIS[bi] (which was 17 *before*
+        // step 10 ran).
+        assert_eq!(ncoeffs[1], 17);
+        // §7.7.1 step 10 then pinned TIS[bi] = 64.
+        assert_eq!(tis[1], 64);
+    }
+
+    /// Display rendering for each new §7.7.1 error variant carries the
+    /// section number so log messages bisect cleanly to the spec.
+    #[test]
+    fn eob_token_error_display_carries_section_number() {
+        let e = Error::EobTokenOutOfRange { token: 7 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.1"), "got: {s}");
+        assert!(s.contains("TOKEN=7"), "got: {s}");
+
+        let e = Error::EobTokenBlockIndexOutOfRange { bi: 4, nbs: 4 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.1"), "got: {s}");
+        assert!(s.contains("bi=4"), "got: {s}");
+
+        let e = Error::EobTokenIndexOutOfRange { ti: 99 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.1"), "got: {s}");
+        assert!(s.contains("ti=99"), "got: {s}");
+
+        let e = Error::EobTokenStateLenMismatch {
+            which: EobTokenStateSlice::Tis,
+            got: 3,
+            nbs: 4,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.1"), "got: {s}");
+        assert!(s.contains("Tis"), "got: {s}");
+    }
+
+    /// The shared-`BitReader` chaining contract: after the inner
+    /// procedure returns, the next read picks up exactly where §7.7.1
+    /// left off. Exercised on token 3 (2 bits of extra-bits payload)
+    /// followed by a sentinel byte.
+    #[test]
+    fn eob_token_inner_leaves_reader_at_correct_offset() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_eob_state(1);
+        // Two payload bits = b11 (the high two bits of byte 0), then
+        // six tail bits in the same byte set to 0b101010, then a fresh
+        // byte = 0xFF as a sentinel.
+        let packet = [0b1110_1010, 0xff];
+        let mut r = BitReader::new(&packet);
+        let eobs = decode_eob_token_inner(&mut r, 3, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap();
+        // Payload was 0b11 = 3 → EOBS = 3 + 4 - 1 = 6.
+        assert_eq!(eobs, 6);
+        // Next 6 bits of byte 0 = 0b101010, then the byte 0xFF sentinel.
+        let tail = r.read_bits(6, "tail").unwrap();
+        assert_eq!(tail, 0b101010);
+        let sentinel = r.read_bits(8, "sentinel").unwrap();
+        assert_eq!(sentinel, 0xff);
+    }
+
+    /// Token 6 zero-payload "all-remaining" interpretation: every
+    /// already-pinned block is excluded; including the current block
+    /// in the tally is the spec's wording ("the size of the remaining
+    /// coded blocks").
+    #[test]
+    fn eob_token_6_zero_payload_excludes_pinned_blocks() {
+        // 8 blocks: 0..=2 pinned (TIS=64), 3..=7 still in play.
+        let mut tis = vec![64u8, 64, 64, 0, 0, 0, 0, 0];
+        let mut ncoeffs = vec![0xffu8; 8];
+        let mut coeffs = vec![[0i16; 64]; 8];
+        // Zero 12-bit payload (token 6 sentinel).
+        let packet = [0u8, 0];
+        let eobs =
+            decode_eob_token(&packet, 6, 8, 3, 0, &mut tis, &mut ncoeffs, &mut coeffs).unwrap();
+        // 5 blocks (3..=7) qualify; step 11 decrements → 4.
+        assert_eq!(eobs, 4);
+        // Only block 3 was pinned by this call.
+        assert_eq!(tis, vec![64, 64, 64, 64, 0, 0, 0, 0]);
     }
 }

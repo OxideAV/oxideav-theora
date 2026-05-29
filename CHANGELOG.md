@@ -4,6 +4,26 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-theora/compare/v0.0.7...v0.0.8) - 2026-05-29
+
+### Other
+
+- decode an EOB token + apply per-block state (round 14)
+- §7.6 Block-Level qi Decode (round 13)
+- §7.5 Motion Vectors decode (round 12)
+- §7.4 Macro Block Coding Modes decode (round 11)
+- §7.3 Coded Block Flags Decode (round 10)
+- §7.2 Long-/Short-Run Bit Strings decode (round 9)
+- decode the frame header (round 8)
+- decode the 80 DCT-token Huffman tables (round 7)
+- §6.4.3 Computing a Quantization Matrix (round 6)
+- §6.4.2 Quantization Parameters Decode (round 5)
+- VP3 LFLIMS/ACSCALE/DCSCALE tables from Appendix B (round 4)
+- Setup-header entrypoint (§6.4.5 step 1) + MSb-first BitReader (§5.2)
+- Comment-header parser per §6.3 of the Theora I Specification
+- Identification-header parser per §6.1 + §6.2 of the Theora I Specification
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **§7.7.1 EOB Token Decode (2026-05-29, round 14).** New public

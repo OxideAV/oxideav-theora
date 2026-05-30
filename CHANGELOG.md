@@ -4,6 +4,59 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **§7.7.2 Coefficient Token Decode (2026-05-30, round 16).** New
+  public `decode_coefficient_token(packet: &[u8], token: u8, nbs: u32,
+  bi: u32, ti: u8, tis: &mut [u8], ncoeffs: &mut [u8],
+  coeffs: &mut [[i16; 64]]) -> Result<CoefficientTokenKind, Error>`
+  transcribing the full §7.7.2 procedure of the Xiph Theora I
+  Specification ("Coefficient Token Decode"). Consumes one of the 25
+  Table 7.38 token values (7..=31), reads the token-specific SIGN /
+  MAG / RLEN extra-bits payload (`0..=11` bits depending on the
+  token), writes one or more entries to `COEFFS[bi]`, advances
+  `TIS[bi]`, and updates `NCOEFFS[bi]` — except for the pure zero-run
+  tokens 7 / 8, which advance `TIS[bi]` but leave `NCOEFFS[bi]`
+  untouched (per §7.7.2's introductory text: "we do not update the
+  coefficient count for the block if we decode a pure zero run").
+  Returns a typed `CoefficientTokenKind` discriminating the token's
+  structural class — `ZeroRun` (tokens 7 / 8), `Single`
+  (tokens 9..=22), or `RunPlusOne` (tokens 23..=31) — so the §7.7.3
+  driver can branch on class without re-deriving Table 7.38.
+
+  Five new `Error` variants reject malformed inputs:
+  `CoefficientTokenOutOfRange { token }` for `token < 7` or
+  `token > 31` (tokens 0..=6 are §7.7.1 EOB tokens, not handled here);
+  `CoefficientTokenBlockIndexOutOfRange { bi, nbs }` for `bi >= nbs`;
+  `CoefficientTokenIndexOutOfRange { ti }` for `ti > 63`;
+  `CoefficientTokenStateLenMismatch { which, got, nbs }` (with a new
+  `CoefficientTokenStateSlice` discriminant) when any of `tis` /
+  `ncoeffs` / `coeffs` has a length other than `nbs`; and
+  `CoefficientTokenWouldOverflowBlock { token, ti, new_tis }` when a
+  multi-coefficient token's implied count would push `TIS[bi]` past
+  64 — surfacing the §7.7.2 MUST-NOT clause as a fail-closed decode
+  error. All five carry `Display` arms citing §7.7.2.
+
+  Twenty-six new unit tests (total now 271) exercise every Table
+  7.38 token (7..=31), the SIGN/MAG/RLEN bit-field ordering, the
+  pure-zero-run `NCOEFFS[bi]` non-update rule, the legal `ti = 63`
+  single-coefficient pin (which produces `TIS = 64`), the legal
+  `ti = 56, RLEN = 8` zero-run terminal-position case, the
+  `RLEN = 64` from `ti = 0` legal boundary, the overflow rejection
+  paths (TOKEN=8 from `ti = 1` with RLEN=64; TOKEN=29 from `ti = 47`
+  with RLEN=17), the truncation error carrying the right `§7.7.2`
+  field-name attribution, the `Display` rendering for each of the
+  five new error variants, the shared-`BitReader` chaining contract
+  via `decode_coefficient_token_inner`, and an end-to-end bit-count
+  audit confirming each token reads exactly as many bits as Table
+  7.38's "Extra Bits" column declares.
+
+  The crate-private `decode_coefficient_token_inner` operates on an
+  already-positioned `BitReader` so that the §7.7.3 driver — once it
+  lands — can chain §7.6 → §7.7 on the same reader without
+  re-aligning at byte boundaries, matching the existing
+  `decode_eob_token_inner` chaining contract.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-theora/compare/v0.0.7...v0.0.8) - 2026-05-29
 
 ### Other

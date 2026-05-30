@@ -2,24 +2,25 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-29
+## Status — 2026-05-30
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter
 limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
 §6.4.4 DCT-token Huffman tables + §7.1 frame-header decode + §7.2
 long-/short-run bit strings + §7.3 coded-block-flags decode + §7.4
 macro-block coding modes + §7.5 motion-vector decode + §7.6 block-level
-qi decode + §7.7.1 EOB token decode (rounds 1–15).** §6.1, §6.2
-(identification), §6.3 (comment), §6.4.5 step 1 (setup-header
-common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
-(Quantization Parameters Decode), §6.4.3 (Computing a Quantization
-Matrix), §6.4.4 (DCT Token Huffman Tables), §7.1 (Frame Header Decode),
-§7.2 (Run-Length Encoded Bit Strings), §7.3 (Coded Block Flags Decode),
-§7.4 (Macro Block Coding Modes), §7.5.1 (single Motion Vector decode),
-§7.5.2 (per-macro-block Motion Vector decode), §7.6 (Block-Level *qi*
-Decode), and §7.7.1 (EOB Token Decode) of the Theora I Specification
-are wired up. Three
-byte-aligned entry points plus eight public bit-level decoders over
+qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode
+(rounds 1–16).** §6.1, §6.2 (identification), §6.3 (comment), §6.4.5
+step 1 (setup-header common-header guard), §6.4.1 (Loop Filter Limit
+Table Decode), §6.4.2 (Quantization Parameters Decode), §6.4.3
+(Computing a Quantization Matrix), §6.4.4 (DCT Token Huffman Tables),
+§7.1 (Frame Header Decode), §7.2 (Run-Length Encoded Bit Strings),
+§7.3 (Coded Block Flags Decode), §7.4 (Macro Block Coding Modes),
+§7.5.1 (single Motion Vector decode), §7.5.2 (per-macro-block Motion
+Vector decode), §7.6 (Block-Level *qi* Decode), §7.7.1 (EOB Token
+Decode), and §7.7.2 (Coefficient Token Decode) of the Theora I
+Specification are wired up. Three
+byte-aligned entry points plus nine public bit-level decoders over
 an MSb-first bit reader; round 4 added the Appendix B VP3 fallback
 tables, round 5 added the full §6.4.2 procedure (ACSCALE / DCSCALE /
 NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added §6.4.3 (64-entry
@@ -42,10 +43,17 @@ alphabets, the on-wire MSCHEME=0 alphabet, and the MSCHEME=7 direct
 3-bit encoding), round 13 adds §7.6 — the per-block `QIIS` array
 decoder chaining `NQIS − 1` §7.2.1 long-run passes over the per-block
 subset of still-`qii`-tied coded blocks (VP3-compat `NQIS == 1`
-short-circuit consumes zero bits and returns all-zero `QIIS`), and
-round 14 adds §7.7.1 — the EOB token applicator decoding one of the
+short-circuit consumes zero bits and returns all-zero `QIIS`), round
+14 adds §7.7.1 — the EOB token applicator decoding one of the
 Table 7.33 EOB tokens against per-block `TIS`/`NCOEFFS`/`COEFFS`
-state arrays and returning the residual `EOBS` run length.
+state arrays and returning the residual `EOBS` run length, and
+round 16 adds §7.7.2 — the coefficient token applicator decoding one
+of the 25 non-EOB tokens (Table 7.38 values 7..=31), writing the
+implied SIGN/MAG-derived coefficients to `COEFFS[bi]`, advancing
+`TIS[bi]`, updating `NCOEFFS[bi]` (skipping the count update for pure
+zero-run tokens 7 / 8 per the §7.7.2 introductory text), and
+returning a typed `CoefficientTokenKind` discriminating zero-run /
+single / run-plus-one classes for the §7.7.3 driver to branch on.
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -172,6 +180,27 @@ state arrays and returning the residual `EOBS` run length.
   for `tis`/`ncoeffs`/`coeffs` length mismatch) reject malformed
   inputs. The shared-reader chaining contract is preserved via a
   crate-private `decode_eob_token_inner`.
+* [`decode_coefficient_token`] — round 16 public §7.7.2 procedure
+  consuming one of the 25 non-EOB DCT tokens (`token: u8` in `7..=31`,
+  Table 7.38), reading the token-specific SIGN / MAG / RLEN
+  extra-bits payload (0..=11 bits), writing the implied coefficient(s)
+  to `coeffs[bi]`, advancing `tis[bi]`, and updating `ncoeffs[bi]`
+  except for the pure zero-run tokens 7 / 8 (per §7.7.2's introductory
+  text: "we do not update the coefficient count for the block if we
+  decode a pure zero run"). Returns a typed `CoefficientTokenKind`
+  (`ZeroRun` / `Single` / `RunPlusOne`) so the §7.7.3 driver can
+  branch on the token's structural class without re-deriving
+  Table 7.38. Multi-coefficient tokens fail closed with
+  `Error::CoefficientTokenWouldOverflowBlock` when their implied
+  coefficient count would push `TIS[bi]` past 64, surfacing §7.7.2's
+  own MUST-NOT clause ("they MUST NOT bring the total number of
+  coefficients in the block to more than 64"). Five new typed errors
+  (`CoefficientTokenOutOfRange`, `CoefficientTokenBlockIndexOutOfRange`,
+  `CoefficientTokenIndexOutOfRange`, `CoefficientTokenStateLenMismatch`
+  with a `CoefficientTokenStateSlice` discriminant,
+  `CoefficientTokenWouldOverflowBlock`) reject malformed inputs. The
+  shared-reader chaining contract is preserved via a crate-private
+  `decode_coefficient_token_inner`.
 * [`decode_single_motion_vector`] / [`decode_macroblock_motion_vectors`]
   — round 12 public §7.5.1 / §7.5.2 procedures returning a single
   [`MotionVector`] or an `NBS`-element `Vec<MotionVector>` of per-

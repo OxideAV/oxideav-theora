@@ -59,7 +59,18 @@
 //! coefficient count in `NCOEFFS[bi]`, pins `TIS[bi]` to `64`, and
 //! returns the residual EOBS run length the §7.7.3 driver will use
 //! to free-skip subsequent blocks. Independent of the §6.4.1 spec
-//! gap.
+//! gap. Round 16 lands the **§7.7.2 Coefficient Token Decode**
+//! procedure as [`decode_coefficient_token`], the second §7.7
+//! sub-procedure: it consumes one of the 25 non-EOB tokens
+//! (Table 7.38 values 7..=31), reads the token's SIGN / MAG / RLEN
+//! extra-bits payload (`0..=11` bits depending on the token), writes
+//! one or more entries to `COEFFS[bi]`, advances `TIS[bi]`, and
+//! updates `NCOEFFS[bi]` (skipping the count update for pure
+//! zero-run tokens 7 / 8 per the §7.7.2 introductory text). Returns
+//! a typed [`CoefficientTokenKind`] discriminating the token's
+//! structural class — zero run, single coefficient, or zero run
+//! followed by a single trailing coefficient — so the §7.7.3 driver
+//! can branch on the class without re-deriving Table 7.38.
 //!
 //! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
 //! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
@@ -111,6 +122,17 @@
 //!   driver. Reads 0 / 2 / 3 / 4 / 12 bits of extra payload depending
 //!   on the token; token 6 with a zero 12-bit payload becomes the
 //!   "all remaining coded blocks" sentinel.
+//! * [`decode_coefficient_token`] applies one §7.7.2 coefficient token
+//!   (Table 7.38 tokens 7..=31) to the per-block `TIS` / `NCOEFFS` /
+//!   `COEFFS` state arrays and returns a typed
+//!   [`CoefficientTokenKind`] (`ZeroRun` / `Single` / `RunPlusOne`).
+//!   Reads `0..=11` bits of extra-bits payload (SIGN / MAG / RLEN
+//!   subfields depending on the token); pure zero-run tokens 7 / 8
+//!   advance `TIS[bi]` but leave `NCOEFFS[bi]` untouched per §7.7.2's
+//!   introductory text. Multi-coefficient tokens fail closed with
+//!   [`Error::CoefficientTokenWouldOverflowBlock`] when the implied
+//!   coefficient count would push `TIS[bi]` past 64, surfacing the
+//!   §7.7.2 MUST-NOT clause on invalid streams.
 //! * [`decode_loop_filter_limit_table`] returns the 64-element
 //!   per-stream `LFLIMS` table per §6.4.1 — the first sub-procedure of
 //!   the setup-header body decode. Reads a 3-bit `NBITS` followed by
@@ -548,6 +570,60 @@ pub enum Error {
         /// `nbs`.
         nbs: usize,
     },
+    /// The `token` argument to [`decode_coefficient_token`] was outside
+    /// the `7..=31` range mandated by §7.7.2 ("This must be in the
+    /// range 7 . . . 31"). Coefficient tokens occupy values 7..=31 of
+    /// the DCT-token alphabet (Table 7.38); values 0..=6 are EOB tokens
+    /// handled by [`decode_eob_token`] and are rejected here.
+    CoefficientTokenOutOfRange {
+        /// The offending `token` value.
+        token: u8,
+    },
+    /// The `bi` argument to [`decode_coefficient_token`] was `>= nbs`,
+    /// so the state arrays cannot be indexed safely. §7.7 / §7.7.2
+    /// work per-block in coded order; the caller must keep
+    /// `bi < NBS`.
+    CoefficientTokenBlockIndexOutOfRange {
+        /// The offending `bi` value.
+        bi: u32,
+        /// The `nbs` length the state arrays were sized to.
+        nbs: u32,
+    },
+    /// The `ti` argument to [`decode_coefficient_token`] was `> 63`,
+    /// so any `COEFFS[bi][ti]` write in §7.7.2 would overflow the
+    /// 64-entry zig-zag axis. §7.7's outer loop runs `0..=63`; values
+    /// outside that range have no meaning.
+    CoefficientTokenIndexOutOfRange {
+        /// The offending `ti` value.
+        ti: u8,
+    },
+    /// One of the state slices passed to [`decode_coefficient_token`]
+    /// had a length other than the agreed `nbs`. §7.7.2 indexes
+    /// `TIS[bi]`, `NCOEFFS[bi]`, and `COEFFS[bi]`; all three must be
+    /// `nbs` long.
+    CoefficientTokenStateLenMismatch {
+        /// Which state slice failed the length check.
+        which: CoefficientTokenStateSlice,
+        /// The slice's actual length.
+        got: usize,
+        /// `nbs`.
+        nbs: usize,
+    },
+    /// A §7.7.2 token would have advanced `TIS[bi]` past 64. §7.7.2's
+    /// own normative text warns: "For tokens which represent more than
+    /// one coefficient, they MUST NOT bring the total number of
+    /// coefficients in the block to more than 64." This variant is the
+    /// fail-closed surface for that constraint; rejecting at decode
+    /// prevents an invalid token sequence from writing past the
+    /// `[i16; 64]` row and surfaces the malformed packet to the caller.
+    CoefficientTokenWouldOverflowBlock {
+        /// The decoded `token` value (one of 7..=31).
+        token: u8,
+        /// `ti` on entry.
+        ti: u8,
+        /// The post-token `TIS[bi]` value that exceeded 64.
+        new_tis: u16,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -557,6 +633,18 @@ pub enum Error {
 /// [`Error::EobTokenStateLenMismatch`] check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EobTokenStateSlice {
+    /// `TIS` — per-block current token index.
+    Tis,
+    /// `NCOEFFS` — per-block coefficient count.
+    Ncoeffs,
+    /// `COEFFS` — per-block 64-entry coefficient array.
+    Coeffs,
+}
+
+/// Identifies which §7.7.2 state slice failed an
+/// [`Error::CoefficientTokenStateLenMismatch`] check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoefficientTokenStateSlice {
     /// `TIS` — per-block current token index.
     Tis,
     /// `NCOEFFS` — per-block coefficient count.
@@ -795,6 +883,30 @@ impl core::fmt::Display for Error {
             Error::EobTokenStateLenMismatch { which, got, nbs } => write!(
                 f,
                 "oxideav-theora: §7.7.1 state slice {which:?} length {got} != nbs {nbs}"
+            ),
+            Error::CoefficientTokenOutOfRange { token } => write!(
+                f,
+                "oxideav-theora: §7.7.2 TOKEN={token} out of range 7..=31"
+            ),
+            Error::CoefficientTokenBlockIndexOutOfRange { bi, nbs } => write!(
+                f,
+                "oxideav-theora: §7.7.2 bi={bi} >= nbs={nbs}"
+            ),
+            Error::CoefficientTokenIndexOutOfRange { ti } => write!(
+                f,
+                "oxideav-theora: §7.7.2 ti={ti} > 63 (zig-zag indices are 0..=63)"
+            ),
+            Error::CoefficientTokenStateLenMismatch { which, got, nbs } => write!(
+                f,
+                "oxideav-theora: §7.7.2 state slice {which:?} length {got} != nbs {nbs}"
+            ),
+            Error::CoefficientTokenWouldOverflowBlock {
+                token,
+                ti,
+                new_tis,
+            } => write!(
+                f,
+                "oxideav-theora: §7.7.2 TOKEN={token} from ti={ti} would advance TIS to {new_tis} > 64"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -3934,6 +4046,383 @@ pub(crate) fn decode_eob_token_inner(
     // the start of subsequent §7.7 passes.
     eobs -= 1;
     Ok(eobs)
+}
+
+// =====================================================================
+// §7.7.2 Coefficient Token Decode
+// =====================================================================
+
+/// Per-token classification produced by [`decode_coefficient_token`].
+///
+/// The 25 §7.7.2 tokens fall into three structural classes that
+/// downstream §7.7 / §7.7.3 logic discriminates over. Capturing the
+/// class as a typed enum (rather than echoing the raw token byte) lets
+/// the driver and tests bisect token behaviour without re-encoding the
+/// Table 7.38 case analysis at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoefficientTokenKind {
+    /// Tokens 7 and 8: pure zero runs of length `1..=8` or `1..=64`
+    /// respectively. These do NOT update `NCOEFFS[bi]` (the spec text
+    /// is explicit: "we do not update the coefficient count for the
+    /// block if we decode a pure zero run"). They only advance
+    /// `TIS[bi]`.
+    ZeroRun,
+    /// Tokens 9..=22: a single non-zero coefficient at `COEFFS[bi][ti]`.
+    /// Advances `TIS[bi]` by 1 and writes `NCOEFFS[bi] = TIS[bi]`.
+    Single,
+    /// Tokens 23..=31: a zero run of `1..=17` zeros followed by a
+    /// single trailing non-zero coefficient. Advances `TIS[bi]` by
+    /// `RUN + 1` and writes `NCOEFFS[bi] = TIS[bi]`.
+    RunPlusOne,
+}
+
+/// Decode one §7.7.2 coefficient token (Table 7.38 token values 7..=31)
+/// against per-block `TIS` / `NCOEFFS` / `COEFFS` state arrays.
+///
+/// The 25 tokens partition into three structural classes:
+///
+/// * **Zero-run tokens** — `TOKEN = 7` reads a 3-bit `RLEN` (then
+///   `+1`, range `1..=8`); `TOKEN = 8` reads a 6-bit `RLEN` (then
+///   `+1`, range `1..=64`). Both zero-fill `COEFFS[bi][ti..ti+RLEN]`
+///   and advance `TIS[bi]` by `RLEN`. They do **not** update
+///   `NCOEFFS[bi]` — §7.7.2's introductory text is explicit: "we do
+///   not update the coefficient count for the block if we decode a
+///   pure zero run".
+///
+/// * **Single-coefficient tokens** — `TOKEN` in `9..=22` writes one
+///   coefficient at `COEFFS[bi][ti]`, then advances `TIS[bi]` by 1 and
+///   sets `NCOEFFS[bi] = TIS[bi]`. The coefficient value comes from a
+///   fixed magnitude (tokens 9..=12: `±1, ±2`) or from a `SIGN` bit
+///   plus a `MAG_BITS`-bit `MAG` field added to a fixed offset
+///   (tokens 13..=22: `MAG_BITS = 0..=9`, offset `3, 4, 5, 6, 7, 9,
+///   13, 21, 37, 69`).
+///
+/// * **Run-plus-one tokens** — `TOKEN` in `23..=31` zero-fills
+///   `COEFFS[bi][ti..ti+RUN]` then writes one trailing coefficient at
+///   `COEFFS[bi][ti+RUN]`. The trailing coefficient is `±1` for
+///   tokens 23..=29 and `±MAG` (`MAG = 2..=3`) for tokens 30..=31.
+///   The `RUN` length comes from a fixed value (tokens 23..=27:
+///   `RUN = 1..=5`) or a `RUN_BITS`-bit field plus offset (tokens
+///   28..=31: `RUN_BITS = 2, 3, 1, 1`; offset `6, 10, 1, 2`).
+///   `TIS[bi]` advances by `RUN + 1` and `NCOEFFS[bi] = TIS[bi]`.
+///
+/// Inputs:
+///
+/// * `token` — the decoded token value, in `7..=31`. Tokens `0..=6`
+///   are EOB tokens handled by [`decode_eob_token`] and rejected
+///   here.
+/// * `nbs` — total block count in the frame (Table 6.5 / 6.6), the
+///   length the three state slices must share.
+/// * `bi` — coded-order index of the current block (the §7.7 outer
+///   loop variable). Must satisfy `bi < nbs`.
+/// * `ti` — current token index inside that block. Must be `0..=63`.
+/// * `tis` / `ncoeffs` / `coeffs` — per-block state, all sized `nbs`.
+///
+/// Returns:
+///
+/// * `Ok(CoefficientTokenKind)` indicating which §7.7.2 class the
+///   token belonged to. Useful for §7.7 / §7.7.3 driver
+///   bookkeeping that needs to distinguish a pure zero run (which
+///   leaves `NCOEFFS[bi]` untouched) from a coefficient-writing
+///   token (which updates it).
+/// * [`Error::CoefficientTokenOutOfRange`] when `token < 7` or
+///   `token > 31`.
+/// * [`Error::CoefficientTokenBlockIndexOutOfRange`] when
+///   `bi >= nbs`.
+/// * [`Error::CoefficientTokenIndexOutOfRange`] when `ti > 63`.
+/// * [`Error::CoefficientTokenStateLenMismatch`] when any of `tis` /
+///   `ncoeffs` / `coeffs` does not have exactly `nbs` entries.
+/// * [`Error::CoefficientTokenWouldOverflowBlock`] when the token's
+///   total coefficient count would push `TIS[bi]` past 64. §7.7.2's
+///   own text is explicit: tokens that represent more than one
+///   coefficient "MUST NOT bring the total number of coefficients in
+///   the block to more than 64".
+/// * [`Error::TruncatedHeader`] when the underlying bit reader is
+///   exhausted before the token's extra-bits payload is fully read.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_coefficient_token(
+    packet: &[u8],
+    token: u8,
+    nbs: u32,
+    bi: u32,
+    ti: u8,
+    tis: &mut [u8],
+    ncoeffs: &mut [u8],
+    coeffs: &mut [[i16; 64]],
+) -> Result<CoefficientTokenKind, Error> {
+    let mut r = BitReader::new(packet);
+    decode_coefficient_token_inner(&mut r, token, nbs, bi, ti, tis, ncoeffs, coeffs)
+}
+
+/// Inner §7.7.2 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so the §7.7.3 driver — once it lands — can
+/// chain §7.6 → §7.7 on the same reader without re-aligning to a byte
+/// boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_coefficient_token_inner(
+    r: &mut BitReader<'_>,
+    token: u8,
+    nbs: u32,
+    bi: u32,
+    ti: u8,
+    tis: &mut [u8],
+    ncoeffs: &mut [u8],
+    coeffs: &mut [[i16; 64]],
+) -> Result<CoefficientTokenKind, Error> {
+    // Argument validation. §7.7.2's declared input ranges fail closed
+    // here so a future §7.7.3 driver bug doesn't silently overflow the
+    // state arrays.
+    if !(7..=31).contains(&token) {
+        return Err(Error::CoefficientTokenOutOfRange { token });
+    }
+    if bi >= nbs {
+        return Err(Error::CoefficientTokenBlockIndexOutOfRange { bi, nbs });
+    }
+    if ti > 63 {
+        return Err(Error::CoefficientTokenIndexOutOfRange { ti });
+    }
+    let nbs_us = nbs as usize;
+    if tis.len() != nbs_us {
+        return Err(Error::CoefficientTokenStateLenMismatch {
+            which: CoefficientTokenStateSlice::Tis,
+            got: tis.len(),
+            nbs: nbs_us,
+        });
+    }
+    if ncoeffs.len() != nbs_us {
+        return Err(Error::CoefficientTokenStateLenMismatch {
+            which: CoefficientTokenStateSlice::Ncoeffs,
+            got: ncoeffs.len(),
+            nbs: nbs_us,
+        });
+    }
+    if coeffs.len() != nbs_us {
+        return Err(Error::CoefficientTokenStateLenMismatch {
+            which: CoefficientTokenStateSlice::Coeffs,
+            got: coeffs.len(),
+            nbs: nbs_us,
+        });
+    }
+
+    let bi_us = bi as usize;
+    let ti_us = ti as usize;
+
+    // Helper: read a 1-bit SIGN; +/- the supplied magnitude.
+    fn signed_mag(r: &mut BitReader<'_>, mag: u16, field: &'static str) -> Result<i16, Error> {
+        let sign = r.read_bits(1, field)? as u8;
+        let mag_i = mag as i16;
+        Ok(if sign == 0 { mag_i } else { -mag_i })
+    }
+
+    // Single-coefficient writer: write COEFFS[bi][ti], advance TIS[bi]
+    // by 1, set NCOEFFS[bi] = TIS[bi]. Returns the post-step kind.
+    fn write_single(
+        tis: &mut [u8],
+        ncoeffs: &mut [u8],
+        coeffs: &mut [[i16; 64]],
+        bi_us: usize,
+        ti_us: usize,
+        value: i16,
+    ) -> Result<CoefficientTokenKind, Error> {
+        // No overflow check: a single-coefficient write at ti = 63 is
+        // legal (the resulting TIS = 64 pins the block, exactly as the
+        // §7.7.1 step-10 pin does). Range-checking ti above already
+        // ensured ti <= 63.
+        coeffs[bi_us][ti_us] = value;
+        let new_tis = (ti_us as u16) + 1;
+        tis[bi_us] = new_tis as u8;
+        ncoeffs[bi_us] = new_tis as u8;
+        Ok(CoefficientTokenKind::Single)
+    }
+
+    // Run-plus-one writer: zero-fill ti..ti+run, write COEFFS[bi]
+    // [ti+run] = value, advance TIS[bi] by run+1, set NCOEFFS[bi] =
+    // TIS[bi].
+    fn write_run_plus_one(
+        tis: &mut [u8],
+        ncoeffs: &mut [u8],
+        coeffs: &mut [[i16; 64]],
+        bi_us: usize,
+        ti_us: usize,
+        run: u16,
+        value: i16,
+        token: u8,
+        ti: u8,
+    ) -> Result<CoefficientTokenKind, Error> {
+        let new_tis = (ti_us as u16) + run + 1;
+        if new_tis > 64 {
+            return Err(Error::CoefficientTokenWouldOverflowBlock { token, ti, new_tis });
+        }
+        let run_us = run as usize;
+        coeffs[bi_us][ti_us..ti_us + run_us].fill(0);
+        coeffs[bi_us][ti_us + run_us] = value;
+        tis[bi_us] = new_tis as u8;
+        ncoeffs[bi_us] = new_tis as u8;
+        Ok(CoefficientTokenKind::RunPlusOne)
+    }
+
+    // Zero-run writer: zero-fill ti..ti+run, advance TIS[bi] by run.
+    // Does NOT touch NCOEFFS[bi] per the introductory paragraph of
+    // §7.7.2.
+    fn write_zero_run(
+        tis: &mut [u8],
+        coeffs: &mut [[i16; 64]],
+        bi_us: usize,
+        ti_us: usize,
+        run: u16,
+        token: u8,
+        ti: u8,
+    ) -> Result<CoefficientTokenKind, Error> {
+        let new_tis = (ti_us as u16) + run;
+        if new_tis > 64 {
+            return Err(Error::CoefficientTokenWouldOverflowBlock { token, ti, new_tis });
+        }
+        let run_us = run as usize;
+        coeffs[bi_us][ti_us..ti_us + run_us].fill(0);
+        tis[bi_us] = new_tis as u8;
+        Ok(CoefficientTokenKind::ZeroRun)
+    }
+
+    match token {
+        // Step 1: TOKEN=7 — 3-bit RLEN + 1, range 1..=8, pure zero run.
+        7 => {
+            let rlen = r.read_bits(3, "§7.7.2 RLEN (TOKEN=7)")? as u16 + 1;
+            write_zero_run(tis, coeffs, bi_us, ti_us, rlen, token, ti)
+        }
+        // Step 2: TOKEN=8 — 6-bit RLEN + 1, range 1..=64, pure zero run.
+        8 => {
+            let rlen = r.read_bits(6, "§7.7.2 RLEN (TOKEN=8)")? as u16 + 1;
+            write_zero_run(tis, coeffs, bi_us, ti_us, rlen, token, ti)
+        }
+        // Steps 3..=6: TOKEN=9..=12 — fixed single coefficients.
+        9 => write_single(tis, ncoeffs, coeffs, bi_us, ti_us, 1),
+        10 => write_single(tis, ncoeffs, coeffs, bi_us, ti_us, -1),
+        11 => write_single(tis, ncoeffs, coeffs, bi_us, ti_us, 2),
+        12 => write_single(tis, ncoeffs, coeffs, bi_us, ti_us, -2),
+        // Steps 7..=10: TOKEN=13..=16 — SIGN + fixed magnitude
+        //   13: ±3, 14: ±4, 15: ±5, 16: ±6 (no MAG_BITS).
+        13 => {
+            let v = signed_mag(r, 3, "§7.7.2 SIGN (TOKEN=13)")?;
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        14 => {
+            let v = signed_mag(r, 4, "§7.7.2 SIGN (TOKEN=14)")?;
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        15 => {
+            let v = signed_mag(r, 5, "§7.7.2 SIGN (TOKEN=15)")?;
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        16 => {
+            let v = signed_mag(r, 6, "§7.7.2 SIGN (TOKEN=16)")?;
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        // Steps 11..=16: TOKEN=17..=22 — SIGN + (MAG_BITS-bit MAG) +
+        //   offset. Read SIGN first then MAG, per the spec ordering.
+        //   Table 7.38: 17: ±7..=8 (1 bit, +7); 18: ±9..=12 (2 bits, +9);
+        //   19: ±13..=20 (3 bits, +13); 20: ±21..=36 (4 bits, +21);
+        //   21: ±37..=68 (5 bits, +37); 22: ±69..=580 (9 bits, +69).
+        17 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=17)")? as u8;
+            let mag = r.read_bits(1, "§7.7.2 MAG (TOKEN=17)")? as i16 + 7;
+            let v = if sign == 0 { mag } else { -mag };
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        18 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=18)")? as u8;
+            let mag = r.read_bits(2, "§7.7.2 MAG (TOKEN=18)")? as i16 + 9;
+            let v = if sign == 0 { mag } else { -mag };
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        19 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=19)")? as u8;
+            let mag = r.read_bits(3, "§7.7.2 MAG (TOKEN=19)")? as i16 + 13;
+            let v = if sign == 0 { mag } else { -mag };
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        20 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=20)")? as u8;
+            let mag = r.read_bits(4, "§7.7.2 MAG (TOKEN=20)")? as i16 + 21;
+            let v = if sign == 0 { mag } else { -mag };
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        21 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=21)")? as u8;
+            let mag = r.read_bits(5, "§7.7.2 MAG (TOKEN=21)")? as i16 + 37;
+            let v = if sign == 0 { mag } else { -mag };
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        22 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=22)")? as u8;
+            let mag = r.read_bits(9, "§7.7.2 MAG (TOKEN=22)")? as i16 + 69;
+            let v = if sign == 0 { mag } else { -mag };
+            write_single(tis, ncoeffs, coeffs, bi_us, ti_us, v)
+        }
+        // Steps 17..=21: TOKEN=23..=27 — fixed RUN + (SIGN-of-±1).
+        //   23: 1 zero + ±1; 24: 2 zeros + ±1; 25: 3 zeros + ±1;
+        //   26: 4 zeros + ±1; 27: 5 zeros + ±1.
+        23 => {
+            let v = signed_mag(r, 1, "§7.7.2 SIGN (TOKEN=23)")?;
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, 1, v, token, ti)
+        }
+        24 => {
+            let v = signed_mag(r, 1, "§7.7.2 SIGN (TOKEN=24)")?;
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, 2, v, token, ti)
+        }
+        25 => {
+            let v = signed_mag(r, 1, "§7.7.2 SIGN (TOKEN=25)")?;
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, 3, v, token, ti)
+        }
+        26 => {
+            let v = signed_mag(r, 1, "§7.7.2 SIGN (TOKEN=26)")?;
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, 4, v, token, ti)
+        }
+        27 => {
+            let v = signed_mag(r, 1, "§7.7.2 SIGN (TOKEN=27)")?;
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, 5, v, token, ti)
+        }
+        // Step 22: TOKEN=28 — SIGN, then 2-bit RLEN + 6 (range 6..=9),
+        //   then trailing ±1.
+        //   The spec ordering is "SIGN then RLEN" — the SIGN bit comes
+        //   before the run length payload.
+        28 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=28)")? as u8;
+            let rlen = r.read_bits(2, "§7.7.2 RLEN (TOKEN=28)")? as u16 + 6;
+            let v: i16 = if sign == 0 { 1 } else { -1 };
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, rlen, v, token, ti)
+        }
+        // Step 23: TOKEN=29 — SIGN, then 3-bit RLEN + 10 (range 10..=17),
+        //   then trailing ±1.
+        29 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=29)")? as u8;
+            let rlen = r.read_bits(3, "§7.7.2 RLEN (TOKEN=29)")? as u16 + 10;
+            let v: i16 = if sign == 0 { 1 } else { -1 };
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, rlen, v, token, ti)
+        }
+        // Step 24: TOKEN=30 — fixed RUN=1, then SIGN + 1-bit MAG + 2
+        //   (range ±2..=3). Single zero + ±MAG.
+        30 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=30)")? as u8;
+            let mag_raw = r.read_bits(1, "§7.7.2 MAG (TOKEN=30)")? as i16;
+            let mag = mag_raw + 2;
+            let v = if sign == 0 { mag } else { -mag };
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, 1, v, token, ti)
+        }
+        // Step 25: TOKEN=31 — SIGN, 1-bit MAG + 2 (±MAG = 2..=3), then
+        //   1-bit RLEN + 2 (range 2..=3), trailing ±MAG.
+        31 => {
+            let sign = r.read_bits(1, "§7.7.2 SIGN (TOKEN=31)")? as u8;
+            let mag_raw = r.read_bits(1, "§7.7.2 MAG (TOKEN=31)")? as i16;
+            let mag = mag_raw + 2;
+            let rlen_raw = r.read_bits(1, "§7.7.2 RLEN (TOKEN=31)")? as u16;
+            let rlen = rlen_raw + 2;
+            let v = if sign == 0 { mag } else { -mag };
+            write_run_plus_one(tis, ncoeffs, coeffs, bi_us, ti_us, rlen, v, token, ti)
+        }
+        // Token range check at the top of the function clamps every
+        // other value.
+        _ => unreachable!("token range was clamped to 7..=31"),
+    }
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -9920,5 +10409,691 @@ mod tests {
         let packet = pack_msb_first(&slots);
         let lflims = decode_loop_filter_limit_table(&packet).unwrap();
         assert_eq!(lflims, [127u8; 64]);
+    }
+
+    // ===================================================================
+    // §7.7.2 Coefficient Token Decode tests
+    // ===================================================================
+
+    /// Reusable starting state for §7.7.2 tests. NCOEFFS sentinel is
+    /// 0xff so step-c writes are detectable when TIS[bi] happens to be
+    /// 0. COEFFS sentinel is -777 so the per-token writes are visible
+    /// against the background.
+    fn fresh_coeff_state(nbs: usize) -> (Vec<u8>, Vec<u8>, Vec<[i16; 64]>) {
+        let tis = vec![0u8; nbs];
+        let ncoeffs = vec![0xffu8; nbs];
+        let coeffs = vec![[-777i16; 64]; nbs];
+        (tis, ncoeffs, coeffs)
+    }
+
+    /// TOKEN=7 reads a 3-bit `RLEN`, adds 1, then zero-fills that many
+    /// entries. NCOEFFS[bi] is NOT updated (pure-zero-run exception).
+    /// All eight `RLEN_RAW` values 0..=7 produce runs 1..=8.
+    #[test]
+    fn coeff_token_7_short_zero_run() {
+        for rlen_raw in 0u32..8 {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(2);
+            let byte = ((rlen_raw & 0b111) << 5) as u8;
+            let kind =
+                decode_coefficient_token(&[byte], 7, 2, 1, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+                    .unwrap();
+            assert_eq!(kind, CoefficientTokenKind::ZeroRun);
+            let rlen = rlen_raw + 1;
+            // Block 1's first `rlen` slots are zeroed; everything past
+            // that retains the -777 sentinel.
+            for (ti, &v) in coeffs[1].iter().enumerate() {
+                if (ti as u32) < rlen {
+                    assert_eq!(v, 0, "rlen_raw={rlen_raw} ti={ti}");
+                } else {
+                    assert_eq!(v, -777, "rlen_raw={rlen_raw} ti={ti}");
+                }
+            }
+            assert_eq!(tis[1], rlen as u8);
+            // NCOEFFS[bi] untouched per §7.7.2's pure-zero-run note.
+            assert_eq!(ncoeffs[1], 0xff);
+        }
+    }
+
+    /// TOKEN=8 reads a 6-bit RLEN+1, range 1..=64. The boundary case
+    /// RLEN=64 starting from ti=0 must succeed (writes exactly 64
+    /// zeros, TIS advances to 64).
+    #[test]
+    fn coeff_token_8_long_zero_run_to_block_end() {
+        // 6-bit RLEN_RAW = 63 (0b111_111) → run of 64.
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // 6 bits, MSb-first: 0b111111_xx (top 6 of byte).
+        let byte = 0b1111_1100u8;
+        let kind =
+            decode_coefficient_token(&[byte], 8, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+                .unwrap();
+        assert_eq!(kind, CoefficientTokenKind::ZeroRun);
+        assert_eq!(tis[0], 64);
+        assert_eq!(ncoeffs[0], 0xff);
+        assert_eq!(coeffs[0], [0i16; 64]);
+    }
+
+    /// TOKEN=9..=12 write a fixed coefficient and consume zero extra
+    /// bits. NCOEFFS[bi] is set to the post-step TIS[bi].
+    #[test]
+    fn coeff_token_9_through_12_fixed_singles() {
+        for (token, expected) in [(9u8, 1i16), (10, -1), (11, 2), (12, -2)] {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(2);
+            // Empty packet — these tokens read no extra bits.
+            let kind =
+                decode_coefficient_token(&[], token, 2, 0, 7, &mut tis, &mut ncoeffs, &mut coeffs)
+                    .unwrap();
+            assert_eq!(kind, CoefficientTokenKind::Single);
+            assert_eq!(coeffs[0][7], expected, "token={token}");
+            // Other entries unchanged.
+            assert_eq!(coeffs[0][6], -777);
+            assert_eq!(coeffs[0][8], -777);
+            assert_eq!(tis[0], 8);
+            assert_eq!(ncoeffs[0], 8);
+        }
+    }
+
+    /// TOKEN=13..=16 read a 1-bit SIGN and write ±MAG with
+    /// MAG = 3, 4, 5, 6. The SIGN bit polarity is "zero → positive".
+    #[test]
+    fn coeff_token_13_through_16_fixed_mag_sign() {
+        for (token, mag) in [(13u8, 3i16), (14, 4), (15, 5), (16, 6)] {
+            for sign in 0u8..=1 {
+                let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+                // SIGN bit at MSb of byte 0.
+                let byte = sign << 7;
+                let _ = decode_coefficient_token(
+                    &[byte],
+                    token,
+                    1,
+                    0,
+                    0,
+                    &mut tis,
+                    &mut ncoeffs,
+                    &mut coeffs,
+                )
+                .unwrap();
+                let expected = if sign == 0 { mag } else { -mag };
+                assert_eq!(coeffs[0][0], expected, "token={token} sign={sign}");
+                assert_eq!(tis[0], 1);
+                assert_eq!(ncoeffs[0], 1);
+            }
+        }
+    }
+
+    /// TOKEN=17 reads SIGN (1 bit) + MAG (1 bit) + offset 7 → ±7..=8.
+    #[test]
+    fn coeff_token_17_sign_one_bit_mag() {
+        for sign in 0u8..=1 {
+            for mag_raw in 0u8..=1 {
+                let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+                // SIGN at bit 7, MAG at bit 6.
+                let byte = (sign << 7) | (mag_raw << 6);
+                let _ = decode_coefficient_token(
+                    &[byte],
+                    17,
+                    1,
+                    0,
+                    0,
+                    &mut tis,
+                    &mut ncoeffs,
+                    &mut coeffs,
+                )
+                .unwrap();
+                let mag = mag_raw as i16 + 7;
+                let expected = if sign == 0 { mag } else { -mag };
+                assert_eq!(coeffs[0][0], expected, "sign={sign} mag_raw={mag_raw}");
+            }
+        }
+    }
+
+    /// TOKEN=22 reads SIGN (1 bit) + MAG (9 bits) + offset 69 → range
+    /// ±69..=580. Exercises the largest single-coefficient token.
+    #[test]
+    fn coeff_token_22_ten_bit_payload_round_trip() {
+        // MAG_RAW = 0x1FF (511) → MAG = 580. SIGN = 1 → -580.
+        // 10 bits total, MSb-first: 1_1_1111_1111_xxxxxx.
+        // Byte 0 = 0b1_1_1_1_1_1_1_1 (sign=1, mag bits 8..2 all 1).
+        // Byte 1 = 0b1_1_xxxxxx (mag bits 1..0 = 1,1).
+        let packet = [0b1111_1111u8, 0b1100_0000u8];
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        let _ = decode_coefficient_token(&packet, 22, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap();
+        assert_eq!(coeffs[0][0], -580);
+        assert_eq!(tis[0], 1);
+        assert_eq!(ncoeffs[0], 1);
+    }
+
+    /// TOKEN=23..=27 are "N zeros + ±1" with fixed run lengths
+    /// 1..=5. Tests the run-plus-one structural branch including the
+    /// run-then-coefficient write order.
+    #[test]
+    fn coeff_token_23_through_27_fixed_run_plus_one() {
+        for (token, run) in [(23u8, 1usize), (24, 2), (25, 3), (26, 4), (27, 5)] {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+            // SIGN = 0 → +1.
+            let kind = decode_coefficient_token(
+                &[0u8],
+                token,
+                1,
+                0,
+                10,
+                &mut tis,
+                &mut ncoeffs,
+                &mut coeffs,
+            )
+            .unwrap();
+            assert_eq!(kind, CoefficientTokenKind::RunPlusOne);
+            // Zero run at COEFFS[0][10..10+run].
+            assert!(
+                coeffs[0][10..10 + run].iter().all(|&v| v == 0),
+                "token={token}"
+            );
+            // Trailing +1 at COEFFS[0][10+run].
+            assert_eq!(coeffs[0][10 + run], 1, "token={token}");
+            // TIS advanced by run+1.
+            assert_eq!(tis[0] as usize, 10 + run + 1);
+            assert_eq!(ncoeffs[0] as usize, 10 + run + 1);
+        }
+    }
+
+    /// TOKEN=28 reads SIGN + 2-bit RLEN, then writes RLEN+6 zeros
+    /// followed by trailing ±1. Boundaries: RLEN range 6..=9.
+    #[test]
+    fn coeff_token_28_run_range_6_to_9() {
+        for rlen_raw in 0u32..4 {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+            // SIGN=1 (negative trailing -1), 2-bit RLEN_RAW.
+            // Bits: SIGN at bit 7, RLEN at bits 6..5.
+            let byte = (0b1u8 << 7) | (((rlen_raw & 0b11) << 5) as u8);
+            let _ =
+                decode_coefficient_token(&[byte], 28, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+                    .unwrap();
+            let run = rlen_raw + 6;
+            assert!(
+                coeffs[0][..run as usize].iter().all(|&v| v == 0),
+                "rlen_raw={rlen_raw}"
+            );
+            assert_eq!(coeffs[0][run as usize], -1, "rlen_raw={rlen_raw}");
+            assert_eq!(tis[0] as u32, run + 1);
+            assert_eq!(ncoeffs[0] as u32, run + 1);
+        }
+    }
+
+    /// TOKEN=29 reads SIGN + 3-bit RLEN, then writes RLEN+10 zeros
+    /// followed by trailing ±1. Boundary: RLEN range 10..=17.
+    #[test]
+    fn coeff_token_29_run_range_10_to_17() {
+        for rlen_raw in 0u32..8 {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+            // SIGN=0 (positive). 4 bits = SIGN(1) + RLEN(3); pack at top.
+            let byte = ((rlen_raw & 0b111) << 4) as u8;
+            let _ =
+                decode_coefficient_token(&[byte], 29, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+                    .unwrap();
+            let run = rlen_raw + 10;
+            assert!(
+                coeffs[0][..run as usize].iter().all(|&v| v == 0),
+                "rlen_raw={rlen_raw}"
+            );
+            assert_eq!(coeffs[0][run as usize], 1, "rlen_raw={rlen_raw}");
+            assert_eq!(tis[0] as u32, run + 1);
+            assert_eq!(ncoeffs[0] as u32, run + 1);
+        }
+    }
+
+    /// TOKEN=30 is "one zero + ±MAG" with MAG = 2..=3. SIGN/MAG bits
+    /// are 2 of the 3 read; no RLEN field.
+    #[test]
+    fn coeff_token_30_one_zero_plus_signed_mag() {
+        for sign in 0u8..=1 {
+            for mag_raw in 0u8..=1 {
+                let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+                let byte = (sign << 7) | (mag_raw << 6);
+                let _ = decode_coefficient_token(
+                    &[byte],
+                    30,
+                    1,
+                    0,
+                    5,
+                    &mut tis,
+                    &mut ncoeffs,
+                    &mut coeffs,
+                )
+                .unwrap();
+                let mag = (mag_raw as i16) + 2;
+                let expected = if sign == 0 { mag } else { -mag };
+                // First a zero at ti=5, then ±MAG at ti=6.
+                assert_eq!(coeffs[0][5], 0);
+                assert_eq!(coeffs[0][6], expected);
+                assert_eq!(tis[0], 7);
+                assert_eq!(ncoeffs[0], 7);
+            }
+        }
+    }
+
+    /// TOKEN=31 reads SIGN + MAG (1 bit, +2) + RLEN (1 bit, +2):
+    /// `2..=3` zeros followed by `±2..=3`.
+    #[test]
+    fn coeff_token_31_signed_mag_with_run() {
+        for sign in 0u8..=1 {
+            for mag_raw in 0u8..=1 {
+                for rlen_raw in 0u8..=1 {
+                    let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+                    // Layout: SIGN(1) | MAG(1) | RLEN(1) at top 3 bits.
+                    let byte = (sign << 7) | (mag_raw << 6) | (rlen_raw << 5);
+                    let _ = decode_coefficient_token(
+                        &[byte],
+                        31,
+                        1,
+                        0,
+                        0,
+                        &mut tis,
+                        &mut ncoeffs,
+                        &mut coeffs,
+                    )
+                    .unwrap();
+                    let mag = (mag_raw as i16) + 2;
+                    let expected = if sign == 0 { mag } else { -mag };
+                    let run = (rlen_raw as usize) + 2;
+                    assert!(coeffs[0][..run].iter().all(|&v| v == 0));
+                    assert_eq!(coeffs[0][run], expected);
+                    assert_eq!(tis[0] as usize, run + 1);
+                    assert_eq!(ncoeffs[0] as usize, run + 1);
+                }
+            }
+        }
+    }
+
+    /// Argument validation: tokens 0..=6 belong to §7.7.1 and must be
+    /// rejected by §7.7.2; tokens 32..=255 are out of band entirely.
+    #[test]
+    fn coeff_token_rejects_out_of_range_token() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        for token in 0u8..=6 {
+            let err =
+                decode_coefficient_token(&[], token, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+                    .unwrap_err();
+            assert_eq!(err, Error::CoefficientTokenOutOfRange { token });
+        }
+        for token in [32u8, 64, 99, 200, 255] {
+            let err =
+                decode_coefficient_token(&[], token, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+                    .unwrap_err();
+            assert_eq!(err, Error::CoefficientTokenOutOfRange { token });
+        }
+    }
+
+    /// Argument validation: `bi >= nbs` and `ti > 63` reject with
+    /// dedicated typed errors.
+    #[test]
+    fn coeff_token_rejects_index_out_of_range() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(2);
+        let err = decode_coefficient_token(&[], 9, 2, 2, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::CoefficientTokenBlockIndexOutOfRange { bi: 2, nbs: 2 }
+        );
+
+        let err = decode_coefficient_token(&[], 9, 2, 0, 64, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap_err();
+        assert_eq!(err, Error::CoefficientTokenIndexOutOfRange { ti: 64 });
+    }
+
+    /// Argument validation: the three state slices must each have
+    /// length exactly `nbs`. Each mismatch surfaces with a typed
+    /// `CoefficientTokenStateSlice` discriminant.
+    #[test]
+    fn coeff_token_rejects_state_length_mismatch() {
+        // TIS too short.
+        let mut tis = vec![0u8; 1];
+        let mut ncoeffs = vec![0xffu8; 2];
+        let mut coeffs = vec![[-777i16; 64]; 2];
+        let err = decode_coefficient_token(&[], 9, 2, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::CoefficientTokenStateLenMismatch {
+                which: CoefficientTokenStateSlice::Tis,
+                got: 1,
+                nbs: 2,
+            }
+        );
+
+        // NCOEFFS too long.
+        let mut tis = vec![0u8; 2];
+        let mut ncoeffs = vec![0xffu8; 3];
+        let mut coeffs = vec![[-777i16; 64]; 2];
+        let err = decode_coefficient_token(&[], 9, 2, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::CoefficientTokenStateLenMismatch {
+                which: CoefficientTokenStateSlice::Ncoeffs,
+                got: 3,
+                nbs: 2,
+            }
+        );
+
+        // COEFFS too short.
+        let mut tis = vec![0u8; 2];
+        let mut ncoeffs = vec![0xffu8; 2];
+        let mut coeffs = vec![[-777i16; 64]; 1];
+        let err = decode_coefficient_token(&[], 9, 2, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::CoefficientTokenStateLenMismatch {
+                which: CoefficientTokenStateSlice::Coeffs,
+                got: 1,
+                nbs: 2,
+            }
+        );
+    }
+
+    /// §7.7.2 MUST-NOT clause: tokens that bring TIS[bi] past 64 fail
+    /// closed. TOKEN=8 with RLEN=64 starting from ti=1 is the
+    /// tightest illegal case — it would produce TIS=65.
+    #[test]
+    fn coeff_token_8_overflow_rejects() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // 6-bit RLEN_RAW = 63 (max) → run of 64. Starting from ti=1
+        // would push TIS to 65 > 64.
+        let byte = 0b1111_1100u8;
+        let err =
+            decode_coefficient_token(&[byte], 8, 1, 0, 1, &mut tis, &mut ncoeffs, &mut coeffs)
+                .unwrap_err();
+        assert_eq!(
+            err,
+            Error::CoefficientTokenWouldOverflowBlock {
+                token: 8,
+                ti: 1,
+                new_tis: 65,
+            }
+        );
+        // State arrays untouched on overflow.
+        assert_eq!(tis[0], 0);
+        assert_eq!(ncoeffs[0], 0xff);
+        assert_eq!(coeffs[0][0], -777);
+    }
+
+    /// Run-plus-one tokens (e.g. TOKEN=29 with RLEN=17) also surface
+    /// the overflow when the trailing coefficient would land past
+    /// index 63. RLEN=17 + ti=47 → new TIS = 47+17+1 = 65 > 64.
+    #[test]
+    fn coeff_token_29_run_overflow_rejects() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // SIGN=0, RLEN_RAW=7 → run=17.
+        let byte = (0b111u8) << 4;
+        let err =
+            decode_coefficient_token(&[byte], 29, 1, 0, 47, &mut tis, &mut ncoeffs, &mut coeffs)
+                .unwrap_err();
+        assert_eq!(
+            err,
+            Error::CoefficientTokenWouldOverflowBlock {
+                token: 29,
+                ti: 47,
+                new_tis: 65,
+            }
+        );
+    }
+
+    /// Single-coefficient writes at ti = 63 are legal: TIS advances to
+    /// 64 exactly (the same pinned state §7.7.1 step 10 produces). No
+    /// overflow because §7.7.2's MUST-NOT clause only applies to
+    /// multi-coefficient tokens.
+    #[test]
+    fn coeff_token_9_at_ti_63_pins_block() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        let kind = decode_coefficient_token(&[], 9, 1, 0, 63, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap();
+        assert_eq!(kind, CoefficientTokenKind::Single);
+        assert_eq!(coeffs[0][63], 1);
+        assert_eq!(tis[0], 64);
+        assert_eq!(ncoeffs[0], 64);
+    }
+
+    /// TOKEN=7 with RLEN=8 starting from ti=56 reaches exactly 64 — the
+    /// largest legal zero-run terminal-position case. No overflow.
+    #[test]
+    fn coeff_token_7_reaches_block_end_exactly() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // RLEN_RAW=7 (max) → run=8.
+        let byte = (0b111u8) << 5;
+        let kind =
+            decode_coefficient_token(&[byte], 7, 1, 0, 56, &mut tis, &mut ncoeffs, &mut coeffs)
+                .unwrap();
+        assert_eq!(kind, CoefficientTokenKind::ZeroRun);
+        assert!(coeffs[0][56..64].iter().all(|&v| v == 0));
+        assert_eq!(tis[0], 64);
+        // NCOEFFS untouched per pure-zero-run rule.
+        assert_eq!(ncoeffs[0], 0xff);
+    }
+
+    /// Truncation surfaces with a TruncatedHeader carrying a §7.7.2
+    /// field name so log messages bisect cleanly to the spec.
+    #[test]
+    fn coeff_token_truncation_on_payload() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // TOKEN=22 needs 10 bits (1 SIGN + 9 MAG). Empty packet → trunc.
+        let err = decode_coefficient_token(&[], 22, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+            .unwrap_err();
+        match err {
+            Error::TruncatedHeader { field } => {
+                assert!(field.contains("§7.7.2"), "got: {field}");
+                assert!(field.contains("TOKEN=22"), "got: {field}");
+            }
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    /// Display rendering for each new §7.7.2 error variant carries the
+    /// section number so log lines bisect cleanly to the spec.
+    #[test]
+    fn coeff_token_error_display_carries_section_number() {
+        let e = Error::CoefficientTokenOutOfRange { token: 0 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.2"), "got: {s}");
+        assert!(s.contains("TOKEN=0"), "got: {s}");
+
+        let e = Error::CoefficientTokenBlockIndexOutOfRange { bi: 4, nbs: 4 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.2"), "got: {s}");
+
+        let e = Error::CoefficientTokenIndexOutOfRange { ti: 64 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.2"), "got: {s}");
+
+        let e = Error::CoefficientTokenStateLenMismatch {
+            which: CoefficientTokenStateSlice::Coeffs,
+            got: 3,
+            nbs: 4,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.2"), "got: {s}");
+        assert!(s.contains("Coeffs"), "got: {s}");
+
+        let e = Error::CoefficientTokenWouldOverflowBlock {
+            token: 8,
+            ti: 1,
+            new_tis: 65,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.7.2"), "got: {s}");
+        assert!(s.contains("TOKEN=8"), "got: {s}");
+        assert!(s.contains("65"), "got: {s}");
+    }
+
+    /// Shared-`BitReader` chaining contract: after the inner procedure
+    /// returns, the next read picks up exactly where §7.7.2 left off.
+    /// Exercised on TOKEN=22 (10 bits of payload) followed by a
+    /// sentinel byte.
+    #[test]
+    fn coeff_token_inner_leaves_reader_at_correct_offset() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // 10 bits of TOKEN=22 payload = 1_111111111 (sign=1, mag=511 →
+        // MAG=580, signed → -580). Then 6 tail bits = 0b101010, then a
+        // fresh 0xFF sentinel byte.
+        let packet = [0b1111_1111u8, 0b1110_1010u8, 0xff];
+        let mut r = BitReader::new(&packet);
+        let _ = decode_coefficient_token_inner(
+            &mut r,
+            22,
+            1,
+            0,
+            0,
+            &mut tis,
+            &mut ncoeffs,
+            &mut coeffs,
+        )
+        .unwrap();
+        assert_eq!(coeffs[0][0], -580);
+        // 16 bits consumed → byte 2 next. The 6 unused bits in byte 1
+        // (lsb of mag is bit 6, then 6 remain) were... actually let me
+        // re-verify: we read 10 bits = byte0 (8 bits) + 2 bits of byte
+        // 1. Tail bits in byte 1 = 6 bits 0b101010. Then sentinel byte
+        // 2 = 0xff.
+        let tail = r.read_bits(6, "tail").unwrap();
+        assert_eq!(tail, 0b101010);
+        let sentinel = r.read_bits(8, "sentinel").unwrap();
+        assert_eq!(sentinel, 0xff);
+    }
+
+    /// TOKEN=18 reads 3 bits total (SIGN + 2-bit MAG). With sign=0 and
+    /// mag_raw=3 the result is +12 (MAG = 3 + 9). Confirms the offset
+    /// addition.
+    #[test]
+    fn coeff_token_18_two_bit_mag_offset_9() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // SIGN=0, MAG_RAW=3 → MAG = 12.
+        // Bits: 0_11_xxxxx = 0b0110_0000.
+        let _ = decode_coefficient_token(
+            &[0b0110_0000u8],
+            18,
+            1,
+            0,
+            0,
+            &mut tis,
+            &mut ncoeffs,
+            &mut coeffs,
+        )
+        .unwrap();
+        assert_eq!(coeffs[0][0], 12);
+    }
+
+    /// TOKEN=19 reads 4 bits total: SIGN + 3-bit MAG, offset 13.
+    /// MAG_RAW=7 + SIGN=1 → -20.
+    #[test]
+    fn coeff_token_19_three_bit_mag_offset_13() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // SIGN=1, MAG_RAW=7. Bits: 1_111_xxxx = 0b1111_0000.
+        let _ = decode_coefficient_token(
+            &[0b1111_0000u8],
+            19,
+            1,
+            0,
+            0,
+            &mut tis,
+            &mut ncoeffs,
+            &mut coeffs,
+        )
+        .unwrap();
+        assert_eq!(coeffs[0][0], -20);
+    }
+
+    /// TOKEN=20 reads 5 bits: SIGN + 4-bit MAG, offset 21. The lowest
+    /// magnitude is 21 (mag_raw=0); the highest is 36 (mag_raw=15).
+    #[test]
+    fn coeff_token_20_range_endpoints() {
+        for (mag_raw, sign, expected) in [(0u32, 0u8, 21i16), (15, 1, -36)] {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+            // 5 bits: SIGN(1) + MAG(4); pack at top.
+            let byte = (((sign as u32) << 7) | ((mag_raw & 0xf) << 3)) as u8;
+            let _ =
+                decode_coefficient_token(&[byte], 20, 1, 0, 0, &mut tis, &mut ncoeffs, &mut coeffs)
+                    .unwrap();
+            assert_eq!(coeffs[0][0], expected, "mag_raw={mag_raw} sign={sign}");
+        }
+    }
+
+    /// TOKEN=21 reads 6 bits: SIGN + 5-bit MAG, offset 37. Spot-check
+    /// the midrange.
+    #[test]
+    fn coeff_token_21_midrange() {
+        let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+        // SIGN=0, MAG_RAW=16 → MAG=53.
+        // 6 bits: SIGN(1) + MAG(5); pack: 0_10000_xx = 0b0100_0000.
+        let _ = decode_coefficient_token(
+            &[0b0100_0000u8],
+            21,
+            1,
+            0,
+            0,
+            &mut tis,
+            &mut ncoeffs,
+            &mut coeffs,
+        )
+        .unwrap();
+        assert_eq!(coeffs[0][0], 53);
+    }
+
+    /// Each §7.7.2 token reads exactly as many bits as Table 7.38
+    /// declares in the "Extra Bits" column. This regression catches a
+    /// future edit that mis-orders SIGN/MAG/RLEN reads.
+    #[test]
+    fn coeff_token_bit_counts_match_table_7_38() {
+        // (token, expected bits read after the token byte itself).
+        for (token, expected_bits) in [
+            (7u8, 3u32), // RLEN(3)
+            (8, 6),      // RLEN(6)
+            (9, 0),      // no extra
+            (10, 0),
+            (11, 0),
+            (12, 0),
+            (13, 1), // SIGN(1)
+            (14, 1),
+            (15, 1),
+            (16, 1),
+            (17, 2),  // SIGN(1) + MAG(1)
+            (18, 3),  // SIGN(1) + MAG(2)
+            (19, 4),  // SIGN(1) + MAG(3)
+            (20, 5),  // SIGN(1) + MAG(4)
+            (21, 6),  // SIGN(1) + MAG(5)
+            (22, 10), // SIGN(1) + MAG(9)
+            (23, 1),  // SIGN(1)
+            (24, 1),
+            (25, 1),
+            (26, 1),
+            (27, 1),
+            (28, 3), // SIGN(1) + RLEN(2)
+            (29, 4), // SIGN(1) + RLEN(3)
+            (30, 2), // SIGN(1) + MAG(1)
+            (31, 3), // SIGN(1) + MAG(1) + RLEN(1)
+        ] {
+            let (mut tis, mut ncoeffs, mut coeffs) = fresh_coeff_state(1);
+            // Provide a generous 32-byte buffer of zeros — any token
+            // can read its payload, and the tail-position telemetry
+            // confirms the exact bit count.
+            let packet = [0u8; 32];
+            let mut r = BitReader::new(&packet);
+            let _ = decode_coefficient_token_inner(
+                &mut r,
+                token,
+                1,
+                0,
+                0,
+                &mut tis,
+                &mut ncoeffs,
+                &mut coeffs,
+            )
+            .unwrap();
+            // Compute how many bits the reader has advanced. byte_pos
+            // and bit_pos let us reconstruct the total.
+            let bits_consumed = (r.byte_pos as u32) * 8 + (7u32.wrapping_sub(r.bit_pos as u32));
+            assert_eq!(
+                bits_consumed, expected_bits,
+                "TOKEN={token} expected {expected_bits} bits, got {bits_consumed}"
+            );
+        }
     }
 }

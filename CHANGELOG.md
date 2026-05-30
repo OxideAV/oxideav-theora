@@ -4,6 +4,13 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-theora/compare/v0.0.8...v0.0.9) - 2026-05-30
+
+### Other
+
+- wire §7.7.2 coefficient token decode (round 16)
+- wire §6.4.1 LFLIMS decode (round 15)
+
 ### Added
 
 * **§7.7.2 Coefficient Token Decode (2026-05-30, round 16).** New

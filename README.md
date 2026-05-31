@@ -2,41 +2,41 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-30
+## Status — 2026-05-31
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter
 limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
 §6.4.4 DCT-token Huffman tables + §7.1 frame-header decode + §7.2
 long-/short-run bit strings + §7.3 coded-block-flags decode + §7.4
 macro-block coding modes + §7.5 motion-vector decode + §7.6 block-level
-qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode
-(rounds 1–16).** §6.1, §6.2 (identification), §6.3 (comment), §6.4.5
-step 1 (setup-header common-header guard), §6.4.1 (Loop Filter Limit
-Table Decode), §6.4.2 (Quantization Parameters Decode), §6.4.3
-(Computing a Quantization Matrix), §6.4.4 (DCT Token Huffman Tables),
-§7.1 (Frame Header Decode), §7.2 (Run-Length Encoded Bit Strings),
-§7.3 (Coded Block Flags Decode), §7.4 (Macro Block Coding Modes),
-§7.5.1 (single Motion Vector decode), §7.5.2 (per-macro-block Motion
-Vector decode), §7.6 (Block-Level *qi* Decode), §7.7.1 (EOB Token
-Decode), and §7.7.2 (Coefficient Token Decode) of the Theora I
-Specification are wired up. Three
-byte-aligned entry points plus nine public bit-level decoders over
-an MSb-first bit reader; round 4 added the Appendix B VP3 fallback
-tables, round 5 added the full §6.4.2 procedure (ACSCALE / DCSCALE /
-NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added §6.4.3 (64-entry
-interpolated quantization matrix per `(qti, pli, qi)` selector), round
-7 added §6.4.4 — decode the 80-element array of binary-tree Huffman
-tables that §7.7 will use to decode DCT-residual tokens, round 8 added
-§7.1 (the typed `TheoraFrameHeader` from the start of a video-data
-packet), round 9 added §7.2 — the long-run and short-run bit-string
-decoders that §7.3 (coded-block flags) and §7.6 (block-level `qi`
-values) consume against the §5.2 bit reader, round 10 added §7.3 — the
-per-block `BCODED` array decoder that chains a partially-coded
-super-block §7.2.1 long-run map, a fully-coded super-block §7.2.1
-long-run map (over the non-partially-coded subset), and a per-block
-§7.2.2 short-run stream against a caller-supplied block-to-super-block
-mapping, round 11 adds §7.4 — the per-macro-block `MBMODES` array
-decoder consuming `BCODED` plus a caller-supplied
+qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
+§7.7.3 DCT coefficient decode driver (rounds 1–17).** §6.1, §6.2
+(identification), §6.3 (comment), §6.4.5 step 1 (setup-header
+common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
+(Quantization Parameters Decode), §6.4.3 (Computing a Quantization
+Matrix), §6.4.4 (DCT Token Huffman Tables), §7.1 (Frame Header Decode),
+§7.2 (Run-Length Encoded Bit Strings), §7.3 (Coded Block Flags Decode),
+§7.4 (Macro Block Coding Modes), §7.5.1 (single Motion Vector decode),
+§7.5.2 (per-macro-block Motion Vector decode), §7.6 (Block-Level *qi*
+Decode), §7.7.1 (EOB Token Decode), §7.7.2 (Coefficient Token Decode),
+and §7.7.3 (DCT Coefficient Decode) of the Theora I Specification are
+wired up. Three byte-aligned entry points plus ten public bit-level
+decoders over an MSb-first bit reader; round 4 added the Appendix B
+VP3 fallback tables, round 5 added the full §6.4.2 procedure (ACSCALE
+/ DCSCALE / NBMS / BMS / NQRS / QRSIZES / QRBMIS), round 6 added §6.4.3
+(64-entry interpolated quantization matrix per `(qti, pli, qi)`
+selector), round 7 added §6.4.4 — decode the 80-element array of
+binary-tree Huffman tables that §7.7 will use to decode DCT-residual
+tokens, round 8 added §7.1 (the typed `TheoraFrameHeader` from the
+start of a video-data packet), round 9 added §7.2 — the long-run and
+short-run bit-string decoders that §7.3 (coded-block flags) and §7.6
+(block-level `qi` values) consume against the §5.2 bit reader, round
+10 added §7.3 — the per-block `BCODED` array decoder that chains a
+partially-coded super-block §7.2.1 long-run map, a fully-coded
+super-block §7.2.1 long-run map (over the non-partially-coded subset),
+and a per-block §7.2.2 short-run stream against a caller-supplied
+block-to-super-block mapping, round 11 adds §7.4 — the per-macro-block
+`MBMODES` array decoder consuming `BCODED` plus a caller-supplied
 macro-block-to-luma-blocks mapping, demultiplexing all eight Table
 7.18 modes through Schemes 0..=7 (Table 7.19's six fixed Huffman
 alphabets, the on-wire MSCHEME=0 alphabet, and the MSCHEME=7 direct
@@ -46,14 +46,22 @@ subset of still-`qii`-tied coded blocks (VP3-compat `NQIS == 1`
 short-circuit consumes zero bits and returns all-zero `QIIS`), round
 14 adds §7.7.1 — the EOB token applicator decoding one of the
 Table 7.33 EOB tokens against per-block `TIS`/`NCOEFFS`/`COEFFS`
-state arrays and returning the residual `EOBS` run length, and
-round 16 adds §7.7.2 — the coefficient token applicator decoding one
-of the 25 non-EOB tokens (Table 7.38 values 7..=31), writing the
-implied SIGN/MAG-derived coefficients to `COEFFS[bi]`, advancing
-`TIS[bi]`, updating `NCOEFFS[bi]` (skipping the count update for pure
-zero-run tokens 7 / 8 per the §7.7.2 introductory text), and
-returning a typed `CoefficientTokenKind` discriminating zero-run /
-single / run-plus-one classes for the §7.7.3 driver to branch on.
+state arrays and returning the residual `EOBS` run length, round 16
+adds §7.7.2 — the coefficient token applicator decoding one of the
+25 non-EOB tokens (Table 7.38 values 7..=31), writing the implied
+SIGN/MAG-derived coefficients to `COEFFS[bi]`, advancing `TIS[bi]`,
+updating `NCOEFFS[bi]` (skipping the count update for pure zero-run
+tokens 7 / 8 per the §7.7.2 introductory text), and returning a typed
+`CoefficientTokenKind` discriminating zero-run / single / run-plus-one
+classes for the §7.7.3 driver to branch on, and round 17 adds §7.7.3
+— the per-frame `DCT Coefficient Decode` driver that runs the `ti`
+0..=63 zig-zag outer loop, reads `htiL` / `htiC` at `ti ∈ {0, 1}`,
+selects the Huffman table from the §6.4.4 80-table array via
+Table 7.42's `(HG, htiL|htiC)` lookup (with the `bi < NLBS`
+luma-vs-chroma split), walks the table bit-by-bit to recover `TOKEN`,
+dispatches to §7.7.1 for `TOKEN < 7` or §7.7.2 for `TOKEN >= 7`, and
+enforces the closing-paragraph contract (`EOBS = 0`, `TIS[bi] = 64`
+for every coded block) via two typed reject variants.
 
 * [`decode_identification_header`] — typed `TheoraIdentHeader` per
   Figure 6.2 (round 1).
@@ -201,6 +209,30 @@ single / run-plus-one classes for the §7.7.3 driver to branch on.
   `CoefficientTokenWouldOverflowBlock`) reject malformed inputs. The
   shared-reader chaining contract is preserved via a crate-private
   `decode_coefficient_token_inner`.
+* [`decode_dct_coefficients`] — round 17 public §7.7.3 procedure
+  driving the entire frame's DCT-coefficient stream end-to-end. The
+  driver iterates `ti` from 0 to 63 (the zig-zag axis), reads
+  `htiL` / `htiC` (4 bits each) at `ti ∈ {0, 1}`, and for every coded
+  block whose `TIS[bi] == ti` either continues an in-flight EOB run
+  (zero-fill `COEFFS[bi][ti..=63]`, pin `TIS[bi]=64`, decrement
+  `EOBS`) or decodes a fresh `TOKEN` by selecting `hti = 16*HG +
+  htiL/htiC` (Table 7.42 maps `ti → HG`, `bi < NLBS` chooses luma vs
+  chroma), walking the §6.4.4 Huffman tree bit-by-bit, and dispatching
+  to `decode_eob_token_inner` (`TOKEN < 7`) or
+  `decode_coefficient_token_inner` (`TOKEN >= 7`). The closing-
+  paragraph contract from §7.7.3 ("EOBS MUST be zero, and TIS[bi]
+  MUST be 64 for every coded bi") is enforced fail-closed via two
+  new reject variants (`DctCoefficientLeftoverEobs`,
+  `DctCoefficientBlockNotClosed`). Five more typed errors cover
+  input validation and tree corruption
+  (`DctCoefficientBcodedLenMismatch`, `DctCoefficientNlbsExceedsNbs`,
+  `DctCoefficientEmptyHuffmanTable`, `DctCoefficientHuffmanWalkOffTree`,
+  plus the closing-paragraph pair). The shared-reader chaining
+  contract is preserved via a crate-private
+  `decode_dct_coefficients_inner`. Returns `(coeffs: Vec<[i16; 64]>,
+  ncoeffs: Vec<u8>)` — the populated `NBS × 64` zig-zag-order
+  quantized-DCT array and per-block coefficient count, both sized
+  `nbs`.
 * [`decode_single_motion_vector`] / [`decode_macroblock_motion_vectors`]
   — round 12 public §7.5.1 / §7.5.2 procedures returning a single
   [`MotionVector`] or an `NBS`-element `Vec<MotionVector>` of per-
@@ -633,9 +665,47 @@ A `pack_msb_first` test helper packs `(value, nbits)` slot lists
 MSb-first to mirror the `BitReader` decoding without a real setup-
 header fixture.
 
+Round 17 adds fifteen §7.7.3 DCT-coefficient-decode tests (total now
+286): Table 7.42 row-by-row `huffman_table_group()` lookup across
+every `ti` in 0..=63, the `bcoded.len() != nbs` reject with `Display`
+rendering, the `NLBS = NMBS * 4 > NBS` reject, the all-uncoded
+short-circuit confirming `htiL` / `htiC` are still read at `ti` 0
+and 1 (16 bits total) but no per-block work runs, a single-block EOB
+run via TOKEN=0 (block fully zero, `TIS=64`, `NCOEFFS=0`), a
+single-block full coefficient fill via TOKEN=9 (every `ti` writes
+`+1`, ending with `NCOEFFS=64` and `TIS=64`), truncation rejection
+during a TOKEN=7 RLEN payload read, walk-off-tree rejection via a
+hand-crafted corrupt table with out-of-range child indices, an empty-
+table rejection (slot 0 contains zero entries), the `nbs=0` short-
+circuit (still reads the table indices, vacuous closure check), a
+custom-pack `htiL=3 / htiC=5` round-trip confirming step 4(a) fires
+only at `ti ∈ {0, 1}`, the shared-`BitReader` chaining contract via
+`decode_dct_coefficients_inner` followed by an 8-bit sentinel read
+off the same reader, the `bi < NLBS` luma-vs-chroma split exercised
+on a 5-block / 1-macro-block frame with bi=0 (luma) and bi=4 (chroma)
+both decoded, the leftover-EOBS rejection via TOKEN=6 with a 12-bit
+payload of 4095 producing an EOBS residue of 4094 the loop cannot
+consume, and `Display` rendering for every new §7.7.3 error variant
+carrying the section tag plus the offending quantity. A test-only
+`make_uniform_hts(token)` helper builds an 80-element single-leaf
+table set so the driver picks a deterministic table at every
+`(ti, hg)` slot without forcing the test to lay out 80 distinct
+trees.
+
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually
 decode a frame.
+
+## Roadmap
+
+* Next: §7.8 Undoing DC Prediction — drives the §7.7.3 output
+  `COEFFS[bi][0]` back through the four-neighbour predictor in
+  raster order to recover the original DC values. Splits cleanly
+  into §7.8.1 (Computing the DC Predictor: Table 7.47 weights /
+  divisors) and §7.8.2 (Inverting the DC Prediction Process).
+* After §7.8: §7.9 reconstruction (inverse quantization, IDCT,
+  motion-compensated prediction) — the path to a first decoded
+  Theora frame.
 
 ## Clean-room sources
 

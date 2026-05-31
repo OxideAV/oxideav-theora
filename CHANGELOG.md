@@ -4,6 +4,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- §7.7.3 DCT Coefficient Decode driver (round 17). `decode_dct_coefficients`
+  walks the `ti` 0..=63 zig-zag axis, reads `htiL` / `htiC` at `ti ∈ {0, 1}`,
+  selects the §6.4.4 Huffman table per Table 7.42 + `bi < NLBS` luma/chroma
+  split, walks the tree bit-by-bit, and dispatches to §7.7.1 / §7.7.2 per
+  TOKEN. Enforces the closing-paragraph contract (`EOBS = 0`, `TIS[bi] = 64`
+  for every coded block) via two new typed rejects. Seven new error variants
+  cover input validation, tree corruption, and closing-paragraph violations.
+  Fifteen new tests (total 286).
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-theora/compare/v0.0.8...v0.0.9) - 2026-05-30
 
 ### Other

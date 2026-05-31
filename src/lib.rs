@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-05-25 (round 8 of clean-room rebuild)
+//! ## Status — 2026-05-31 (round 17 of clean-room rebuild)
 //!
 //! Round 1 landed the **identification header** parser per Theora I
 //! Specification §6.1 (common header) + §6.2 (identification header).
@@ -70,7 +70,18 @@
 //! a typed [`CoefficientTokenKind`] discriminating the token's
 //! structural class — zero run, single coefficient, or zero run
 //! followed by a single trailing coefficient — so the §7.7.3 driver
-//! can branch on the class without re-deriving Table 7.38.
+//! can branch on the class without re-deriving Table 7.38. Round 17
+//! lands the **§7.7.3 DCT Coefficient Decode** driver as
+//! [`decode_dct_coefficients`], the third and final §7.7
+//! sub-procedure: it runs the `ti` 0..=63 zig-zag outer loop, reads
+//! `htiL` / `htiC` at `ti ∈ {0, 1}`, selects the Huffman table from
+//! the §6.4.4 80-table array via Table 7.42's `(HG, htiL|htiC)`
+//! lookup (with the `bi < NLBS` luma-vs-chroma split), walks the
+//! table bit-by-bit to recover `TOKEN`, dispatches to §7.7.1 for
+//! `TOKEN < 7` or §7.7.2 for `TOKEN >= 7`, and enforces the
+//! closing-paragraph contract (`EOBS = 0`, `TIS[bi] = 64` for every
+//! coded block) via two typed reject variants. With §7.7.3 the §7.7
+//! DCT-coefficient walk is end-to-end complete.
 //!
 //! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
 //! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
@@ -133,6 +144,17 @@
 //!   [`Error::CoefficientTokenWouldOverflowBlock`] when the implied
 //!   coefficient count would push `TIS[bi]` past 64, surfacing the
 //!   §7.7.2 MUST-NOT clause on invalid streams.
+//! * [`decode_dct_coefficients`] drives the §7.7.3 per-frame
+//!   DCT-coefficient stream end-to-end: it iterates `ti` from 0 to
+//!   63 (the zig-zag axis), reads `htiL` / `htiC` at `ti ∈ {0, 1}`,
+//!   selects the §6.4.4 Huffman table per Table 7.42 (`ti → HG`)
+//!   plus the `bi < NLBS` luma-vs-chroma split, walks the tree
+//!   bit-by-bit to recover `TOKEN`, and dispatches to §7.7.1
+//!   ([`decode_eob_token`]) or §7.7.2 ([`decode_coefficient_token`])
+//!   depending on whether `TOKEN < 7`. Returns the populated
+//!   `(coeffs: Vec<[i16; 64]>, ncoeffs: Vec<u8>)` arrays plus
+//!   fail-closed rejects on the closing-paragraph contract
+//!   (`EOBS = 0`, `TIS[bi] = 64` for every coded block).
 //! * [`decode_loop_filter_limit_table`] returns the 64-element
 //!   per-stream `LFLIMS` table per §6.4.1 — the first sub-procedure of
 //!   the setup-header body decode. Reads a 3-bit `NBITS` followed by
@@ -624,6 +646,61 @@ pub enum Error {
         /// The post-token `TIS[bi]` value that exceeded 64.
         new_tis: u16,
     },
+    /// The §7.7.3 driver received a `bcoded` slice whose length did not
+    /// match `nbs`. The flag array is read once per `(ti, bi)` so a
+    /// mismatch would either silently truncate the per-block loop or
+    /// over-read off the end.
+    DctCoefficientBcodedLenMismatch {
+        /// `bcoded.len()`.
+        got: usize,
+        /// `nbs` (the contracted length).
+        nbs: usize,
+    },
+    /// The §7.7.3 driver received `nmbs` such that
+    /// `NLBS = NMBS * 4 > NBS`. Per §7.7.3 step 1, every luma block is
+    /// counted via macro-blocks, so `NLBS` must fit inside `NBS`.
+    DctCoefficientNlbsExceedsNbs {
+        /// `nmbs`.
+        nmbs: u32,
+        /// `nbs`.
+        nbs: u32,
+    },
+    /// The §7.7.3 driver received an 80-element Huffman table set in
+    /// which the table addressed by `(HG, htiL|htiC)` was an empty
+    /// stub. §6.4.4 ensures conformant streams always populate it; this
+    /// surface catches the case where the caller passed a table set
+    /// with placeholder leaves.
+    DctCoefficientEmptyHuffmanTable {
+        /// The flattened index `16 * HG + hti_*` (0..=79) of the empty
+        /// table.
+        hti: u8,
+    },
+    /// The §7.7.3 driver walked a Huffman tree per §7.7.3 step
+    /// 4(b)iii.D and reached a code path longer than any leaf — i.e. the
+    /// tree disagrees with the bit string. Conformant Theora streams
+    /// never trigger this; rejecting fail-closed surfaces the malformed
+    /// packet to the caller rather than silently looping.
+    DctCoefficientHuffmanWalkOffTree {
+        /// The flattened table index used (0..=79).
+        hti: u8,
+    },
+    /// The §7.7.3 driver completed the `ti` loop with `EOBS > 0`. §7.7.3
+    /// states: "At the end of this procedure, EOBS MUST be zero". Any
+    /// non-zero residue is a malformed-bitstream signal.
+    DctCoefficientLeftoverEobs {
+        /// The residual run length that the loop did not consume.
+        residual: u64,
+    },
+    /// The §7.7.3 driver completed the `ti` loop with a coded block
+    /// `bi` whose `TIS[bi] != 64`. §7.7.3 states: "TIS[bi] MUST be 64
+    /// for every coded bi". Catches the case where a token stream
+    /// ended mid-block.
+    DctCoefficientBlockNotClosed {
+        /// The coded block index whose `TIS` was below 64.
+        bi: u32,
+        /// The block's residual `TIS` value (0..63).
+        tis: u8,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -907,6 +984,33 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-theora: §7.7.2 TOKEN={token} from ti={ti} would advance TIS to {new_tis} > 64"
+            ),
+            Error::DctCoefficientBcodedLenMismatch { got, nbs } => write!(
+                f,
+                "oxideav-theora: §7.7.3 BCODED length {got} != nbs {nbs}"
+            ),
+            Error::DctCoefficientNlbsExceedsNbs { nmbs, nbs } => {
+                let nlbs = (*nmbs).saturating_mul(4);
+                write!(
+                    f,
+                    "oxideav-theora: §7.7.3 NLBS = NMBS*4 = {nlbs} > NBS = {nbs}"
+                )
+            }
+            Error::DctCoefficientEmptyHuffmanTable { hti } => write!(
+                f,
+                "oxideav-theora: §7.7.3 HTS[{hti}] is empty (no leaves)"
+            ),
+            Error::DctCoefficientHuffmanWalkOffTree { hti } => write!(
+                f,
+                "oxideav-theora: §7.7.3 Huffman walk fell off HTS[{hti}]"
+            ),
+            Error::DctCoefficientLeftoverEobs { residual } => write!(
+                f,
+                "oxideav-theora: §7.7.3 ended with EOBS={residual} > 0"
+            ),
+            Error::DctCoefficientBlockNotClosed { bi, tis } => write!(
+                f,
+                "oxideav-theora: §7.7.3 coded block bi={bi} unclosed: TIS={tis} != 64"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -2148,6 +2252,59 @@ impl HuffmanTable {
             HuffmanNode::Branch { .. } => None, // code shorter than any leaf path
         }
     }
+
+    /// Walk the flat binary tree one bit at a time off `r`, returning
+    /// the first leaf reached. Used by the §7.7.3 driver to read a
+    /// TOKEN value per step 4(b)iii.D — "Read one bit at a time until
+    /// one of the codes in HTS[hti] is recognized, and assign the value
+    /// to TOKEN."
+    ///
+    /// Returns:
+    /// * `Ok(token)` — the 5-bit DCT token (`0..=31`) at the matched
+    ///   leaf.
+    /// * `Err(off_tree)` — the tree's root was an empty branch placeholder
+    ///   (no leaves) or the walk escaped the bounded node array. The
+    ///   caller maps this to either
+    ///   [`Error::DctCoefficientEmptyHuffmanTable`] or
+    ///   [`Error::DctCoefficientHuffmanWalkOffTree`] depending on
+    ///   whether the table started empty.
+    /// * `Err(truncated)` — the underlying bit reader is exhausted; the
+    ///   caller surfaces it as [`Error::TruncatedHeader`].
+    pub(crate) fn read_token(&self, r: &mut BitReader<'_>) -> Result<u8, ReadTokenErr> {
+        // Degenerate single-leaf table: the root is the leaf.
+        if self.nodes.len() == 1 {
+            if let HuffmanNode::Leaf { token } = self.nodes[0] {
+                return Ok(token);
+            }
+        }
+        let mut idx = 0u32;
+        // Hard upper bound on the walk length: §6.4.4 step 1(b) caps
+        // codes at 32 bits, so any longer walk is malformed.
+        for _ in 0..=32u32 {
+            let node = self.nodes.get(idx as usize).ok_or(ReadTokenErr::OffTree)?;
+            match node {
+                HuffmanNode::Leaf { token } => return Ok(*token),
+                HuffmanNode::Branch { zero, one } => {
+                    let bit = r
+                        .read_bits(1, "§7.7.3 TOKEN bit")
+                        .map_err(ReadTokenErr::Truncated)?;
+                    idx = if bit == 0 { *zero } else { *one };
+                }
+            }
+        }
+        Err(ReadTokenErr::OffTree)
+    }
+}
+
+/// Internal error type for [`HuffmanTable::read_token`]. The caller
+/// chooses the public [`Error`] variant.
+#[derive(Debug)]
+pub(crate) enum ReadTokenErr {
+    /// The walk escaped the tree (node index out of bounds, or the
+    /// root was a stub).
+    OffTree,
+    /// The bit reader was exhausted mid-walk.
+    Truncated(Error),
 }
 
 /// Decode the 80 DCT-token Huffman tables from the §6.4.4 setup-header
@@ -4423,6 +4580,255 @@ pub(crate) fn decode_coefficient_token_inner(
         // other value.
         _ => unreachable!("token range was clamped to 7..=31"),
     }
+}
+
+// =====================================================================
+// §7.7.3 DCT Coefficient Decode
+// =====================================================================
+
+/// Map `ti` (token index, 0..=63) to a §7.7.3 Huffman table group `HG`
+/// per Table 7.42.
+///
+/// | ti     | HG |
+/// |--------|----|
+/// | 0      |  0 |
+/// | 1..=5  |  1 |
+/// | 6..=14 |  2 |
+/// | 15..=27|  3 |
+/// | 28..=63|  4 |
+///
+/// `ti` outside `0..=63` is rejected by the caller (the §7.7.3 outer
+/// loop only ever supplies 0..=63), so this helper saturates the
+/// out-of-range case to the highest group as a defensive fallback. The
+/// crate's API never lets a user trip the saturation path; it exists
+/// purely so the function is total.
+fn huffman_table_group(ti: u8) -> u8 {
+    match ti {
+        0 => 0,
+        1..=5 => 1,
+        6..=14 => 2,
+        15..=27 => 3,
+        _ => 4,
+    }
+}
+
+/// Decode the entire frame's DCT coefficients per §7.7.3 of the Xiph
+/// Theora I Specification.
+///
+/// The driver consumes a single packed bitstream that carries:
+///   * For each `ti` in `{0, 1}`: a 4-bit `htiL` (luma table) and a
+///     4-bit `htiC` (chroma table). These select which Huffman table
+///     to use for each coded block at this `ti`.
+///   * For each `(ti, bi)` where `BCODED[bi] != 0` and `TIS[bi] == ti`:
+///     either an EOB run continuation (no bits read; `EOBS` decremented)
+///     or a Huffman-coded TOKEN whose value steers into §7.7.1 (EOB
+///     token, `TOKEN < 7`) or §7.7.2 (coefficient token, `TOKEN >= 7`).
+///
+/// On success the procedure populates a freshly-allocated `COEFFS`
+/// (`NBS × 64` zig-zag-order quantized DCT array) and `NCOEFFS` (per-
+/// block coefficient count). Both follow §7.7.3's bookkeeping rules
+/// exactly:
+///   * `TIS[bi]` ends at 64 for every coded block (§7.7.3 closing
+///     paragraph; enforced via [`Error::DctCoefficientBlockNotClosed`]).
+///   * `EOBS` must end at 0 (also §7.7.3 closing paragraph; enforced
+///     via [`Error::DctCoefficientLeftoverEobs`]).
+///   * `NCOEFFS[bi]` is updated to `ti` at step 4(b)i *before* the EOB
+///     check, mirroring the VP3 accounting rule the spec explicitly
+///     calls out ("we update the coefficient count of every block
+///     before continuing an EOB run or decoding a token, despite the
+///     fact that it is already up to date unless the previous token
+///     was a pure zero run").
+///
+/// Inputs:
+///   * `packet` — the §7.7.3 bitstream segment. The driver consumes
+///     from the start; the position at return is undefined (the §7.7.3
+///     section is the last sub-section of §7.7, so no caller currently
+///     chains after it; once the frame-data driver lands, the inner
+///     helper `decode_dct_coefficients_inner` will be used instead).
+///   * `nbs` — total block count in the frame (Table 6.5 / 6.6).
+///   * `nmbs` — total macro-block count in the frame; `NLBS = NMBS * 4`
+///     selects per-coded-block whether the luma or chroma Huffman
+///     index is used (`bi < NLBS` ⇒ luma).
+///   * `bcoded` — the §7.3 per-block coded-flag array, length `nbs`.
+///   * `hts` — the 80-element §6.4.4 Huffman table array.
+///
+/// Outputs:
+///   * `Ok((coeffs, ncoeffs))` — the populated `NBS × 64` coefficient
+///     array and per-block coefficient count.
+///   * [`Error::DctCoefficientBcodedLenMismatch`] if `bcoded.len() !=
+///     nbs as usize`.
+///   * [`Error::DctCoefficientNlbsExceedsNbs`] if `nmbs * 4 > nbs`.
+///   * [`Error::DctCoefficientEmptyHuffmanTable`] if a table reached
+///     during step 4(b)iii.D had no leaves.
+///   * [`Error::DctCoefficientHuffmanWalkOffTree`] if the bit walk
+///     escaped the tree (malformed bitstream).
+///   * [`Error::DctCoefficientLeftoverEobs`] if `EOBS > 0` at the end
+///     of the `ti` loop.
+///   * [`Error::DctCoefficientBlockNotClosed`] if a coded block ends
+///     with `TIS[bi] != 64`.
+///   * [`Error::TruncatedHeader`] if the bit reader runs dry.
+///   * Any §7.7.1 or §7.7.2 error variant that the sub-procedures may
+///     emit (token-out-of-range, would-overflow-block, etc.).
+pub fn decode_dct_coefficients(
+    packet: &[u8],
+    nbs: u32,
+    nmbs: u32,
+    bcoded: &[u8],
+    hts: &[HuffmanTable],
+) -> Result<(Vec<[i16; 64]>, Vec<u8>), Error> {
+    let mut r = BitReader::new(packet);
+    decode_dct_coefficients_inner(&mut r, nbs, nmbs, bcoded, hts)
+}
+
+/// Inner §7.7.3 procedure operating on an already-positioned
+/// [`BitReader`]. Split out so a future frame-data driver can chain
+/// §7.6 → §7.7 on the same reader without re-aligning to a byte
+/// boundary.
+pub(crate) fn decode_dct_coefficients_inner(
+    r: &mut BitReader<'_>,
+    nbs: u32,
+    nmbs: u32,
+    bcoded: &[u8],
+    hts: &[HuffmanTable],
+) -> Result<(Vec<[i16; 64]>, Vec<u8>), Error> {
+    let nbs_us = nbs as usize;
+    if bcoded.len() != nbs_us {
+        return Err(Error::DctCoefficientBcodedLenMismatch {
+            got: bcoded.len(),
+            nbs: nbs_us,
+        });
+    }
+    // Step 1: NLBS = NMBS * 4. NLBS must fit inside NBS so the
+    // luma-vs-chroma split is well-defined.
+    let nlbs = nmbs.saturating_mul(4);
+    if nlbs > nbs {
+        return Err(Error::DctCoefficientNlbsExceedsNbs { nmbs, nbs });
+    }
+    // The 80-table set is a §6.4.4 contract; clip read accesses with
+    // bounds rather than assert! to surface as DctCoefficientHuffman*
+    // errors at the call site.
+
+    // Step 2: TIS[bi] = 0 for all bi.
+    let mut tis: Vec<u8> = vec![0u8; nbs_us];
+    // COEFFS starts all-zero so the implicit "any additional
+    // coefficients are still set to zero" clause from the §7.7.3
+    // prose (paragraph 2) holds for every block we never visit at
+    // every ti.
+    let mut coeffs: Vec<[i16; 64]> = vec![[0i16; 64]; nbs_us];
+    let mut ncoeffs: Vec<u8> = vec![0u8; nbs_us];
+    // Step 3: EOBS = 0.
+    let mut eobs: u64 = 0;
+
+    // Track the current per-ti Huffman table indices. Only updated at
+    // ti=0 and ti=1; otherwise carried across iterations.
+    let mut hti_l: u8 = 0;
+    let mut hti_c: u8 = 0;
+
+    // Step 4: for each ti in 0..=63.
+    for ti in 0u8..=63 {
+        // Step 4(a): refresh htiL / htiC at ti=0 and ti=1.
+        if ti == 0 || ti == 1 {
+            hti_l = r.read_bits(4, "§7.7.3 htiL")? as u8;
+            hti_c = r.read_bits(4, "§7.7.3 htiC")? as u8;
+        }
+
+        // Step 4(b): for each bi in 0..(nbs-1) where BCODED[bi] != 0
+        // and TIS[bi] == ti.
+        for bi in 0u32..nbs {
+            if bcoded[bi as usize] == 0 {
+                continue;
+            }
+            if tis[bi as usize] != ti {
+                continue;
+            }
+            // Step 4(b)i: NCOEFFS[bi] = ti. Always — even when an EOB
+            // run is being continued.
+            ncoeffs[bi as usize] = ti;
+
+            if eobs > 0 {
+                // Step 4(b)ii: continuing an in-flight EOB run.
+                // Step 4(b)ii.A: zero-fill COEFFS[bi][ti..=63]. (The
+                // vector is already all-zero, but write the slice
+                // explicitly to mirror the spec text.)
+                coeffs[bi as usize][(ti as usize)..64].fill(0);
+                // Step 4(b)ii.B: TIS[bi] = 64.
+                tis[bi as usize] = 64;
+                // Step 4(b)ii.C: EOBS -= 1.
+                eobs -= 1;
+            } else {
+                // Step 4(b)iii: decode a fresh token.
+                // Step 4(b)iii.A: HG from Table 7.42.
+                let hg = huffman_table_group(ti);
+                // Step 4(b)iii.B/C: hti = 16 * HG + (htiL | htiC).
+                let hti_idx = if bi < nlbs {
+                    16u8 * hg + hti_l
+                } else {
+                    16u8 * hg + hti_c
+                };
+                let table = hts
+                    .get(hti_idx as usize)
+                    .ok_or(Error::DctCoefficientEmptyHuffmanTable { hti: hti_idx })?;
+                if table.entries.is_empty() {
+                    return Err(Error::DctCoefficientEmptyHuffmanTable { hti: hti_idx });
+                }
+                // Step 4(b)iii.D: read TOKEN.
+                let token = match table.read_token(r) {
+                    Ok(t) => t,
+                    Err(ReadTokenErr::OffTree) => {
+                        return Err(Error::DctCoefficientHuffmanWalkOffTree { hti: hti_idx });
+                    }
+                    Err(ReadTokenErr::Truncated(e)) => return Err(e),
+                };
+                if token < 7 {
+                    // Step 4(b)iii.E: expand an EOB token. The §7.7.1
+                    // procedure updates TIS / COEFFS, and returns the
+                    // post-step-11 residual EOBS — exactly what §7.7.3
+                    // wants to carry across iterations.
+                    eobs = decode_eob_token_inner(
+                        r,
+                        token,
+                        nbs,
+                        bi,
+                        ti,
+                        &mut tis,
+                        &mut ncoeffs,
+                        &mut coeffs,
+                    )?;
+                } else {
+                    // Step 4(b)iii.F: expand a coefficient token. The
+                    // §7.7.2 procedure updates TIS / NCOEFFS / COEFFS
+                    // and returns a classification we discard here
+                    // (the driver only needs the side effects).
+                    let _ = decode_coefficient_token_inner(
+                        r,
+                        token,
+                        nbs,
+                        bi,
+                        ti,
+                        &mut tis,
+                        &mut ncoeffs,
+                        &mut coeffs,
+                    )?;
+                }
+            }
+        }
+    }
+
+    // §7.7.3 closing paragraph: "EOBS MUST be zero, and TIS[bi] MUST
+    // be 64 for every coded bi".
+    if eobs > 0 {
+        return Err(Error::DctCoefficientLeftoverEobs { residual: eobs });
+    }
+    for (bi, &is_coded) in bcoded.iter().enumerate() {
+        if is_coded != 0 && tis[bi] != 64 {
+            return Err(Error::DctCoefficientBlockNotClosed {
+                bi: bi as u32,
+                tis: tis[bi],
+            });
+        }
+    }
+
+    Ok((coeffs, ncoeffs))
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -11094,6 +11500,368 @@ mod tests {
                 bits_consumed, expected_bits,
                 "TOKEN={token} expected {expected_bits} bits, got {bits_consumed}"
             );
+        }
+    }
+
+    // =================================================================
+    // §7.7.3 DCT Coefficient Decode tests
+    // =================================================================
+
+    /// Build an 80-element Huffman-table set where every table is the
+    /// same single-leaf table that maps the empty code to `token`. The
+    /// driver picks tables by `(HG, htiL|htiC)` so a single-leaf table
+    /// in every slot lets the driver read TOKEN deterministically
+    /// without forcing the test to lay out 80 distinct tables.
+    ///
+    /// Single-leaf tables are degenerate but spec-legal — the
+    /// `HuffmanTable::lookup` doc explicitly calls out the "root is a
+    /// leaf" shape — and our [`HuffmanTable::read_token`] handles it
+    /// without consuming any bits, which is exactly what we want for a
+    /// driver smoke test.
+    fn make_uniform_hts(token: u8) -> Vec<HuffmanTable> {
+        let entry = HuffmanEntry {
+            code: 0,
+            len: 0,
+            token,
+        };
+        let table = HuffmanTable {
+            entries: vec![entry],
+            nodes: vec![HuffmanNode::Leaf { token }],
+        };
+        vec![table; NUM_HUFFMAN_TABLES]
+    }
+
+    /// Table 7.42 row check.
+    #[test]
+    fn huffman_table_group_table_7_42() {
+        assert_eq!(huffman_table_group(0), 0);
+        for ti in 1u8..=5 {
+            assert_eq!(huffman_table_group(ti), 1, "ti={ti}");
+        }
+        for ti in 6u8..=14 {
+            assert_eq!(huffman_table_group(ti), 2, "ti={ti}");
+        }
+        for ti in 15u8..=27 {
+            assert_eq!(huffman_table_group(ti), 3, "ti={ti}");
+        }
+        for ti in 28u8..=63 {
+            assert_eq!(huffman_table_group(ti), 4, "ti={ti}");
+        }
+    }
+
+    /// `bcoded.len() != nbs` is caught at the input-validation gate
+    /// before any state is allocated.
+    #[test]
+    fn dct_coefficients_rejects_bcoded_len_mismatch() {
+        let hts = make_uniform_hts(0);
+        let r = decode_dct_coefficients(&[], 4, 1, &[1u8, 0u8], &hts);
+        match r {
+            Err(Error::DctCoefficientBcodedLenMismatch { got, nbs }) => {
+                assert_eq!(got, 2);
+                assert_eq!(nbs, 4);
+            }
+            other => panic!("expected DctCoefficientBcodedLenMismatch, got {other:?}"),
+        }
+        // Display rendering carries the section tag.
+        let s = format!(
+            "{}",
+            Error::DctCoefficientBcodedLenMismatch { got: 2, nbs: 4 }
+        );
+        assert!(s.contains("§7.7.3"));
+    }
+
+    /// `nmbs * 4 > nbs` is rejected — every macro-block carries four
+    /// luma blocks, so `NLBS` exceeding `NBS` is a contradiction.
+    #[test]
+    fn dct_coefficients_rejects_nlbs_exceeds_nbs() {
+        let hts = make_uniform_hts(0);
+        // nmbs=2 ⇒ nlbs=8; nbs=4 ⇒ nlbs > nbs.
+        let bcoded = vec![0u8; 4];
+        let r = decode_dct_coefficients(&[], 4, 2, &bcoded, &hts);
+        match r {
+            Err(Error::DctCoefficientNlbsExceedsNbs { nmbs, nbs }) => {
+                assert_eq!(nmbs, 2);
+                assert_eq!(nbs, 4);
+            }
+            other => panic!("expected DctCoefficientNlbsExceedsNbs, got {other:?}"),
+        }
+    }
+
+    /// `bcoded` all-zero short-circuit: the driver still reads the
+    /// `htiL` + `htiC` at ti=0 and ti=1 (4+4+4+4 = 16 bits total), but
+    /// performs no per-block work. EOBS stays zero (no token decoded),
+    /// every TIS stays at 0, and the closure check skips uncoded
+    /// blocks per the spec text.
+    #[test]
+    fn dct_coefficients_all_uncoded_reads_only_table_indices() {
+        let hts = make_uniform_hts(0);
+        // 16 bits = 2 bytes; payload value irrelevant (no token decode).
+        let packet = [0u8, 0u8];
+        let bcoded = vec![0u8; 4];
+        let (coeffs, ncoeffs) = decode_dct_coefficients(&packet, 4, 1, &bcoded, &hts).unwrap();
+        assert_eq!(coeffs.len(), 4);
+        assert_eq!(ncoeffs.len(), 4);
+        for bi in 0..4 {
+            assert_eq!(coeffs[bi], [0i16; 64]);
+            assert_eq!(ncoeffs[bi], 0);
+        }
+    }
+
+    /// Drive a 1-block frame where TOKEN=0 (EOB run of length 1) at
+    /// ti=0. Table 7.42 maps ti=0 to HG=0, so hti = 0; with a
+    /// single-leaf HTS[0] mapping to TOKEN=0, the driver:
+    ///   * reads htiL (4 bits) + htiC (4 bits) at ti=0 — 8 bits total
+    ///   * picks HTS[0], reads zero bits to recognise TOKEN=0
+    ///   * calls §7.7.1 with TOKEN=0 — zero-fills the entire block,
+    ///     TIS=64, returns EOBS=0 (after the step-11 decrement of the
+    ///     fixed run length 1)
+    ///   * reads htiL (4 bits) + htiC (4 bits) at ti=1 — 8 more bits
+    ///   * skips the per-block loop at every ti >= 1 because TIS=64
+    ///
+    /// Total bits read: 16. Block ends fully zero with TIS pinned.
+    #[test]
+    fn dct_coefficients_single_block_eob_run_token_0() {
+        let hts = make_uniform_hts(0);
+        let packet = [0u8, 0u8];
+        let bcoded = vec![1u8];
+        let (coeffs, ncoeffs) = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts).unwrap();
+        assert_eq!(coeffs[0], [0i16; 64]);
+        // Step 4(b)i runs once at ti=0 with NCOEFFS[0] = 0; the §7.7.1
+        // step-9 write inside the token expander then sets NCOEFFS[0]
+        // to the pre-call TIS (still 0).
+        assert_eq!(ncoeffs[0], 0);
+    }
+
+    /// Drive a 1-block frame where the table maps the empty code to
+    /// TOKEN=9 (the fixed `+1` single-coefficient token from §7.7.2).
+    /// The driver iterates ti from 0 upward; at every ti where TIS=ti
+    /// (which is every ti, given each token writes exactly one
+    /// coefficient), it decodes TOKEN=9 and advances TIS by 1.
+    /// Because TOKEN=9 has zero extra-bit payload (Table 7.38 column
+    /// "Extra Bits" = 0) and the table itself consumes zero bits, the
+    /// loop reads exactly 16 bits (the htiL/htiC at ti=0,1) and fills
+    /// the entire 64-entry block with +1. At the end NCOEFFS=64 and
+    /// TIS=64, satisfying the §7.7.3 closing-paragraph contract.
+    #[test]
+    fn dct_coefficients_single_block_full_token_9_fill() {
+        let hts = make_uniform_hts(9);
+        let packet = [0u8, 0u8];
+        let bcoded = vec![1u8];
+        let (coeffs, ncoeffs) = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts).unwrap();
+        assert_eq!(coeffs[0], [1i16; 64]);
+        assert_eq!(ncoeffs[0], 64);
+    }
+
+    /// A coded block whose TOKEN stream runs out of tokens before
+    /// TIS hits 64 triggers the §7.7.3 closing-paragraph guard. We
+    /// build a degenerate setup: a table mapping to TOKEN=7 with a
+    /// 3-bit RLEN payload that the driver will keep reading until
+    /// the bit reader runs dry — TruncatedHeader surfaces first
+    /// (before the closing-paragraph check), which is the spec-
+    /// preferred error (a truncated token stream is the proximate
+    /// cause).
+    #[test]
+    fn dct_coefficients_truncation_during_token_payload() {
+        // TOKEN=7 → 3-bit RLEN. Provide only the 16 bits of table
+        // indices, no token payload — the very first token decode at
+        // ti=0 immediately tries to read RLEN and trips
+        // TruncatedHeader from the §7.7.2 RLEN read.
+        let hts = make_uniform_hts(7);
+        let packet = [0u8, 0u8];
+        let bcoded = vec![1u8];
+        let r = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts);
+        match r {
+            Err(Error::TruncatedHeader { .. }) => {}
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+    }
+
+    /// Walk-off-tree surfaces when the table has interior branches
+    /// pointing past the allocated node array. Constructing such a
+    /// table by hand simulates a corrupt setup header reaching the
+    /// driver. (Conformant Theora streams cannot produce this from
+    /// §6.4.4 because the decode builds the tree breadth-first and
+    /// always allocates both children before pushing them — but the
+    /// public driver still has to fail closed on the case rather
+    /// than panic.)
+    #[test]
+    fn dct_coefficients_huffman_walk_off_tree() {
+        // Hand-crafted table whose only interior node points at
+        // child indices well past the node array.
+        let table = HuffmanTable {
+            entries: vec![HuffmanEntry {
+                code: 0,
+                len: 1,
+                token: 0,
+            }],
+            nodes: vec![HuffmanNode::Branch {
+                zero: 999,
+                one: 999,
+            }],
+        };
+        let mut hts = vec![
+            HuffmanTable {
+                entries: vec![HuffmanEntry {
+                    code: 0,
+                    len: 0,
+                    token: 0,
+                }],
+                nodes: vec![HuffmanNode::Leaf { token: 0 }],
+            };
+            NUM_HUFFMAN_TABLES
+        ];
+        // HG=0, htiL=0 ⇒ hti=0 at ti=0 picks this corrupt table.
+        hts[0] = table;
+        // Pack htiL=0, htiC=0 at ti=0 and ti=1 (16 bits) then a single
+        // 0-bit so the read_token walk consumes one bit and dives into
+        // the bogus child index.
+        let packet = [0u8, 0u8, 0u8];
+        let bcoded = vec![1u8];
+        let r = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts);
+        match r {
+            Err(Error::DctCoefficientHuffmanWalkOffTree { hti }) => {
+                assert_eq!(hti, 0);
+            }
+            other => panic!("expected DctCoefficientHuffmanWalkOffTree, got {other:?}"),
+        }
+    }
+
+    /// Empty-table case: an 80-element set in which slot 0 has zero
+    /// entries trips the validation gate when ti=0 / hti=0 is reached
+    /// for a coded block.
+    #[test]
+    fn dct_coefficients_empty_huffman_table_rejected() {
+        let mut hts = make_uniform_hts(0);
+        hts[0] = HuffmanTable {
+            entries: vec![],
+            nodes: vec![],
+        };
+        // 8 bits for htiL/htiC at ti=0 then we hit the per-block path.
+        let packet = [0u8];
+        let bcoded = vec![1u8];
+        let r = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts);
+        match r {
+            Err(Error::DctCoefficientEmptyHuffmanTable { hti }) => assert_eq!(hti, 0),
+            other => panic!("expected DctCoefficientEmptyHuffmanTable, got {other:?}"),
+        }
+    }
+
+    /// `nbs = 0` short-circuits cleanly: the driver still reads the
+    /// 16 bits of htiL/htiC (steps 4(a) at ti=0 and ti=1 are
+    /// unconditional on coded-block count per the spec text), and
+    /// the closure check is vacuous.
+    #[test]
+    fn dct_coefficients_zero_nbs_short_circuit() {
+        let hts = make_uniform_hts(0);
+        let packet = [0u8, 0u8];
+        let (coeffs, ncoeffs) = decode_dct_coefficients(&packet, 0, 0, &[], &hts).unwrap();
+        assert!(coeffs.is_empty());
+        assert!(ncoeffs.is_empty());
+    }
+
+    /// `htiL` and `htiC` are read at ti=0 and ti=1 — only. Subsequent
+    /// ti values reuse the cached pair without consuming bits. The
+    /// test packs htiL=3 and htiC=5 at ti=0, then htiL=3 and htiC=5
+    /// at ti=1 (16 bits total), then 0 bytes — yet the driver
+    /// completes via the EOB run because TOKEN=0 closes the block.
+    #[test]
+    fn dct_coefficients_table_indices_only_at_ti_0_and_1() {
+        let hts = make_uniform_hts(0); // TOKEN=0 — fixed EOB-run-1.
+                                       // Pack htiL=3 (4 bits) + htiC=5 (4 bits) at ti=0; htiL=3 + htiC=5
+                                       // at ti=1: 0011_0101 0011_0101 = 0x35 0x35.
+        let packet = [0x35, 0x35];
+        let bcoded = vec![1u8];
+        let (coeffs, ncoeffs) = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts).unwrap();
+        // Block fully zero-filled; closure check satisfied.
+        assert_eq!(coeffs[0], [0i16; 64]);
+        assert_eq!(ncoeffs[0], 0);
+    }
+
+    /// Inner driver shares the bit reader with whatever sits after
+    /// §7.7.3 in the frame payload. The test confirms a sentinel byte
+    /// read off the same reader after the driver returns is intact.
+    #[test]
+    fn dct_coefficients_inner_shares_bit_reader() {
+        let hts = make_uniform_hts(0); // TOKEN=0 closes the block.
+                                       // 8 bits (htiL/htiC at ti=0) + 8 bits (htiL/htiC at ti=1) + 8
+                                       // sentinel bits set to 0xA5.
+        let packet = [0u8, 0u8, 0xA5u8];
+        let bcoded = vec![1u8];
+        let mut r = BitReader::new(&packet);
+        let (_coeffs, _ncoeffs) =
+            decode_dct_coefficients_inner(&mut r, 1, 0, &bcoded, &hts).unwrap();
+        let sentinel = r.read_bits(8, "sentinel").unwrap();
+        assert_eq!(sentinel, 0xA5);
+    }
+
+    /// Two coded blocks: bi=0 in luma (NLBS=4, so bi<NLBS), bi=4
+    /// would be chroma. With NMBS=1 ⇒ NLBS=4. Block 0 takes htiL=0,
+    /// block 4 takes htiC=0. We use a fresh 5-block frame with only
+    /// bi=0 and bi=4 coded, both with the EOB-run-1 token, and
+    /// confirm both blocks close.
+    #[test]
+    fn dct_coefficients_luma_vs_chroma_split() {
+        let hts = make_uniform_hts(0);
+        let packet = [0u8, 0u8];
+        // NBS=5, NMBS=1 ⇒ NLBS=4: bi 0..=3 are luma, bi=4 is chroma.
+        let mut bcoded = vec![0u8; 5];
+        bcoded[0] = 1; // luma
+        bcoded[4] = 1; // chroma
+        let (coeffs, ncoeffs) = decode_dct_coefficients(&packet, 5, 1, &bcoded, &hts).unwrap();
+        // Both coded blocks are zero (TOKEN=0 EOB run).
+        assert_eq!(coeffs[0], [0i16; 64]);
+        assert_eq!(coeffs[4], [0i16; 64]);
+        // Uncoded blocks stay at default zero.
+        for bi in [1usize, 2, 3] {
+            assert_eq!(coeffs[bi], [0i16; 64]);
+            assert_eq!(ncoeffs[bi], 0);
+        }
+    }
+
+    /// EOB-run residue at end of frame: TOKEN=6 with a 12-bit payload
+    /// of 4095 produces an EOB run far longer than any frame's coded-
+    /// block count. The driver decodes it on the first coded block,
+    /// then exhausts the per-ti loop without further per-block work
+    /// (nothing left to consume the run); the closing-paragraph guard
+    /// fires with the residue.
+    #[test]
+    fn dct_coefficients_leftover_eobs_rejected() {
+        let hts = make_uniform_hts(6);
+        // TOKEN=6 reads 12 bits of payload. Pack 8 bits of htiL/htiC=0
+        // at ti=0 then 12 bits of payload = 0xFFF then 4 bits of
+        // htiL/htiC=0 at ti=1 (driver only reaches ti=1 if blocks
+        // remain open, but EOBS pin them; ti=1 still reads htiL/htiC
+        // unconditionally per step 4(a)).
+        // Bit layout (MSb-first): hti_at_0(8) + payload(12) + hti_at_1(8)
+        //   = 0000_0000 1111_1111 1111_0000 0000_0000 = 0x00 0xFF 0xF0 0x00
+        let packet = [0x00, 0xFF, 0xF0, 0x00];
+        let bcoded = vec![1u8];
+        let r = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts);
+        match r {
+            Err(Error::DctCoefficientLeftoverEobs { residual }) => {
+                // TOKEN=6 payload 4095 means EOBS=4095 pre-step-11,
+                // then -=1 once for our single coded block ⇒ 4094.
+                assert_eq!(residual, 4094);
+            }
+            other => panic!("expected DctCoefficientLeftoverEobs, got {other:?}"),
+        }
+    }
+
+    /// `Display` rendering carries the section tag for every new
+    /// §7.7.3 error variant.
+    #[test]
+    fn dct_coefficients_error_display_carries_section_tag() {
+        for s in [
+            format!(
+                "{}",
+                Error::DctCoefficientNlbsExceedsNbs { nmbs: 2, nbs: 4 }
+            ),
+            format!("{}", Error::DctCoefficientEmptyHuffmanTable { hti: 7 }),
+            format!("{}", Error::DctCoefficientHuffmanWalkOffTree { hti: 7 }),
+            format!("{}", Error::DctCoefficientLeftoverEobs { residual: 3 }),
+            format!("{}", Error::DctCoefficientBlockNotClosed { bi: 2, tis: 17 }),
+        ] {
+            assert!(s.contains("§7.7.3"), "missing §7.7.3 tag in: {s}");
         }
     }
 }

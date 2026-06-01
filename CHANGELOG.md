@@ -6,6 +6,29 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.8.1 Computing the DC Predictor (round 18). New public
+  `compute_dc_predictor(bi, bcoded, mbmodes, block_to_macro_block,
+  neighbors, lastdc, coeffs) -> Result<i32, Error>` transcribing all
+  twelve numbered steps of §7.8.1 of the Theora I Specification.
+  Forms `DCPRED` for a single block from up to four already-decoded
+  neighbour DC values (left, lower-left, lower, lower-right), with
+  the per-slot present-and-coded-and-same-rfi gate (steps 3..=10),
+  the `LASTDC[rfi]` step-11 fallback, the Table 7.47-indexed weighted
+  sum + `//` (truncated-toward-zero) divide (step 12(a)..=(g)), and
+  the step 12(h) outranging guard (DC2 → DC0 → DC1 swap order,
+  gated on P[0] && P[1] && P[2]). Public helpers:
+  `reference_frame_for_mb_mode` exposes the Table 7.46
+  `MBMODES → ReferenceFrame` mapping, `dc_predictor_weights` exposes
+  the 15 non-zero Table 7.47 rows for round-trip / spot-check use,
+  `DcLastDc::zero` / `get` / `set` give §7.8.2 a typed surface for
+  the LASTDC register file. New types: `ReferenceFrame`,
+  `DcPredictorNeighbors`, `DcLastDc`, `DcPredictorWeights`,
+  `DcPredictorLenField`. Four new error variants
+  (`DcPredictorBlockIndexOutOfRange`, `DcPredictorBcodedLenMismatch`,
+  `DcPredictorMacroBlockIndexOutOfRange`,
+  `DcPredictorNeighborIndexOutOfRange`) reject malformed inputs.
+  Seventeen new tests (total 303).
+
 - §7.7.3 DCT Coefficient Decode driver (round 17). `decode_dct_coefficients`
   walks the `ti` 0..=63 zig-zag axis, reads `htiL` / `htiC` at `ti ∈ {0, 1}`,
   selects the §6.4.4 Huffman table per Table 7.42 + `bi < NLBS` luma/chroma

@@ -2,7 +2,7 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-05-31
+## Status — 2026-06-01
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter
 limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
@@ -10,7 +10,8 @@ limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
 long-/short-run bit strings + §7.3 coded-block-flags decode + §7.4
 macro-block coding modes + §7.5 motion-vector decode + §7.6 block-level
 qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
-§7.7.3 DCT coefficient decode driver (rounds 1–17).** §6.1, §6.2
+§7.7.3 DCT coefficient decode driver + §7.8.1 DC predictor compute
+(rounds 1–18).** §6.1, §6.2
 (identification), §6.3 (comment), §6.4.5 step 1 (setup-header
 common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
 (Quantization Parameters Decode), §6.4.3 (Computing a Quantization
@@ -209,6 +210,32 @@ for every coded block) via two typed reject variants.
   `CoefficientTokenWouldOverflowBlock`) reject malformed inputs. The
   shared-reader chaining contract is preserved via a crate-private
   `decode_coefficient_token_inner`.
+* [`compute_dc_predictor`] — round 18 public §7.8.1 procedure
+  returning the typed `DCPRED: i32` for a single block from up to four
+  already-decoded neighbour DC values (left, lower-left, lower,
+  lower-right in plane-local raster geometry). Caller supplies `bi`,
+  the per-block `bcoded` / `mbmodes` / `block_to_macro_block` /
+  `neighbors: &[DcPredictorNeighbors]` arrays + the current `lastdc:
+  &DcLastDc` register file (one slot per Table 7.46 reference frame:
+  `None` / `Previous` / `Golden`) + the `coeffs: &[[i16; 64]]` per-
+  block coefficient array. Each neighbour slot is gated by the §7.8.1
+  steps 3..=10 chain: present-and-coded-and-same-rfi → `P[k]=1,
+  PBI[k]=bj`; otherwise `P[k]=0`. When the mask `P[0..=3]` is zero
+  (step 11), `LASTDC[rfi]` is returned directly. Otherwise step 12
+  applies the Table 7.47 weights + divisor (15 rows, exposed as
+  [`dc_predictor_weights`] for spot-check / round-trip use) with the
+  spec's `//` (truncated-toward-zero) division, then the step 12(h)
+  outranging guard pulls `DCPRED` back to `COEFFS[PBI[k]][0]` for
+  `k ∈ {2, 0, 1}` (in that spec-mandated order) when the weighted
+  estimate diverges by more than 128 — but only when `P[0]`, `P[1]`,
+  `P[2]` are all set (the spec explicitly excludes `P[3]` from the
+  guard predicate). The Table 7.46 `MBMODES → ReferenceFrame` mapping
+  is exposed as the public helper [`reference_frame_for_mb_mode`].
+  Four new typed errors (`DcPredictorBlockIndexOutOfRange`,
+  `DcPredictorBcodedLenMismatch` with a `DcPredictorLenField`
+  discriminant for `BlockToMacroBlock` / `Neighbors` / `Coeffs`,
+  `DcPredictorMacroBlockIndexOutOfRange`,
+  `DcPredictorNeighborIndexOutOfRange`) reject malformed inputs.
 * [`decode_dct_coefficients`] — round 17 public §7.7.3 procedure
   driving the entire frame's DCT-coefficient stream end-to-end. The
   driver iterates `ti` from 0 to 63 (the zig-zag axis), reads
@@ -692,18 +719,110 @@ table set so the driver picks a deterministic table at every
 `(ti, hg)` slot without forcing the test to lay out 80 distinct
 trees.
 
+Round 18 adds seventeen §7.8.1 DC-predictor tests (total now 303):
+the Table 7.46 `MBMODES → ReferenceFrame` round-trip across every
+coding mode (with the `ReferenceFrame::index()` numeric check), four
+spot-checks of Table 7.47 rows including the signed-weight
+`[29, -26, 29, 0]` PDIV=32 entry and the asymmetric `[0, 3, 10, 3]`
+PDIV=16 entry, the step-11 `LASTDC[rfi]` fallback across all three
+reference-frame slots (Intra → `LASTDC[0]`, InterMv → `LASTDC[1]`,
+InterGoldenMv → `LASTDC[2]`), the single-left-neighbour P=0b0001
+copy-DC0 path, an uncoded-neighbour case (`BCODED[bj] == 0`
+masks `P[k]` to zero), a different-reference-frame case (Golden
+neighbour to an Intra block masks `P[k]` even though
+`BCODED[bj] == 1`), the three-neighbour P=0b0111 signed-weight
+worked example (`(29*30 + -26*10 + 29*20) / 32 = 37`, guard within
+range so no swap), the outranging-guard DC2-swap path with a
+hand-crafted large divergence, the no-swap guard path
+(`DCPRED == DC0 == DC1 == DC2` so every branch is within 128), a
+negative-DC + truncated-division case, the `bi >= nbs` reject, all
+three paired-length-mismatch rejects with the correct
+`DcPredictorLenField` discriminator (`BlockToMacroBlock` /
+`Neighbors` / `Coeffs`), both flavours of the macro-block-index OOR
+reject (current block's `b2m[bi]` and a neighbour's `b2m[bj]`), the
+neighbour-`bj >= nbs` reject, the `DcLastDc::get` / `set` round-
+trip across all three slots, and `Display` rendering for every new
+§7.8.1 error variant carrying the section tag.
+
+### §7.8.1 Computing the DC Predictor (round 18)
+
+```rust
+pub fn compute_dc_predictor(
+    bi: u32,
+    bcoded: &[u8],
+    mbmodes: &[MacroBlockMode],
+    block_to_macro_block: &[u32],
+    neighbors: &[DcPredictorNeighbors],
+    lastdc: &DcLastDc,
+    coeffs: &[[i16; 64]],
+) -> Result<i32, Error>;
+
+pub fn reference_frame_for_mb_mode(mode: MacroBlockMode) -> ReferenceFrame;
+pub fn dc_predictor_weights(mask: u8) -> Option<DcPredictorWeights>;
+
+pub struct DcPredictorNeighbors {
+    pub left:        Option<u32>, // P[0] candidate (§7.8.1 step 3)
+    pub lower_left:  Option<u32>, // P[1] candidate (§7.8.1 step 5)
+    pub lower:       Option<u32>, // P[2] candidate (§7.8.1 step 7)
+    pub lower_right: Option<u32>, // P[3] candidate (§7.8.1 step 9)
+}
+
+pub struct DcLastDc { pub intra: i32, pub previous: i32, pub golden: i32 }
+pub enum ReferenceFrame { None, Previous, Golden }
+pub struct DcPredictorWeights { pub w: [i32; 4], pub pdiv: i32 }
+```
+
+The procedure transcribes all twelve numbered steps of §7.8.1: the
+`(mbi, rfi)` lookup via Table 7.46, the per-slot
+present-and-coded-and-same-rfi gate that fills the four `P[k]` /
+`PBI[k]` arrays (steps 3..=10), the `LASTDC[rfi]` step-11 fallback
+when no neighbour qualifies, the Table 7.47-indexed weighted sum
+(step 12(a)..=(f)), the spec's `//` (truncated-toward-zero) divide
+(step 12(g) — Rust's `/` already truncates toward zero for signed
+operands, matching `//`), and the step 12(h) outranging guard that
+pulls `DCPRED` back to one of `COEFFS[PBI[k]][0]` for
+`k ∈ {2, 0, 1}` (DC2 → DC0 → DC1, first match wins) when the
+weighted estimate diverges by more than 128 — but only when `P[0]`,
+`P[1]`, `P[2]` are all set (the spec writes "If P[0], P[1], and P[2]
+are all non-zero"; `P[3]` is intentionally excluded from the guard
+predicate). `DCPRED` and the per-slot DC values are widened to
+`i32` so the worst-case `29 * 32767 ≈ 9.5e5` weighted-sum
+intermediate (plus the `LASTDC` register file's signed `i32`
+domain) fits without overflow.
+
+The caller-supplied `DcPredictorNeighbors` table encodes the plane-
+local raster geometry that the spec assumes but does not compute
+(the procedure prose says "in the same row but one column to the
+left" etc., but block ordering in Theora is plane-local raster — a
+mapping that depends on §2.x geometry, the plane's subsampling,
+and the coded-order Hilbert traversal within super-blocks). A
+`None` slot represents BOTH "block `bi` is on the corresponding
+edge of the coded frame" and "the neighbour `bj` is not coded";
+both collapse to `P[k] = 0` in the spec, so the typed `Option`
+captures both branches without a separate edge mask.
+
+`LASTDC` is a 3-element register file (one slot per Table 7.46
+reference frame: `None` = Intra, `Previous`, `Golden`) tracked
+across blocks by §7.8.2. §7.8.1 itself only reads from it — the
+step 11 fallback returns `LASTDC[rfi]` when no neighbour qualifies.
+The `DcLastDc::get` / `set` accessors plus `DcLastDc::zero()`
+(matching §7.8.2 step 1's initialisation to zero) give §7.8.2 a
+typed surface to thread through the raster-order driver landing in
+the next round.
+
 No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually
 decode a frame.
 
 ## Roadmap
 
-* Next: §7.8 Undoing DC Prediction — drives the §7.7.3 output
-  `COEFFS[bi][0]` back through the four-neighbour predictor in
-  raster order to recover the original DC values. Splits cleanly
-  into §7.8.1 (Computing the DC Predictor: Table 7.47 weights /
-  divisors) and §7.8.2 (Inverting the DC Prediction Process).
-* After §7.8: §7.9 reconstruction (inverse quantization, IDCT,
+* Next: §7.8.2 Inverting the DC Prediction Process — chains
+  [`compute_dc_predictor`] over every coded block in plane-local
+  raster order, updating `LASTDC[rfi]` and writing
+  `COEFFS[bi][0] = DC` after the 16-bit two's-complement truncation
+  step 1(d)i.C. Round 18 landed step 1's per-block DC predictor
+  helper as a standalone entry point; §7.8.2 chains it.
+* After §7.8.2: §7.9 reconstruction (inverse quantization, IDCT,
   motion-compensated prediction) — the path to a first decoded
   Theora frame.
 

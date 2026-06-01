@@ -701,6 +701,46 @@ pub enum Error {
         /// The block's residual `TIS` value (0..63).
         tis: u8,
     },
+    /// The `bi` argument to [`compute_dc_predictor`] was `>= nbs`, so the
+    /// per-block arrays cannot be indexed safely. §7.8.1 works per
+    /// coded-order block index; the caller must keep `bi < NBS`.
+    DcPredictorBlockIndexOutOfRange {
+        /// The offending `bi` value.
+        bi: u32,
+        /// `bcoded.len()` (the contracted `nbs`).
+        nbs: u32,
+    },
+    /// `bcoded.len()`, `block_to_macro_block.len()`, or `neighbors.len()`
+    /// did not match each other. All three describe the same NBS-element
+    /// block universe; a length mismatch would either truncate or
+    /// over-read the per-block loops.
+    DcPredictorBcodedLenMismatch {
+        /// Which paired length triggered the mismatch.
+        which: DcPredictorLenField,
+        /// The slice's actual length.
+        got: usize,
+        /// `nbs` (the reference length, taken from `bcoded`).
+        nbs: usize,
+    },
+    /// A `block_to_macro_block` entry was `>= nmbs`, so the `MBMODES`
+    /// lookup at §7.8.1 step 1 (and steps 3(b)i / 5(b)i / 7(b)i /
+    /// 9(b)i for neighbours) would index past the end. `nmbs` is taken
+    /// from `mbmodes.len()`.
+    DcPredictorMacroBlockIndexOutOfRange {
+        /// The offending macro-block index.
+        mbi: u32,
+        /// `mbmodes.len()`.
+        nmbs: u32,
+    },
+    /// A `neighbors[bi]` slot pointed at a `bj >= nbs`, so neither
+    /// `BCODED[bj]` nor any subsequent state lookup could be performed
+    /// safely.
+    DcPredictorNeighborIndexOutOfRange {
+        /// The offending `bj` value.
+        bj: u32,
+        /// `bcoded.len()` (the contracted `nbs`).
+        nbs: u32,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -727,6 +767,20 @@ pub enum CoefficientTokenStateSlice {
     /// `NCOEFFS` — per-block coefficient count.
     Ncoeffs,
     /// `COEFFS` — per-block 64-entry coefficient array.
+    Coeffs,
+}
+
+/// Identifies which of the §7.8.1 length-paired inputs failed an
+/// [`Error::DcPredictorBcodedLenMismatch`] check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DcPredictorLenField {
+    /// The per-block macro-block lookup vector
+    /// `block_to_macro_block: &[u32]`.
+    BlockToMacroBlock,
+    /// The per-block neighbour table `neighbors: &[DcPredictorNeighbors]`.
+    Neighbors,
+    /// The per-block 64-entry coefficient array
+    /// `coeffs: &[[i16; 64]]`.
     Coeffs,
 }
 
@@ -1011,6 +1065,22 @@ impl core::fmt::Display for Error {
             Error::DctCoefficientBlockNotClosed { bi, tis } => write!(
                 f,
                 "oxideav-theora: §7.7.3 coded block bi={bi} unclosed: TIS={tis} != 64"
+            ),
+            Error::DcPredictorBlockIndexOutOfRange { bi, nbs } => write!(
+                f,
+                "oxideav-theora: §7.8.1 bi={bi} >= nbs={nbs}"
+            ),
+            Error::DcPredictorBcodedLenMismatch { which, got, nbs } => write!(
+                f,
+                "oxideav-theora: §7.8.1 input slice {which:?} length {got} != nbs {nbs}"
+            ),
+            Error::DcPredictorMacroBlockIndexOutOfRange { mbi, nmbs } => write!(
+                f,
+                "oxideav-theora: §7.8.1 mbi={mbi} >= nmbs={nmbs}"
+            ),
+            Error::DcPredictorNeighborIndexOutOfRange { bj, nbs } => write!(
+                f,
+                "oxideav-theora: §7.8.1 neighbor bj={bj} >= nbs={nbs}"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -4829,6 +4899,426 @@ pub(crate) fn decode_dct_coefficients_inner(
     }
 
     Ok((coeffs, ncoeffs))
+}
+
+// ----------------------------------------------------------------------
+// §7.8.1 Computing the DC Predictor
+// ----------------------------------------------------------------------
+
+/// Table 7.46 reference-frame index for each macro-block coding mode.
+///
+/// Used by §7.8.1 to decide which previously-decoded blocks count as
+/// "neighbours that use the same reference frame" when forming the DC
+/// predictor for the current block. The table is reproduced exactly
+/// from the spec (page 99) — the only departure is the typed return
+/// (`ReferenceFrame`) instead of the bare 0/1/2 integers.
+///
+/// Note that even when the previous and golden frames happen to refer
+/// to the same physical data (e.g. the first inter frame after an
+/// intra frame), they are still treated as distinct reference frames
+/// for the purposes of DC prediction — exactly what the per-mode
+/// mapping in Table 7.46 captures.
+pub fn reference_frame_for_mb_mode(mode: MacroBlockMode) -> ReferenceFrame {
+    match mode {
+        MacroBlockMode::InterNoMv => ReferenceFrame::Previous,
+        MacroBlockMode::Intra => ReferenceFrame::None,
+        MacroBlockMode::InterMv => ReferenceFrame::Previous,
+        MacroBlockMode::InterMvLast => ReferenceFrame::Previous,
+        MacroBlockMode::InterMvLast2 => ReferenceFrame::Previous,
+        MacroBlockMode::InterGoldenNoMv => ReferenceFrame::Golden,
+        MacroBlockMode::InterGoldenMv => ReferenceFrame::Golden,
+        MacroBlockMode::InterMvFour => ReferenceFrame::Previous,
+    }
+}
+
+/// Reference-frame discriminator for §7.8.1's "same reference frame"
+/// neighbour test. Values match the `rfi` column of Table 7.46:
+/// `None` = 0, `Previous` = 1, `Golden` = 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceFrame {
+    /// Table 7.46 `rfi = 0`. Intra blocks have no reference frame.
+    None,
+    /// Table 7.46 `rfi = 1`. The most-recently decoded inter reference.
+    Previous,
+    /// Table 7.46 `rfi = 2`. The golden reference frame.
+    Golden,
+}
+
+impl ReferenceFrame {
+    /// Index into [`DcLastDc`] used by §7.8.1 step 11. Matches Table
+    /// 7.46's numeric column directly so the typed enum stays
+    /// interchangeable with the spec's integer arithmetic.
+    pub fn index(self) -> usize {
+        match self {
+            ReferenceFrame::None => 0,
+            ReferenceFrame::Previous => 1,
+            ReferenceFrame::Golden => 2,
+        }
+    }
+}
+
+/// The §7.8.1 neighbour slots for a single block, all in coded-order.
+///
+/// `left`, `lower_left`, `lower`, `lower_right` correspond exactly to
+/// the §7.8.1 steps 3 / 5 / 7 / 9 lookups and feed `P[0]` / `P[1]` /
+/// `P[2]` / `P[3]` respectively. `None` in any slot represents both
+/// "block `bi` is on the corresponding edge of the coded frame"
+/// (steps 4 / 6 / 8 / 10) and "the neighbour is not coded"
+/// (`BCODED[bj] == 0` branches 3(c) / 5(c) / 7(c) / 9(c)). Both cases
+/// collapse to `P[k] = 0` in the spec, so the typed `Option` is the
+/// cleanest representation.
+///
+/// Per §7.8 prose, the relative geometry is plane-local: "DC prediction
+/// must proceed in raster order". The caller is responsible for
+/// computing the raster→coded-order mapping for the current plane (the
+/// procedure spec itself does not — it relies on §2.x geometry and
+/// the caller's per-plane layout knowledge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DcPredictorNeighbors {
+    /// Same row, one column to the left (§7.8.1 step 3). `None` =
+    /// left edge or neighbour not coded.
+    pub left: Option<u32>,
+    /// One row down, one column to the left (§7.8.1 step 5). `None` =
+    /// left or bottom edge, or neighbour not coded.
+    pub lower_left: Option<u32>,
+    /// Same column, one row down (§7.8.1 step 7). `None` = bottom
+    /// edge or neighbour not coded.
+    pub lower: Option<u32>,
+    /// One row down, one column to the right (§7.8.1 step 9). `None` =
+    /// right or bottom edge, or neighbour not coded.
+    pub lower_right: Option<u32>,
+}
+
+/// The §7.8.1 `LASTDC` 3-element register file, indexed by
+/// [`ReferenceFrame::index`]. Carried across blocks in raster order by
+/// the §7.8.2 driver; §7.8.1 itself only reads from it (step 11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DcLastDc {
+    /// `LASTDC[0]` — Intra. Initialised to zero per §7.8.2 step 1(c).
+    pub intra: i32,
+    /// `LASTDC[1]` — Previous reference. Initialised to zero per
+    /// §7.8.2 step 1(a).
+    pub previous: i32,
+    /// `LASTDC[2]` — Golden reference. Initialised to zero per
+    /// §7.8.2 step 1(b).
+    pub golden: i32,
+}
+
+impl DcLastDc {
+    /// Construct a fresh `LASTDC` register file with all three slots
+    /// at zero, matching the §7.8.2 step 1 initialisation.
+    pub fn zero() -> Self {
+        Self::default()
+    }
+
+    /// Lookup `LASTDC[rfi]` for a given reference frame.
+    pub fn get(&self, rfi: ReferenceFrame) -> i32 {
+        match rfi {
+            ReferenceFrame::None => self.intra,
+            ReferenceFrame::Previous => self.previous,
+            ReferenceFrame::Golden => self.golden,
+        }
+    }
+
+    /// Update `LASTDC[rfi] = dc` (§7.8.2 step 1(d)i.G).
+    pub fn set(&mut self, rfi: ReferenceFrame, dc: i32) {
+        match rfi {
+            ReferenceFrame::None => self.intra = dc,
+            ReferenceFrame::Previous => self.previous = dc,
+            ReferenceFrame::Golden => self.golden = dc,
+        }
+    }
+}
+
+/// Table 7.47 weights / divisor for a given P[0..=3] bitmask
+/// (`p0 | (p1 << 1) | (p2 << 2) | (p3 << 3)`), in the row order
+/// presented by the spec (i.e. ascending bitmask, skipping the
+/// all-zero row which is handled separately by §7.8.1 step 11). The
+/// rows tabulated here cover the 15 non-zero combinations; `entry(0)`
+/// returns `None` so callers cannot accidentally index the all-zero
+/// fallback case here.
+///
+/// The spec lists rows top-to-bottom by ascending `(P[0], P[1], P[2],
+/// P[3])` bit tuple (LSb-first), which means a packed bitmask
+/// `p0 + 2*p1 + 4*p2 + 8*p3` is the natural index minus one.
+///
+/// Weights are signed (one entry, `1 1 1 0`, uses `-26` for `W[1]`);
+/// `PDIV` is positive (1..=128). Both follow exactly the values on
+/// page 101 of the spec.
+const TABLE_7_47: [DcPredictorWeights; 15] = [
+    // P[0] P[1] P[2] P[3]  | W[0]  W[1]  W[2] W[3]  PDIV
+    //   1    0    0    0   |   1     0     0    0    1
+    DcPredictorWeights {
+        w: [1, 0, 0, 0],
+        pdiv: 1,
+    },
+    //   0    1    0    0   |   0     1     0    0    1
+    DcPredictorWeights {
+        w: [0, 1, 0, 0],
+        pdiv: 1,
+    },
+    //   1    1    0    0   |   1     0     0    0    1
+    DcPredictorWeights {
+        w: [1, 0, 0, 0],
+        pdiv: 1,
+    },
+    //   0    0    1    0   |   0     0     1    0    1
+    DcPredictorWeights {
+        w: [0, 0, 1, 0],
+        pdiv: 1,
+    },
+    //   1    0    1    0   |   1     0     1    0    2
+    DcPredictorWeights {
+        w: [1, 0, 1, 0],
+        pdiv: 2,
+    },
+    //   0    1    1    0   |   0     0     1    0    1
+    DcPredictorWeights {
+        w: [0, 0, 1, 0],
+        pdiv: 1,
+    },
+    //   1    1    1    0   |  29   -26    29    0   32
+    DcPredictorWeights {
+        w: [29, -26, 29, 0],
+        pdiv: 32,
+    },
+    //   0    0    0    1   |   0     0     0    1    1
+    DcPredictorWeights {
+        w: [0, 0, 0, 1],
+        pdiv: 1,
+    },
+    //   1    0    0    1   |  75     0     0   53  128
+    DcPredictorWeights {
+        w: [75, 0, 0, 53],
+        pdiv: 128,
+    },
+    //   0    1    0    1   |   0     1     0    1    2
+    DcPredictorWeights {
+        w: [0, 1, 0, 1],
+        pdiv: 2,
+    },
+    //   1    1    0    1   |  75     0     0   53  128
+    DcPredictorWeights {
+        w: [75, 0, 0, 53],
+        pdiv: 128,
+    },
+    //   0    0    1    1   |   0     0     1    0    1
+    DcPredictorWeights {
+        w: [0, 0, 1, 0],
+        pdiv: 1,
+    },
+    //   1    0    1    1   |  75     0     0   53  128
+    DcPredictorWeights {
+        w: [75, 0, 0, 53],
+        pdiv: 128,
+    },
+    //   0    1    1    1   |   0     3    10    3   16
+    DcPredictorWeights {
+        w: [0, 3, 10, 3],
+        pdiv: 16,
+    },
+    //   1    1    1    1   |  29   -26    29    0   32
+    DcPredictorWeights {
+        w: [29, -26, 29, 0],
+        pdiv: 32,
+    },
+];
+
+/// One row of Table 7.47 (Weights and Divisors for Each Set of
+/// Available DC Predictors). Packed exactly as the spec presents it:
+/// four signed weights followed by a positive divisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DcPredictorWeights {
+    /// `[W[0], W[1], W[2], W[3]]`, one weight per neighbour slot.
+    pub w: [i32; 4],
+    /// `PDIV`, the divisor for the weighted sum (§7.8.1 step 12(g)).
+    pub pdiv: i32,
+}
+
+/// Return the Table 7.47 row for a given `(P[0], P[1], P[2], P[3])`
+/// availability bitmask. The mask is packed LSb-first
+/// (`p0 | (p1 << 1) | (p2 << 2) | (p3 << 3)`), matching the order in
+/// which §7.8.1 fills `P[]`. Returns `None` for `mask == 0` so the
+/// all-zero §7.8.1 step 11 fallback path stays out of band.
+pub fn dc_predictor_weights(mask: u8) -> Option<DcPredictorWeights> {
+    if mask == 0 || mask > 15 {
+        return None;
+    }
+    Some(TABLE_7_47[(mask - 1) as usize])
+}
+
+/// Compute the DC predictor for a single block per §7.8.1 of the
+/// Theora I Specification.
+///
+/// The procedure returns a typed `DCPRED` value formed from the DC
+/// coefficients of up to four already-decoded neighbour blocks (left,
+/// lower-left, lower, lower-right in plane-local raster geometry). Only
+/// neighbours that are both coded (`BCODED[bj] != 0`) and use the same
+/// reference frame as the current block contribute to the sum; the
+/// `P[]` 4-element availability flags, Table 7.47 weights / divisor,
+/// and the spec's `//` (truncated-toward-zero) division reproduce the
+/// procedure step-by-step.
+///
+/// When none of the four neighbours qualify, the predictor falls back
+/// to `LASTDC[rfi]` per step 11. The outranging guard (step 12(h))
+/// pulls the predictor back to one of the three neighbour DC values
+/// when the weighted estimate diverges by more than 128 from any of
+/// them — but only when all three of `P[0]`, `P[1]`, `P[2]` are
+/// available.
+///
+/// # Inputs
+///
+/// * `bi` — coded-order index of the current block; must satisfy
+///   `bi < nbs` (where `nbs = bcoded.len()`).
+/// * `bcoded` — NBS-element `BCODED` array (§7.3 output).
+/// * `mbmodes` — NMBS-element `MBMODES` array (§7.4 output).
+/// * `block_to_macro_block` — NBS-element `bi → mbi` lookup
+///   (caller-supplied, per-plane raster geometry).
+/// * `neighbors` — NBS-element [`DcPredictorNeighbors`] array
+///   (caller-supplied, also per-plane raster geometry).
+/// * `lastdc` — current `LASTDC` register file (§7.8.2 carries this
+///   across blocks).
+/// * `coeffs` — NBS-element `[i16; 64]` zig-zag coefficient array;
+///   only `coeffs[bj][0]` (DC) is read.
+///
+/// # Errors
+///
+/// * [`Error::DcPredictorBlockIndexOutOfRange`] if `bi >= nbs`.
+/// * [`Error::DcPredictorBcodedLenMismatch`] if `block_to_macro_block`,
+///   `neighbors`, or `coeffs` is not `nbs` long.
+/// * [`Error::DcPredictorMacroBlockIndexOutOfRange`] if any consulted
+///   `block_to_macro_block[*]` is `>= mbmodes.len()`.
+/// * [`Error::DcPredictorNeighborIndexOutOfRange`] if any populated
+///   neighbour slot points outside `nbs`.
+pub fn compute_dc_predictor(
+    bi: u32,
+    bcoded: &[u8],
+    mbmodes: &[MacroBlockMode],
+    block_to_macro_block: &[u32],
+    neighbors: &[DcPredictorNeighbors],
+    lastdc: &DcLastDc,
+    coeffs: &[[i16; 64]],
+) -> Result<i32, Error> {
+    let nbs = bcoded.len();
+    let nbs_u32 = nbs as u32;
+    if bi >= nbs_u32 {
+        return Err(Error::DcPredictorBlockIndexOutOfRange { bi, nbs: nbs_u32 });
+    }
+    if block_to_macro_block.len() != nbs {
+        return Err(Error::DcPredictorBcodedLenMismatch {
+            which: DcPredictorLenField::BlockToMacroBlock,
+            got: block_to_macro_block.len(),
+            nbs,
+        });
+    }
+    if neighbors.len() != nbs {
+        return Err(Error::DcPredictorBcodedLenMismatch {
+            which: DcPredictorLenField::Neighbors,
+            got: neighbors.len(),
+            nbs,
+        });
+    }
+    if coeffs.len() != nbs {
+        return Err(Error::DcPredictorBcodedLenMismatch {
+            which: DcPredictorLenField::Coeffs,
+            got: coeffs.len(),
+            nbs,
+        });
+    }
+    let nmbs = mbmodes.len() as u32;
+
+    // Step 1: mbi = block_to_macro_block[bi].
+    let mbi = block_to_macro_block[bi as usize];
+    if mbi >= nmbs {
+        return Err(Error::DcPredictorMacroBlockIndexOutOfRange { mbi, nmbs });
+    }
+    // Step 2: rfi = Table 7.46[MBMODES[mbi]].
+    let rfi = reference_frame_for_mb_mode(mbmodes[mbi as usize]);
+
+    // Helper: walk one neighbour slot per §7.8.1 steps 3/5/7/9. The
+    // four branches are structurally identical: gate on slot presence,
+    // gate on BCODED[bj], gate on same-reference-frame, then either
+    // record (P=1, PBI=bj) or leave (P=0, PBI=undef).
+    let neigh = neighbors[bi as usize];
+    let mut p = [0u8; 4];
+    let mut pbi = [0u32; 4];
+
+    let slot_eval = |bj_opt: Option<u32>| -> Result<(u8, u32), Error> {
+        let bj = match bj_opt {
+            Some(bj) => bj,
+            None => return Ok((0, 0)),
+        };
+        if bj >= nbs_u32 {
+            return Err(Error::DcPredictorNeighborIndexOutOfRange { bj, nbs: nbs_u32 });
+        }
+        if bcoded[bj as usize] == 0 {
+            return Ok((0, 0));
+        }
+        let mbj = block_to_macro_block[bj as usize];
+        if mbj >= nmbs {
+            return Err(Error::DcPredictorMacroBlockIndexOutOfRange { mbi: mbj, nmbs });
+        }
+        if reference_frame_for_mb_mode(mbmodes[mbj as usize]) == rfi {
+            Ok((1, bj))
+        } else {
+            Ok((0, 0))
+        }
+    };
+
+    let (p0, pbi0) = slot_eval(neigh.left)?;
+    p[0] = p0;
+    pbi[0] = pbi0;
+    let (p1, pbi1) = slot_eval(neigh.lower_left)?;
+    p[1] = p1;
+    pbi[1] = pbi1;
+    let (p2, pbi2) = slot_eval(neigh.lower)?;
+    p[2] = p2;
+    pbi[2] = pbi2;
+    let (p3, pbi3) = slot_eval(neigh.lower_right)?;
+    p[3] = p3;
+    pbi[3] = pbi3;
+
+    // Step 11: no neighbour available → fall back to LASTDC[rfi].
+    let mask = p[0] | (p[1] << 1) | (p[2] << 2) | (p[3] << 3);
+    if mask == 0 {
+        return Ok(lastdc.get(rfi));
+    }
+
+    // Step 12: weighted sum with Table 7.47.
+    let weights = TABLE_7_47[(mask - 1) as usize];
+    let mut dcpred: i32 = 0;
+    for k in 0..4 {
+        if p[k] != 0 {
+            // Step 12(c..f): DCPRED += W[k] * COEFFS[PBI[k]][0].
+            let dc = coeffs[pbi[k] as usize][0] as i32;
+            dcpred = dcpred.wrapping_add(weights.w[k].wrapping_mul(dc));
+        }
+    }
+    // Step 12(g): DCPRED //= PDIV (truncated-toward-zero division).
+    // Both signs are possible; Rust's `/` already truncates toward
+    // zero for signed operands, matching the spec's `//` definition.
+    dcpred /= weights.pdiv;
+
+    // Step 12(h): outranging guard. Only fires when P[0], P[1], P[2]
+    // are all non-zero (the spec writes "If P[0], P[1], and P[2] are
+    // all non-zero" — P[3] is intentionally excluded).
+    if p[0] != 0 && p[1] != 0 && p[2] != 0 {
+        let dc0 = coeffs[pbi[0] as usize][0] as i32;
+        let dc1 = coeffs[pbi[1] as usize][0] as i32;
+        let dc2 = coeffs[pbi[2] as usize][0] as i32;
+        // 12(h)i: prefer DC2 when |DCPRED - DC2| > 128.
+        if (dcpred - dc2).abs() > 128 {
+            dcpred = dc2;
+        // 12(h)ii: otherwise prefer DC0 when |DCPRED - DC0| > 128.
+        } else if (dcpred - dc0).abs() > 128 {
+            dcpred = dc0;
+        // 12(h)iii: otherwise prefer DC1 when |DCPRED - DC1| > 128.
+        } else if (dcpred - dc1).abs() > 128 {
+            dcpred = dc1;
+        }
+    }
+
+    Ok(dcpred)
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -11862,6 +12352,462 @@ mod tests {
             format!("{}", Error::DctCoefficientBlockNotClosed { bi: 2, tis: 17 }),
         ] {
             assert!(s.contains("§7.7.3"), "missing §7.7.3 tag in: {s}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §7.8.1 Computing the DC Predictor — round 18 tests
+    // -----------------------------------------------------------------
+
+    /// Helper: build a 1-block coeffs array with the given DC value.
+    fn coeffs_with_dc(dcs: &[i16]) -> Vec<[i16; 64]> {
+        dcs.iter()
+            .map(|&dc| {
+                let mut row = [0i16; 64];
+                row[0] = dc;
+                row
+            })
+            .collect()
+    }
+
+    /// Table 7.46 — every coding mode maps to the spec-printed
+    /// reference-frame index.
+    #[test]
+    fn reference_frame_table_7_46_round_trip() {
+        use MacroBlockMode::*;
+        use ReferenceFrame::*;
+        let cases = [
+            (InterNoMv, Previous),
+            (Intra, None),
+            (InterMv, Previous),
+            (InterMvLast, Previous),
+            (InterMvLast2, Previous),
+            (InterGoldenNoMv, Golden),
+            (InterGoldenMv, Golden),
+            (InterMvFour, Previous),
+        ];
+        for (mode, rfi) in cases {
+            assert_eq!(reference_frame_for_mb_mode(mode), rfi);
+            assert_eq!(
+                rfi.index(),
+                match rfi {
+                    None => 0,
+                    Previous => 1,
+                    Golden => 2,
+                }
+            );
+        }
+    }
+
+    /// Table 7.47 — every non-zero `(P[0], P[1], P[2], P[3])` bitmask
+    /// returns the spec's weights/divisor. Spot-check a handful of
+    /// rows including the signed-weight entry and the all-ones row.
+    #[test]
+    fn table_7_47_known_rows() {
+        assert_eq!(dc_predictor_weights(0), None);
+        assert_eq!(
+            dc_predictor_weights(0b0001).unwrap(),
+            DcPredictorWeights {
+                w: [1, 0, 0, 0],
+                pdiv: 1
+            }
+        );
+        assert_eq!(
+            dc_predictor_weights(0b0111).unwrap(),
+            DcPredictorWeights {
+                w: [29, -26, 29, 0],
+                pdiv: 32
+            }
+        );
+        assert_eq!(
+            dc_predictor_weights(0b1001).unwrap(),
+            DcPredictorWeights {
+                w: [75, 0, 0, 53],
+                pdiv: 128
+            }
+        );
+        assert_eq!(
+            dc_predictor_weights(0b1110).unwrap(),
+            DcPredictorWeights {
+                w: [0, 3, 10, 3],
+                pdiv: 16
+            }
+        );
+        assert_eq!(
+            dc_predictor_weights(0b1111).unwrap(),
+            DcPredictorWeights {
+                w: [29, -26, 29, 0],
+                pdiv: 32
+            }
+        );
+        assert_eq!(dc_predictor_weights(16), None);
+    }
+
+    /// Step 11 fallback — when no neighbours qualify, the predictor
+    /// is `LASTDC[rfi]` for the current block's reference frame.
+    #[test]
+    fn dc_predictor_step_11_lastdc_fallback() {
+        let bcoded = vec![1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32];
+        let neighbors = vec![DcPredictorNeighbors::default()];
+        let mut lastdc = DcLastDc::zero();
+        lastdc.intra = 42;
+        lastdc.previous = -17;
+        lastdc.golden = 99;
+        let c = coeffs_with_dc(&[0]);
+        // Intra mode → rfi = None → LASTDC[0] = 42.
+        let dcpred =
+            compute_dc_predictor(0, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, 42);
+
+        // Repeat with InterGoldenMv → rfi = Golden → LASTDC[2] = 99.
+        let mbmodes2 = vec![MacroBlockMode::InterGoldenMv];
+        let dcpred =
+            compute_dc_predictor(0, &bcoded, &mbmodes2, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, 99);
+
+        // And with InterMv → rfi = Previous → LASTDC[1] = -17.
+        let mbmodes3 = vec![MacroBlockMode::InterMv];
+        let dcpred =
+            compute_dc_predictor(0, &bcoded, &mbmodes3, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, -17);
+    }
+
+    /// Single-left-neighbour predictor: P=0b0001 → DCPRED = W[0]*DC0
+    /// / PDIV = 1 * DC0 / 1 = DC0.
+    #[test]
+    fn dc_predictor_single_left_neighbour_copies_dc() {
+        // 2-block frame, both Intra, both coded. bi=1's left neighbour
+        // is bi=0 with DC=33.
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].left = Some(0);
+        let lastdc = DcLastDc::zero();
+        let c = coeffs_with_dc(&[33, 0]);
+        let dcpred =
+            compute_dc_predictor(1, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, 33);
+    }
+
+    /// Neighbour exists in the table but is not coded → P[k] stays
+    /// zero → falls through to step 11 LASTDC.
+    #[test]
+    fn dc_predictor_uncoded_neighbour_treated_as_absent() {
+        let bcoded = vec![0u8, 1u8]; // bi=0 uncoded; bi=1 coded.
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].left = Some(0);
+        let mut lastdc = DcLastDc::zero();
+        lastdc.intra = 7;
+        let c = coeffs_with_dc(&[999, 0]);
+        let dcpred =
+            compute_dc_predictor(1, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, 7, "uncoded neighbour must not contribute");
+    }
+
+    /// Neighbour is coded but uses a different reference frame →
+    /// same-rfi check zeros it out → fallback to LASTDC[rfi].
+    #[test]
+    fn dc_predictor_different_reference_frame_ignored() {
+        let bcoded = vec![1u8, 1u8];
+        // Two macroblocks, one Intra (rfi=None), one Golden (rfi=Golden).
+        let mbmodes = vec![MacroBlockMode::InterGoldenMv, MacroBlockMode::Intra];
+        // bi=0 in mb 0 (Golden), bi=1 in mb 1 (Intra).
+        let b2m = vec![0u32, 1u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].left = Some(0);
+        let mut lastdc = DcLastDc::zero();
+        lastdc.intra = -5;
+        let c = coeffs_with_dc(&[100, 0]);
+        // bi=1 is Intra (rfi=None); left neighbour bi=0 is Golden.
+        // RFI mismatch → P[0] = 0 → step 11 returns LASTDC[None] = -5.
+        let dcpred =
+            compute_dc_predictor(1, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, -5);
+    }
+
+    /// Three-neighbour case with P=0b0111 (L + DL + D) and signed
+    /// weights `[29, -26, 29]`, PDIV=32. Walks the full step 12
+    /// weighted-sum path including signed division.
+    #[test]
+    fn dc_predictor_three_neighbours_signed_weights() {
+        // 4-block frame, all Intra, all coded.
+        let bcoded = vec![1u8; 4];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 4];
+        // bi=3 has L=2, DL=0, D=1, DR=None.
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 4];
+        neighbors[3].left = Some(2);
+        neighbors[3].lower_left = Some(0);
+        neighbors[3].lower = Some(1);
+        let lastdc = DcLastDc::zero();
+        let c = coeffs_with_dc(&[10, 20, 30, 0]);
+        // P = 0b0111 → row [29, -26, 29, 0], PDIV=32.
+        // DCPRED = (29*30 + -26*10 + 29*20 + 0) / 32
+        //        = (870 - 260 + 580) / 32
+        //        = 1190 / 32 = 37 (truncated toward zero).
+        // Outranging guard fires (P[0]/P[1]/P[2] all set):
+        //   |37 - 20| = 17 ≤ 128 — skip DC2 swap.
+        //   |37 - 30| = 7 ≤ 128 — skip DC0 swap.
+        //   |37 - 10| = 27 ≤ 128 — skip DC1 swap.
+        // So DCPRED stays 37.
+        let dcpred =
+            compute_dc_predictor(3, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, 37);
+    }
+
+    /// The step 12(h) outranging guard fires when the weighted estimate
+    /// strays > 128 from one of the three full-neighbour DC values. The
+    /// spec orders the checks as DC2 → DC0 → DC1 (first match wins).
+    /// Here DCPRED is far from DC2 → swap to DC2 first.
+    #[test]
+    fn dc_predictor_outranging_prefers_dc2_first() {
+        let bcoded = vec![1u8; 4];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 4];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 4];
+        // PBI[0] = bi=2 (left), PBI[1] = bi=0 (DL), PBI[2] = bi=1 (D).
+        neighbors[3].left = Some(2);
+        neighbors[3].lower_left = Some(0);
+        neighbors[3].lower = Some(1);
+        let lastdc = DcLastDc::zero();
+        // coeffs[bi][0]: bi=0 → -500 (=DC1), bi=1 → 0 (=DC2),
+        // bi=2 → 100 (=DC0).
+        // DCPRED = 29*100 + -26*-500 + 29*0 = 2900 + 13000 = 15900.
+        // 15900 / 32 = 496 (truncated). |496-0|=496 > 128 → swap to
+        // DC2 = 0 first (spec checks DC2 before DC0 / DC1).
+        let c = coeffs_with_dc(&[-500, 0, 100, 0]);
+        let dcpred =
+            compute_dc_predictor(3, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, 0);
+    }
+
+    /// Outranging guard does NOT fire when the weighted estimate is
+    /// within 128 of all three neighbour DCs — DCPRED is returned
+    /// unchanged. This covers the no-swap path of step 12(h).
+    #[test]
+    fn dc_predictor_outranging_no_swap_in_range() {
+        let bcoded = vec![1u8; 4];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 4];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 4];
+        // PBI[0]=2 (left), PBI[1]=0 (DL), PBI[2]=1 (D).
+        neighbors[3].left = Some(2);
+        neighbors[3].lower_left = Some(0);
+        neighbors[3].lower = Some(1);
+        let lastdc = DcLastDc::zero();
+        // coeffs DC: bi=0 → 50, bi=1 → 50, bi=2 → 50.
+        // DC0=coeffs[2][0]=50, DC1=coeffs[0][0]=50, DC2=coeffs[1][0]=50.
+        // DCPRED = 29*50 + -26*50 + 29*50 = (29 - 26 + 29) * 50 = 1600.
+        // 1600 / 32 = 50. |50 - 50| = 0 for every guard branch → stays.
+        let c = coeffs_with_dc(&[50, 50, 50, 0]);
+        let dcpred =
+            compute_dc_predictor(3, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, 50);
+    }
+
+    /// Outranging guard is gated on P[0] && P[1] && P[2]; with only
+    /// P[0] + P[3] (mask 0b1001, weights [75, 0, 0, 53], PDIV=128)
+    /// the guard MUST NOT fire even if DCPRED ends up far from DC0.
+    #[test]
+    fn dc_predictor_outranging_skipped_when_p2_missing() {
+        // 4-block frame: bi=3 has L=0 and DR=2 only.
+        let bcoded = vec![1u8; 4];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 4];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 4];
+        neighbors[3].left = Some(0);
+        neighbors[3].lower_right = Some(2);
+        let lastdc = DcLastDc::zero();
+        // DC0=400, DC2=100. P[1]=P[2]=0, so guard skipped.
+        // 75*400 + 53*100 = 30000 + 5300 = 35300. / 128 = 275.
+        let c = coeffs_with_dc(&[400, 0, 100, 0]);
+        let dcpred =
+            compute_dc_predictor(3, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, 275, "guard MUST NOT fire when P[2]==0");
+    }
+
+    /// Negative DC values + spec's truncated-toward-zero `//` division.
+    /// P=0b0001 with DC0 = -7 → DCPRED = 1*-7 / 1 = -7 (exact).
+    /// With P=0b0010 weights `[0, 1, 0, 0]` PDIV=1 → DCPRED = DC1.
+    #[test]
+    fn dc_predictor_negative_dc_round_to_zero() {
+        let bcoded = vec![1u8; 2];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].lower_left = Some(0);
+        let lastdc = DcLastDc::zero();
+        let c = coeffs_with_dc(&[-7, 0]);
+        // bi=1 has only DL set → mask 0b0010 → weights [0,1,0,0] PDIV=1.
+        let dcpred =
+            compute_dc_predictor(1, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c).unwrap();
+        assert_eq!(dcpred, -7);
+    }
+
+    /// `bi >= nbs` rejects fail-closed.
+    #[test]
+    fn dc_predictor_rejects_bi_out_of_range() {
+        let bcoded = vec![1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32];
+        let neighbors = vec![DcPredictorNeighbors::default()];
+        let lastdc = DcLastDc::zero();
+        let c = coeffs_with_dc(&[0]);
+        match compute_dc_predictor(1, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c) {
+            Err(Error::DcPredictorBlockIndexOutOfRange { bi: 1, nbs: 1 }) => {}
+            other => panic!("expected DcPredictorBlockIndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// All three paired-length mismatches surface a typed reject with
+    /// the correct field discriminator.
+    #[test]
+    fn dc_predictor_rejects_paired_length_mismatches() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let lastdc = DcLastDc::zero();
+        let c = coeffs_with_dc(&[0, 0]);
+
+        // block_to_macro_block too short.
+        let b2m_short = vec![0u32];
+        let n2 = vec![DcPredictorNeighbors::default(); 2];
+        match compute_dc_predictor(0, &bcoded, &mbmodes, &b2m_short, &n2, &lastdc, &c) {
+            Err(Error::DcPredictorBcodedLenMismatch {
+                which: DcPredictorLenField::BlockToMacroBlock,
+                got: 1,
+                nbs: 2,
+            }) => {}
+            other => panic!("expected b2m mismatch, got {other:?}"),
+        }
+
+        // neighbors too long.
+        let b2m_ok = vec![0u32, 0u32];
+        let n_long = vec![DcPredictorNeighbors::default(); 3];
+        match compute_dc_predictor(0, &bcoded, &mbmodes, &b2m_ok, &n_long, &lastdc, &c) {
+            Err(Error::DcPredictorBcodedLenMismatch {
+                which: DcPredictorLenField::Neighbors,
+                got: 3,
+                nbs: 2,
+            }) => {}
+            other => panic!("expected neighbors mismatch, got {other:?}"),
+        }
+
+        // coeffs too short.
+        let c_short = coeffs_with_dc(&[0]);
+        let n_ok = vec![DcPredictorNeighbors::default(); 2];
+        match compute_dc_predictor(0, &bcoded, &mbmodes, &b2m_ok, &n_ok, &lastdc, &c_short) {
+            Err(Error::DcPredictorBcodedLenMismatch {
+                which: DcPredictorLenField::Coeffs,
+                got: 1,
+                nbs: 2,
+            }) => {}
+            other => panic!("expected coeffs mismatch, got {other:?}"),
+        }
+    }
+
+    /// `block_to_macro_block[bi] >= nmbs` and a neighbour's
+    /// `block_to_macro_block[bj] >= nmbs` both surface the
+    /// macro-block-index reject.
+    #[test]
+    fn dc_predictor_rejects_mb_index_out_of_range() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m_bad_current = vec![5u32, 0u32];
+        let neighbors = vec![DcPredictorNeighbors::default(); 2];
+        let lastdc = DcLastDc::zero();
+        let c = coeffs_with_dc(&[0, 0]);
+        match compute_dc_predictor(
+            0,
+            &bcoded,
+            &mbmodes,
+            &b2m_bad_current,
+            &neighbors,
+            &lastdc,
+            &c,
+        ) {
+            Err(Error::DcPredictorMacroBlockIndexOutOfRange { mbi: 5, nmbs: 1 }) => {}
+            other => panic!("expected MB OOR (current), got {other:?}"),
+        }
+
+        // Neighbour's MB index out of range.
+        let b2m_bad_nbr = vec![7u32, 0u32];
+        let mut n2 = vec![DcPredictorNeighbors::default(); 2];
+        n2[1].left = Some(0);
+        match compute_dc_predictor(1, &bcoded, &mbmodes, &b2m_bad_nbr, &n2, &lastdc, &c) {
+            Err(Error::DcPredictorMacroBlockIndexOutOfRange { mbi: 7, nmbs: 1 }) => {}
+            other => panic!("expected MB OOR (neighbour), got {other:?}"),
+        }
+    }
+
+    /// A neighbour slot pointing past `nbs` surfaces a typed reject.
+    #[test]
+    fn dc_predictor_rejects_neighbour_index_out_of_range() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].left = Some(99);
+        let lastdc = DcLastDc::zero();
+        let c = coeffs_with_dc(&[0, 0]);
+        match compute_dc_predictor(1, &bcoded, &mbmodes, &b2m, &neighbors, &lastdc, &c) {
+            Err(Error::DcPredictorNeighborIndexOutOfRange { bj: 99, nbs: 2 }) => {}
+            other => panic!("expected neighbour OOR, got {other:?}"),
+        }
+    }
+
+    /// `DcLastDc::get` / `set` round-trip across all three reference
+    /// frame slots independently.
+    #[test]
+    fn dc_lastdc_get_set_round_trip() {
+        let mut l = DcLastDc::zero();
+        assert_eq!(l.get(ReferenceFrame::None), 0);
+        assert_eq!(l.get(ReferenceFrame::Previous), 0);
+        assert_eq!(l.get(ReferenceFrame::Golden), 0);
+        l.set(ReferenceFrame::None, 11);
+        l.set(ReferenceFrame::Previous, 22);
+        l.set(ReferenceFrame::Golden, -33);
+        assert_eq!(l.get(ReferenceFrame::None), 11);
+        assert_eq!(l.get(ReferenceFrame::Previous), 22);
+        assert_eq!(l.get(ReferenceFrame::Golden), -33);
+        // Setting one slot doesn't disturb the others.
+        l.set(ReferenceFrame::Previous, 0);
+        assert_eq!(l.get(ReferenceFrame::None), 11);
+        assert_eq!(l.get(ReferenceFrame::Previous), 0);
+        assert_eq!(l.get(ReferenceFrame::Golden), -33);
+    }
+
+    /// `Display` rendering carries the §7.8.1 section tag for every
+    /// new error variant.
+    #[test]
+    fn dc_predictor_error_display_carries_section_tag() {
+        for s in [
+            format!(
+                "{}",
+                Error::DcPredictorBlockIndexOutOfRange { bi: 5, nbs: 3 }
+            ),
+            format!(
+                "{}",
+                Error::DcPredictorBcodedLenMismatch {
+                    which: DcPredictorLenField::Neighbors,
+                    got: 2,
+                    nbs: 4,
+                }
+            ),
+            format!(
+                "{}",
+                Error::DcPredictorMacroBlockIndexOutOfRange { mbi: 9, nmbs: 4 }
+            ),
+            format!(
+                "{}",
+                Error::DcPredictorNeighborIndexOutOfRange { bj: 99, nbs: 4 }
+            ),
+        ] {
+            assert!(s.contains("§7.8.1"), "missing §7.8.1 tag in: {s}");
         }
     }
 }

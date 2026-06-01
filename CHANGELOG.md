@@ -6,6 +6,27 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.8.2 Inverting the DC Prediction Process (round 19). New public
+  `invert_dc_prediction(bcoded, mbmodes, block_to_macro_block,
+  neighbors, plane_raster_order, coeffs) -> Result<(), Error>`
+  transcribing the full §7.8.2 procedure of the Xiph Theora I
+  Specification. Walks every plane (Y / Cb / Cr) and inside each
+  plane every block in raster order: resets the `LASTDC[0..=2]`
+  register file to zero at the start of each plane (step 1(a)–(c)),
+  recomputes the DC predictor via §7.8.1 for each coded block
+  (step 1(d)i.A), adds it to the residual `COEFFS[bi][0]`
+  (step 1(d)i.B), truncates to a 16-bit two's-complement
+  representation via `i32 -> i16 -> i32` narrowing (step 1(d)i.C),
+  writes the reconstructed DC back into `COEFFS[bi][0]`
+  (step 1(d)i.D), and seeds `LASTDC[rfi]` for the current macro
+  block's reference frame (steps 1(d)i.E–G). AC coefficients are
+  not touched. New `DcInversionLenField` discriminant covers the
+  three paired-length checks; four new error variants
+  (`DcInversionPlaneCount`, `DcInversionLenMismatch`,
+  `DcInversionBlockIndexOutOfRange`, `DcInversionDuplicateBlockIndex`)
+  reject malformed inputs. Inner §7.8.1 errors propagate unchanged.
+  Seventeen new tests (total 320).
+
 - §7.8.1 Computing the DC Predictor (round 18). New public
   `compute_dc_predictor(bi, bcoded, mbmodes, block_to_macro_block,
   neighbors, lastdc, coeffs) -> Result<i32, Error>` transcribing all

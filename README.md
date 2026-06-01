@@ -2,7 +2,7 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-06-01
+## Status — 2026-06-02
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter
 limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
@@ -10,8 +10,8 @@ limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
 long-/short-run bit strings + §7.3 coded-block-flags decode + §7.4
 macro-block coding modes + §7.5 motion-vector decode + §7.6 block-level
 qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
-§7.7.3 DCT coefficient decode driver + §7.8.1 DC predictor compute
-(rounds 1–18).** §6.1, §6.2
+§7.7.3 DCT coefficient decode driver + §7.8.1 DC predictor compute +
+§7.8.2 DC prediction inversion driver (rounds 1–19).** §6.1, §6.2
 (identification), §6.3 (comment), §6.4.5 step 1 (setup-header
 common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
 (Quantization Parameters Decode), §6.4.3 (Computing a Quantization
@@ -210,6 +210,32 @@ for every coded block) via two typed reject variants.
   `CoefficientTokenWouldOverflowBlock`) reject malformed inputs. The
   shared-reader chaining contract is preserved via a crate-private
   `decode_coefficient_token_inner`.
+* [`invert_dc_prediction`] — round 19 public §7.8.2 driver chaining
+  [`compute_dc_predictor`] over every coded block of the frame in
+  plane-local raster order. Walks `pli` from 0 to 2, resets the
+  `LASTDC` register file to `[0, 0, 0]` at the top of each plane
+  (steps 1(a)–(c)), and for each coded block calls §7.8.1 to form
+  the predictor against the freshly-updated DC values of earlier
+  raster neighbours (step 1(d)i.A), adds the predictor to the
+  residual `COEFFS[bi][0]` (step 1(d)i.B), truncates the sum to a
+  16-bit two's-complement representation via an `i32 → i16 → i32`
+  narrowing cast (step 1(d)i.C), writes the reconstructed DC back
+  into `COEFFS[bi][0]` (step 1(d)i.D), then seeds `LASTDC[rfi]` with
+  the new DC for the current macro block's reference frame
+  (steps 1(d)i.E–G). AC coefficients (indices 1..=63) are never
+  touched. The caller supplies `plane_raster_order: &[&[u32]]` (an
+  exact-3 array of plane slices, each listing the coded-order block
+  indices belonging to that plane in plane-local raster order); the
+  driver enforces that no coded-order index appears in two plane
+  slices via [`Error::DcInversionDuplicateBlockIndex`]. Four new
+  typed errors (`DcInversionPlaneCount`, `DcInversionLenMismatch`
+  with a [`DcInversionLenField`] discriminant for
+  `BlockToMacroBlock` / `Neighbors` / `Coeffs`,
+  `DcInversionBlockIndexOutOfRange`,
+  `DcInversionDuplicateBlockIndex`) reject malformed inputs; any
+  §7.8.1 error from the inner [`compute_dc_predictor`] propagates
+  unchanged. Operates in place on `coeffs: &mut [[i16; 64]]` so the
+  call site keeps the §7.7.3 output's allocation.
 * [`compute_dc_predictor`] — round 18 public §7.8.1 procedure
   returning the typed `DCPRED: i32` for a single block from up to four
   already-decoded neighbour DC values (left, lower-left, lower,
@@ -814,17 +840,90 @@ No video-data packet decode yet. [`register`] is still a no-op —
 `RuntimeContext` integration arrives once the codec can actually
 decode a frame.
 
+### §7.8.2 Inverting the DC Prediction Process (round 19)
+
+```rust
+pub fn invert_dc_prediction(
+    bcoded: &[u8],
+    mbmodes: &[MacroBlockMode],
+    block_to_macro_block: &[u32],
+    neighbors: &[DcPredictorNeighbors],
+    plane_raster_order: &[&[u32]],
+    coeffs: &mut [[i16; 64]],
+) -> Result<(), Error>;
+```
+
+The driver walks the three colour planes (Y, Cb, Cr) in order. At
+the start of each plane the `LASTDC` register file is reset to
+`[0, 0, 0]` (steps 1(a)–(c)). For every block of the plane in the
+caller-supplied raster ordering:
+
+1. If `BCODED[bi] == 0` the block is skipped (step 1(d)i's
+   non-zero gate is false).
+2. Otherwise step 1(d)i.A recomputes the DC predictor via
+   [`compute_dc_predictor`] against the freshly-updated DC values
+   of earlier raster neighbours. The neighbour table is the same
+   `&[DcPredictorNeighbors]` consumed by §7.8.1 and references
+   coded-order indices of blocks already visited in this plane.
+3. Step 1(d)i.B forms `DC = COEFFS[bi][0] + DCPRED` in `i32`.
+4. Step 1(d)i.C truncates `DC` to a 16-bit two's-complement
+   representation. The spec explicitly allows the raw sum to
+   exceed 16 bits ("Because it is possible to add a value as large
+   as 580 to the predicted DC coefficient value at every block …
+   the reconstructed DC value could overflow a 16-bit integer.
+   This is handled by truncating the result to a 16-bit signed
+   representation, simply throwing away any higher bits"). An
+   `i32 → i16 → i32` narrowing cast performs exactly this wrap
+   under Rust's well-defined two's-complement narrowing rules.
+5. Step 1(d)i.D writes the truncated DC back into
+   `COEFFS[bi][0]`. AC coefficients (indices 1..=63) are never
+   touched.
+6. Steps 1(d)i.E–G compute `mbi = block_to_macro_block[bi]`, look
+   up `rfi` via Table 7.46 ([`reference_frame_for_mb_mode`]), and
+   record `LASTDC[rfi] = DC` so the next coded block on this plane
+   can read it from the §7.8.1 step-11 fallback.
+
+The caller supplies the plane raster ordering as
+`plane_raster_order: &[&[u32]]` — a three-element slice (Y / Cb /
+Cr) of coded-order indices in plane-local raster order. The driver
+checks `plane_raster_order.len() == 3`
+([`Error::DcInversionPlaneCount`]), `bi < bcoded.len()` for every
+entry ([`Error::DcInversionBlockIndexOutOfRange`]), and (via a
+crate-private visit bitmap) that no coded-order index appears in
+more than one plane slice ([`Error::DcInversionDuplicateBlockIndex`]).
+Any §7.8.1 error returned by the inner [`compute_dc_predictor`]
+propagates unchanged so existing reject paths stay observable.
+
+Round 19 adds 17 new tests (total now 320): the all-uncoded
+short-circuit, the single-Intra-block reconstructed-DC path, the
+two-block left-chain showing `LASTDC[None]` flows from block 0 to
+block 1, the plane-boundary LASTDC reset (step 1(a)/(b)/(c) — second
+plane's first block must NOT pick up the first plane's reconstructed
+DC), the per-reference-frame `LASTDC[rfi]` index check (Intra →
+Previous → Golden each fresh), the 16-bit two's-complement wrap
+(`30_000 + 2_768 = 32_768 → -32_768`), the
+AC-coefficients-untouched assertion, the wrong-plane-count reject
+(2 and 4 plane slices), all three paired-length-mismatch rejects
+with the correct `DcInversionLenField` discriminator, the
+`bi >= nbs` plane-entry reject, the cross-plane duplicate-block
+reject citing the second-visit plane, the §7.8.1 inner-error
+propagation case (neighbour `bj >= nbs`), the three-planes-each-one-
+block independence check, the `NBS = 0` short-circuit, the
+§7.8.2-tag Display assertion for every new error variant, the
+left-chain accumulation across four blocks
+(`[+10, +20, +30, +40] → [10, 30, 60, 100]`), and the
+uncoded-intermediate-doesn't-reset-LASTDC case (uncoded blocks are
+visited for duplicate-tracking but leave `LASTDC[rfi]` unchanged).
+
 ## Roadmap
 
-* Next: §7.8.2 Inverting the DC Prediction Process — chains
-  [`compute_dc_predictor`] over every coded block in plane-local
-  raster order, updating `LASTDC[rfi]` and writing
-  `COEFFS[bi][0] = DC` after the 16-bit two's-complement truncation
-  step 1(d)i.C. Round 18 landed step 1's per-block DC predictor
-  helper as a standalone entry point; §7.8.2 chains it.
-* After §7.8.2: §7.9 reconstruction (inverse quantization, IDCT,
-  motion-compensated prediction) — the path to a first decoded
-  Theora frame.
+* Next: §7.9 Reconstruction — three-tier predictor (intra constant
+  128, whole-pixel motion compensation, half-pixel motion
+  compensation), inverse quantization against the §6.4.3 quant
+  matrices, the §7.9.3 IDCT, and the predictor + residual sum.
+  This is the path to a first decoded Theora frame.
+* After §7.9: §7.10 Loop Filter — deblocking applied with the
+  §6.4.1 LFLIMS table.
 
 ## Clean-room sources
 

@@ -741,6 +741,44 @@ pub enum Error {
         /// `bcoded.len()` (the contracted `nbs`).
         nbs: u32,
     },
+    /// [`invert_dc_prediction`] requires exactly three plane raster
+    /// orderings (one per Table 2.1 colour plane: Y, Cb, Cr); the
+    /// caller supplied a different count.
+    DcInversionPlaneCount {
+        /// Number of plane orderings the caller supplied.
+        got: usize,
+    },
+    /// A length-paired input to [`invert_dc_prediction`] did not match
+    /// the universal `nbs = bcoded.len()` size.
+    DcInversionLenMismatch {
+        /// Which slice failed the check.
+        which: DcInversionLenField,
+        /// Slice's actual length.
+        got: usize,
+        /// `bcoded.len()` (the contracted `nbs`).
+        nbs: usize,
+    },
+    /// An entry in one of the per-plane raster orderings exceeded the
+    /// universal `nbs` bound, so it cannot be used as a coded-order
+    /// block index.
+    DcInversionBlockIndexOutOfRange {
+        /// Plane index (`0`, `1`, or `2`).
+        pli: u8,
+        /// The offending coded-order block index.
+        bi: u32,
+        /// `bcoded.len()` (the contracted `nbs`).
+        nbs: u32,
+    },
+    /// The same coded-order block index appeared twice across the
+    /// three per-plane raster orderings. Each block belongs to a
+    /// single plane; visiting it twice would re-apply the DC
+    /// prediction inversion and corrupt subsequent reconstruction.
+    DcInversionDuplicateBlockIndex {
+        /// The duplicated coded-order index.
+        bi: u32,
+        /// The plane where the duplicate was observed.
+        pli: u8,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -781,6 +819,20 @@ pub enum DcPredictorLenField {
     Neighbors,
     /// The per-block 64-entry coefficient array
     /// `coeffs: &[[i16; 64]]`.
+    Coeffs,
+}
+
+/// Identifies which of the §7.8.2 length-paired inputs failed an
+/// [`Error::DcInversionLenMismatch`] check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DcInversionLenField {
+    /// The per-block macro-block lookup vector
+    /// `block_to_macro_block: &[u32]`.
+    BlockToMacroBlock,
+    /// The per-block neighbour table `neighbors: &[DcPredictorNeighbors]`.
+    Neighbors,
+    /// The per-block 64-entry coefficient array
+    /// `coeffs: &mut [[i16; 64]]`.
     Coeffs,
 }
 
@@ -1081,6 +1133,22 @@ impl core::fmt::Display for Error {
             Error::DcPredictorNeighborIndexOutOfRange { bj, nbs } => write!(
                 f,
                 "oxideav-theora: §7.8.1 neighbor bj={bj} >= nbs={nbs}"
+            ),
+            Error::DcInversionPlaneCount { got } => write!(
+                f,
+                "oxideav-theora: §7.8.2 expected 3 plane raster orderings (Table 2.1), got {got}"
+            ),
+            Error::DcInversionLenMismatch { which, got, nbs } => write!(
+                f,
+                "oxideav-theora: §7.8.2 input slice {which:?} length {got} != nbs {nbs}"
+            ),
+            Error::DcInversionBlockIndexOutOfRange { pli, bi, nbs } => write!(
+                f,
+                "oxideav-theora: §7.8.2 plane {pli} raster entry bi={bi} >= nbs={nbs}"
+            ),
+            Error::DcInversionDuplicateBlockIndex { bi, pli } => write!(
+                f,
+                "oxideav-theora: §7.8.2 coded-order block bi={bi} appears twice across planes (re-entered at plane {pli})"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -5319,6 +5387,176 @@ pub fn compute_dc_predictor(
     }
 
     Ok(dcpred)
+}
+
+// ----------------------------------------------------------------------
+// §7.8.2 Inverting the DC Prediction Process
+// ----------------------------------------------------------------------
+
+/// Invert the §7.8 DC prediction over every coded block of the frame
+/// (§7.8.2 of the Theora I Specification).
+///
+/// `COEFFS[bi][0]` arrives carrying a residual that was DC-predicted at
+/// encode time; this procedure adds back the predictor and writes the
+/// reconstructed DC value (truncated to a 16-bit two's-complement
+/// representation per §7.8.2 step 1(d)i.C) in place. AC coefficients
+/// (indices 1..=63) are not touched.
+///
+/// Iteration is plane-by-plane: for each colour plane the `LASTDC`
+/// register file is reset to `[0, 0, 0]` (step 1(a)–(c)) and each
+/// coded block of that plane is visited in raster order (step 1(d)).
+/// On every coded block the predictor is recomputed via §7.8.1 against
+/// the freshly-updated DC values of earlier raster neighbours, then
+/// the new DC is written back into `COEFFS[bi][0]` and recorded into
+/// `LASTDC[rfi]` (step 1(d)i.A–G).
+///
+/// # Inputs
+///
+/// * `bcoded` — NBS-element `BCODED` array (§7.3 output). `bcoded.len()`
+///   is the universal `nbs` size used for every paired slice.
+/// * `mbmodes` — NMBS-element `MBMODES` array (§7.4 output). Used by
+///   §7.8.1 and by step 1(d)i.F's `rfi` lookup.
+/// * `block_to_macro_block` — NBS-element `bi → mbi` lookup
+///   (caller-supplied, per-plane raster geometry).
+/// * `neighbors` — NBS-element [`DcPredictorNeighbors`] array
+///   (caller-supplied, also per-plane raster geometry). The neighbour
+///   slots reference coded-order indices of blocks that have already
+///   been visited in the current plane's raster pass.
+/// * `plane_raster_order` — three slices (Y, Cb, Cr) where each
+///   element lists the coded-order block indices belonging to that
+///   plane in plane-local raster order. Each block index must be `<
+///   nbs`; no index may appear in two different plane slices.
+/// * `coeffs` — NBS-element `[i16; 64]` array, updated in place.
+///   Only the DC slot (index `0`) of coded blocks is written.
+///
+/// # Errors
+///
+/// * [`Error::DcInversionPlaneCount`] if `plane_raster_order.len() != 3`.
+/// * [`Error::DcInversionLenMismatch`] if any of
+///   `block_to_macro_block` / `neighbors` / `coeffs` has a length other
+///   than `bcoded.len()`.
+/// * [`Error::DcInversionBlockIndexOutOfRange`] if any plane raster
+///   entry references a `bi >= nbs`.
+/// * [`Error::DcInversionDuplicateBlockIndex`] if a coded-order index
+///   appears in more than one plane's raster ordering.
+/// * Any error returned by [`compute_dc_predictor`] propagates.
+pub fn invert_dc_prediction(
+    bcoded: &[u8],
+    mbmodes: &[MacroBlockMode],
+    block_to_macro_block: &[u32],
+    neighbors: &[DcPredictorNeighbors],
+    plane_raster_order: &[&[u32]],
+    coeffs: &mut [[i16; 64]],
+) -> Result<(), Error> {
+    if plane_raster_order.len() != 3 {
+        return Err(Error::DcInversionPlaneCount {
+            got: plane_raster_order.len(),
+        });
+    }
+    let nbs = bcoded.len();
+    let nbs_u32 = nbs as u32;
+    if block_to_macro_block.len() != nbs {
+        return Err(Error::DcInversionLenMismatch {
+            which: DcInversionLenField::BlockToMacroBlock,
+            got: block_to_macro_block.len(),
+            nbs,
+        });
+    }
+    if neighbors.len() != nbs {
+        return Err(Error::DcInversionLenMismatch {
+            which: DcInversionLenField::Neighbors,
+            got: neighbors.len(),
+            nbs,
+        });
+    }
+    if coeffs.len() != nbs {
+        return Err(Error::DcInversionLenMismatch {
+            which: DcInversionLenField::Coeffs,
+            got: coeffs.len(),
+            nbs,
+        });
+    }
+
+    // Cross-plane duplicate-index guard. A block belongs to exactly one
+    // plane, so visiting it twice would re-add the predictor and
+    // double-truncate. We track visitation with a u8 bitmap rather than
+    // a HashSet to keep the helper allocation-bounded.
+    let mut visited = vec![0u8; nbs];
+
+    // Step 1: for each pli in 0..=2.
+    for (pli_usize, plane_blocks) in plane_raster_order.iter().enumerate() {
+        let pli = pli_usize as u8;
+        // Step 1(a)/(b)/(c): reset LASTDC[0..=2] to zero at the start of
+        // each plane.
+        let mut lastdc = DcLastDc::zero();
+
+        // Step 1(d): for each block of the plane in raster order.
+        for &bi in plane_blocks.iter() {
+            if bi >= nbs_u32 {
+                return Err(Error::DcInversionBlockIndexOutOfRange {
+                    pli,
+                    bi,
+                    nbs: nbs_u32,
+                });
+            }
+            if visited[bi as usize] != 0 {
+                return Err(Error::DcInversionDuplicateBlockIndex { bi, pli });
+            }
+            visited[bi as usize] = 1;
+
+            // Step 1(d)i: only coded blocks have a DC to invert.
+            if bcoded[bi as usize] == 0 {
+                continue;
+            }
+
+            // Step 1(d)i.A: recompute the DC predictor against the
+            // freshly-updated COEFFS state of earlier raster neighbours.
+            let dcpred = compute_dc_predictor(
+                bi,
+                bcoded,
+                mbmodes,
+                block_to_macro_block,
+                neighbors,
+                &lastdc,
+                coeffs,
+            )?;
+
+            // Step 1(d)i.B: DC = COEFFS[bi][0] + DCPRED.
+            let raw = (coeffs[bi as usize][0] as i32).wrapping_add(dcpred);
+
+            // Step 1(d)i.C: truncate to a 16-bit two's-complement
+            // representation. The spec calls out the wrap explicitly:
+            // because the predictor accumulates additions of up to 580
+            // per block, the raw sum can exceed the 16-bit range and is
+            // "truncated to a 16-bit signed representation, simply
+            // throwing away any higher bits". An `i32 -> i16 -> i32`
+            // cast does exactly that under Rust's well-defined
+            // two's-complement narrowing.
+            let dc = raw as i16 as i32;
+
+            // Step 1(d)i.D: COEFFS[bi][0] = DC.
+            coeffs[bi as usize][0] = dc as i16;
+
+            // Step 1(d)i.E: mbi = block_to_macro_block[bi]. compute_dc_
+            // predictor already validated the index for `bi`, but the
+            // direct lookup here would still need the bound — guard it.
+            let mbi = block_to_macro_block[bi as usize];
+            if (mbi as usize) >= mbmodes.len() {
+                return Err(Error::DcPredictorMacroBlockIndexOutOfRange {
+                    mbi,
+                    nmbs: mbmodes.len() as u32,
+                });
+            }
+
+            // Step 1(d)i.F: rfi = Table 7.46 column for MBMODES[mbi].
+            let rfi = reference_frame_for_mb_mode(mbmodes[mbi as usize]);
+
+            // Step 1(d)i.G: LASTDC[rfi] = DC.
+            lastdc.set(rfi, dc);
+        }
+    }
+
+    Ok(())
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -12809,5 +13047,402 @@ mod tests {
         ] {
             assert!(s.contains("§7.8.1"), "missing §7.8.1 tag in: {s}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §7.8.2 Inverting the DC Prediction Process — round 19 tests
+    // -----------------------------------------------------------------
+
+    /// All-zero `BCODED` frame: the driver visits every block (to
+    /// reject duplicates) but writes nothing because `BCODED[bi] == 0`
+    /// short-circuits step 1(d)i.
+    #[test]
+    fn dc_inversion_skips_uncoded_blocks() {
+        let bcoded = vec![0u8; 3];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 3];
+        let neighbors = vec![DcPredictorNeighbors::default(); 3];
+        let mut coeffs = coeffs_with_dc(&[42, 43, 44]);
+        let plane = [&[0u32][..], &[1u32][..], &[2u32][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        // No DC modified — every block stays at its input value.
+        assert_eq!(coeffs[0][0], 42);
+        assert_eq!(coeffs[1][0], 43);
+        assert_eq!(coeffs[2][0], 44);
+    }
+
+    /// Single coded Intra block with no neighbours: §7.8.1 step 11
+    /// returns `LASTDC[None] == 0`, so the residual is added to zero,
+    /// truncated to 16 bits, written back, and seeded into the LASTDC
+    /// register for any later block on this plane.
+    #[test]
+    fn dc_inversion_single_intra_block() {
+        let bcoded = vec![1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32];
+        let neighbors = vec![DcPredictorNeighbors::default()];
+        // Residual delta = 100.
+        let mut coeffs = coeffs_with_dc(&[100]);
+        let plane = [&[0u32][..], &[][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 100);
+    }
+
+    /// Two coded Intra blocks chained left → right: the second block's
+    /// raster-left neighbour is block 0, so its predictor picks up the
+    /// reconstructed DC of block 0 (40), and 40 + 7 = 47 is the
+    /// inverted DC for block 1.
+    #[test]
+    fn dc_inversion_two_block_lastdc_chain() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].left = Some(0);
+        // Residuals: block 0 delta = 40, block 1 delta = 7.
+        let mut coeffs = coeffs_with_dc(&[40, 7]);
+        let plane = [&[0u32, 1u32][..], &[][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        // Block 0: DCPRED=LASTDC[None]=0, DC=0+40=40.
+        assert_eq!(coeffs[0][0], 40);
+        // Block 1: §7.8.1 predicts DC=40 (single left neighbour),
+        // DC=40+7=47.
+        assert_eq!(coeffs[1][0], 47);
+    }
+
+    /// Step 1(a)/(b)/(c) — LASTDC resets to zero on each plane
+    /// transition. Two planes each with a single Intra block: the
+    /// second plane's LASTDC must not carry over from the first.
+    #[test]
+    fn dc_inversion_lastdc_resets_between_planes() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let neighbors = vec![DcPredictorNeighbors::default(); 2];
+        // Both residuals are large; if LASTDC carried over, block 1
+        // would be predicted from block 0's reconstructed DC even
+        // across a plane boundary. With a fresh LASTDC at the plane
+        // boundary, block 1's predictor is 0 → DC = 0 + 200 = 200.
+        let mut coeffs = coeffs_with_dc(&[300, 200]);
+        let plane = [&[0u32][..], &[1u32][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 300);
+        assert_eq!(coeffs[1][0], 200);
+    }
+
+    /// Step 1(d)i.G — `LASTDC[rfi]` updates pick the right slot for
+    /// the current macro block's coding mode. Three blocks on the
+    /// same plane: Intra → Previous → Golden, all with no spatial
+    /// neighbours, so each predictor is the prior `LASTDC[rfi]` (zero
+    /// for the first hit on each slot).
+    #[test]
+    fn dc_inversion_lastdc_indexed_by_reference_frame() {
+        let bcoded = vec![1u8; 3];
+        let mbmodes = vec![
+            MacroBlockMode::Intra,         // rfi = None
+            MacroBlockMode::InterMv,       // rfi = Previous
+            MacroBlockMode::InterGoldenMv, // rfi = Golden
+        ];
+        let b2m = vec![0u32, 1u32, 2u32];
+        let neighbors = vec![DcPredictorNeighbors::default(); 3];
+        let mut coeffs = coeffs_with_dc(&[11, 22, 33]);
+        let plane = [&[0u32, 1u32, 2u32][..], &[][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        // All three predictors fall back to LASTDC[rfi] = 0 (each rfi
+        // is fresh on first visit within this plane).
+        assert_eq!(coeffs[0][0], 11);
+        assert_eq!(coeffs[1][0], 22);
+        assert_eq!(coeffs[2][0], 33);
+    }
+
+    /// Step 1(d)i.C — DC values exceeding the 16-bit signed range wrap
+    /// around per two's-complement truncation. A residual that pushes
+    /// the sum to 32_768 wraps to -32_768.
+    #[test]
+    fn dc_inversion_truncates_to_16_bit_signed() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].left = Some(0);
+        // Block 0: input DC = 30_000 (no neighbours, so reconstructed
+        // = 30_000). Block 1: input DC = 2_768 + predictor 30_000 =
+        // 32_768, which wraps to -32_768.
+        let mut coeffs = coeffs_with_dc(&[30_000, 2_768]);
+        let plane = [&[0u32, 1u32][..], &[][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 30_000);
+        assert_eq!(coeffs[1][0], -32_768);
+    }
+
+    /// AC coefficients (indices 1..=63) are never touched by §7.8.2 —
+    /// only the DC slot (index 0) is updated.
+    #[test]
+    fn dc_inversion_does_not_touch_ac_coefficients() {
+        let bcoded = vec![1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32];
+        let neighbors = vec![DcPredictorNeighbors::default()];
+        let mut coeffs = vec![[0i16; 64]];
+        coeffs[0][0] = 5;
+        coeffs[0][1] = 7;
+        coeffs[0][32] = -11;
+        coeffs[0][63] = 99;
+        let plane = [&[0u32][..], &[][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 5, "DC updated");
+        assert_eq!(coeffs[0][1], 7, "AC[1] untouched");
+        assert_eq!(coeffs[0][32], -11, "AC[32] untouched");
+        assert_eq!(coeffs[0][63], 99, "AC[63] untouched");
+    }
+
+    /// `plane_raster_order.len() != 3` rejects with a typed error.
+    #[test]
+    fn dc_inversion_rejects_wrong_plane_count() {
+        let bcoded = vec![1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32];
+        let neighbors = vec![DcPredictorNeighbors::default()];
+        let mut coeffs = coeffs_with_dc(&[0]);
+        let plane2 = [&[0u32][..], &[][..]];
+        match invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane2, &mut coeffs) {
+            Err(Error::DcInversionPlaneCount { got: 2 }) => {}
+            other => panic!("expected DcInversionPlaneCount, got {other:?}"),
+        }
+        let plane4 = [&[0u32][..], &[][..], &[][..], &[][..]];
+        match invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane4, &mut coeffs) {
+            Err(Error::DcInversionPlaneCount { got: 4 }) => {}
+            other => panic!("expected DcInversionPlaneCount, got {other:?}"),
+        }
+    }
+
+    /// Each of `block_to_macro_block`, `neighbors`, and `coeffs` is
+    /// rejected with the right field discriminator when it doesn't
+    /// match `bcoded.len()`.
+    #[test]
+    fn dc_inversion_rejects_len_mismatch() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let neighbors = vec![DcPredictorNeighbors::default(); 2];
+        let mut coeffs = coeffs_with_dc(&[0, 0]);
+        let plane = [&[0u32, 1u32][..], &[][..], &[][..]];
+        // block_to_macro_block too short.
+        let b2m_short = vec![0u32];
+        match invert_dc_prediction(
+            &bcoded,
+            &mbmodes,
+            &b2m_short,
+            &neighbors,
+            &plane,
+            &mut coeffs,
+        ) {
+            Err(Error::DcInversionLenMismatch {
+                which: DcInversionLenField::BlockToMacroBlock,
+                got: 1,
+                nbs: 2,
+            }) => {}
+            other => panic!("expected BlockToMacroBlock mismatch, got {other:?}"),
+        }
+        // neighbors too short.
+        let b2m_ok = vec![0u32, 0u32];
+        let neighbors_short = vec![DcPredictorNeighbors::default()];
+        match invert_dc_prediction(
+            &bcoded,
+            &mbmodes,
+            &b2m_ok,
+            &neighbors_short,
+            &plane,
+            &mut coeffs,
+        ) {
+            Err(Error::DcInversionLenMismatch {
+                which: DcInversionLenField::Neighbors,
+                got: 1,
+                nbs: 2,
+            }) => {}
+            other => panic!("expected Neighbors mismatch, got {other:?}"),
+        }
+        // coeffs too long.
+        let mut coeffs_long = coeffs_with_dc(&[0, 0, 0]);
+        match invert_dc_prediction(
+            &bcoded,
+            &mbmodes,
+            &b2m_ok,
+            &neighbors,
+            &plane,
+            &mut coeffs_long,
+        ) {
+            Err(Error::DcInversionLenMismatch {
+                which: DcInversionLenField::Coeffs,
+                got: 3,
+                nbs: 2,
+            }) => {}
+            other => panic!("expected Coeffs mismatch, got {other:?}"),
+        }
+    }
+
+    /// A plane raster ordering that references `bi >= nbs` rejects
+    /// with the right `(pli, bi)` pair surfaced.
+    #[test]
+    fn dc_inversion_rejects_block_index_oor() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 2];
+        let neighbors = vec![DcPredictorNeighbors::default(); 2];
+        let mut coeffs = coeffs_with_dc(&[0, 0]);
+        let plane = [
+            &[0u32][..],
+            &[5u32][..], // 5 >= nbs=2
+            &[1u32][..],
+        ];
+        match invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs) {
+            Err(Error::DcInversionBlockIndexOutOfRange {
+                pli: 1,
+                bi: 5,
+                nbs: 2,
+            }) => {}
+            other => panic!("expected DcInversionBlockIndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// Same coded-order index in two plane slices rejects with a
+    /// duplicate error citing the second-visit plane.
+    #[test]
+    fn dc_inversion_rejects_duplicate_block_index() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let neighbors = vec![DcPredictorNeighbors::default(); 2];
+        let mut coeffs = coeffs_with_dc(&[0, 0]);
+        let plane = [&[0u32, 1u32][..], &[1u32][..], &[][..]];
+        match invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs) {
+            Err(Error::DcInversionDuplicateBlockIndex { bi: 1, pli: 1 }) => {}
+            other => panic!("expected DcInversionDuplicateBlockIndex, got {other:?}"),
+        }
+    }
+
+    /// §7.8.1 errors propagate from the §7.8.2 driver. Here a
+    /// neighbour `bj >= nbs` should surface unchanged.
+    #[test]
+    fn dc_inversion_propagates_inner_predictor_error() {
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].left = Some(99); // > nbs
+        let mut coeffs = coeffs_with_dc(&[0, 0]);
+        let plane = [&[0u32, 1u32][..], &[][..], &[][..]];
+        match invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs) {
+            Err(Error::DcPredictorNeighborIndexOutOfRange { bj: 99, nbs: 2 }) => {}
+            other => panic!("expected inner DcPredictor error to propagate, got {other:?}"),
+        }
+    }
+
+    /// Three planes, three blocks (one per plane). Each plane's
+    /// LASTDC is independent, and visiting one plane doesn't disturb
+    /// the others.
+    #[test]
+    fn dc_inversion_three_planes_independent() {
+        let bcoded = vec![1u8; 3];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 3];
+        let neighbors = vec![DcPredictorNeighbors::default(); 3];
+        // Each plane has exactly one block; nothing carries over.
+        let mut coeffs = coeffs_with_dc(&[7, 13, 19]);
+        let plane = [&[0u32][..], &[1u32][..], &[2u32][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 7);
+        assert_eq!(coeffs[1][0], 13);
+        assert_eq!(coeffs[2][0], 19);
+    }
+
+    /// Empty NBS=0 frame: every length check passes vacuously, no
+    /// per-plane iteration body runs.
+    #[test]
+    fn dc_inversion_nbs_zero_short_circuits() {
+        let bcoded: Vec<u8> = vec![];
+        let mbmodes: Vec<MacroBlockMode> = vec![];
+        let b2m: Vec<u32> = vec![];
+        let neighbors: Vec<DcPredictorNeighbors> = vec![];
+        let mut coeffs: Vec<[i16; 64]> = vec![];
+        let plane = [&[][..], &[][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert!(coeffs.is_empty());
+    }
+
+    /// `Display` rendering carries the §7.8.2 section tag for every
+    /// new error variant.
+    #[test]
+    fn dc_inversion_error_display_carries_section_tag() {
+        for s in [
+            format!("{}", Error::DcInversionPlaneCount { got: 4 }),
+            format!(
+                "{}",
+                Error::DcInversionLenMismatch {
+                    which: DcInversionLenField::Coeffs,
+                    got: 5,
+                    nbs: 3,
+                }
+            ),
+            format!(
+                "{}",
+                Error::DcInversionBlockIndexOutOfRange {
+                    pli: 2,
+                    bi: 100,
+                    nbs: 5,
+                }
+            ),
+            format!(
+                "{}",
+                Error::DcInversionDuplicateBlockIndex { bi: 7, pli: 1 }
+            ),
+        ] {
+            assert!(s.contains("§7.8.2"), "missing §7.8.2 tag in: {s}");
+        }
+    }
+
+    /// Long chain of left-neighbour blocks: each block's predictor is
+    /// the previous reconstructed DC, so the residual stream
+    /// `[+10, +20, +30, +40]` reconstructs to `[10, 30, 60, 100]`.
+    #[test]
+    fn dc_inversion_long_left_chain_accumulates() {
+        let bcoded = vec![1u8; 4];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 4];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 4];
+        neighbors[1].left = Some(0);
+        neighbors[2].left = Some(1);
+        neighbors[3].left = Some(2);
+        let mut coeffs = coeffs_with_dc(&[10, 20, 30, 40]);
+        let plane = [&[0u32, 1u32, 2u32, 3u32][..], &[][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 10);
+        assert_eq!(coeffs[1][0], 30);
+        assert_eq!(coeffs[2][0], 60);
+        assert_eq!(coeffs[3][0], 100);
+    }
+
+    /// Mixed coded/uncoded blocks in a single plane raster ordering:
+    /// uncoded blocks are still visited (for duplicate-tracking) but
+    /// don't update LASTDC. The next coded block's predictor must
+    /// therefore still pick up the prior coded DC, not zero.
+    #[test]
+    fn dc_inversion_uncoded_intermediate_does_not_reset_lastdc() {
+        // Three blocks, all Intra: [coded, uncoded, coded]. Block 2's
+        // left neighbour is block 1 (uncoded, so P[0]=0), so step 11
+        // returns LASTDC[None] which equals block 0's reconstructed
+        // DC = 50. With residual 7 → 50 + 7 = 57.
+        let bcoded = vec![1u8, 0u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 3];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 3];
+        neighbors[2].left = Some(1);
+        let mut coeffs = coeffs_with_dc(&[50, 999, 7]);
+        let plane = [&[0u32, 1u32, 2u32][..], &[][..], &[][..]];
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 50);
+        // Uncoded block 1's DC slot is unchanged.
+        assert_eq!(coeffs[1][0], 999);
+        // Block 2: LASTDC[None] picks up block 0's 50, plus residual 7.
+        assert_eq!(coeffs[2][0], 57);
     }
 }

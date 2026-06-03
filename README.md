@@ -2,7 +2,7 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-06-02
+## Status — 2026-06-03
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter
 limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
@@ -11,7 +11,8 @@ long-/short-run bit strings + §7.3 coded-block-flags decode + §7.4
 macro-block coding modes + §7.5 motion-vector decode + §7.6 block-level
 qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
 §7.7.3 DCT coefficient decode driver + §7.8.1 DC predictor compute +
-§7.8.2 DC prediction inversion driver (rounds 1–19).** §6.1, §6.2
+§7.8.2 DC prediction inversion driver + §7.9.2 dequantization
+(rounds 1–20).** §6.1, §6.2
 (identification), §6.3 (comment), §6.4.5 step 1 (setup-header
 common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
 (Quantization Parameters Decode), §6.4.3 (Computing a Quantization
@@ -236,6 +237,30 @@ for every coded block) via two typed reject variants.
   §7.8.1 error from the inner [`compute_dc_predictor`] propagates
   unchanged. Operates in place on `coeffs: &mut [[i16; 64]]` so the
   call site keeps the §7.7.3 output's allocation.
+* [`dequantize_block`] / [`dequantize_block_from_params`] — round 20
+  public §7.9.2 procedure. Takes a single block's zig-zag-order
+  `[i16; 64]` (the §7.8.2 output) plus the precomputed DC and AC
+  quantization matrices (§6.4.3 outputs for `(qti, pli, qi0)` and
+  `(qti, pli, qi)` respectively) and returns the natural-order
+  dequantized `[i16; 64]` (`DQC`). Step 2 sets `DQC[0] =
+  trunc16(COEFFS[bi][0] * QMAT_DC[0])`; step 6 walks `ci` from 1 to 63,
+  reads the zig-zag position `zzi` via the new public
+  `ZIGZAG_NATURAL_TO_ZIGZAG: [u8; 64]` table (a row-by-row flattening
+  of Figure 2.8), and sets `DQC[ci] = trunc16(COEFFS[bi][zzi] *
+  QMAT_AC[ci])`. The §7.9.2 narrative explicitly anticipates the
+  16-bit truncation ("If large coefficient values are decoded for
+  coarsely quantized coefficients, the resulting dequantized value can
+  be significantly larger than 16 bits"); Rust's `i32 → i16 → i32`
+  narrowing performs the spec's "discarding the higher-order bits"
+  under well-defined two's-complement semantics. The two-matrix split
+  honours §7.6's per-block `qii` selector, which lets the per-block AC
+  `qi` differ from the frame-wide DC `qi0`. The `_from_params`
+  convenience form takes the spec's `(qti, pli, qi0, qi)` selector
+  directly and propagates any §6.4.3 validation error
+  (`qti > 1`, `pli > 2`, or `qi > 63`); production callers will
+  amortise the §6.4.3 work over multiple blocks sharing the same
+  `(qti, pli, qi)` by passing pre-built matrices into `dequantize_block`
+  directly, per the §7.9.2 narrative's efficiency note.
 * [`compute_dc_predictor`] — round 18 public §7.8.1 procedure
   returning the typed `DCPRED: i32` for a single block from up to four
   already-decoded neighbour DC values (left, lower-left, lower,

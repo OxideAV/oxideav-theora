@@ -6,6 +6,27 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.9.2 Dequantization (round 20). New public `dequantize_block(
+  coeffs_zz, qmat_dc, qmat_ac) -> [i16; 64]` transcribing steps 2–6
+  of §7.9.2 of the Theora I Specification: scales `COEFFS[bi][0]` by
+  `QMAT_DC[0]` for the DC term, then for each natural-order
+  coefficient `ci in 1..=63` maps `ci` to its zig-zag index `zzi` via
+  Figure 2.8 (the new `ZIGZAG_NATURAL_TO_ZIGZAG: [u8; 64]` constant)
+  and scales `COEFFS[bi][zzi]` by `QMAT_AC[ci]`. Both products are
+  truncated to a signed 16-bit two's-complement representation per
+  the spec's "discarding the higher-order bits" rule via Rust's
+  well-defined `i32 -> i16 -> i32` narrowing. Convenience helper
+  `dequantize_block_from_params(coeffs_zz, params, qti, pli, qi0,
+  qi)` builds both quantization matrices inline via §6.4.3 to match
+  the §7.9.2 input list verbatim; production callers will typically
+  pre-build the at-most-six per-plane matrices and pass them into
+  `dequantize_block` directly, per the §7.9.2 narrative's efficiency
+  note. Eighteen new tests (zig-zag permutation invariants, DC/AC
+  multiplication, ci-vs-zzi addressing, signed coefficient handling,
+  16-bit overflow truncation, params-driven matrix construction,
+  error propagation for `qti > 1` / `pli > 2` / `qi > 63`,
+  independent `qi0`/`qi` selection) — total 338.
+
 - §7.8.2 Inverting the DC Prediction Process (round 19). New public
   `invert_dc_prediction(bcoded, mbmodes, block_to_macro_block,
   neighbors, plane_raster_order, coeffs) -> Result<(), Error>`

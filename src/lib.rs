@@ -5559,6 +5559,141 @@ pub fn invert_dc_prediction(
     Ok(())
 }
 
+/// Mapping from natural-order DCT coefficient index `ci` (row-major,
+/// `row = ci/8`, `col = ci%8`) to its zig-zag position `zzi`, per
+/// Figure 2.8 ("Zig-zag order") of the Theora I Specification.
+///
+/// §7.9.2 step 6(a) instructs the implementer to read this mapping
+/// off Figure 2.8 at row `ci // 8` and column `ci % 8`; this table
+/// flattens the figure row-by-row so that
+/// `ZIGZAG_NATURAL_TO_ZIGZAG[ci]` is the zig-zag index that
+/// corresponds to natural-order `ci`.
+///
+/// The mapping is its own self-consistency check: it is a permutation
+/// of `0..=63`, with `ZIGZAG_NATURAL_TO_ZIGZAG[0] == 0` (the DC term
+/// is at zig-zag index 0).
+pub const ZIGZAG_NATURAL_TO_ZIGZAG: [u8; 64] = [
+    // Row 0 (ci = 0..=7).
+    0, 1, 5, 6, 14, 15, 27, 28, // Row 1 (ci = 8..=15).
+    2, 4, 7, 13, 16, 26, 29, 42, // Row 2 (ci = 16..=23).
+    3, 8, 12, 17, 25, 30, 41, 43, // Row 3 (ci = 24..=31).
+    9, 11, 18, 24, 31, 40, 44, 53, // Row 4 (ci = 32..=39).
+    10, 19, 23, 32, 39, 45, 52, 54, // Row 5 (ci = 40..=47).
+    20, 22, 33, 38, 46, 51, 55, 60, // Row 6 (ci = 48..=55).
+    21, 34, 37, 47, 50, 56, 59, 61, // Row 7 (ci = 56..=63).
+    35, 36, 48, 49, 57, 58, 62, 63,
+];
+
+/// Dequantize a single block's quantized DCT coefficients per §7.9.2
+/// ("Dequantization") of the Theora I Specification.
+///
+/// This consumes a §7.8.2 output — a 64-element zig-zag-order `i16`
+/// array `COEFFS[bi]` with the DC term already restored from
+/// predictive coding — and emits a 64-element natural-order `i16`
+/// array `DQC` where each entry has been scaled by the matching
+/// quantization-matrix entry.
+///
+/// The DC term is scaled by `qmat_dc[0]` and the AC terms by
+/// `qmat_ac[1..=63]`. The spec separates DC and AC because §7.6
+/// allows the per-block `qii` index to select an AC `qi` distinct
+/// from the frame-wide DC `qi0`, so the two matrices may differ
+/// per-block. When `qi0 == qi`, callers may pass the same matrix
+/// for both.
+///
+/// The procedure (§7.9.2 steps 2–4 and 6):
+///
+/// 1. `DQC[0]` = `(COEFFS[bi][0] * qmat_dc[0])` truncated to a
+///    signed 16-bit two's-complement representation by discarding
+///    the higher-order bits.
+/// 2. For each natural-order `ci` in `1..=63`, locate the
+///    corresponding zig-zag index `zzi = ZIGZAG_NATURAL_TO_ZIGZAG[ci]`
+///    and set `DQC[ci] = (COEFFS[bi][zzi] * qmat_ac[ci])`, again
+///    truncated to a signed 16-bit two's-complement representation.
+///
+/// The §7.9.2 narrative explicitly anticipates the truncation:
+/// "If large coefficient values are decoded for coarsely quantized
+/// coefficients, the resulting dequantized value can be
+/// significantly larger than 16 bits. Such a coefficient is truncated
+/// to a signed 16-bit representation by discarding the higher-order
+/// bits of its two's-complement representation." Rust's
+/// `i32 -> i16 -> i32` narrowing performs that drop under
+/// well-defined two's-complement semantics.
+///
+/// The matrices are precomputed by callers to amortise the §6.4.3
+/// work over multiple blocks sharing the same `(qti, pli, qi)`
+/// selector — the §7.9.2 narrative notes "Although this procedure
+/// recomputes the quantization matrices ... for each block, there
+/// are at most six different ones used for each color plane. An
+/// efficient implementation could compute them once in advance."
+/// Callers consult [`compute_quantization_matrix`] for `qmat_dc`
+/// with `(qti, pli, qi0)` and for `qmat_ac` with `(qti, pli, qi)`.
+///
+/// See [`dequantize_block_from_params`] for the convenience form
+/// that takes `(qti, pli, qi0, qi)` and builds the matrices inline.
+///
+/// This function does not return errors: it takes fixed-size inputs
+/// and produces a fixed-size output. Mis-wiring is prevented by the
+/// type system rather than runtime checks.
+pub fn dequantize_block(
+    coeffs_zz: &[i16; 64],
+    qmat_dc: &QuantizationMatrix,
+    qmat_ac: &QuantizationMatrix,
+) -> [i16; 64] {
+    let mut dqc = [0i16; 64];
+
+    // Steps 2–4: DC term. The product widens to i32 to hold the
+    // exact value before the i16 narrowing. `qmat_dc[0]` is in
+    // `1..=4096` (§6.4.3 step 6(e)) so the multiplication has at
+    // most |i16::MIN| * 4096 = 2^15 * 2^12 = 2^27 magnitude, which
+    // fits in i32 with margin.
+    let prod_dc = (coeffs_zz[0] as i32).wrapping_mul(qmat_dc.values[0] as i32);
+    // Step 3 truncation: cast to i16 to drop the high bits, then
+    // store. The cast is the two's-complement narrowing the spec
+    // calls for.
+    dqc[0] = prod_dc as i16;
+
+    // Step 6: AC terms ci = 1..=63 in natural order. Read
+    // COEFFS[bi][zzi] via Figure 2.8 then multiply by qmat_ac[ci].
+    for ci in 1usize..=63 {
+        let zzi = ZIGZAG_NATURAL_TO_ZIGZAG[ci] as usize;
+        let prod = (coeffs_zz[zzi] as i32).wrapping_mul(qmat_ac.values[ci] as i32);
+        dqc[ci] = prod as i16;
+    }
+
+    dqc
+}
+
+/// Convenience wrapper around [`dequantize_block`] that builds the
+/// `QMAT_DC` and `QMAT_AC` matrices from a setup-header
+/// [`QuantizationParameters`] and the per-block `(qti, pli, qi0, qi)`
+/// selector, matching the §7.9.2 input list verbatim.
+///
+/// Step 1 of §7.9.2 builds the DC matrix from `(qti, pli, qi0)`;
+/// step 5 builds the AC matrix from `(qti, pli, qi)`. The two share
+/// the same `qti` (the block's coding-type) and `pli` (the block's
+/// plane) — only `qi` differs.
+///
+/// Most callers driving a frame's reconstruction will instead
+/// pre-build the at-most-six per-plane matrices and pass them into
+/// [`dequantize_block`] directly, per the §7.9.2 efficiency note.
+/// This wrapper exists so individual blocks can be dequantized
+/// against the spec's exact input list (e.g. for unit tests).
+///
+/// Returns any error propagated by [`compute_quantization_matrix`]
+/// (`qti > 1`, `pli > 2`, or `qi > 63`).
+pub fn dequantize_block_from_params(
+    coeffs_zz: &[i16; 64],
+    params: &QuantizationParameters,
+    qti: usize,
+    pli: usize,
+    qi0: usize,
+    qi: usize,
+) -> Result<[i16; 64], Error> {
+    let qmat_dc = compute_quantization_matrix(params, qti, pli, qi0)?;
+    let qmat_ac = compute_quantization_matrix(params, qti, pli, qi)?;
+    Ok(dequantize_block(coeffs_zz, &qmat_dc, &qmat_ac))
+}
+
 /// MSb-first bit reader implementing §5.2 of the Theora I
 /// Specification.
 ///
@@ -13444,5 +13579,311 @@ mod tests {
         assert_eq!(coeffs[1][0], 999);
         // Block 2: LASTDC[None] picks up block 0's 50, plus residual 7.
         assert_eq!(coeffs[2][0], 57);
+    }
+
+    // ---- §7.9.2 Dequantization --------------------------------------
+
+    /// Build a [`QuantizationMatrix`] whose entries are all the same
+    /// `v`. Used to drive [`dequantize_block`] when the test only
+    /// exercises the multiplication / truncation logic.
+    fn flat_qmat(v: u16) -> QuantizationMatrix {
+        QuantizationMatrix { values: [v; 64] }
+    }
+
+    /// Build a [`QuantizationMatrix`] whose entry `ci` is `seed + ci`
+    /// (clamped to fit `u16`). Used to confirm that step 6 indexes
+    /// `qmat_ac[ci]` and not, say, `qmat_ac[zzi]`.
+    fn ramp_qmat(seed: u16) -> QuantizationMatrix {
+        let mut values = [0u16; 64];
+        for (ci, slot) in values.iter_mut().enumerate() {
+            *slot = seed.saturating_add(ci as u16).max(1);
+        }
+        QuantizationMatrix { values }
+    }
+
+    #[test]
+    fn zigzag_natural_to_zigzag_is_a_permutation_of_0_63() {
+        // Figure 2.8 must be a bijection on 0..=63; any duplicate or
+        // omitted slot would corrupt § 7.9.2 step 6.
+        let mut seen = [false; 64];
+        for &zzi in ZIGZAG_NATURAL_TO_ZIGZAG.iter() {
+            assert!((zzi as usize) < 64, "zzi {zzi} out of range");
+            assert!(!seen[zzi as usize], "zzi {zzi} appeared twice");
+            seen[zzi as usize] = true;
+        }
+        for (idx, &b) in seen.iter().enumerate() {
+            assert!(b, "zzi {idx} not produced by any ci");
+        }
+    }
+
+    #[test]
+    fn zigzag_natural_to_zigzag_dc_is_zero() {
+        // §7.9.2 step 2 reads COEFFS[bi][0] as the DC term, which by
+        // construction is at zig-zag index 0; Figure 2.8 confirms the
+        // top-left cell (row 0, col 0) is zzi=0.
+        assert_eq!(ZIGZAG_NATURAL_TO_ZIGZAG[0], 0);
+    }
+
+    #[test]
+    fn zigzag_natural_to_zigzag_matches_figure_2_8_corners() {
+        // Spot-check the four corners of Figure 2.8 against the
+        // tabulated rendering: (0,0)=0, (0,7)=28, (7,0)=35, (7,7)=63.
+        // Spelled-out indices match the (row*8 + col) addressing the
+        // text uses but written as final ci to keep clippy happy.
+        let (row0_col0, row0_col7, row7_col0, row7_col7) = (0, 7, 56, 63);
+        assert_eq!(ZIGZAG_NATURAL_TO_ZIGZAG[row0_col0], 0);
+        assert_eq!(ZIGZAG_NATURAL_TO_ZIGZAG[row0_col7], 28);
+        assert_eq!(ZIGZAG_NATURAL_TO_ZIGZAG[row7_col0], 35);
+        assert_eq!(ZIGZAG_NATURAL_TO_ZIGZAG[row7_col7], 63);
+    }
+
+    #[test]
+    fn dequantize_block_scales_dc_by_qmat_dc_slot_zero() {
+        // §7.9.2 steps 2–4: DQC[0] = COEFFS[bi][0] * QMAT_DC[0] truncated
+        // to i16. With COEFFS[bi][0]=10 and QMAT_DC[0]=8 the product
+        // 80 fits within i16 so no truncation occurs.
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 10;
+        let qdc = flat_qmat(8);
+        let qac = flat_qmat(1);
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+        assert_eq!(dqc[0], 80);
+    }
+
+    #[test]
+    fn dequantize_block_scales_each_ac_by_qmat_ac_at_natural_index() {
+        // §7.9.2 step 6: for ci in 1..=63, DQC[ci] = COEFFS[bi][zzi] *
+        // QMAT_AC[ci]. We seed COEFFS at each zig-zag slot with value 1
+        // and check DQC[ci] == QMAT_AC[ci] (i.e. the AC matrix is
+        // indexed by ci, not zzi).
+        let mut coeffs = [0i16; 64];
+        for &zzi in ZIGZAG_NATURAL_TO_ZIGZAG.iter() {
+            coeffs[zzi as usize] = 1;
+        }
+        let qdc = flat_qmat(7);
+        let qac = ramp_qmat(10);
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+
+        // DC: COEFFS[0]*qdc[0] = 1*7 = 7.
+        assert_eq!(dqc[0], 7);
+
+        // AC: DQC[ci] = qac[ci] = 10 + ci for ci in 1..=63.
+        for (ci, (&got, &want)) in dqc.iter().zip(qac.values.iter()).enumerate().skip(1) {
+            assert_eq!(got, want as i16, "ci={ci}");
+        }
+    }
+
+    #[test]
+    fn dequantize_block_zig_zag_remap_routes_coeffs_correctly() {
+        // Place a distinctive non-1 value at zig-zag slot zzi=5 (which
+        // is Figure 2.8 cell (row 0, col 2), so natural ci=2) and zero
+        // elsewhere. Every other DQC[ci] for ci != 2 must come out 0;
+        // DQC[2] must be COEFFS[5] * QMAT_AC[2].
+        let mut coeffs = [0i16; 64];
+        coeffs[5] = 9;
+        let qdc = flat_qmat(1);
+        let mut qac_values = [1u16; 64];
+        qac_values[2] = 17;
+        let qac = QuantizationMatrix { values: qac_values };
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+
+        for (ci, &got) in dqc.iter().enumerate() {
+            let expected: i16 = if ci == 2 { 9 * 17 } else { 0 };
+            assert_eq!(got, expected, "ci={ci}");
+        }
+    }
+
+    #[test]
+    fn dequantize_block_dc_negative_coefficient_is_signed() {
+        // The COEFFS DC term is signed; check that a negative residual
+        // gives a negative DQC.
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = -3;
+        let qdc = flat_qmat(11);
+        let qac = flat_qmat(1);
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+        assert_eq!(dqc[0], -33);
+    }
+
+    #[test]
+    fn dequantize_block_ac_negative_coefficient_is_signed() {
+        // Likewise for an AC slot.
+        let mut coeffs = [0i16; 64];
+        // ci=3 maps to zzi=3 per Figure 2.8 (row 0, col 4 -> wait,
+        // ci=3 is row 0 col 3 -> zzi=6). Use the table directly to
+        // avoid confusion.
+        let zzi = ZIGZAG_NATURAL_TO_ZIGZAG[3] as usize;
+        coeffs[zzi] = -7;
+        let qdc = flat_qmat(1);
+        let mut qac_values = [1u16; 64];
+        qac_values[3] = 5;
+        let qac = QuantizationMatrix { values: qac_values };
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+        assert_eq!(dqc[3], -35);
+    }
+
+    #[test]
+    fn dequantize_block_truncates_dc_overflow_to_i16() {
+        // §7.9.2 step 3: when COEFFS[0]*QMAT_DC[0] exceeds the signed
+        // 16-bit range, the spec mandates truncation by dropping the
+        // higher-order bits of its two's-complement representation.
+        //
+        // COEFFS[0] = 1000, QMAT_DC[0] = 4096 -> product 4,096,000.
+        // In two's-complement: 4_096_000 = 0x003E_8000; dropping the
+        // top 16 bits leaves 0x8000 = -32768 (i16).
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 1000;
+        let qdc = flat_qmat(4096);
+        let qac = flat_qmat(1);
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+        assert_eq!(dqc[0], -32768);
+    }
+
+    #[test]
+    fn dequantize_block_truncates_ac_overflow_to_i16() {
+        // Same truncation rule for an AC slot at ci=1.
+        //
+        // COEFFS at zzi (Figure 2.8 ci=1 -> zzi=1) = 200, QMAT_AC[1]
+        // = 4096 -> product 819_200 = 0x000C_8000; dropping the top
+        // 16 bits leaves 0x8000 = -32768 (i16).
+        let zzi = ZIGZAG_NATURAL_TO_ZIGZAG[1] as usize;
+        let mut coeffs = [0i16; 64];
+        coeffs[zzi] = 200;
+        let qdc = flat_qmat(1);
+        let mut qac_values = [1u16; 64];
+        qac_values[1] = 4096;
+        let qac = QuantizationMatrix { values: qac_values };
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+        assert_eq!(dqc[1], -32768);
+    }
+
+    #[test]
+    fn dequantize_block_all_zero_input_yields_all_zero_output() {
+        // Sanity check: a zero residual block has no contribution
+        // regardless of the quantization matrices.
+        let coeffs = [0i16; 64];
+        let qdc = flat_qmat(4096);
+        let qac = ramp_qmat(4000);
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+        assert_eq!(dqc, [0i16; 64]);
+    }
+
+    #[test]
+    fn dequantize_block_independent_dc_and_ac_matrices() {
+        // §7.6 lets the per-block AC `qi` differ from the frame-wide
+        // DC `qi0`, so callers may supply mismatched (qmat_dc,
+        // qmat_ac). The function must honour both independently.
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 5;
+        coeffs[ZIGZAG_NATURAL_TO_ZIGZAG[1] as usize] = 7;
+        let qdc = flat_qmat(13);
+        let mut qac_values = [1u16; 64];
+        qac_values[1] = 9;
+        let qac = QuantizationMatrix { values: qac_values };
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+        // DC term scaled by qdc[0]=13: 5*13=65.
+        assert_eq!(dqc[0], 65);
+        // AC term ci=1 scaled by qac[1]=9: 7*9=63.
+        assert_eq!(dqc[1], 63);
+    }
+
+    #[test]
+    fn dequantize_block_from_params_builds_both_matrices() {
+        // Drive the full §7.9.2 input list: a flat single-range params
+        // table with bm[ci]=10 for every ci, scale 100, gives
+        // QMAT_DC = QMAT_AC = 10*4 = 40 (qmin clamped to 8 floors when
+        // smaller, but 40 > 8).
+        //
+        // With COEFFS[0]=2 and a single AC seed of 3 at zzi=1, DQC[0]
+        // = 2*40 = 80 and DQC[1] = 3*40 = 120.
+        let params = single_range_params(vec![[10u8; 64]; 2], 0, 1, 100, 100);
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 2;
+        coeffs[ZIGZAG_NATURAL_TO_ZIGZAG[1] as usize] = 3;
+        let dqc = dequantize_block_from_params(
+            &coeffs, &params, /*qti*/ 0, /*pli*/ 0, /*qi0*/ 30, /*qi*/ 30,
+        )
+        .expect("qti,pli,qi all in range");
+        assert_eq!(dqc[0], 80);
+        assert_eq!(dqc[1], 120);
+        // All other slots remain zero.
+        for (ci, &got) in dqc.iter().enumerate().skip(2) {
+            assert_eq!(got, 0, "ci={ci}");
+        }
+    }
+
+    #[test]
+    fn dequantize_block_from_params_propagates_qti_oor() {
+        // §7.9.2 borrows §6.4.3's `qti` validation; passing qti=2
+        // (only 0/1 are defined) must surface as the §6.4.3 error.
+        let params = single_range_params(vec![[10u8; 64]; 2], 0, 1, 100, 100);
+        let coeffs = [0i16; 64];
+        let err = dequantize_block_from_params(&coeffs, &params, 2, 0, 0, 0).unwrap_err();
+        assert_eq!(err, Error::QuantTypeIndexOutOfRange { qti: 2 });
+    }
+
+    #[test]
+    fn dequantize_block_from_params_propagates_pli_oor() {
+        let params = single_range_params(vec![[10u8; 64]; 2], 0, 1, 100, 100);
+        let coeffs = [0i16; 64];
+        let err = dequantize_block_from_params(&coeffs, &params, 0, 3, 0, 0).unwrap_err();
+        assert_eq!(err, Error::QuantPlaneIndexOutOfRange { pli: 3 });
+    }
+
+    #[test]
+    fn dequantize_block_from_params_propagates_qi0_oor() {
+        // DC matrix builds first; qi0 OOR surfaces as the §6.4.3 error
+        // on that build before the AC matrix is even attempted.
+        let params = single_range_params(vec![[10u8; 64]; 2], 0, 1, 100, 100);
+        let coeffs = [0i16; 64];
+        let err = dequantize_block_from_params(&coeffs, &params, 0, 0, 64, 0).unwrap_err();
+        assert_eq!(err, Error::QuantIndexOutOfRange { qi: 64 });
+    }
+
+    #[test]
+    fn dequantize_block_from_params_propagates_qi_oor() {
+        // AC matrix builds second; qi OOR surfaces after the DC build
+        // succeeded.
+        let params = single_range_params(vec![[10u8; 64]; 2], 0, 1, 100, 100);
+        let coeffs = [0i16; 64];
+        let err = dequantize_block_from_params(&coeffs, &params, 0, 0, 0, 99).unwrap_err();
+        assert_eq!(err, Error::QuantIndexOutOfRange { qi: 99 });
+    }
+
+    #[test]
+    fn dequantize_block_from_params_independent_qi0_and_qi() {
+        // Same `(qti, pli)` but distinct qi0 / qi values should select
+        // different quantizers when the scale tables differ.
+        let mut ac_scale = [100u16; 64];
+        let mut dc_scale = [100u16; 64];
+        ac_scale[20] = 200;
+        dc_scale[10] = 300;
+        let mut qrsizes = [[[0u8; 63]; 3]; 2];
+        let mut qrbmis = [[[0u16; 64]; 3]; 2];
+        for qti in 0..2 {
+            for pli in 0..3 {
+                qrsizes[qti][pli][0] = 63;
+                qrbmis[qti][pli][0] = 0;
+                qrbmis[qti][pli][1] = 0;
+            }
+        }
+        let params = QuantizationParameters {
+            ac_scale,
+            dc_scale,
+            num_base_matrices: 1,
+            base_matrices: vec![[10u8; 64]],
+            num_quant_ranges: [[1u8; 3]; 2],
+            quant_range_sizes: qrsizes,
+            quant_range_base_matrix_indices: qrbmis,
+        };
+
+        // qi0 = 10: DC scale 300 -> qmat_dc[0] = (300*10/100)*4 = 120.
+        // qi  = 20: AC scale 200 -> qmat_ac[ci] = (200*10/100)*4 = 80.
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 1;
+        coeffs[ZIGZAG_NATURAL_TO_ZIGZAG[5] as usize] = 1;
+        let dqc = dequantize_block_from_params(&coeffs, &params, 0, 0, 10, 20).expect("in range");
+        assert_eq!(dqc[0], 120);
+        assert_eq!(dqc[5], 80);
     }
 }

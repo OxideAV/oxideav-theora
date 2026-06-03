@@ -779,6 +779,34 @@ pub enum Error {
         /// The plane where the duplicate was observed.
         pli: u8,
     },
+    /// A §7.9.1.2 / §7.9.1.3 predictor call was given a reference
+    /// plane whose flattened buffer length does not match
+    /// `rpw * rph`. The spec consumes `REFP` as a `RPH × RPW`
+    /// 2D array; the flat slice must be exactly that many pixels.
+    ReferencePlaneLenMismatch {
+        /// Slice's actual length.
+        got: usize,
+        /// Expected length (`rpw * rph`).
+        expected: usize,
+    },
+    /// `RPW` or `RPH` was zero in a §7.9.1.2 / §7.9.1.3 predictor
+    /// call. The clamping rules (`> RPH − 1`, `< 0`) require a
+    /// non-empty reference plane to have at least one sample to
+    /// clamp to.
+    ReferencePlaneZeroDimension {
+        /// `RPW`.
+        rpw: u32,
+        /// `RPH`.
+        rph: u32,
+    },
+    /// `RPW * RPH` overflowed `usize` when validating the §7.9.1.2 /
+    /// §7.9.1.3 reference-plane slice length.
+    ReferencePlaneDimensionsOverflow {
+        /// `RPW`.
+        rpw: u32,
+        /// `RPH`.
+        rph: u32,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -1149,6 +1177,18 @@ impl core::fmt::Display for Error {
             Error::DcInversionDuplicateBlockIndex { bi, pli } => write!(
                 f,
                 "oxideav-theora: §7.8.2 coded-order block bi={bi} appears twice across planes (re-entered at plane {pli})"
+            ),
+            Error::ReferencePlaneLenMismatch { got, expected } => write!(
+                f,
+                "oxideav-theora: §7.9.1 reference-plane slice length {got} != rpw*rph {expected}"
+            ),
+            Error::ReferencePlaneZeroDimension { rpw, rph } => write!(
+                f,
+                "oxideav-theora: §7.9.1 reference plane has zero dimension (rpw={rpw}, rph={rph})"
+            ),
+            Error::ReferencePlaneDimensionsOverflow { rpw, rph } => write!(
+                f,
+                "oxideav-theora: §7.9.1 reference-plane dimensions overflow usize (rpw={rpw}, rph={rph})"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -5692,6 +5732,347 @@ pub fn dequantize_block_from_params(
     let qmat_dc = compute_quantization_matrix(params, qti, pli, qi0)?;
     let qmat_ac = compute_quantization_matrix(params, qti, pli, qi)?;
     Ok(dequantize_block(coeffs_zz, &qmat_dc, &qmat_ac))
+}
+
+/// A reference-frame plane consumed by the §7.9.1.2 / §7.9.1.3
+/// inter predictors.
+///
+/// The Theora I Specification §7.9.1.2 describes `REFP` as a
+/// `RPH × RPW` two-dimensional array of 8-bit unsigned samples
+/// (the reference frame's current colour plane, sized in pixels —
+/// not macro-blocks). This typed wrapper carries the dimensions
+/// alongside a flat row-major slice so the predictors can index it
+/// without a separate `(width, height)` parameter pair.
+///
+/// Pixels are indexed as `samples[ry * rpw + rx]` with `rx` in
+/// `0..rpw` and `ry` in `0..rph`. Theora reference frames are
+/// stored as the contents of the previous decoded frame's
+/// reconstruction (rounded to 8-bit) of the matching colour plane.
+///
+/// The reference plane consumed for an inter-coded block is the
+/// **previous** decoded frame's plane for `Previous` reference
+/// frames (`InterMv`, `InterMvLast`, `InterMvLast2`, `InterNoMv`,
+/// `InterMvFour`) and the **golden** frame's plane for `Golden`
+/// reference frames (`InterGoldenMv`, `InterGoldenNoMv`). Intra
+/// blocks do not consult `REFP`; they use [`compute_intra_predictor`]
+/// instead.
+#[derive(Debug, Clone, Copy)]
+pub struct ReferencePlane<'a> {
+    /// Reference-plane width in pixels (`RPW`, §7.9.1.2 input).
+    pub rpw: u32,
+    /// Reference-plane height in pixels (`RPH`, §7.9.1.2 input).
+    pub rph: u32,
+    /// Row-major samples (length `rpw * rph`).
+    pub samples: &'a [u8],
+}
+
+impl<'a> ReferencePlane<'a> {
+    /// Build a typed reference-plane view, validating that the flat
+    /// `samples` slice exactly matches `rpw * rph` and that both
+    /// dimensions are non-zero.
+    ///
+    /// Returns:
+    /// * [`Error::ReferencePlaneZeroDimension`] if either dimension
+    ///   is zero (the clamping rules in §7.9.1.2 step 1(b) — "If
+    ///   `ry` is greater than `(RPH − 1)`, assign `ry` the value
+    ///   `(RPH − 1)`" — require at least one row of samples).
+    /// * [`Error::ReferencePlaneDimensionsOverflow`] if `rpw * rph`
+    ///   would overflow `usize`.
+    /// * [`Error::ReferencePlaneLenMismatch`] if `samples.len()`
+    ///   does not match the product.
+    pub fn new(rpw: u32, rph: u32, samples: &'a [u8]) -> Result<Self, Error> {
+        if rpw == 0 || rph == 0 {
+            return Err(Error::ReferencePlaneZeroDimension { rpw, rph });
+        }
+        let expected = (rpw as usize)
+            .checked_mul(rph as usize)
+            .ok_or(Error::ReferencePlaneDimensionsOverflow { rpw, rph })?;
+        if samples.len() != expected {
+            return Err(Error::ReferencePlaneLenMismatch {
+                got: samples.len(),
+                expected,
+            });
+        }
+        Ok(Self { rpw, rph, samples })
+    }
+
+    /// Read a single sample at `(rx, ry)` after applying §7.9.1.2
+    /// edge clamping (`(rx, ry)` projected back into the valid
+    /// `[0, RPW − 1] × [0, RPH − 1]` window). Both coordinates use
+    /// `i32` so the upstream `BX + MVX + bx` sum can be evaluated in
+    /// signed arithmetic without overflow.
+    #[inline]
+    fn read_clamped(&self, rx: i32, ry: i32) -> u8 {
+        let rx_clamped = rx.clamp(0, (self.rpw as i32) - 1);
+        let ry_clamped = ry.clamp(0, (self.rph as i32) - 1);
+        // Both rx_clamped and ry_clamped are now in valid bounds, so
+        // the cast to usize and the flat index are well-defined.
+        let idx = (ry_clamped as usize) * (self.rpw as usize) + (rx_clamped as usize);
+        self.samples[idx]
+    }
+}
+
+/// Compute the §7.9.1.1 intra predictor: an 8×8 block of the constant
+/// value 128.
+///
+/// The Theora I Specification §7.9.1.1 ("The Intra Predictor") prose:
+///
+/// > The intra predictor is nothing more than the constant value
+/// > 128. This is applied for the sole purpose of centering the
+/// > range of possible DC values for INTRA blocks around zero.
+///
+/// The procedure (§7.9.1.1 step 1) walks `by` from 0 to 7 inclusive,
+/// and for each `bx` from 0 to 7 inclusive assigns
+/// `PRED[by][bx] = 128`. This function returns the result as a
+/// row-major `[[u8; 8]; 8]` array, indexed `pred[by][bx]` to match
+/// the spec notation.
+///
+/// The predictor is fixed and takes no inputs. Callers add the
+/// 64-element dequantized residual `DQC` (output of the §7.9.3
+/// inverse DCT) to this constant grid to recover the reconstructed
+/// intra block.
+pub fn compute_intra_predictor() -> [[u8; 8]; 8] {
+    // Step 1: `for by in 0..=7 { for bx in 0..=7 { PRED[by][bx] = 128 } }`.
+    // The literal-128 fill is the entire procedure — no branching,
+    // no inputs, no clamping. Rust's value initialisation produces
+    // the same 64-byte tile.
+    [[128u8; 8]; 8]
+}
+
+/// Compute the §7.9.1.2 whole-pixel predictor: copy an 8×8 block out
+/// of the reference frame at the location pointed to by a whole-pixel
+/// motion vector, clamping the indices to the reference plane's edges.
+///
+/// Per §7.9.1.2 the procedure:
+///
+/// 1. For each `by` from 0 to 7 inclusive:
+///    (a) Assign `ry = BY + MVY + by`.
+///    (b) If `ry > RPH − 1`, assign `ry = RPH − 1`.
+///    (c) If `ry < 0`, assign `ry = 0`.
+///    (d) For each `bx` from 0 to 7 inclusive:
+///    i.   `rx = BX + MVX + bx`.
+///    ii.  If `rx > RPW − 1`, assign `rx = RPW − 1`.
+///    iii. If `rx < 0`, assign `rx = 0`.
+///    iv.  `PRED[by][bx] = REFP[ry][rx]`.
+///
+/// `bx` / `by` (§7.9.1.2 "Variables used") are typed as `Yes` signed
+/// in the §7.9.1.2 table because the per-component sums can be
+/// negative before clamping; we widen to `i32` for the arithmetic and
+/// clamp via [`ReferencePlane::read_clamped`].
+///
+/// Inputs:
+/// * `refp` — the reference frame's current plane.
+/// * `bx_origin` (`BX`) — horizontal pixel index of the block's
+///   lower-left corner in the reference plane.
+/// * `by_origin` (`BY`) — vertical pixel index of the block's
+///   lower-left corner in the reference plane.
+/// * `mv` — the motion vector. Both components must be whole-pixel
+///   values; the predictor itself does not enforce this (the §7.9.4
+///   driver decides which of §7.9.1.2 / §7.9.1.3 applies).
+///
+/// Returns the 8×8 predictor tile `PRED[by][bx]` as `[[u8; 8]; 8]`.
+///
+/// `BX` / `BY` are `u32` (the spec writes "20-bit unsigned") but the
+/// implementation widens to `i32` because the per-coordinate sums
+/// `BY + MVY + by` can be negative for blocks near the upper or left
+/// edge with negative MVs. The widening is bounds-safe because the
+/// largest legal `BX` from a 1920×1088 (or even the §6.2 ceiling)
+/// frame, plus a `+31` MV and a `+7` block index, fits in 21 bits.
+pub fn compute_whole_pixel_predictor(
+    refp: &ReferencePlane<'_>,
+    bx_origin: u32,
+    by_origin: u32,
+    mv: MotionVector,
+) -> [[u8; 8]; 8] {
+    let mut pred = [[0u8; 8]; 8];
+    // Widen origins to i32 so signed sums work. The spec's RPW/RPH
+    // top-end is 2^20 - 1 < 2^31; BX + MVX + bx peaks at ~2^21 with
+    // ample margin.
+    let bx0 = bx_origin as i32;
+    let by0 = by_origin as i32;
+    let mvx = mv.x as i32;
+    let mvy = mv.y as i32;
+
+    // Step 1: by from 0..=7. The spec's "for each by" wraps the per-
+    // row clamping then the inner bx loop.
+    for by in 0i32..=7 {
+        // Step 1(a)-(c): compute ry and clamp it into [0, RPH-1].
+        // `read_clamped` folds the clamping into the sample read so
+        // we only pay it once per (rx, ry) pair.
+        let ry = by0 + mvy + by;
+        // Step 1(d): bx from 0..=7.
+        for bx in 0i32..=7 {
+            let rx = bx0 + mvx + bx;
+            // Step 1(d)iv: PRED[by][bx] = REFP[ry][rx] with the
+            // step 1(d)ii / 1(d)iii (rx clamping) and the
+            // step 1(b) / 1(c) (ry clamping) applied inside.
+            pred[by as usize][bx as usize] = refp.read_clamped(rx, ry);
+        }
+    }
+
+    pred
+}
+
+/// Compute the §7.9.1.3 half-pixel predictor: average two whole-pixel
+/// reads of the reference frame, one for each "decomposed" motion
+/// vector, truncating the sum toward negative infinity.
+///
+/// Per §7.9.1.3 ("The Half-Pixel Predictor"):
+///
+/// > If one or both of the components of the block motion vector is
+/// > not a whole-pixel value, then the half-pixel predictor is used.
+/// > The half-pixel predictor converts the fractional motion vector
+/// > into two whole-pixel motion vectors. The first is formed by
+/// > truncating the values of each component towards zero, and the
+/// > second is formed by truncating them away from zero. The
+/// > contributions from the reference frame at the locations pointed
+/// > to by each vector are averaged, truncating towards negative
+/// > infinity.
+///
+/// The procedure (§7.9.1.3 step 1) walks `by` from 0 to 7, fetches
+/// the (rx1, ry1) / (rx2, ry2) reference samples with the same edge
+/// clamping as §7.9.1.2, and stores
+/// `PRED[by][bx] = (REFP[ry1][rx1] + REFP[ry2][rx2]) >> 1`.
+///
+/// The §7.9.1.3 narrative notes "Only two samples from the reference
+/// frame contribute to each predictor value, even if both components
+/// of the motion vector have non-zero fractional components. Motion
+/// vector components with quarter-pixel accuracy in the chroma planes
+/// are treated exactly the same as those with half-pixel accuracy.
+/// Any non-zero fractional part gets rounded one way in the first
+/// vector, and the other way in the second."
+///
+/// The right-shift `>> 1` on `u16` (the sum width) is an unsigned
+/// shift, matching the spec's "truncating towards negative infinity"
+/// (the sum is non-negative because both samples are non-negative
+/// 8-bit unsigned).
+///
+/// Inputs:
+/// * `refp` — the reference frame's current plane.
+/// * `bx_origin` (`BX`) — horizontal pixel index of the block's
+///   lower-left corner in the reference plane.
+/// * `by_origin` (`BY`) — vertical pixel index of the block's
+///   lower-left corner in the reference plane.
+/// * `mv1` — the first whole-pixel motion vector (rounded toward
+///   zero).
+/// * `mv2` — the second whole-pixel motion vector (rounded away
+///   from zero).
+///
+/// Returns the 8×8 predictor tile `PRED[by][bx]` as `[[u8; 8]; 8]`.
+pub fn compute_half_pixel_predictor(
+    refp: &ReferencePlane<'_>,
+    bx_origin: u32,
+    by_origin: u32,
+    mv1: MotionVector,
+    mv2: MotionVector,
+) -> [[u8; 8]; 8] {
+    let mut pred = [[0u8; 8]; 8];
+    let bx0 = bx_origin as i32;
+    let by0 = by_origin as i32;
+    let mvx1 = mv1.x as i32;
+    let mvy1 = mv1.y as i32;
+    let mvx2 = mv2.x as i32;
+    let mvy2 = mv2.y as i32;
+
+    // Step 1: by from 0..=7.
+    for by in 0i32..=7 {
+        // Steps 1(a)-(c) for ry1, 1(d)-(f) for ry2. Folded into the
+        // clamped reads below.
+        let ry1 = by0 + mvy1 + by;
+        let ry2 = by0 + mvy2 + by;
+        // Step 1(g): bx from 0..=7.
+        for bx in 0i32..=7 {
+            // Steps 1(g)i..vi: compute and clamp both rx values, then
+            // the read in step 1(g)vii.
+            let rx1 = bx0 + mvx1 + bx;
+            let rx2 = bx0 + mvx2 + bx;
+            let s1 = refp.read_clamped(rx1, ry1) as u16;
+            let s2 = refp.read_clamped(rx2, ry2) as u16;
+            // Step 1(g)vii: PRED[by][bx] = (s1 + s2) >> 1. The sum
+            // peaks at 2 * 255 = 510 < 2^16; the >> 1 is the spec's
+            // "truncate towards negative infinity" (the sum is
+            // non-negative).
+            pred[by as usize][bx as usize] = ((s1 + s2) >> 1) as u8;
+        }
+    }
+
+    pred
+}
+
+/// Helper for the §7.9.4 reconstruction driver: split a single motion
+/// vector with possibly fractional components into the two whole-pixel
+/// vectors the §7.9.1.3 predictor consumes.
+///
+/// The §7.9.1.3 narrative says "The first is formed by truncating the
+/// values of each component towards zero, and the second is formed by
+/// truncating them away from zero." For a Theora motion vector
+/// `(MVX, MVY)` in `-31..=31` (§7.5.1 codings) the §7.9.4 driver halves
+/// each component to derive the chroma-plane MV; that halving is the
+/// only source of fractional MVs in this codec. So the "fractional"
+/// shape is `(integer + 0.5)` or `(integer - 0.5)` in the chroma plane
+/// — i.e. `(MVX, MVY)` came in as a half-pixel value the spec writes
+/// as a `1/2`-step.
+///
+/// This helper takes the full-precision integer-doubled MV `(2*MVX,
+/// 2*MVY)` (i.e. the MV the §7.9.4 chroma derivation produces before
+/// rounding) and returns `(mv1, mv2)` where:
+///
+/// * `mv1` rounds each component toward zero (spec §7.9.1.3
+///   "truncating … towards zero").
+/// * `mv2` rounds each component away from zero.
+///
+/// For a component already on a whole-pixel boundary (the doubled
+/// value is even), both vectors are identical and §7.9.1.3 collapses
+/// to two identical reads averaged together — equivalent to §7.9.1.2
+/// in pixel output. Callers should still dispatch to
+/// [`compute_whole_pixel_predictor`] in that case for efficiency, per
+/// the §7.9.1 dispatch rule.
+///
+/// The inputs are `i32` so they can hold both signed and doubled
+/// magnitudes without overflow concerns; the outputs are `MotionVector`
+/// (a wrapper over `i8` components) to match the §7.9.1.2 / §7.9.1.3
+/// input shape.
+///
+/// Returns `None` if either doubled component is outside the range
+/// representable as an `i8 * 2` (i.e. would overflow `i8` after the
+/// truncation).
+pub fn split_half_pixel_motion_vector(
+    double_mvx: i32,
+    double_mvy: i32,
+) -> Option<(MotionVector, MotionVector)> {
+    // Truncate-toward-zero halving: i32 / 2 already truncates toward
+    // zero for signed operands in Rust, matching the spec's
+    // "truncating … towards zero" wording.
+    let mvx1 = double_mvx / 2;
+    let mvy1 = double_mvy / 2;
+    // Truncate-away-from-zero halving: if the doubled value is even,
+    // it's identical to mvx1; if odd, it rounds away from zero. The
+    // direction depends on the original sign.
+    let round_away = |dv: i32| -> i32 {
+        let q = dv / 2;
+        let r = dv % 2;
+        if r == 0 {
+            q
+        } else if dv > 0 {
+            q + 1
+        } else {
+            q - 1
+        }
+    };
+    let mvx2 = round_away(double_mvx);
+    let mvy2 = round_away(double_mvy);
+    // Bounds-check the four components against i8 range (the
+    // `MotionVector` wrapper's stored type).
+    let to_i8 = |v: i32| -> Option<i8> {
+        if (i8::MIN as i32) <= v && v <= (i8::MAX as i32) {
+            Some(v as i8)
+        } else {
+            None
+        }
+    };
+    let mv1 = MotionVector::new(to_i8(mvx1)?, to_i8(mvy1)?);
+    let mv2 = MotionVector::new(to_i8(mvx2)?, to_i8(mvy2)?);
+    Some((mv1, mv2))
 }
 
 /// MSb-first bit reader implementing §5.2 of the Theora I
@@ -13885,5 +14266,510 @@ mod tests {
         let dqc = dequantize_block_from_params(&coeffs, &params, 0, 0, 10, 20).expect("in range");
         assert_eq!(dqc[0], 120);
         assert_eq!(dqc[5], 80);
+    }
+
+    // ------------------------------------------------------------------
+    // §7.9.1 predictor tests (round 21).
+    // ------------------------------------------------------------------
+
+    /// Build a reference plane that fills `samples[ry * w + rx] = (ry * w + rx) as u8`.
+    /// For `w * h <= 256` each sample value uniquely identifies its flat
+    /// index. The helper accepts larger planes; sample values then wrap
+    /// modulo 256 (test cases compute expected values the same way).
+    fn make_ramp_plane(w: u32, h: u32) -> Vec<u8> {
+        (0..(w * h)).map(|i| i as u8).collect()
+    }
+
+    #[test]
+    fn intra_predictor_returns_constant_128() {
+        let pred = compute_intra_predictor();
+        for (by, row) in pred.iter().enumerate() {
+            for (bx, &val) in row.iter().enumerate() {
+                assert_eq!(val, 128, "by={by} bx={bx}");
+            }
+        }
+    }
+
+    #[test]
+    fn intra_predictor_returns_64_entries() {
+        let pred = compute_intra_predictor();
+        let flat: Vec<u8> = pred.iter().flat_map(|r| r.iter().copied()).collect();
+        assert_eq!(flat.len(), 64);
+        assert!(flat.iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn reference_plane_new_validates_zero_dimension() {
+        let buf = vec![0u8; 0];
+        match ReferencePlane::new(0, 8, &buf) {
+            Err(Error::ReferencePlaneZeroDimension { rpw: 0, rph: 8 }) => {}
+            other => panic!("expected ReferencePlaneZeroDimension, got {other:?}"),
+        }
+        match ReferencePlane::new(8, 0, &buf) {
+            Err(Error::ReferencePlaneZeroDimension { rpw: 8, rph: 0 }) => {}
+            other => panic!("expected ReferencePlaneZeroDimension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_plane_new_validates_len_mismatch() {
+        let buf = vec![0u8; 31];
+        match ReferencePlane::new(8, 4, &buf) {
+            Err(Error::ReferencePlaneLenMismatch {
+                got: 31,
+                expected: 32,
+            }) => {}
+            other => panic!("expected ReferencePlaneLenMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_plane_new_accepts_exact_size() {
+        let buf = vec![0u8; 32];
+        let plane = ReferencePlane::new(8, 4, &buf).expect("8*4=32");
+        assert_eq!(plane.rpw, 8);
+        assert_eq!(plane.rph, 4);
+        assert_eq!(plane.samples.len(), 32);
+    }
+
+    #[test]
+    fn reference_plane_display_errors() {
+        let len_err = Error::ReferencePlaneLenMismatch {
+            got: 5,
+            expected: 32,
+        };
+        let s = format!("{len_err}");
+        assert!(s.contains("§7.9.1"));
+        assert!(s.contains("5"));
+        assert!(s.contains("32"));
+
+        let zero_err = Error::ReferencePlaneZeroDimension { rpw: 0, rph: 8 };
+        let s = format!("{zero_err}");
+        assert!(s.contains("§7.9.1"));
+        assert!(s.contains("rpw=0"));
+
+        let ov_err = Error::ReferencePlaneDimensionsOverflow {
+            rpw: u32::MAX,
+            rph: u32::MAX,
+        };
+        let s = format!("{ov_err}");
+        assert!(s.contains("§7.9.1"));
+        assert!(s.contains("overflow"));
+    }
+
+    #[test]
+    fn whole_pixel_predictor_zero_mv_copies_block_aligned() {
+        // Plane: 16 x 16 ramp. Pull an 8x8 block from (bx=0, by=0)
+        // with MV (0, 0). Expected: samples[ry*16+rx] for ry in 0..8,
+        // rx in 0..8.
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("rpw*rph=256");
+        let pred = compute_whole_pixel_predictor(&refp, 0, 0, MotionVector::ZERO);
+        for by in 0..8u32 {
+            for bx in 0..8u32 {
+                let expected = (by * w + bx) as u8;
+                assert_eq!(
+                    pred[by as usize][bx as usize], expected,
+                    "by={by} bx={bx} expected ramp position"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn whole_pixel_predictor_positive_mv_offsets_into_plane() {
+        // 16x16 ramp, MV = (+2, +3), origin (0, 0). The (by, bx)
+        // sample reads from REFP[3+by][2+bx].
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_whole_pixel_predictor(&refp, 0, 0, MotionVector::new(2, 3));
+        for by in 0..8u32 {
+            for bx in 0..8u32 {
+                let ry = 3 + by;
+                let rx = 2 + bx;
+                let expected = (ry * w + rx) as u8;
+                assert_eq!(pred[by as usize][bx as usize], expected, "by={by} bx={bx}");
+            }
+        }
+    }
+
+    #[test]
+    fn whole_pixel_predictor_clamps_above_rph_minus_1() {
+        // Origin near bottom edge: BY = 14 in a 16-row plane.
+        // BY + by = 14..21. Steps 14..15 read REFP rows 14, 15;
+        // steps 16..21 clamp to row 15.
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_whole_pixel_predictor(&refp, 0, 14, MotionVector::ZERO);
+        // by=0 -> ry=14 (in range)
+        for bx in 0..8u32 {
+            assert_eq!(pred[0][bx as usize], (14 * w + bx) as u8);
+        }
+        // by=1 -> ry=15 (in range, last valid row)
+        for bx in 0..8u32 {
+            assert_eq!(pred[1][bx as usize], (15 * w + bx) as u8);
+        }
+        // by=2..=7 -> ry clamped to 15.
+        for by in 2..8 {
+            for bx in 0..8u32 {
+                assert_eq!(pred[by as usize][bx as usize], (15 * w + bx) as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn whole_pixel_predictor_clamps_above_rpw_minus_1() {
+        // Origin near right edge: BX = 14 in a 16-col plane.
+        // BX + bx = 14..21. bx=0,1 in range; bx=2..=7 clamp to 15.
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_whole_pixel_predictor(&refp, 14, 0, MotionVector::ZERO);
+        for by in 0..8u32 {
+            // bx=0 -> rx=14, bx=1 -> rx=15, bx=2..=7 -> rx=15.
+            assert_eq!(pred[by as usize][0], (by * w + 14) as u8);
+            for bx in 1..8u32 {
+                let expected_rx = 15;
+                assert_eq!(
+                    pred[by as usize][bx as usize],
+                    (by * w + expected_rx) as u8,
+                    "by={by} bx={bx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn whole_pixel_predictor_clamps_below_zero() {
+        // Negative MV with origin (0, 0) drives both rx and ry
+        // into negatives that should clamp to 0.
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_whole_pixel_predictor(&refp, 0, 0, MotionVector::new(-3, -2));
+        // For by < 2 the row sum (-2 + by) is < 0, clamps to 0.
+        // For by >= 2 the row is (by - 2).
+        // For bx < 3 the column sum (-3 + bx) is < 0, clamps to 0.
+        for by in 0..8u32 {
+            for bx in 0..8u32 {
+                let ry = by.saturating_sub(2);
+                let rx = bx.saturating_sub(3);
+                let expected = (ry * w + rx) as u8;
+                assert_eq!(pred[by as usize][bx as usize], expected, "by={by} bx={bx}");
+            }
+        }
+    }
+
+    #[test]
+    fn whole_pixel_predictor_clamps_all_four_corners_combined() {
+        // 8x8 plane, MV pulls every read off all four edges.
+        // BX = 3, BY = 3, MV = (-5, -5) sends rx/ry negative for
+        // every (by, bx).
+        let w = 8u32;
+        let h = 8u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_whole_pixel_predictor(&refp, 3, 3, MotionVector::new(-5, -5));
+        // BY + MVY + by = -2 + by. by=0,1 -> -2,-1 clamp to 0.
+        // by=2..=7 -> 0..=5.
+        // BX + MVX + bx = -2 + bx. bx=0,1 -> -2,-1 clamp to 0.
+        // bx=2..=7 -> 0..=5.
+        for by in 0..8u32 {
+            for bx in 0..8u32 {
+                let ry = by.saturating_sub(2);
+                let rx = bx.saturating_sub(2);
+                let expected = (ry * w + rx) as u8;
+                assert_eq!(pred[by as usize][bx as usize], expected, "by={by} bx={bx}");
+            }
+        }
+    }
+
+    #[test]
+    fn whole_pixel_predictor_constant_plane_returns_constant_block() {
+        let w = 32u32;
+        let h = 32u32;
+        let buf = vec![97u8; (w * h) as usize];
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_whole_pixel_predictor(&refp, 7, 11, MotionVector::new(2, -1));
+        for row in pred.iter() {
+            for &v in row.iter() {
+                assert_eq!(v, 97);
+            }
+        }
+    }
+
+    #[test]
+    fn half_pixel_predictor_identical_vectors_match_whole_pixel() {
+        // When both vectors are identical the predictor degenerates
+        // to (s + s) >> 1 = s, i.e. it agrees with the whole-pixel
+        // path on the same MV.
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let mv = MotionVector::new(2, 1);
+        let wp = compute_whole_pixel_predictor(&refp, 0, 0, mv);
+        let hp = compute_half_pixel_predictor(&refp, 0, 0, mv, mv);
+        assert_eq!(wp, hp);
+    }
+
+    #[test]
+    fn half_pixel_predictor_averages_adjacent_columns() {
+        // MV1 = (0, 0), MV2 = (1, 0). For each (by, bx) the read
+        // pair is (REFP[by][bx], REFP[by][bx + 1]); the predictor
+        // averages with >>1 truncation.
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_half_pixel_predictor(
+            &refp,
+            0,
+            0,
+            MotionVector::new(0, 0),
+            MotionVector::new(1, 0),
+        );
+        for by in 0..8u32 {
+            for bx in 0..8u32 {
+                let s1 = (by * w + bx) as u16;
+                let s2 = (by * w + bx + 1) as u16;
+                let expected = ((s1 + s2) >> 1) as u8;
+                assert_eq!(pred[by as usize][bx as usize], expected, "by={by} bx={bx}");
+            }
+        }
+    }
+
+    #[test]
+    fn half_pixel_predictor_averages_adjacent_rows() {
+        // MV1 = (0, 0), MV2 = (0, 1). For each (by, bx) the read
+        // pair is (REFP[by][bx], REFP[by+1][bx]).
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_half_pixel_predictor(
+            &refp,
+            0,
+            0,
+            MotionVector::new(0, 0),
+            MotionVector::new(0, 1),
+        );
+        for by in 0..8u32 {
+            for bx in 0..8u32 {
+                let s1 = (by * w + bx) as u16;
+                let s2 = ((by + 1) * w + bx) as u16;
+                let expected = ((s1 + s2) >> 1) as u8;
+                assert_eq!(pred[by as usize][bx as usize], expected, "by={by} bx={bx}");
+            }
+        }
+    }
+
+    #[test]
+    fn half_pixel_predictor_truncates_toward_negative_infinity() {
+        // Two samples with sum = 5 (e.g. 2 + 3). (2 + 3) >> 1 = 2,
+        // i.e. truncated toward -inf — the spec's "truncating
+        // towards negative infinity" wording.
+        let w = 4u32;
+        let h = 1u32;
+        let buf = [2u8, 3, 4, 5];
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        // Build a 1x1-effective block by reading the same column for
+        // each (by, bx) via clamping (rph=1 forces ry=0 for all by).
+        let pred = compute_half_pixel_predictor(
+            &refp,
+            0,
+            0,
+            MotionVector::new(0, 0),
+            MotionVector::new(1, 0),
+        );
+        // (by, bx) = (0, 0): s1 = 2, s2 = 3 -> 5 >> 1 = 2.
+        assert_eq!(pred[0][0], 2);
+        // (by, bx) = (0, 1): s1 = 3, s2 = 4 -> 7 >> 1 = 3.
+        assert_eq!(pred[0][1], 3);
+        // (by, bx) = (0, 2): s1 = 4, s2 = 5 -> 9 >> 1 = 4.
+        assert_eq!(pred[0][2], 4);
+        // (by, bx) = (0, 3): s1 = 5, s2 clamps -> 5 -> 10 >> 1 = 5.
+        assert_eq!(pred[0][3], 5);
+        // Beyond, both clamp to the last column (5), (5+5)>>1 = 5.
+        for &v in pred[0].iter().skip(4) {
+            assert_eq!(v, 5);
+        }
+    }
+
+    #[test]
+    fn half_pixel_predictor_clamps_each_vector_independently() {
+        // Edge case: MV1 points off the left edge for every bx,
+        // MV2 points off the right edge for every bx. Both clamp
+        // independently, then average. With w=4, h=4, BX=0:
+        //   bx in 0..=7 -> rx1 = -15 + bx in -15..-8 (all <0)
+        //   bx in 0..=7 -> rx2 = 15 + bx in 15..22 (all >3)
+        // So rx1 clamps to 0 and rx2 clamps to 3 for every bx.
+        let w = 4u32;
+        let h = 4u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let pred = compute_half_pixel_predictor(
+            &refp,
+            0,
+            0,
+            MotionVector::new(-15, 0),
+            MotionVector::new(15, 0),
+        );
+        for by in 0..4u32 {
+            for bx in 0..8u32 {
+                let s1 = (by * w) as u16; // rx1 clamps to 0
+                let s2 = (by * w + (w - 1)) as u16; // rx2 clamps to rpw-1
+                let expected = ((s1 + s2) >> 1) as u8;
+                assert_eq!(pred[by as usize][bx as usize], expected, "by={by} bx={bx}");
+            }
+        }
+    }
+
+    #[test]
+    fn half_pixel_predictor_two_samples_only_per_output() {
+        // Spec note: "Only two samples from the reference frame
+        // contribute to each predictor value". The function signature
+        // forces exactly two read sites; this test makes the
+        // invariant observable: predictor value at (by, bx) depends
+        // only on REFP[ry1][rx1] and REFP[ry2][rx2], unaffected by
+        // any other sample. We verify by mutating a non-contributing
+        // sample and confirming the predictor output is unchanged.
+        let w = 8u32;
+        let h = 8u32;
+        let buf = vec![100u8; (w * h) as usize];
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let mv1 = MotionVector::new(0, 0);
+        let mv2 = MotionVector::new(1, 1);
+        let pred_a = compute_half_pixel_predictor(&refp, 0, 0, mv1, mv2);
+
+        // Mutate a sample that is NOT touched by the (0,0)..(8,8)
+        // and (1,1)..(9,9) read sets but stays inside the plane:
+        // there isn't one — every plane sample is touched at the
+        // 8x8 corner. Make a 16x16 plane instead so we can mutate
+        // a far sample.
+        let mut buf2 = vec![100u8; 16 * 16];
+        let far_idx = 15 * 16 + 15;
+        buf2[far_idx] = 200;
+        let refp2 = ReferencePlane::new(16, 16, &buf2).expect("ok");
+        let pred_b = compute_half_pixel_predictor(&refp2, 0, 0, mv1, mv2);
+        // The predictor reads at most (BX..BX+8) x (BY..BY+8) plus
+        // (BX+1..BX+9) x (BY+1..BY+9). Index (15, 15) is outside
+        // both windows, so the modification must not change the
+        // output.
+        for by in 0..8 {
+            for bx in 0..8 {
+                assert_eq!(
+                    pred_a[by][bx], pred_b[by][bx],
+                    "by={by} bx={bx} predictor depends on out-of-window sample"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_half_pixel_motion_vector_even_value() {
+        // Even doubled value: both vectors identical to MV/1 (i.e.
+        // halved exactly).
+        let (mv1, mv2) = split_half_pixel_motion_vector(6, -4).expect("in range");
+        assert_eq!(mv1, MotionVector::new(3, -2));
+        assert_eq!(mv2, MotionVector::new(3, -2));
+    }
+
+    #[test]
+    fn split_half_pixel_motion_vector_positive_odd_value() {
+        // Positive odd doubled value: mv1 truncates toward zero
+        // (down to 2), mv2 rounds away from zero (up to 3).
+        let (mv1, mv2) = split_half_pixel_motion_vector(5, 7).expect("in range");
+        assert_eq!(mv1, MotionVector::new(2, 3));
+        assert_eq!(mv2, MotionVector::new(3, 4));
+    }
+
+    #[test]
+    fn split_half_pixel_motion_vector_negative_odd_value() {
+        // Negative odd doubled value: mv1 truncates toward zero
+        // (up to -2), mv2 rounds away from zero (down to -3).
+        let (mv1, mv2) = split_half_pixel_motion_vector(-5, -7).expect("in range");
+        assert_eq!(mv1, MotionVector::new(-2, -3));
+        assert_eq!(mv2, MotionVector::new(-3, -4));
+    }
+
+    #[test]
+    fn split_half_pixel_motion_vector_mixed_signs() {
+        let (mv1, mv2) = split_half_pixel_motion_vector(3, -3).expect("in range");
+        assert_eq!(mv1, MotionVector::new(1, -1));
+        assert_eq!(mv2, MotionVector::new(2, -2));
+    }
+
+    #[test]
+    fn split_half_pixel_motion_vector_zero() {
+        let (mv1, mv2) = split_half_pixel_motion_vector(0, 0).expect("zero is fine");
+        assert_eq!(mv1, MotionVector::ZERO);
+        assert_eq!(mv2, MotionVector::ZERO);
+    }
+
+    #[test]
+    fn split_half_pixel_motion_vector_out_of_range() {
+        // i8::MAX = 127, so a doubled value > 254 would overflow.
+        let r = split_half_pixel_motion_vector(300, 0);
+        assert!(r.is_none(), "300/2 = 150 > i8::MAX");
+    }
+
+    #[test]
+    fn half_pixel_predictor_with_split_helper_round_trip() {
+        // Drive the half-pixel predictor via the split helper to
+        // cover the §7.9.1.3 narrative's "the first is formed by
+        // truncating toward zero, the second by truncating away
+        // from zero" path explicitly.
+        let w = 16u32;
+        let h = 16u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        // Doubled MV (3, 5) -> mv1 = (1, 2), mv2 = (2, 3).
+        let (mv1, mv2) = split_half_pixel_motion_vector(3, 5).expect("in range");
+        assert_eq!(mv1, MotionVector::new(1, 2));
+        assert_eq!(mv2, MotionVector::new(2, 3));
+        let pred = compute_half_pixel_predictor(&refp, 0, 0, mv1, mv2);
+        // Hand-check (by=0, bx=0): s1 = REFP[2][1] = 33,
+        // s2 = REFP[3][2] = 50 -> (33+50)>>1 = 41.
+        assert_eq!(pred[0][0], ((33u16 + 50u16) >> 1) as u8);
+    }
+
+    #[test]
+    fn intra_predictor_dc_centering_property() {
+        // Spec rationale: "applied for the sole purpose of centering
+        // the range of possible DC values for INTRA blocks around
+        // zero." Verify the centering math: a real 8-bit pixel in
+        // [0, 255] minus the predictor 128 lands in [-128, 127], which
+        // fits in i8 exactly.
+        let pred = compute_intra_predictor();
+        for s in [0u8, 1, 127, 128, 200, 255] {
+            let centered: i32 = (s as i32) - (pred[0][0] as i32);
+            assert!((-128..=127).contains(&centered), "s={s} → {centered}");
+        }
+    }
+
+    #[test]
+    fn whole_pixel_predictor_distinct_block_origins() {
+        // Confirm the predictor's BX/BY origin is honoured: two
+        // disjoint (BX, BY) on the same plane with the same MV
+        // produce disjoint pixel content.
+        let w = 32u32;
+        let h = 32u32;
+        let buf = make_ramp_plane(w, h);
+        let refp = ReferencePlane::new(w, h, &buf).expect("ok");
+        let p1 = compute_whole_pixel_predictor(&refp, 0, 0, MotionVector::ZERO);
+        let p2 = compute_whole_pixel_predictor(&refp, 8, 8, MotionVector::ZERO);
+        // First and last samples in each tile.
+        assert_eq!(p1[0][0], 0);
+        assert_eq!(p2[0][0], (8 * w + 8) as u8);
+        assert_ne!(p1, p2);
     }
 }

@@ -6,6 +6,45 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.9.1 Predictors (round 21). Three new public entry points
+  transcribing the three §7.9.1.x predictor procedures of the Xiph
+  Theora I Specification:
+  - `compute_intra_predictor() -> [[u8; 8]; 8]` returns the constant
+    128 tile from §7.9.1.1 ("The Intra Predictor"). The Theora prose
+    rationale is that 128 centres the range of legal 8-bit DC values
+    around zero so INTRA blocks fit signed arithmetic with no bias.
+  - `compute_whole_pixel_predictor(refp, BX, BY, MV) -> [[u8; 8]; 8]`
+    transcribes §7.9.1.2 ("The Whole-Pixel Predictor"): for each
+    `by`/`bx` in 0..=7 it computes `ry = BY + MVY + by`, `rx = BX +
+    MVX + bx`, clamps both into the reference plane's `[0, RPH-1]` /
+    `[0, RPW-1]` window, and assigns `PRED[by][bx] = REFP[ry][rx]`.
+  - `compute_half_pixel_predictor(refp, BX, BY, MV1, MV2) -> [[u8; 8];
+    8]` transcribes §7.9.1.3 ("The Half-Pixel Predictor"): two
+    clamped reference samples per output, averaged with `(s1 + s2) >>
+    1` (truncating toward negative infinity per the spec).
+  Supporting types: `ReferencePlane { rpw, rph, samples }` carries a
+  reference-plane view alongside the row-major flat byte slice;
+  `ReferencePlane::new(rpw, rph, samples)` validates `rpw * rph` against
+  the buffer length plus the non-zero-dimension and overflow rejects
+  (three new error variants: `ReferencePlaneLenMismatch`,
+  `ReferencePlaneZeroDimension`, `ReferencePlaneDimensionsOverflow`).
+  Companion helper `split_half_pixel_motion_vector(double_mvx,
+  double_mvy) -> Option<(MotionVector, MotionVector)>` produces the
+  truncate-toward-zero / truncate-away-from-zero pair the §7.9.1.3
+  driver expects when the §7.9.4 chroma derivation halves an MV with
+  an odd integer-doubled value. Twenty-eight new tests (total 366):
+  intra constant-128 invariants, DC-centering math, whole-pixel zero-
+  MV ramp-block copy, positive-MV offsetting, all four clamping
+  edges (bottom, right, left, top — covered via combined-corner case
+  and all-negative case), constant-plane round-trip, distinct-origin
+  isolation, half-pixel identical-vectors degeneration to whole-pixel,
+  adjacent-column and adjacent-row averaging, truncation-toward-
+  negative-infinity worked example (the (2+3)>>1 = 2 spec case),
+  independent per-vector clamping, two-samples-only invariant,
+  even/odd/zero/mixed-signs/out-of-range branches of the split
+  helper, the split-then-predict round-trip, plus all three reject-
+  path tests for `ReferencePlane::new` and their `Display` rendering.
+
 - §7.9.2 Dequantization (round 20). New public `dequantize_block(
   coeffs_zz, qmat_dc, qmat_ac) -> [i16; 64]` transcribing steps 2–6
   of §7.9.2 of the Theora I Specification: scales `COEFFS[bi][0]` by

@@ -11,8 +11,9 @@ long-/short-run bit strings + §7.3 coded-block-flags decode + §7.4
 macro-block coding modes + §7.5 motion-vector decode + §7.6 block-level
 qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
 §7.7.3 DCT coefficient decode driver + §7.8.1 DC predictor compute +
-§7.8.2 DC prediction inversion driver + §7.9.2 dequantization
-(rounds 1–20).** §6.1, §6.2
+§7.8.2 DC prediction inversion driver + §7.9.1 predictors (intra /
+whole-pixel / half-pixel) + §7.9.2 dequantization
+(rounds 1–21).** §6.1, §6.2
 (identification), §6.3 (comment), §6.4.5 step 1 (setup-header
 common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
 (Quantization Parameters Decode), §6.4.3 (Computing a Quantization
@@ -237,6 +238,28 @@ for every coded block) via two typed reject variants.
   §7.8.1 error from the inner [`compute_dc_predictor`] propagates
   unchanged. Operates in place on `coeffs: &mut [[i16; 64]]` so the
   call site keeps the §7.7.3 output's allocation.
+* [`compute_intra_predictor`] / [`compute_whole_pixel_predictor`] /
+  [`compute_half_pixel_predictor`] — round 21 public §7.9.1.x
+  procedures returning an `[[u8; 8]; 8]` predictor tile.
+  `compute_intra_predictor` is the §7.9.1.1 constant-128 fill (the
+  spec's centring rationale leaves DC residuals in the signed range
+  `[-128, 127]`). `compute_whole_pixel_predictor(refp, BX, BY, MV)`
+  transcribes §7.9.1.2 step 1: copy `REFP[ry][rx]` for `ry = BY +
+  MVY + by` and `rx = BX + MVX + bx`, with both indices clamped into
+  `[0, RPH-1]` and `[0, RPW-1]` so the predictor degrades gracefully
+  at the reference plane's edges. `compute_half_pixel_predictor(refp,
+  BX, BY, MV1, MV2)` transcribes §7.9.1.3 step 1: average two
+  clamped reads with `(s1 + s2) >> 1` (truncation toward negative
+  infinity per the spec's wording). Reference samples flow through a
+  typed [`ReferencePlane { rpw, rph, samples }`] view; the
+  `ReferencePlane::new` constructor validates `rpw * rph` against the
+  buffer length and rejects zero-dimension / overflow inputs with
+  three new typed errors (`ReferencePlaneLenMismatch`,
+  `ReferencePlaneZeroDimension`, `ReferencePlaneDimensionsOverflow`).
+  Companion helper [`split_half_pixel_motion_vector`] consumes a
+  doubled MV and emits the (truncate-toward-zero, truncate-away-from-
+  zero) pair §7.9.1.3 expects when the §7.9.4 chroma derivation
+  halves an MV with odd integer-doubled components.
 * [`dequantize_block`] / [`dequantize_block_from_params`] — round 20
   public §7.9.2 procedure. Takes a single block's zig-zag-order
   `[i16; 64]` (the §7.8.2 output) plus the precomputed DC and AC
@@ -940,13 +963,101 @@ left-chain accumulation across four blocks
 uncoded-intermediate-doesn't-reset-LASTDC case (uncoded blocks are
 visited for duplicate-tracking but leave `LASTDC[rfi]` unchanged).
 
+### §7.9.1 Predictors (round 21)
+
+```rust
+pub fn compute_intra_predictor() -> [[u8; 8]; 8];
+
+pub struct ReferencePlane<'a> {
+    pub rpw: u32,
+    pub rph: u32,
+    pub samples: &'a [u8],
+}
+
+impl<'a> ReferencePlane<'a> {
+    pub fn new(rpw: u32, rph: u32, samples: &'a [u8]) -> Result<Self, Error>;
+}
+
+pub fn compute_whole_pixel_predictor(
+    refp: &ReferencePlane<'_>,
+    bx_origin: u32,
+    by_origin: u32,
+    mv: MotionVector,
+) -> [[u8; 8]; 8];
+
+pub fn compute_half_pixel_predictor(
+    refp: &ReferencePlane<'_>,
+    bx_origin: u32,
+    by_origin: u32,
+    mv1: MotionVector,
+    mv2: MotionVector,
+) -> [[u8; 8]; 8];
+
+pub fn split_half_pixel_motion_vector(
+    double_mvx: i32,
+    double_mvy: i32,
+) -> Option<(MotionVector, MotionVector)>;
+```
+
+§7.9.1.1 (Intra) is the constant-128 fill. §7.9.1.2 (Whole-Pixel)
+copies `REFP[ry][rx]` per `(by, bx)`, clamping `ry` into
+`[0, RPH-1]` and `rx` into `[0, RPW-1]` so motion vectors that point
+outside the reference plane fall back to the nearest edge sample.
+§7.9.1.3 (Half-Pixel) averages two such clamped reads with the
+spec's `>> 1` (truncation toward negative infinity for the always-
+non-negative sum). The narrative anchors are §7.9.1.1's centring
+rationale ("applied for the sole purpose of centering the range of
+possible DC values for INTRA blocks around zero") and §7.9.1.3's
+two-vectors-only invariant ("Only two samples from the reference
+frame contribute to each predictor value, even if both components
+of the motion vector have non-zero fractional components").
+
+The §7.9.4 reconstruction driver decides at each block whether to
+call the intra path, the whole-pixel path (fractional MV components
+both zero), or the half-pixel path (any non-zero fractional
+component). Theora MVs always come in as integer values; the
+fractional shape arises only when §7.9.4 halves an MV for the
+chroma planes — the `split_half_pixel_motion_vector` helper performs
+that decomposition into the (round-toward-zero, round-away-from-
+zero) pair the §7.9.1.3 procedure consumes.
+
+The `ReferencePlane` wrapper carries the plane dimensions next to
+the row-major flat byte slice; `ReferencePlane::new` validates the
+`rpw * rph` invariant against the buffer length and rejects zero-
+dimension / overflow inputs (`ReferencePlaneLenMismatch` /
+`ReferencePlaneZeroDimension` / `ReferencePlaneDimensionsOverflow`).
+The §7.9.1.2 / §7.9.1.3 procedures themselves do not return errors
+— the `[[u8; 8]; 8]` output is fixed-size, the inputs are pre-
+validated, and the edge clamping is total over the i32-widened
+coordinate space.
+
+Round 21 adds twenty-eight new tests (total now 366): intra
+constant-128 invariants, the DC-centering math (`(s - 128)` lands
+in `[-128, 127]`), `ReferencePlane::new` accept and three reject
+paths plus their `Display` rendering, whole-pixel zero-MV
+ramp-block copy, positive-MV offsetting, all four clamping edges
+(`above_rph_minus_1`, `above_rpw_minus_1`, `below_zero`,
+`all_four_corners_combined`), constant-plane round-trip, distinct-
+origin isolation, half-pixel identical-vectors degenerate-to-whole-
+pixel agreement, adjacent-column and adjacent-row averaging, the
+truncation-toward-negative-infinity worked example
+(`(2+3)>>1 = 2`), independent per-vector clamping, the
+two-samples-only out-of-window invariant, even/odd/zero/mixed-
+signs/out-of-range branches of `split_half_pixel_motion_vector`,
+and a split-then-predict round-trip exercising the §7.9.1.3
+narrative's "first toward zero, second away from zero" rule end-
+to-end.
+
 ## Roadmap
 
-* Next: §7.9 Reconstruction — three-tier predictor (intra constant
-  128, whole-pixel motion compensation, half-pixel motion
-  compensation), inverse quantization against the §6.4.3 quant
-  matrices, the §7.9.3 IDCT, and the predictor + residual sum.
-  This is the path to a first decoded Theora frame.
+* Next: §7.9.3 The Inverse DCT — the 1D / 2D IDCT and the DC-only
+  special case, consuming the §7.9.2 dequantized coefficients to
+  produce the residual that adds to the §7.9.1 predictor.
+* After §7.9.3: §7.9.4 The Complete Reconstruction Algorithm — the
+  end-to-end driver that selects per-block predictor / inverse DCT
+  / predictor-plus-residual sum and writes reconstructed samples
+  into the output frame plane. This is the path to a first decoded
+  Theora frame.
 * After §7.9: §7.10 Loop Filter — deblocking applied with the
   §6.4.1 LFLIMS table.
 

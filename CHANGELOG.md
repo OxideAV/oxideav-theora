@@ -6,6 +6,42 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.9.3 The Inverse DCT (round 22). Two new public entry points
+  transcribing the normative parts of §7.9.3 of the Xiph Theora I
+  Specification:
+  - `inverse_dct_1d(y: &[i16; 8]) -> [i16; 8]` walks the §7.9.3.1
+    55-step procedure verbatim — eight i32-typed `T[]` slots, the
+    `Truncate to i16` narrowing steps before each `C4 * T[i] >> 16`
+    multiply, and the final `as i16` truncation on every output
+    `X[i]`. The constants `C3`/`S3`, `C4`, `C6`/`S6`, `C7`/`S7` come
+    from Table 7.65 (16-bit approximations of cosines and sines
+    of `iπ/16`).
+  - `inverse_dct_2d(dqc: &[i16; 64]) -> [[i16; 8]; 8]` applies the
+    §7.9.3.2 two-pass driver: pass 1 walks `ri ∈ 0..=7`, extracts
+    each row of natural-order `DQC`, applies `inverse_dct_1d`, and
+    stores the result in `RES[ri][ci]`; pass 2 walks `ci ∈ 0..=7`,
+    extracts each column of `RES`, applies the 1D transform again,
+    and finalises with `(X[ri] + 8) >> 4` to scale out the two 1D
+    passes' factor-of-four expansion. The `(+8) >> 4` step
+    implements the §7.9.3 final-rounding rule ("division by 16,
+    ties rounded toward positive infinity"): Rust's signed `>>`
+    truncates toward negative infinity, and the `+8` bias shifts
+    the tie boundary so the rule comes out correct.
+  Thirteen new tests (total 379): both procedures on all-zero
+  input, DC-only positive and negative input on the 1D path
+  (pinned to `(C4 * Y[0]) >> 16 = 724` / `−725` with literal
+  cross-checks), extreme `i16::MAX` / `i16::MIN` input
+  determinism, the §7.9.3.2 DC-only flat-block invariant
+  (`DQC[0] = 1024 → RES[ri][ci] = 32`), the negative-DC parallel
+  (`DQC[0] = −1024 → RES[ri][ci] = −32`), the small-DC rounds-to-
+  zero case (`DQC[0] = 16 → RES = 0`), the row-vs-column AC-only
+  excitation transpose-invariant (proving `DQC[1]` and `DQC[8]`
+  produce transposed `RES`), and the Table 7.65 constants
+  pinned to their integer values. §7.9.3.3 (the 1D Forward DCT
+  for encoder convenience) is explicitly non-normative per the
+  spec and is deferred to a later encoder round; this commit
+  lands only the §7.9.3.1 / §7.9.3.2 normative decoder path.
+
 - §7.9.1 Predictors (round 21). Three new public entry points
   transcribing the three §7.9.1.x predictor procedures of the Xiph
   Theora I Specification:

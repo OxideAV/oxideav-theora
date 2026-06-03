@@ -12,8 +12,8 @@ macro-block coding modes + §7.5 motion-vector decode + §7.6 block-level
 qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
 §7.7.3 DCT coefficient decode driver + §7.8.1 DC predictor compute +
 §7.8.2 DC prediction inversion driver + §7.9.1 predictors (intra /
-whole-pixel / half-pixel) + §7.9.2 dequantization
-(rounds 1–21).** §6.1, §6.2
+whole-pixel / half-pixel) + §7.9.2 dequantization + §7.9.3 inverse DCT
+(1D + 2D) (rounds 1–22).** §6.1, §6.2
 (identification), §6.3 (comment), §6.4.5 step 1 (setup-header
 common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
 (Quantization Parameters Decode), §6.4.3 (Computing a Quantization
@@ -284,6 +284,26 @@ for every coded block) via two typed reject variants.
   amortise the §6.4.3 work over multiple blocks sharing the same
   `(qti, pli, qi)` by passing pre-built matrices into `dequantize_block`
   directly, per the §7.9.2 narrative's efficiency note.
+* [`inverse_dct_1d`] / [`inverse_dct_2d`] — round 22 public §7.9.3
+  procedures. `inverse_dct_1d(y: &[i16; 8]) -> [i16; 8]` walks the
+  55 numbered steps of §7.9.3.1 verbatim — eight i32-typed `T[]`
+  slots, three explicit "Truncate `T[i]` to a 16-bit signed
+  representation" narrowing steps before each `C4 * T[i] >> 16`
+  multiply, the eight rotation-pair multiplications using `C3` /
+  `S3` / `C6` / `S6` / `C7` / `S7` from Table 7.65, the butterfly
+  ladder in steps 13–31, and the eight `(T[a] ± T[b]) as i16`
+  output truncations in steps 32–55. `inverse_dct_2d(dqc: &[i16;
+  64]) -> [[i16; 8]; 8]` is the §7.9.3.2 two-pass driver: pass 1
+  walks `ri ∈ 0..=7`, extracts each row of natural-order `DQC`,
+  applies the 1D transform, and stores the result in `RES[ri][ci]`;
+  pass 2 walks `ci ∈ 0..=7`, extracts each column of `RES`, applies
+  the 1D transform again, and finalises each cell with
+  `(X[ri] + 8) >> 4` to scale out the factor-of-four amplification
+  introduced by the two 1D passes. The `(+8) >> 4` step implements
+  the §7.9.3 final-rounding rule ("ties rounded towards positive
+  infinity"): Rust's arithmetic `>>` on signed i32 truncates toward
+  negative infinity, and the `+8` bias shifts the tie boundary so
+  the resulting rounding direction matches the spec.
 * [`compute_dc_predictor`] — round 18 public §7.8.1 procedure
   returning the typed `DCPRED: i32` for a single block from up to four
   already-decoded neighbour DC values (left, lower-left, lower,
@@ -1048,18 +1068,93 @@ and a split-then-predict round-trip exercising the §7.9.1.3
 narrative's "first toward zero, second away from zero" rule end-
 to-end.
 
+### §7.9.3 The Inverse DCT (round 22)
+
+§7.9.3 of the Theora I Specification defines an integerised
+8-point 1D inverse DCT (§7.9.3.1, 55 numbered steps) and a 2D
+driver that applies the 1D transform once per row and once per
+column of the resulting 8×8 grid (§7.9.3.2). The 1D transform
+uses the Chen factorisation: each "rotation" pair `(Ci, Si)`
+introduces a multiplication of the form `(Ci * Y[j]) >> 16` /
+`(Si * Y[j]) >> 16` with the constants taken from Table 7.65.
+The 1D transform scales the orthonormal result by a factor of
+two; the 2D driver finalises with `(X[ri] + 8) >> 4` to scale
+out the resulting factor-of-four and apply the spec's "ties
+rounded towards positive infinity" rounding rule.
+
+The two new public entry points are pure functions:
+
+```text
+pub fn inverse_dct_1d(y: &[i16; 8]) -> [i16; 8]
+pub fn inverse_dct_2d(dqc: &[i16; 64]) -> [[i16; 8]; 8]
+```
+
+§7.9.3 prose: "A compliant decoder MUST use the exact
+implementation of the inverse DCT defined in this specification.
+Some operations may be re-ordered, but the result must be
+precisely equivalent." The implementation does not reorder; each
+of the 55 numbered steps appears as a single Rust statement,
+preserving the spec's i16/i32 narrowing schedule verbatim. The
+truncation steps are implemented as `(t[i] as i16) as i32`
+narrow-then-widen so the subsequent `wrapping_mul(IDCT_C4)`
+operand is the spec's mandated low-16-bit value. Output
+truncation in steps 32–55 is `wrapping_add` / `wrapping_sub`
+producing an i32 that is then narrowed via `as i16`.
+
+The §7.9.3.2 driver respects the spec's exact ordering: the
+row-pass loop completes (filling all of `RES`) before the column
+pass starts. The `(X[ri] + 8) >> 4` rounding step happens only
+on the column pass — the row pass stores the 1D output verbatim
+into the i16 `RES` buffer. The `(+8) >> 4` step relies on Rust's
+arithmetic right shift on signed i32 truncating toward negative
+infinity; the `+8` bias shifts the tie boundary so that
+`(0 + 8) >> 4 = 0` (no tie), `(8 + 8) >> 4 = 1` (positive tie
+toward `+∞` = 1), and `(−8 + 8) >> 4 = 0` (negative tie toward
+`+∞` = 0), matching the spec's three rounding modes.
+
+The DC-only special case mentioned in §7.9.3 ("a special DC-only
+case is used, which is described below in step 2(d)vii of
+Section 7.9.4") is *not* part of the §7.9.3 procedures themselves
+— it is a §7.9.4 decision. This round lands the full §7.9.3.1 +
+§7.9.3.2 path; the §7.9.4 driver will own the per-block branch
+between the full IDCT and the special case.
+
+Round 22 adds thirteen new tests (total now 379): all-zero
+input on both 1D and 2D paths, DC-only positive input on the 1D
+path (pinned to `(C4 * 1024) >> 16 = 724` with literal
+cross-check), DC-only negative input on the 1D path (pinned to
+`−725` documenting the toward-negative-infinity floor of the
+arithmetic right shift), `i16::MAX` / `i16::MIN` extreme input
+exercising the wrapping arithmetic without panicking,
+determinism of the 1D path under repeated calls with the same
+non-trivial input, the §7.9.3.2 DC-only flat-block invariant
+(`DQC[0] = 1024 → RES[ri][ci] = 32`), the negative-DC parallel
+(`DQC[0] = −1024 → RES[ri][ci] = −32`), the small-DC rounds-to-
+zero case (`DQC[0] = 16 → RES = 0` end-to-end), an AC-only
+excitation test confirming the §7.9.3.1 transform is actually
+active (output values are not all equal), a row-vs-column
+transpose invariant confirming `DQC[1]` (`ri=0, ci=1`) and
+`DQC[8]` (`ri=1, ci=0`) produce *transposed* `RES` blocks
+(catching an accidental row/column swap), extreme i14 DC input
+not panicking, and Table 7.65 constants pinned to their integer
+values via a guard test.
+
 ## Roadmap
 
-* Next: §7.9.3 The Inverse DCT — the 1D / 2D IDCT and the DC-only
-  special case, consuming the §7.9.2 dequantized coefficients to
-  produce the residual that adds to the §7.9.1 predictor.
-* After §7.9.3: §7.9.4 The Complete Reconstruction Algorithm — the
-  end-to-end driver that selects per-block predictor / inverse DCT
-  / predictor-plus-residual sum and writes reconstructed samples
-  into the output frame plane. This is the path to a first decoded
-  Theora frame.
-* After §7.9: §7.10 Loop Filter — deblocking applied with the
+* Next: §7.9.4 The Complete Reconstruction Algorithm — the
+  end-to-end driver that selects per-block predictor / inverse
+  DCT / predictor-plus-residual sum and writes reconstructed
+  samples into the output frame plane. This is the path to a
+  first decoded Theora frame. The §7.9.4 driver also defines the
+  DC-only special case for blocks with no non-zero AC coefficient
+  (which is non-equivalent to applying the full inverse transform
+  and is required by §7.9.3 for bit-exact decode).
+* After §7.9.4: §7.10 Loop Filter — deblocking applied with the
   §6.4.1 LFLIMS table.
+* §7.9.3.3 (the 1D forward DCT) is explicitly non-normative per
+  the spec ("the version of the transform used by Xiph.Org's
+  Theora encoder, which is the same as that used by VP3") and is
+  deferred to a later encoder-side round.
 
 ## Clean-room sources
 

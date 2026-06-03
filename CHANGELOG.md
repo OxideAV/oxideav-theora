@@ -6,6 +6,64 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.9.4 per-block reconstruction (round 23). New public entry
+  point `reconstruct_block(inputs, pli, bx_origin, by_origin,
+  qis, params, refs) -> Result<ReconstructedBlock, Error>`
+  transcribing step 1 plus steps 2(a)–2(f) of §7.9.4 of the Xiph
+  Theora I Specification for a single block. The procedure:
+  resolves `qi0` from `QIS[0]`; on the coded branch (step 2(d))
+  picks `qti` from the mode (`Intra` = 0, else 1), looks up
+  `rfi` via `reference_frame_for_mb_mode` (Table 7.46), routes
+  intra to §7.9.1.1 (constant 128), routes inter to
+  `ReferencePlaneSet::pick` (Table 7.75), splits the per-block
+  MV into the §7.9.1.3 truncate-toward-zero / truncate-away-from-
+  zero pair (the integer-MV case collapses MVX==MVX2 so step
+  2(d)vi.F routes to §7.9.1.2 whole-pixel), takes the DC-only
+  shortcut when `NCOEFFS[bi] < 2` (build the DC quant matrix,
+  compute `DC = (COEFFS[0] * QMAT[0] + 15) >> 5` truncated to
+  i16, fill RES uniformly) or the full path when `NCOEFFS[bi] >=
+  2` (build both DC + AC matrices from §6.4.3, dequantize via
+  §7.9.2, inverse DCT via §7.9.3.2); on the uncoded branch (step
+  2(e)) the predictor is a zero-MV whole-pixel read of the
+  Previous reference and the residual is zero. Step 2(f) sums
+  PRED + RES, clamps to `0..=255`, and writes the result into
+  `ReconstructedBlock.samples`.
+  Supporting types: `ReconstructedBlock { samples: [[u8; 8]; 8] }`
+  (the 8×8 output tile), `ReconstructBlockInputs` (the per-block
+  view of the §7.9.4 input tables — `bcoded`, `mb_mode`,
+  `mvect`, `coeffs_zz`, `ncoeffs`, `qii`), and `ReferencePlaneSet`
+  (the six (rfi, pli) reference planes Table 7.75 enumerates,
+  with a `pick` lookup that rejects Intra-routed calls as an
+  internal-invariant guard).
+  Four new error variants: `ReconstructPlaneIndexOutOfRange`
+  (`pli > 2`), `ReconstructEmptyQis` (step 1 has nothing to
+  read), `ReconstructQiiIndexOutOfRange` (step 2(d)viii.A's
+  `QIS[QIIS[bi]]` overrun), and
+  `ReconstructIntraInterBranchMismatch` (the Intra-routed
+  `ReferencePlaneSet::pick` reject — `reconstruct_block` itself
+  routes Intra before consulting `refs`, so this is reachable
+  only from a direct `pick` call). Each variant carries a
+  `§7.9.4`-tagged `Display`.
+  Eighteen new tests (total now 397): the Intra-DC-zero-residual
+  all-128 invariant, an Intra-DC-positive PRED+DC offset, both
+  clamp paths (high → 255, low → 0), the uncoded `Previous-Y`
+  co-located copy, plane-specific routing (uncoded Cb →
+  Previous-Cb, uncoded Cr → Previous-Cr), the Inter-Golden
+  Table 7.46 routing (`InterGoldenNoMv` → Golden-Y), the
+  Inter-Previous Table 7.46 routing (`InterMv` → Previous-Cr at
+  `pli = 2`), the whole-pixel-MV positional shift across the 8×8
+  tile, the all-zero-COEFFS full-DCT path collapsing to PRED,
+  the three reject paths, the Table 7.75 `pick` lookup over all
+  six (rfi, pli) pairs, a pinned step 2(d)vii.B formula
+  cross-check (`DC = (COEFFS[0] * qmat_dc[0] + 15) >> 5` matched
+  against a hand-computed expectation), `Display` rendering for
+  all four new error variants, and a determinism guard for the
+  per-block path. The §7.9.4 frame-level driver (the `bi in
+  0..NBS` raster walk that consults per-plane `(BX, BY)`
+  geometry and the macro-block-of-block mapping) is intentionally
+  deferred so the per-block body can be audited against §7.9.4
+  steps 2(a)–2(f) in isolation.
+
 - §7.9.3 The Inverse DCT (round 22). Two new public entry points
   transcribing the normative parts of §7.9.3 of the Xiph Theora I
   Specification:

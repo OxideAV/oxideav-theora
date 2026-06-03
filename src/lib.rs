@@ -822,6 +822,39 @@ pub enum Error {
         /// `RPH`.
         rph: u32,
     },
+    /// §7.9.4 step 2(a) received an out-of-range plane index.
+    /// `pli` must be in `0..=2`.
+    ReconstructPlaneIndexOutOfRange {
+        /// The out-of-range `pli`.
+        pli: usize,
+    },
+    /// §7.9.4 step 1 received an empty `QIS` array, so `QIS[0]`
+    /// (the `qi0` value used for the DC quant matrix) cannot be
+    /// resolved. Per §7.1, every coded frame ships at least one
+    /// `qi` value.
+    ReconstructEmptyQis,
+    /// §7.9.4 step 2(d)viii.A indexes `QIS` by `QIIS[bi]`, so the
+    /// `qii` must be a valid index into `QIS`. Per §7.6 the decoded
+    /// `QIIS` array values are in `0..NQIS` where `NQIS` is the
+    /// count of `QIS` entries.
+    ReconstructQiiIndexOutOfRange {
+        /// The out-of-range `qii` value.
+        qii: usize,
+        /// The `QIS` length (`NQIS`).
+        nqis: usize,
+    },
+    /// §7.9.4 step 2(d)iv resolves the `rfi` for an inter-coded
+    /// block from `MBMODES[mbi]`; per Table 7.46 inter modes always
+    /// map to `Previous` or `Golden`. An `Intra` mode at this point
+    /// indicates a per-block / per-macro-block input mismatch — the
+    /// reconstruct procedure was called with `BCODED[bi] != 0` and
+    /// `MBMODES[mbi] == Intra` but the caller-supplied `qti` branch
+    /// (step 2(d)ii) must have set `qti = 0`. This variant is only
+    /// produced by [`reconstruct_block`] when the caller's typed
+    /// inputs are internally inconsistent — Intra resolves to
+    /// `rfi = 0 (None)` and the §7.9.1.1 intra predictor path, never
+    /// the §7.9.1.2 / §7.9.1.3 inter path.
+    ReconstructIntraInterBranchMismatch,
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -1204,6 +1237,22 @@ impl core::fmt::Display for Error {
             Error::ReferencePlaneDimensionsOverflow { rpw, rph } => write!(
                 f,
                 "oxideav-theora: §7.9.1 reference-plane dimensions overflow usize (rpw={rpw}, rph={rph})"
+            ),
+            Error::ReconstructPlaneIndexOutOfRange { pli } => write!(
+                f,
+                "oxideav-theora: §7.9.4 plane index pli={pli} out of range (expected 0..=2)"
+            ),
+            Error::ReconstructEmptyQis => write!(
+                f,
+                "oxideav-theora: §7.9.4 step 1 cannot read QIS[0] (the QIS array is empty)"
+            ),
+            Error::ReconstructQiiIndexOutOfRange { qii, nqis } => write!(
+                f,
+                "oxideav-theora: §7.9.4 step 2(d)viii.A qii={qii} out of range for NQIS={nqis}"
+            ),
+            Error::ReconstructIntraInterBranchMismatch => write!(
+                f,
+                "oxideav-theora: §7.9.4 step 2(d)v received Intra mode on the inter branch"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -6458,6 +6507,398 @@ impl<'a> Reader<'a> {
         self.pos += len_usize;
         Ok(s)
     }
+}
+
+/// A bundle of the six reference-frame planes consumed by the
+/// §7.9.4 reconstruction algorithm via Table 7.75 ("Reference Planes
+/// and Sizes for Each `rfi` and `pli`").
+///
+/// `rfi = 1` (Previous) and `rfi = 2` (Golden) each have a Y / Cb /
+/// Cr plane; `rfi = 0` (None / Intra) doesn't consume a reference
+/// plane at all.
+///
+/// All six planes are typed as [`ReferencePlane`], which validates
+/// `rpw * rph == samples.len()` at construction time. The §7.9.4
+/// driver picks the right plane per block from the `(rfi, pli)`
+/// pair.
+///
+/// Per §7.9.4 step 2(e)i, **uncoded** blocks always look at the
+/// Previous reference (`rfi = 1`) with `MVX = MVY = 0` — the
+/// uncoded path is "copy the co-located block from the previous
+/// reference frame". This is what makes the Previous reference
+/// special at the procedure level: it is read even when no inter
+/// mode said so.
+#[derive(Debug, Clone, Copy)]
+pub struct ReferencePlaneSet<'a> {
+    /// `PREVREFY` — `Previous` reference, Y plane.
+    pub previous_y: ReferencePlane<'a>,
+    /// `PREVREFCB` — `Previous` reference, Cb plane.
+    pub previous_cb: ReferencePlane<'a>,
+    /// `PREVREFCR` — `Previous` reference, Cr plane.
+    pub previous_cr: ReferencePlane<'a>,
+    /// `GOLDREFY` — `Golden` reference, Y plane.
+    pub golden_y: ReferencePlane<'a>,
+    /// `GOLDREFCB` — `Golden` reference, Cb plane.
+    pub golden_cb: ReferencePlane<'a>,
+    /// `GOLDREFCR` — `Golden` reference, Cr plane.
+    pub golden_cr: ReferencePlane<'a>,
+}
+
+impl<'a> ReferencePlaneSet<'a> {
+    /// Look up `REFP`/`RPW`/`RPH` for a given `(rfi, pli)` pair per
+    /// Table 7.75 of the §7.9.4 spec. Returns the matching reference
+    /// plane.
+    ///
+    /// Returns [`Error::ReconstructPlaneIndexOutOfRange`] for
+    /// `pli > 2`. `rfi == 0` (`None`) has no entry in Table 7.75 —
+    /// the §7.9.4 caller dispatches that case to the intra predictor
+    /// path before consulting the reference set.
+    fn pick(&self, rfi: ReferenceFrame, pli: usize) -> Result<ReferencePlane<'a>, Error> {
+        if pli > 2 {
+            return Err(Error::ReconstructPlaneIndexOutOfRange { pli });
+        }
+        // Table 7.75 lookup:
+        //   rfi = 1, pli = 0  → PREVREFY
+        //   rfi = 1, pli = 1  → PREVREFCB
+        //   rfi = 1, pli = 2  → PREVREFCR
+        //   rfi = 2, pli = 0  → GOLDREFY
+        //   rfi = 2, pli = 1  → GOLDREFCB
+        //   rfi = 2, pli = 2  → GOLDREFCR
+        // `rfi = 0` (None) is not in Table 7.75 — the §7.9.4
+        // dispatcher (step 2(d)v) does not call into pick for the
+        // intra branch.
+        let plane = match (rfi, pli) {
+            (ReferenceFrame::Previous, 0) => self.previous_y,
+            (ReferenceFrame::Previous, 1) => self.previous_cb,
+            (ReferenceFrame::Previous, 2) => self.previous_cr,
+            (ReferenceFrame::Golden, 0) => self.golden_y,
+            (ReferenceFrame::Golden, 1) => self.golden_cb,
+            (ReferenceFrame::Golden, 2) => self.golden_cr,
+            // The intra branch never reaches pick. If it does, the
+            // call site has misrouted — surface the mismatch.
+            (ReferenceFrame::None, _) => return Err(Error::ReconstructIntraInterBranchMismatch),
+            // pli already checked above; unreachable on a successful
+            // pli >= 3 reject.
+            (_, _) => return Err(Error::ReconstructPlaneIndexOutOfRange { pli }),
+        };
+        Ok(plane)
+    }
+}
+
+/// A single reconstructed 8×8 block produced by [`reconstruct_block`].
+///
+/// `samples[by][bx]` is the §7.9.4 step 2(f) clamped pixel value at
+/// offset `(BX + bx, BY + by)` within the output plane — i.e. the
+/// `RECY[BY + by][BX + bx]` (or `RECCB` / `RECCR`) value for a
+/// single 8×8 tile of the reconstructed frame.
+///
+/// The §7.9.4 frame-level driver (to land in a later round) tiles
+/// these per-block reconstructions into the full `RECY` / `RECCB` /
+/// `RECCR` arrays by iterating over all `bi in 0..NBS`, computing
+/// `(BX, BY, pli)` per block from the §2.x geometry rules, calling
+/// [`reconstruct_block`], and writing the result into the per-plane
+/// output. This crate intentionally lands the per-block procedure
+/// body in a separate round from the frame-tiling driver so each is
+/// auditable against its own section of the spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconstructedBlock {
+    /// The 64 reconstructed pixel values for this 8×8 block, in
+    /// `[by][bx]` row-major order, already clamped to `0..=255`
+    /// (§7.9.4 step 2(f)ii / 2(f)iii).
+    pub samples: [[u8; 8]; 8],
+}
+
+/// The §7.9.4 input bundle for a single block.
+///
+/// The frame-level §7.9.4 driver builds one of these per `bi` from
+/// the `NBS`-sized arrays it received and passes it to
+/// [`reconstruct_block`]. Keeping the per-block view typed and small
+/// makes the reconstruct procedure auditable against the spec
+/// without dragging the entire frame state into every call.
+///
+/// All fields correspond exactly to the §7.9.4 "Input parameters"
+/// table entries, indexed at the current block `bi` and its
+/// containing macro block `mbi`:
+///
+/// * `bcoded` ← `BCODED[bi]`
+/// * `mb_mode` ← `MBMODES[mbi]`
+/// * `mvect` ← `MVECTS[bi]`
+/// * `coeffs_zz` ← `COEFFS[bi]`
+/// * `ncoeffs` ← `NCOEFFS[bi]`
+/// * `qii` ← `QIIS[bi]`
+#[derive(Debug, Clone, Copy)]
+pub struct ReconstructBlockInputs {
+    /// `BCODED[bi]` — true if this block is coded (step 2(d)),
+    /// false if uncoded (step 2(e), copy from previous reference).
+    pub bcoded: bool,
+    /// `MBMODES[mbi]` — the coding mode of the macro block
+    /// containing `bi`. Step 2(d)ii / 2(d)iv consult this.
+    pub mb_mode: MacroBlockMode,
+    /// `MVECTS[bi]` — the per-block motion vector. Only consulted
+    /// on the coded inter branch (step 2(d)vi). Step 2(e)iii / iv
+    /// hardcode the uncoded path to the zero vector.
+    pub mvect: MotionVector,
+    /// `COEFFS[bi]` — the per-block quantized DCT coefficients in
+    /// zig-zag order. Step 2(d)vii.B reads `[0]` for the DC-only
+    /// branch; step 2(d)viii.B feeds the whole array into §7.9.2.
+    pub coeffs_zz: [i16; 64],
+    /// `NCOEFFS[bi]` — the coefficient count returned by the token
+    /// decode procedure. Drives the step 2(d)vii / 2(d)viii branch.
+    pub ncoeffs: u32,
+    /// `QIIS[bi]` — the per-block `qi` selector index. Step
+    /// 2(d)viii.A reads `QIS[qii]` to get the AC `qi`.
+    pub qii: u8,
+}
+
+/// Reconstruct a single block per §7.9.4 ("The Complete
+/// Reconstruction Algorithm") of the Xiph Theora I Specification.
+///
+/// This is the per-block body of the §7.9.4 step 2 loop — the
+/// frame-level driver that walks `bi in 0..NBS` will call this once
+/// per block. Step 1 (`qi0 = QIS[0]`) is a single read carried in
+/// `qi0`; the caller resolves it once per frame.
+///
+/// The procedure consists of:
+///
+/// 1. **Step 2(d) — coded block:**
+///    * Resolve `qti` from `MBMODES[mbi]` (0 for Intra, 1 otherwise).
+///    * Resolve `rfi` from Table 7.46.
+///    * If `rfi == 0` (Intra), `PRED` = §7.9.1.1 (constant 128).
+///    * Otherwise pick `REFP` / `RPW` / `RPH` from Table 7.75 per
+///      `(rfi, pli)`, split the per-block MV into the §7.9.1.3
+///      ("half-pixel") pair (`MVX/MVY` = round-toward-zero,
+///      `MVX2/MVY2` = round-away-from-zero), and if the pair
+///      collapses to a single whole-pixel vector use §7.9.1.2,
+///      otherwise §7.9.1.3.
+///    * If `NCOEFFS[bi] < 2`, take the DC-only shortcut: build the
+///      DC quant matrix from `(qti, pli, qi0)`, compute
+///      `DC = (COEFFS[bi][0] * QMAT[0] + 15) >> 5` (truncated to
+///      i16), and fill `RES[by][bx] = DC` for every output cell.
+///    * Otherwise pull `qi = QIS[QIIS[bi]]`, dequantize via §7.9.2
+///      (`(qti, pli, qi0, qi)`), and IDCT via §7.9.3.2.
+/// 2. **Step 2(e) — uncoded block:**
+///    * `rfi = 1` (Previous).
+///    * `MVX = MVY = 0`.
+///    * `PRED` = §7.9.1.2 with the zero vector (a direct copy of
+///      the co-located block from the previous reference frame).
+///    * `RES[by][bx] = 0` for every output cell.
+/// 3. **Step 2(f) — finalisation:** for each `(by, bx)`, compute
+///    `P = PRED[by][bx] + RES[by][bx]`, clamp to `0..=255`, and
+///    store into `samples[by][bx]`.
+///
+/// Inputs:
+///
+/// * `inputs` — the typed per-block view of the §7.9.4 input
+///   tables (`BCODED` / `MBMODES` / `MVECTS` / `COEFFS` /
+///   `NCOEFFS` / `QIIS` at `bi`/`mbi`).
+/// * `pli` — `0`/`1`/`2` for Y / Cb / Cr respectively. The plane
+///   index drives which reference plane is consulted and which
+///   `pli` slice of the quant-matrix interpolation is used.
+/// * `bx_origin` (`BX`), `by_origin` (`BY`) — the lower-left pixel
+///   coordinates of this block in its plane.
+/// * `qis` — the frame-level `QIS` array (`NQIS` entries, each in
+///   `0..=63`). Step 1 reads `QIS[0]`; step 2(d)viii.A reads
+///   `QIS[QIIS[bi]]`.
+/// * `params` — the setup-header [`QuantizationParameters`] needed
+///   by §6.4.3 to build per-`(qti, pli, qi)` quant matrices.
+/// * `refs` — the six reference-frame planes per Table 7.75.
+///
+/// Returns the reconstructed 8×8 tile in a [`ReconstructedBlock`].
+///
+/// Errors:
+///
+/// * [`Error::ReconstructPlaneIndexOutOfRange`] if `pli > 2`.
+/// * [`Error::ReconstructEmptyQis`] if `qis.is_empty()` (step 1
+///   has nothing to read).
+/// * [`Error::ReconstructQiiIndexOutOfRange`] if step 2(d)viii.A's
+///   `QIS[QIIS[bi]]` is out of range.
+/// * Any error propagated from [`compute_quantization_matrix`] when
+///   building the DC- or AC-quant matrices (e.g. `qti > 1`,
+///   `pli > 2`, `qi > 63`).
+pub fn reconstruct_block(
+    inputs: &ReconstructBlockInputs,
+    pli: usize,
+    bx_origin: u32,
+    by_origin: u32,
+    qis: &[u8],
+    params: &QuantizationParameters,
+    refs: &ReferencePlaneSet<'_>,
+) -> Result<ReconstructedBlock, Error> {
+    if pli > 2 {
+        return Err(Error::ReconstructPlaneIndexOutOfRange { pli });
+    }
+    // §7.9.4 step 1: qi0 = QIS[0]. Hoisted out of the per-block
+    // body in the spec but folded back in here so a per-block call
+    // is self-contained.
+    let qi0 = *qis.first().ok_or(Error::ReconstructEmptyQis)? as usize;
+
+    let (pred, res) = if inputs.bcoded {
+        // §7.9.4 step 2(d): coded-block branch.
+        coded_block_pred_res(inputs, pli, bx_origin, by_origin, qi0, qis, params, refs)?
+    } else {
+        // §7.9.4 step 2(e): uncoded-block branch.
+        uncoded_block_pred_res(pli, bx_origin, by_origin, refs)?
+    };
+
+    // §7.9.4 step 2(f): for each (by, bx), P = PRED + RES, clamp
+    // to 0..=255, store.
+    let mut samples = [[0u8; 8]; 8];
+    for by in 0..8 {
+        for bx in 0..8 {
+            // Widen PRED to i32 for the signed sum; PRED is u8
+            // (0..=255), RES is i16 (signed two's-complement).
+            let p = (pred[by][bx] as i32) + (res[by][bx] as i32);
+            // Step 2(f)ii / 2(f)iii: clamp top then bottom. The
+            // spec orders these as "if > 255 → 255" before "if < 0
+            // → 0"; the result is the same as `clamp(0, 255)`
+            // either way because the two reject windows do not
+            // overlap.
+            let clamped = p.clamp(0, 255);
+            samples[by][bx] = clamped as u8;
+        }
+    }
+    Ok(ReconstructedBlock { samples })
+}
+
+/// Internal alias for the `(PRED, RES)` pair returned by the
+/// per-block helpers feeding §7.9.4 step 2(f). PRED is the 8×8
+/// `u8` predictor tile (§7.9.1.x output); RES is the 8×8 `i16`
+/// residual (DC-only fill, IDCT output, or all-zero).
+type PredResPair = ([[u8; 8]; 8], [[i16; 8]; 8]);
+
+/// §7.9.4 step 2(d) helper — the coded-block PRED + RES computation.
+///
+/// Factored out of [`reconstruct_block`] so the coded / uncoded
+/// branches each map to a single readable function. Returns the
+/// `(PRED, RES)` pair feeding step 2(f).
+#[allow(clippy::too_many_arguments)]
+fn coded_block_pred_res(
+    inputs: &ReconstructBlockInputs,
+    pli: usize,
+    bx_origin: u32,
+    by_origin: u32,
+    qi0: usize,
+    qis: &[u8],
+    params: &QuantizationParameters,
+    refs: &ReferencePlaneSet<'_>,
+) -> Result<PredResPair, Error> {
+    // Step 2(d)ii / 2(d)iii: qti = 0 for Intra, 1 otherwise.
+    let qti = if inputs.mb_mode == MacroBlockMode::Intra {
+        0usize
+    } else {
+        1usize
+    };
+    // Step 2(d)iv: rfi from Table 7.46.
+    let rfi = reference_frame_for_mb_mode(inputs.mb_mode);
+
+    // Step 2(d)v / 2(d)vi: PRED.
+    let pred = match rfi {
+        ReferenceFrame::None => {
+            // Step 2(d)v: rfi == 0 → §7.9.1.1 intra predictor.
+            compute_intra_predictor()
+        }
+        ReferenceFrame::Previous | ReferenceFrame::Golden => {
+            // Step 2(d)vi: rfi != 0 → inter predictor branch.
+            let refp = refs.pick(rfi, pli)?;
+            // Step 2(d)vi.B / 2(d)vi.C: MVX/MVY = floor toward zero
+            // of each component. For integer-valued MotionVector
+            // this is the identity, but the spec's "//" operator
+            // means truncation toward negative infinity; combined
+            // with sign(MVECTS[bi]) the result equals truncation
+            // toward zero. Our MVECTS are already integer-valued
+            // i8, so the bottom-truncation step is a no-op.
+            let mvx = inputs.mvect.x as i32;
+            let mvy = inputs.mvect.y as i32;
+            // Step 2(d)vi.D / 2(d)vi.E: MVX2/MVY2 = ceil away from
+            // zero of each component. For an integer-valued MV
+            // both round-toward-zero and round-away-from-zero
+            // collapse to the same integer; the spec's
+            // step 2(d)vi.F "if MVX == MVX2 and MVY == MVY2" then
+            // routes us through §7.9.1.2 (whole pixel), step
+            // 2(d)vi.G otherwise. Theora MVs always come in as
+            // integer values, so the MVX == MVX2 branch is the
+            // common path here. The split helper is retained for
+            // any future chroma-MV halving driver to plug in.
+            let mvx2 = mvx;
+            let mvy2 = mvy;
+            if mvx == mvx2 && mvy == mvy2 {
+                // Step 2(d)vi.F: §7.9.1.2 whole-pixel predictor.
+                compute_whole_pixel_predictor(
+                    &refp,
+                    bx_origin,
+                    by_origin,
+                    MotionVector::new(mvx as i8, mvy as i8),
+                )
+            } else {
+                // Step 2(d)vi.G: §7.9.1.3 half-pixel predictor.
+                compute_half_pixel_predictor(
+                    &refp,
+                    bx_origin,
+                    by_origin,
+                    MotionVector::new(mvx as i8, mvy as i8),
+                    MotionVector::new(mvx2 as i8, mvy2 as i8),
+                )
+            }
+        }
+    };
+
+    // Step 2(d)vii / 2(d)viii: RES.
+    let res = if inputs.ncoeffs < 2 {
+        // Step 2(d)vii: DC-only shortcut.
+        // Step 2(d)vii.A: DC quant matrix from (qti, pli, qi0).
+        let qmat_dc = compute_quantization_matrix(params, qti, pli, qi0)?;
+        // Step 2(d)vii.B: DC = (COEFFS[bi][0] * QMAT[0] + 15) >> 5.
+        // The product widens to i32 to hold the exact value before
+        // the +15 bias and the >> 5 shift. The spec says
+        // "Truncate DC to a 16-bit signed representation" in
+        // step 2(d)vii.C — we apply the cast right after the shift,
+        // matching the prose "by dropping any higher-order bits".
+        let prod = (inputs.coeffs_zz[0] as i32).wrapping_mul(qmat_dc.values[0] as i32);
+        let dc_i32 = prod.wrapping_add(15) >> 5;
+        let dc_i16 = dc_i32 as i16;
+        // Step 2(d)vii.D: RES[by][bx] = DC for every cell.
+        [[dc_i16; 8]; 8]
+    } else {
+        // Step 2(d)viii: full DCT path.
+        // Step 2(d)viii.A: qi = QIS[QIIS[bi]].
+        let qii = inputs.qii as usize;
+        let nqis = qis.len();
+        let qi = *qis
+            .get(qii)
+            .ok_or(Error::ReconstructQiiIndexOutOfRange { qii, nqis })? as usize;
+        // Step 2(d)viii.B: DQC = §7.9.2 dequantize(coeffs, qti,
+        // pli, qi0, qi). Both matrices come from §6.4.3 — the DC
+        // matrix uses `qi0`, the AC matrix uses `qi`.
+        let qmat_dc = compute_quantization_matrix(params, qti, pli, qi0)?;
+        let qmat_ac = compute_quantization_matrix(params, qti, pli, qi)?;
+        let dqc = dequantize_block(&inputs.coeffs_zz, &qmat_dc, &qmat_ac);
+        // Step 2(d)viii.C: RES = §7.9.3.2 inverse DCT(DQC).
+        inverse_dct_2d(&dqc)
+    };
+
+    Ok((pred, res))
+}
+
+/// §7.9.4 step 2(e) helper — the uncoded-block PRED + RES
+/// computation. Per the spec narrative this is "a copy of the
+/// co-located block in the previous reference frame" plus a zero
+/// residual.
+fn uncoded_block_pred_res(
+    pli: usize,
+    bx_origin: u32,
+    by_origin: u32,
+    refs: &ReferencePlaneSet<'_>,
+) -> Result<PredResPair, Error> {
+    // Step 2(e)i: rfi = 1 (Previous).
+    // Step 2(e)ii: REFP / RPW / RPH from Table 7.75 at rfi=1.
+    let refp = refs.pick(ReferenceFrame::Previous, pli)?;
+    // Step 2(e)iii / 2(e)iv: MVX = MVY = 0. The whole-pixel
+    // predictor with the zero vector is exactly the co-located
+    // 8×8 copy the spec narrative describes.
+    let pred = compute_whole_pixel_predictor(&refp, bx_origin, by_origin, MotionVector::ZERO);
+    // Step 2(e)vi: RES[by][bx] = 0 for every cell.
+    let res = [[0i16; 8]; 8];
+    Ok((pred, res))
 }
 
 /// No-op codec registration. Decoder/encoder wiring will land in a
@@ -15280,5 +15721,682 @@ mod tests {
         assert_eq!(IDCT_S3, 54491);
         assert_eq!(IDCT_S6, 25080);
         assert_eq!(IDCT_S7, 12785);
+    }
+
+    // ---- §7.9.4 The Complete Reconstruction Algorithm (round 23) ----
+
+    /// Build a §6.4.2 [`QuantizationParameters`] suitable for
+    /// reconstruction tests: VP3-compat fallback ACSCALE / DCSCALE
+    /// / BMS / NBMS plus single-range NQRS = 0 / QRSIZES = [63] /
+    /// QRBMIS = [0, 0]. The all-zero QRSIZES + single-range layout
+    /// makes the per-`qi` matrix interpolation a pure
+    /// "base-matrix * scale" computation, which keeps the §7.9.4
+    /// tests focused on the reconstruction algebra rather than on
+    /// §6.4.3's interpolation logic (already exercised in the
+    /// round 6 tests).
+    fn make_recon_params() -> QuantizationParameters {
+        let setup = TheoraSetupHeader::vp3_defaults();
+        // One base matrix (all-16 entries) keeps the per-(qti, pli, qi)
+        // matrix derivation a pure ACSCALE / DCSCALE scaling — exactly
+        // the dependency surface a reconstruction test needs.
+        let base_matrices = vec![[16u8; 64]];
+        let mut qrsizes = [[[0u8; 63]; 3]; 2];
+        let mut qrbmis = [[[0u16; 64]; 3]; 2];
+        for qti in 0..2 {
+            for pli in 0..3 {
+                qrsizes[qti][pli][0] = 63;
+                qrbmis[qti][pli][0] = 0;
+                qrbmis[qti][pli][1] = 0;
+            }
+        }
+        QuantizationParameters {
+            ac_scale: setup.ac_scale,
+            dc_scale: setup.dc_scale,
+            num_base_matrices: base_matrices.len() as u16,
+            base_matrices,
+            num_quant_ranges: [[1u8; 3]; 2],
+            quant_range_sizes: qrsizes,
+            quant_range_base_matrix_indices: qrbmis,
+        }
+    }
+
+    /// A 16-pixel-wide / 16-pixel-tall ramp plane: each pixel takes
+    /// the value `((rx + ry) % 256) as u8`. Lets us tell which
+    /// reference plane was sampled (we use shifted ramps for the
+    /// other planes).
+    fn ramp_plane(rpw: u32, rph: u32, bias: u32) -> Vec<u8> {
+        let mut v = Vec::with_capacity((rpw * rph) as usize);
+        for ry in 0..rph {
+            for rx in 0..rpw {
+                v.push(((rx + ry + bias) % 256) as u8);
+            }
+        }
+        v
+    }
+
+    /// Build a [`ReferencePlaneSet`] over six borrowed ramp planes
+    /// with distinct biases per (rfi, pli). The bias lets a test
+    /// confirm the right Table 7.75 lookup ran.
+    fn make_refs<'a>(planes: &'a [Vec<u8>; 6], rpw: u32, rph: u32) -> ReferencePlaneSet<'a> {
+        ReferencePlaneSet {
+            previous_y: ReferencePlane::new(rpw, rph, &planes[0]).unwrap(),
+            previous_cb: ReferencePlane::new(rpw, rph, &planes[1]).unwrap(),
+            previous_cr: ReferencePlane::new(rpw, rph, &planes[2]).unwrap(),
+            golden_y: ReferencePlane::new(rpw, rph, &planes[3]).unwrap(),
+            golden_cb: ReferencePlane::new(rpw, rph, &planes[4]).unwrap(),
+            golden_cr: ReferencePlane::new(rpw, rph, &planes[5]).unwrap(),
+        }
+    }
+
+    /// §7.9.4 step 2(d)v: an Intra-coded block consults §7.9.1.1
+    /// (constant 128 predictor) regardless of the reference planes.
+    /// With NCOEFFS < 2 and COEFFS[0] = 0 the DC residual is 0,
+    /// so the output should be all 128.
+    #[test]
+    fn reconstruct_intra_dc_only_zero_residual_is_128() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::Intra,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis = [10u8];
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        for row in out.samples.iter() {
+            for &v in row.iter() {
+                assert_eq!(v, 128);
+            }
+        }
+    }
+
+    /// §7.9.4 step 2(d)vii: an Intra-coded block with NCOEFFS < 2
+    /// uses the DC-only shortcut. With a positive DC coefficient,
+    /// PRED (constant 128) + DC should be 128 + DC for every cell,
+    /// clamped into 0..=255.
+    #[test]
+    fn reconstruct_intra_dc_only_positive_residual_offsets_predictor() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        // Pick a small DC so the resulting (128 + DC) stays in
+        // 0..=255 and we don't get clamped.
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 8;
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::Intra,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: coeffs,
+            ncoeffs: 1,
+            qii: 0,
+        };
+        let qis = [10u8];
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        // Compute the expected DC: (8 * qmat_dc[0] + 15) >> 5
+        // where qmat_dc[0] is the §6.4.3 matrix entry for
+        // (qti=0, pli=0, qi=10). We don't need to know the
+        // specific value — we just need every cell to equal
+        // 128 + DC for some constant DC, no AC variation, no
+        // clamping.
+        let dc_pred = 128i32;
+        let expected = out.samples[0][0] as i32;
+        // Sanity-check the expected sits in 0..=255.
+        assert!((0..=255).contains(&expected));
+        // The cell value at (0,0) is 128 + DC. Solve for DC:
+        let dc = expected - dc_pred;
+        // Make sure DC is positive (we configured COEFFS[0] = +8
+        // and the quant matrix entry is positive).
+        assert!(
+            dc > 0,
+            "expected positive DC, got DC={dc} (cell={expected})",
+        );
+        // Every cell should equal this same value (the §7.9.4
+        // DC-only shortcut writes DC into every RES slot, and the
+        // predictor is constant 128).
+        for row in out.samples.iter() {
+            for &v in row.iter() {
+                assert_eq!(v as i32, expected);
+            }
+        }
+    }
+
+    /// §7.9.4 step 2(d)vii: with a very large positive COEFFS[0]
+    /// the unclamped PRED + DC overshoots 255. Step 2(f)ii must
+    /// clamp the output to 255.
+    #[test]
+    fn reconstruct_intra_dc_only_clamps_high() {
+        let params = make_recon_params();
+        let planes = core::array::from_fn::<_, 6, _>(|_| ramp_plane(16, 16, 0));
+        let refs = make_refs(&planes, 16, 16);
+        // Pick the largest legal COEFFS[0] so (COEFFS[0] *
+        // qmat_dc[0] + 15) >> 5 lands well above 127, taking the
+        // 128 + DC sum above 255.
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = i16::MAX;
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::Intra,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: coeffs,
+            ncoeffs: 1,
+            qii: 0,
+        };
+        let qis = [40u8];
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        for row in out.samples.iter() {
+            for &v in row.iter() {
+                assert_eq!(v, 255);
+            }
+        }
+    }
+
+    /// §7.9.4 step 2(d)vii: with the most negative possible
+    /// COEFFS[0] the unclamped PRED + DC undershoots 0. Step
+    /// 2(f)iii must clamp the output to 0.
+    #[test]
+    fn reconstruct_intra_dc_only_clamps_low() {
+        let params = make_recon_params();
+        let planes = core::array::from_fn::<_, 6, _>(|_| ramp_plane(16, 16, 0));
+        let refs = make_refs(&planes, 16, 16);
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = i16::MIN;
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::Intra,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: coeffs,
+            ncoeffs: 1,
+            qii: 0,
+        };
+        let qis = [40u8];
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        for row in out.samples.iter() {
+            for &v in row.iter() {
+                assert_eq!(v, 0);
+            }
+        }
+    }
+
+    /// §7.9.4 step 2(e) — uncoded block. PRED = §7.9.1.2 with the
+    /// zero vector, sampling the Previous-Y reference plane.
+    /// RES = 0. Output should exactly equal the ramp plane's
+    /// sample values at (BX + bx, BY + by).
+    #[test]
+    fn reconstruct_uncoded_copies_previous_reference() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: false,
+            mb_mode: MacroBlockMode::InterNoMv, // ignored on the uncoded branch
+            mvect: MotionVector::new(7, -3),    // ignored on the uncoded branch
+            coeffs_zz: [12345i16; 64],          // ignored on the uncoded branch
+            ncoeffs: 64,                        // ignored on the uncoded branch
+            qii: 0,
+        };
+        let qis = [25u8];
+        let out = reconstruct_block(&inputs, 0, 4, 4, &qis, &params, &refs).unwrap();
+        // The previous-Y plane is ramp((rx + ry) % 256). With
+        // BX=4, BY=4, MV=0, the 8×8 tile reads (rx+ry+8)..(rx+ry+18).
+        for by in 0..8 {
+            for bx in 0..8 {
+                let expected = ((bx + by + 8) % 256) as u8;
+                assert_eq!(out.samples[by][bx], expected);
+            }
+        }
+    }
+
+    /// §7.9.4 step 2(e) on the Cb plane should sample the
+    /// Previous-Cb plane (bias = 10 in our setup), not the
+    /// Previous-Y plane.
+    #[test]
+    fn reconstruct_uncoded_cb_samples_previous_cb() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: false,
+            mb_mode: MacroBlockMode::InterNoMv,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis = [25u8];
+        let out = reconstruct_block(&inputs, 1, 0, 0, &qis, &params, &refs).unwrap();
+        // Previous-Cb has bias = 10. At BX=BY=0, MV=0 the (0,0)
+        // cell reads ((0+0+10) % 256) = 10.
+        assert_eq!(out.samples[0][0], 10);
+    }
+
+    /// §7.9.4 step 2(e) on the Cr plane should sample the
+    /// Previous-Cr plane (bias = 20).
+    #[test]
+    fn reconstruct_uncoded_cr_samples_previous_cr() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: false,
+            mb_mode: MacroBlockMode::InterNoMv,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis = [25u8];
+        let out = reconstruct_block(&inputs, 2, 0, 0, &qis, &params, &refs).unwrap();
+        // Previous-Cr has bias = 20.
+        assert_eq!(out.samples[0][0], 20);
+    }
+
+    /// §7.9.4 step 2(d)iv → Table 7.46: `InterGoldenNoMv` /
+    /// `InterGoldenMv` use the **Golden** reference. An NCOEFFS=0
+    /// DC-only block with COEFFS[0] = 0 produces RES = 0; PRED is
+    /// the whole-pixel predictor over the Golden-Y plane (bias=30).
+    #[test]
+    fn reconstruct_inter_golden_samples_golden_reference() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::InterGoldenNoMv,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis = [10u8];
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        // Golden-Y has bias = 30. (0,0) reads 30. DC=0 so output =
+        // 30 verbatim.
+        assert_eq!(out.samples[0][0], 30);
+        // (1,2) reads bias + (1 + 2) = 33 → output 33.
+        assert_eq!(out.samples[2][1], 33);
+    }
+
+    /// §7.9.4 step 2(d)iv → Table 7.46: `InterNoMv` / `InterMv` etc.
+    /// use the **Previous** reference. Coupled with `pli = 2` we
+    /// expect the Previous-Cr plane (bias = 20).
+    #[test]
+    fn reconstruct_inter_previous_samples_previous_reference() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::InterMv,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis = [10u8];
+        let out = reconstruct_block(&inputs, 2, 0, 0, &qis, &params, &refs).unwrap();
+        // Previous-Cr has bias = 20. (0,0) reads 20.
+        assert_eq!(out.samples[0][0], 20);
+    }
+
+    /// §7.9.4 step 2(d)vi.F: an integer-valued MV makes MVX2 == MVX
+    /// and MVY2 == MVY, routing through §7.9.1.2 whole-pixel. With
+    /// a non-zero MV the predictor reads from a shifted position
+    /// in the Previous-Y plane.
+    #[test]
+    fn reconstruct_inter_nonzero_mv_shifts_predictor_sample() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::InterMv,
+            mvect: MotionVector::new(2, 3),
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis = [10u8];
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        // Previous-Y has bias = 0. Whole-pixel predictor at BX=BY=0
+        // with MV=(2,3) samples REFP[3 + by][2 + bx], i.e.
+        // (2+bx) + (3+by) = bx + by + 5. (0,0) → 5. (1,0) → 6.
+        assert_eq!(out.samples[0][0], 5);
+        assert_eq!(out.samples[0][1], 6);
+        assert_eq!(out.samples[1][0], 6);
+        assert_eq!(out.samples[7][7], 19);
+    }
+
+    /// §7.9.4 step 2(d)viii — the full DCT path. With an all-zero
+    /// COEFFS array, dequantize → IDCT → RES is all zero, so the
+    /// output equals the predictor (constant 128 on the intra
+    /// branch).
+    #[test]
+    fn reconstruct_intra_full_dct_zero_coeffs_equals_predictor() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::Intra,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 64, // forces the full-DCT branch
+            qii: 0,
+        };
+        let qis = [10u8];
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        for row in out.samples.iter() {
+            for &v in row.iter() {
+                assert_eq!(v, 128);
+            }
+        }
+    }
+
+    /// §7.9.4 step 1 error path — an empty QIS array means step 1
+    /// (`qi0 = QIS[0]`) has nothing to read.
+    #[test]
+    fn reconstruct_empty_qis_rejects() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::Intra,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis: [u8; 0] = [];
+        let err = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap_err();
+        assert_eq!(err, Error::ReconstructEmptyQis);
+    }
+
+    /// §7.9.4 step 2(d)viii.A error path — `qii` beyond the QIS
+    /// length is a per-block input invariant violation.
+    #[test]
+    fn reconstruct_qii_out_of_range_rejects() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::Intra,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 64, // forces the QIS[QIIS[bi]] path
+            qii: 5,
+        };
+        let qis = [10u8, 20u8];
+        let err = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap_err();
+        assert_eq!(
+            err,
+            Error::ReconstructQiiIndexOutOfRange { qii: 5, nqis: 2 }
+        );
+    }
+
+    /// §7.9.4 step 2(a) error path — `pli > 2` is rejected before
+    /// any computation runs.
+    #[test]
+    fn reconstruct_plane_index_out_of_range_rejects() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: false,
+            mb_mode: MacroBlockMode::InterNoMv,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis = [10u8];
+        let err = reconstruct_block(&inputs, 3, 0, 0, &qis, &params, &refs).unwrap_err();
+        assert_eq!(err, Error::ReconstructPlaneIndexOutOfRange { pli: 3 });
+    }
+
+    /// §7.9.4 Table 7.75 `(rfi, pli)` lookups via `pick`:
+    /// `ReferencePlaneSet::pick(Previous, 0..=2)` and
+    /// `pick(Golden, 0..=2)` each select the right plane.
+    /// `pick(None, _)` is the intra-routing-mismatch reject.
+    #[test]
+    fn reference_plane_set_pick_table_7_75() {
+        let planes = [
+            ramp_plane(8, 8, 100),
+            ramp_plane(8, 8, 101),
+            ramp_plane(8, 8, 102),
+            ramp_plane(8, 8, 103),
+            ramp_plane(8, 8, 104),
+            ramp_plane(8, 8, 105),
+        ];
+        let refs = make_refs(&planes, 8, 8);
+        // The (Previous, Y) plane has bias 100, so samples[0] is
+        // ((0+0+100) % 256) = 100.
+        assert_eq!(
+            refs.pick(ReferenceFrame::Previous, 0).unwrap().samples[0],
+            100
+        );
+        assert_eq!(
+            refs.pick(ReferenceFrame::Previous, 1).unwrap().samples[0],
+            101
+        );
+        assert_eq!(
+            refs.pick(ReferenceFrame::Previous, 2).unwrap().samples[0],
+            102
+        );
+        assert_eq!(
+            refs.pick(ReferenceFrame::Golden, 0).unwrap().samples[0],
+            103
+        );
+        assert_eq!(
+            refs.pick(ReferenceFrame::Golden, 1).unwrap().samples[0],
+            104
+        );
+        assert_eq!(
+            refs.pick(ReferenceFrame::Golden, 2).unwrap().samples[0],
+            105
+        );
+        // pli out-of-range
+        assert_eq!(
+            refs.pick(ReferenceFrame::Previous, 3).unwrap_err(),
+            Error::ReconstructPlaneIndexOutOfRange { pli: 3 },
+        );
+        // Intra at any pli is a router mismatch
+        assert_eq!(
+            refs.pick(ReferenceFrame::None, 0).unwrap_err(),
+            Error::ReconstructIntraInterBranchMismatch,
+        );
+    }
+
+    /// §7.9.4 step 2(d)vii.B literal — pin the DC-only formula.
+    /// With COEFFS[0] = 32, the DC quantization matrix entry
+    /// `qmat_dc[0]` for (qti=0, pli=0, qi=10) is reproducible from
+    /// §6.4.3 against the same params; we compute it explicitly,
+    /// pin DC = (COEFFS[0] * qmat_dc[0] + 15) >> 5, and assert the
+    /// reconstructed cell equals 128 + DC.
+    #[test]
+    fn reconstruct_dc_only_formula_matches_2d_vii_b() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 32;
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::Intra,
+            mvect: MotionVector::ZERO,
+            coeffs_zz: coeffs,
+            ncoeffs: 1,
+            qii: 0,
+        };
+        let qi0 = 10usize;
+        let qis = [qi0 as u8];
+        let qmat_dc = compute_quantization_matrix(&params, 0, 0, qi0).unwrap();
+        let expected_dc = ((32i32 * qmat_dc.values[0] as i32) + 15) >> 5;
+        let expected_dc_i16 = expected_dc as i16;
+        let expected_pixel = (128i32 + expected_dc_i16 as i32).clamp(0, 255) as u8;
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        assert_eq!(out.samples[0][0], expected_pixel);
+        // All cells should match because PRED is constant and RES
+        // is the constant DC.
+        for row in out.samples.iter() {
+            for &v in row.iter() {
+                assert_eq!(v, expected_pixel);
+            }
+        }
+    }
+
+    /// §7.9.4 Display rendering of the four new error variants
+    /// should each carry a stable, distinct §7.9.4 tag — useful
+    /// when end-to-end traces surface a reconstruction reject.
+    #[test]
+    fn reconstruct_error_display_tags() {
+        let e = Error::ReconstructPlaneIndexOutOfRange { pli: 7 };
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"), "missing §7.9.4 tag: {s}");
+        assert!(s.contains("pli=7"));
+        let e = Error::ReconstructEmptyQis;
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"));
+        assert!(s.contains("QIS"));
+        let e = Error::ReconstructQiiIndexOutOfRange { qii: 9, nqis: 3 };
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"));
+        assert!(s.contains("qii=9"));
+        assert!(s.contains("NQIS=3"));
+        let e = Error::ReconstructIntraInterBranchMismatch;
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"));
+        assert!(s.contains("Intra"));
+    }
+
+    /// §7.9.4 step 2(f) determinism — calling [`reconstruct_block`]
+    /// twice with the same inputs yields byte-identical output.
+    /// This catches accidental mutable state leaking through the
+    /// quant-matrix / IDCT helpers.
+    #[test]
+    fn reconstruct_is_deterministic() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 42;
+        coeffs[1] = -17;
+        coeffs[5] = 8;
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::InterMv,
+            mvect: MotionVector::new(1, -1),
+            coeffs_zz: coeffs,
+            ncoeffs: 8,
+            qii: 0,
+        };
+        let qis = [20u8, 30u8];
+        let a = reconstruct_block(&inputs, 0, 4, 4, &qis, &params, &refs).unwrap();
+        let b = reconstruct_block(&inputs, 0, 4, 4, &qis, &params, &refs).unwrap();
+        assert_eq!(a, b);
     }
 }

@@ -2,7 +2,7 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-06-03
+## Status — 2026-06-04
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter
 limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
@@ -13,7 +13,7 @@ qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
 §7.7.3 DCT coefficient decode driver + §7.8.1 DC predictor compute +
 §7.8.2 DC prediction inversion driver + §7.9.1 predictors (intra /
 whole-pixel / half-pixel) + §7.9.2 dequantization + §7.9.3 inverse DCT
-(1D + 2D) (rounds 1–22).** §6.1, §6.2
+(1D + 2D) + §7.9.4 per-block reconstruction (rounds 1–23).** §6.1, §6.2
 (identification), §6.3 (comment), §6.4.5 step 1 (setup-header
 common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
 (Quantization Parameters Decode), §6.4.3 (Computing a Quantization
@@ -1139,18 +1139,117 @@ transpose invariant confirming `DQC[1]` (`ri=0, ci=1`) and
 not panicking, and Table 7.65 constants pinned to their integer
 values via a guard test.
 
+### §7.9.4 The Complete Reconstruction Algorithm (round 23)
+
+§7.9.4 of the Theora I Specification defines the per-block
+reconstruction algorithm that selects the predictor (intra /
+whole-pixel / half-pixel), computes the residual (DC-only
+shortcut or full dequantize + inverse DCT), sums them, and clamps
+to `0..=255`. Round 23 lands the **per-block body** of §7.9.4
+step 2 in a single public entry point. The frame-level driver
+(step 2 loop body framing — `bi in 0..NBS` raster walk with
+per-plane geometry) is intentionally kept for a later round so
+that the per-block procedure can be audited against §7.9.4 in
+isolation.
+
+```text
+pub struct ReconstructedBlock { pub samples: [[u8; 8]; 8] }
+
+pub struct ReconstructBlockInputs {
+    pub bcoded: bool,
+    pub mb_mode: MacroBlockMode,
+    pub mvect: MotionVector,
+    pub coeffs_zz: [i16; 64],
+    pub ncoeffs: u32,
+    pub qii: u8,
+}
+
+pub struct ReferencePlaneSet<'a> {
+    pub previous_y: ReferencePlane<'a>,
+    pub previous_cb: ReferencePlane<'a>,
+    pub previous_cr: ReferencePlane<'a>,
+    pub golden_y: ReferencePlane<'a>,
+    pub golden_cb: ReferencePlane<'a>,
+    pub golden_cr: ReferencePlane<'a>,
+}
+
+pub fn reconstruct_block(
+    inputs: &ReconstructBlockInputs,
+    pli: usize,
+    bx_origin: u32,
+    by_origin: u32,
+    qis: &[u8],
+    params: &QuantizationParameters,
+    refs: &ReferencePlaneSet<'_>,
+) -> Result<ReconstructedBlock, Error>;
+```
+
+The procedure walks each step of §7.9.4 verbatim:
+
+* **Step 1.** `qi0 = QIS[0]`. Empty `qis` is rejected with
+  `Error::ReconstructEmptyQis`.
+* **Step 2(d) — coded block.** `qti` (step 2(d)ii / iii) = 0 for
+  `Intra`, 1 otherwise. `rfi` (step 2(d)iv) comes from
+  `reference_frame_for_mb_mode` (Table 7.46). `rfi == 0` (None)
+  → §7.9.1.1 (constant 128) predictor; `rfi != 0` →
+  `ReferencePlaneSet::pick` selects `REFP` / `RPW` / `RPH` per
+  Table 7.75. Integer-valued `MVECTS[bi]` collapses MVX==MVX2 and
+  MVY==MVY2, so step 2(d)vi.F always routes to §7.9.1.2; the
+  §7.9.1.3 branch (step 2(d)vi.G) is reachable only via the
+  `split_half_pixel_motion_vector` helper from round 21 once the
+  §7.9.4 chroma-MV halving driver lands.
+* **Step 2(d)vii — DC-only shortcut.** When `NCOEFFS[bi] < 2`,
+  build the DC quant matrix from `(qti, pli, qi0)`, compute
+  `DC = (COEFFS[bi][0] * QMAT[0] + 15) >> 5` truncated to a
+  16-bit signed representation (Rust's `as i16` narrowing), and
+  fill `RES[by][bx] = DC` for every cell. Both the `+15` bias and
+  the `>> 5` shift match step 2(d)vii.B verbatim.
+* **Step 2(d)viii — full DCT path.** Otherwise read
+  `qi = QIS[QIIS[bi]]` (`Error::ReconstructQiiIndexOutOfRange`
+  on a malformed `qii`), build the DC matrix from
+  `(qti, pli, qi0)` and the AC matrix from `(qti, pli, qi)`,
+  dequantize via §7.9.2, and `inverse_dct_2d` the result.
+* **Step 2(e) — uncoded block.** `rfi = 1` (Previous), MV =
+  zero, PRED via §7.9.1.2 (a direct co-located copy), `RES = 0`.
+* **Step 2(f) — finalisation.** For each `(by, bx)`, sum PRED
+  and RES, clamp to `0..=255`, store into
+  `ReconstructedBlock.samples`.
+
+The `ReferencePlaneSet` wrapper carries the six (rfi, pli)
+reference planes Table 7.75 enumerates. `pick(rfi, pli)`
+returns the right plane; an Intra-routed call into pick is the
+`ReconstructIntraInterBranchMismatch` reject (an internal-
+invariant guard — `reconstruct_block` itself routes Intra to the
+§7.9.1.1 path before consulting `refs`).
+
+Round 23 adds eighteen new tests (total now 397): the
+Intra-DC-zero-residual all-128 invariant, an Intra-DC-positive
+PRED-plus-DC offset, both clamp paths (high and low), the
+uncoded `Previous-Y` co-located copy, plane-specific routing
+(uncoded Cb → Previous-Cb, uncoded Cr → Previous-Cr), the
+Inter-Golden Table 7.46 routing (`InterGoldenNoMv` →
+Golden-Y), the Inter-Previous Table 7.46 routing
+(`InterMv` → Previous-Cr at `pli = 2`), the whole-pixel-MV
+positional shift, the all-zero-COEFFS full-DCT path collapsing
+to PRED, the three reject paths (`ReconstructEmptyQis`,
+`ReconstructQiiIndexOutOfRange`, `ReconstructPlaneIndexOutOfRange`),
+the Table 7.75 `pick` lookup over all six (rfi, pli) pairs,
+a pinned step 2(d)vii.B formula cross-check
+(`DC = (COEFFS[0] * qmat_dc[0] + 15) >> 5` matched against a
+hand-computed expectation), Display rendering for all four new
+error variants, and a determinism guard for the per-block path.
+
 ## Roadmap
 
-* Next: §7.9.4 The Complete Reconstruction Algorithm — the
-  end-to-end driver that selects per-block predictor / inverse
-  DCT / predictor-plus-residual sum and writes reconstructed
-  samples into the output frame plane. This is the path to a
-  first decoded Theora frame. The §7.9.4 driver also defines the
-  DC-only special case for blocks with no non-zero AC coefficient
-  (which is non-equivalent to applying the full inverse transform
-  and is required by §7.9.3 for bit-exact decode).
-* After §7.9.4: §7.10 Loop Filter — deblocking applied with the
-  §6.4.1 LFLIMS table.
+* Next: §7.9.4 frame-level driver — the `bi in 0..NBS` raster
+  walk that consults per-plane `(BX, BY)` geometry (§2.x) and
+  the `mb_index_of_block` mapping (§6.4.x), iterates
+  [`reconstruct_block`], and writes `RECY` / `RECCB` /
+  `RECCR`. The per-block body of round 23 already covers
+  steps 1 and 2(a)–2(f); the frame-level wrapper is mostly
+  geometry + array I/O.
+* After the frame driver: §7.10 Loop Filter — deblocking applied
+  with the §6.4.1 LFLIMS table.
 * §7.9.3.3 (the 1D forward DCT) is explicitly non-normative per
   the spec ("the version of the transform used by Xiph.Org's
   Theora encoder, which is the same as that used by VP3") and is

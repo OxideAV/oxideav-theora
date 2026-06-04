@@ -13,7 +13,8 @@ qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
 §7.7.3 DCT coefficient decode driver + §7.8.1 DC predictor compute +
 §7.8.2 DC prediction inversion driver + §7.9.1 predictors (intra /
 whole-pixel / half-pixel) + §7.9.2 dequantization + §7.9.3 inverse DCT
-(1D + 2D) + §7.9.4 per-block reconstruction (rounds 1–23).** §6.1, §6.2
+(1D + 2D) + §7.9.4 per-block reconstruction + §7.9.4 frame-level
+driver (rounds 1–23, 233).** §6.1, §6.2
 (identification), §6.3 (comment), §6.4.5 step 1 (setup-header
 common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
 (Quantization Parameters Decode), §6.4.3 (Computing a Quantization
@@ -1239,17 +1240,105 @@ a pinned step 2(d)vii.B formula cross-check
 hand-computed expectation), Display rendering for all four new
 error variants, and a determinism guard for the per-block path.
 
+### §7.9.4 frame-level driver (round 233)
+
+Round 233 closes the framing layer above [`reconstruct_block`]:
+the public [`reconstruct_frame`] entry point walks
+`bi in 0..NBS`, dispatches each block to the round-23 per-block
+body, and tiles the resulting 8×8 samples into three flat output
+plane vectors per §7.9.4 step 2(f)iv-vi.
+
+```text
+pub struct PlaneDimensions { pub width: u32, pub height: u32 }
+
+pub struct ReconstructedFrame {
+    pub samples_y:  Vec<u8>,
+    pub samples_cb: Vec<u8>,
+    pub samples_cr: Vec<u8>,
+    pub dims_y:  PlaneDimensions,
+    pub dims_cb: PlaneDimensions,
+    pub dims_cr: PlaneDimensions,
+}
+
+pub fn reconstruct_frame(
+    bcoded:        &[bool],          // BCODED[bi]   — §7.3
+    mb_modes:      &[MacroBlockMode],// MBMODES[mbi] — §7.4
+    mvects:        &[MotionVector],  // MVECTS[bi]   — §7.5
+    coeffs:        &[[i16; 64]],     // COEFFS[bi]   — §7.7
+    ncoeffs:       &[u32],           // NCOEFFS[bi]  — §7.7
+    qiis:          &[u8],            // QIIS[bi]     — §7.6
+    pli_of_block:  &[u8],            // §2.3 colour-plane index per bi
+    bx_of_block:   &[u32],           // §7.9.4 step 2(b)
+    by_of_block:   &[u32],           // §7.9.4 step 2(c)
+    mbi_of_block:  &[u32],           // §7.9.4 step 2(d)i
+    qis:           &[u8],            // §7.1
+    params:        &QuantizationParameters,
+    refs:          &ReferencePlaneSet<'_>,
+    dims_y:  PlaneDimensions,
+    dims_cb: PlaneDimensions,
+    dims_cr: PlaneDimensions,
+) -> Result<ReconstructedFrame, Error>;
+```
+
+Per-plane (§2.3) raster geometry is **caller-supplied** rather
+than re-derived inside the driver — matching the §7.8.2 convention
+where the caller resolves the coded-order Hilbert mapping into a
+per-block `(pli, BX, BY, mbi)` quadruple. This keeps the driver
+focused on the §7.9.4 step 2 algebra (block-by-block dispatch +
+output tiling) rather than on §2.3 / §2.4 coded-order mechanics.
+
+The driver:
+
+* **Length-checks** every per-block input slice against `nbs`
+  before iterating. A mismatch surfaces as
+  `ReconstructFrameBlockLenMismatch { which, got, nbs }` with a
+  typed [`ReconstructFrameBlockSlice`] tag identifying the
+  failing slice.
+* **Allocates** three `Vec<u8>` planes of `width * height` zero
+  bytes; `width * height` overflow surfaces as
+  `ReconstructFramePlaneDimensionsOverflow`.
+* **Resolves** `pli` (step 2(a)) from `pli_of_block[bi]`, with
+  out-of-range values rejected as `ReconstructFramePliOutOfRange`.
+* **Resolves** the destination plane + its dimensions, then rejects
+  any `(BX, BY)` whose 8×8 footprint would escape the plane as
+  `ReconstructFrameBlockOutOfPlane`.
+* **For coded blocks** (step 2(d)) reads
+  `mb_modes[mbi_of_block[bi]]`, with `mbi >= nmbs` rejected as
+  `ReconstructFrameMbIndexOutOfRange`.
+* **For uncoded blocks** (step 2(e)) skips the macro-block lookup
+  entirely — step 2(d) is gated on `BCODED[bi] != 0`. The
+  per-block call enters [`reconstruct_block`] with a placeholder
+  `mb_mode` that the uncoded path ignores.
+* **Tiles** the [`ReconstructedBlock`] return into the destination
+  plane in lower-left row-major order per §2.1 ("origin in the
+  lower-left corner"), writing `samples[BY + by][BX + bx]` for
+  each of the 64 cells.
+
+Round 233 adds eight new tests (total now 405): an all-intra
+all-zero-coefficient 4:2:0 frame producing three planes of all-128
+across the four-luma + one-Cb + one-Cr geometry; an uncoded luma
+block at `(BX=0, BY=0)` confirmed to sample the `PREVREFY` ramp at
+the same coordinates (with the other three luma blocks still
+hitting the intra path); the four reject paths
+(`ReconstructFramePliOutOfRange`,
+`ReconstructFrameBlockLenMismatch` on `Mvects`,
+`ReconstructFrameBlockOutOfPlane` for a `BX = 10` luma block on a
+16-wide plane, and `ReconstructFrameMbIndexOutOfRange` for an
+`mbi = 5` against `nmbs = 1`); Display tag rendering for all five
+new error variants; and a determinism guard over a mixed
+coded/uncoded input.
+
 ## Roadmap
 
-* Next: §7.9.4 frame-level driver — the `bi in 0..NBS` raster
-  walk that consults per-plane `(BX, BY)` geometry (§2.x) and
-  the `mb_index_of_block` mapping (§6.4.x), iterates
-  [`reconstruct_block`], and writes `RECY` / `RECCB` /
-  `RECCR`. The per-block body of round 23 already covers
-  steps 1 and 2(a)–2(f); the frame-level wrapper is mostly
-  geometry + array I/O.
-* After the frame driver: §7.10 Loop Filter — deblocking applied
-  with the §6.4.1 LFLIMS table.
+* Next: §7.10 Loop Filter — deblocking applied to the
+  pre-loop-filter frame returned by [`reconstruct_frame`] using
+  the §6.4.1 `LFLIMS[qi0]` table.
+* After §7.10: the §2.3 coded-order resolver — a standalone
+  helper that takes `(FMBW, FMBH, PF)` from the identification
+  header and returns the per-block `(pli, BX, BY, mbi)`
+  quadruple [`reconstruct_frame`] currently expects from the
+  caller. This is mostly Hilbert-curve geometry over the
+  super-block / macro-block / block hierarchy of §2.3 / §2.4.
 * §7.9.3.3 (the 1D forward DCT) is explicitly non-normative per
   the spec ("the version of the transform used by Xiph.Org's
   Theora encoder, which is the same as that used by VP3") and is

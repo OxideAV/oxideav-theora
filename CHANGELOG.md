@@ -6,6 +6,42 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.9.4 frame-level driver (round 233). New public entry point
+  `reconstruct_frame(bcoded, mb_modes, mvects, coeffs, ncoeffs,
+  qiis, pli_of_block, bx_of_block, by_of_block, mbi_of_block, qis,
+  params, refs, dims_y, dims_cb, dims_cr) -> Result<ReconstructedFrame,
+  Error>` walks the §7.9.4 step 2 loop over `bi in 0..NBS`,
+  dispatches each block to the round-23 `reconstruct_block` body,
+  and tiles the resulting 8×8 samples into three flat output plane
+  vectors per §7.9.4 step 2(f)iv-vi. Per-plane `(pli, BX, BY, mbi)`
+  geometry is caller-supplied (matching the §7.8.2 convention)
+  rather than re-derived inside the driver, so the §2.3 coded-order
+  Hilbert mapping is the caller's responsibility. Output planes
+  are returned in lower-left row-major order per the §2.1 origin
+  convention.
+  Supporting types: `PlaneDimensions { width: u32, height: u32 }`
+  (per-plane output dimensions), `ReconstructedFrame { samples_y,
+  samples_cb, samples_cr, dims_y, dims_cb, dims_cr }` (the three
+  reconstructed planes plus their geometry), and
+  `ReconstructFrameBlockSlice` (a typed tag identifying which
+  per-block slice failed a length check).
+  Five new error variants: `ReconstructFrameBlockLenMismatch`
+  (per-block slice length != `nbs`),
+  `ReconstructFramePliOutOfRange` (`pli_of_block[bi] > 2`),
+  `ReconstructFrameMbIndexOutOfRange` (`mbi >= nmbs` on a coded
+  block), `ReconstructFrameBlockOutOfPlane` (block 8×8 footprint
+  escapes destination plane), and
+  `ReconstructFramePlaneDimensionsOverflow` (plane `width * height`
+  overflows `usize`).
+  Eight new tests (total now 405): an all-intra all-zero-coefficient
+  4:2:0 frame producing three planes of all-128 across a four-luma
+  + one-Cb + one-Cr geometry; an uncoded luma block confirmed to
+  sample `PREVREFY` at the same coordinates while the other three
+  luma blocks still hit the intra path; the four reject paths and
+  a five-variant Display tag check; and a determinism guard over
+  a mixed coded/uncoded input. The frame is returned
+  pre-loop-filter — §7.10 is the next clause.
+
 - §7.9.4 per-block reconstruction (round 23). New public entry
   point `reconstruct_block(inputs, pli, bx_origin, by_origin,
   qis, params, refs) -> Result<ReconstructedBlock, Error>`

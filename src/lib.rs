@@ -2,7 +2,21 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-06-03 (round 22 of clean-room rebuild)
+//! ## Status — 2026-06-04 (round 233 of clean-room rebuild)
+//!
+//! Round 233 lands the **§7.9.4 frame-level driver** as
+//! [`reconstruct_frame`]: it walks `bi in 0..NBS`, dispatches each
+//! block to [`reconstruct_block`] (the per-block body landed in
+//! round 23), and tiles the resulting 8×8 samples into three
+//! flat [`Vec<u8>`] output planes per step 2(f)iv-vi. The
+//! per-plane geometry (`(pli, BX, BY, mbi)` per block) is
+//! caller-supplied — matching the §7.8.2 convention where the
+//! caller resolves §2.3 raster orderings — so the driver is a
+//! pure tiler over the per-block algebra rather than a §2.3
+//! geometry computer. Coded blocks consult `mb_modes[mbi]`;
+//! uncoded blocks skip step 2(d) entirely and copy from the
+//! Previous reference per step 2(e)i. The frame is returned
+//! pre-loop-filter (§7.10 is the next clause).
 //!
 //! Round 22 lands the **§7.9.3 Inverse DCT** procedures as
 //! [`inverse_dct_1d`] and [`inverse_dct_2d`]. The 1D path walks the
@@ -855,9 +869,102 @@ pub enum Error {
     /// `rfi = 0 (None)` and the §7.9.1.1 intra predictor path, never
     /// the §7.9.1.2 / §7.9.1.3 inter path.
     ReconstructIntraInterBranchMismatch,
+    /// A per-block input slice handed to the §7.9.4 frame-level driver
+    /// has a length other than `nbs`. The driver iterates `bi in
+    /// 0..NBS` and indexes every per-block array uniformly, so each
+    /// must agree on `nbs` up front.
+    ReconstructFrameBlockLenMismatch {
+        /// Which per-block slice tripped the check.
+        which: ReconstructFrameBlockSlice,
+        /// The slice's actual length.
+        got: usize,
+        /// The expected length (`nbs`).
+        nbs: usize,
+    },
+    /// A `pli_of_block[bi]` entry handed to the §7.9.4 frame-level
+    /// driver was outside `0..=2`. Step 2(a) reads `pli` once per
+    /// `bi`; invalid values cannot route to a real output plane.
+    ReconstructFramePliOutOfRange {
+        /// The block index whose `pli` was rejected.
+        bi: usize,
+        /// The out-of-range `pli` value.
+        pli: u8,
+    },
+    /// A `mbi_of_block[bi]` entry handed to the §7.9.4 frame-level
+    /// driver was `>= nmbs`. Step 2(d)i reads `MBMODES[mbi]` so the
+    /// index must point at a real macro block. Only enforced for
+    /// coded blocks (uncoded blocks skip step 2(d)).
+    ReconstructFrameMbIndexOutOfRange {
+        /// The block index whose `mbi` was rejected.
+        bi: usize,
+        /// The out-of-range `mbi` value.
+        mbi: usize,
+        /// The macro-block count (`nmbs`).
+        nmbs: usize,
+    },
+    /// A `(bx_of_block[bi], by_of_block[bi])` pair handed to the
+    /// §7.9.4 frame-level driver would write past the right or top
+    /// edge of its output plane. Step 2(f)iv-vi writes
+    /// `RECY/RECCB/RECCR[BY + by][BX + bx]` for `by, bx ∈ 0..=7`, so
+    /// `BX + 8 <= plane_width` and `BY + 8 <= plane_height` must
+    /// hold.
+    ReconstructFrameBlockOutOfPlane {
+        /// The block index whose origin was rejected.
+        bi: usize,
+        /// The plane index for that block.
+        pli: u8,
+        /// `BX`, the horizontal lower-left coordinate.
+        bx: u32,
+        /// `BY`, the vertical lower-left coordinate.
+        by: u32,
+        /// The plane's width in pixels.
+        plane_w: u32,
+        /// The plane's height in pixels.
+        plane_h: u32,
+    },
+    /// The output-plane geometry handed to the §7.9.4 frame-level
+    /// driver had `plane_w * plane_h` overflowing `usize`, so the
+    /// driver cannot allocate the destination plane vector.
+    ReconstructFramePlaneDimensionsOverflow {
+        /// Which output plane (0=Y, 1=Cb, 2=Cr) tripped the check.
+        pli: u8,
+        /// The plane width.
+        plane_w: u32,
+        /// The plane height.
+        plane_h: u32,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
+}
+
+/// Identifies which per-block slice handed to the §7.9.4 frame-level
+/// driver failed an [`Error::ReconstructFrameBlockLenMismatch`] check.
+///
+/// The driver requires every per-block array to have the same length
+/// (`nbs`), since each is indexed by the same `bi in 0..NBS` loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconstructFrameBlockSlice {
+    /// `BCODED[bi]` — true if the block is coded.
+    Bcoded,
+    /// `MVECTS[bi]` — per-block motion vector.
+    Mvects,
+    /// `COEFFS[bi]` — per-block quantized DCT coefficients in zig-zag
+    /// order.
+    Coeffs,
+    /// `NCOEFFS[bi]` — per-block coefficient count from §7.7.
+    Ncoeffs,
+    /// `QIIS[bi]` — per-block `qi` selector index from §7.6.
+    Qiis,
+    /// `pli_of_block[bi]` — per-block plane index from §2.3.
+    PliOfBlock,
+    /// `bx_of_block[bi]` — per-block `BX` from §2.3.
+    BxOfBlock,
+    /// `by_of_block[bi]` — per-block `BY` from §2.3.
+    ByOfBlock,
+    /// `mbi_of_block[bi]` — per-block containing-macro-block index
+    /// from §2.4.
+    MbiOfBlock,
 }
 
 /// Identifies which §7.7.1 state slice failed an
@@ -1253,6 +1360,37 @@ impl core::fmt::Display for Error {
             Error::ReconstructIntraInterBranchMismatch => write!(
                 f,
                 "oxideav-theora: §7.9.4 step 2(d)v received Intra mode on the inter branch"
+            ),
+            Error::ReconstructFrameBlockLenMismatch { which, got, nbs } => write!(
+                f,
+                "oxideav-theora: §7.9.4 frame-driver input slice {which:?} length {got} != nbs {nbs}"
+            ),
+            Error::ReconstructFramePliOutOfRange { bi, pli } => write!(
+                f,
+                "oxideav-theora: §7.9.4 frame-driver bi={bi} has pli={pli} out of range (expected 0..=2)"
+            ),
+            Error::ReconstructFrameMbIndexOutOfRange { bi, mbi, nmbs } => write!(
+                f,
+                "oxideav-theora: §7.9.4 frame-driver bi={bi} has mbi={mbi} >= nmbs={nmbs}"
+            ),
+            Error::ReconstructFrameBlockOutOfPlane {
+                bi,
+                pli,
+                bx,
+                by,
+                plane_w,
+                plane_h,
+            } => write!(
+                f,
+                "oxideav-theora: §7.9.4 frame-driver bi={bi} pli={pli} block at (BX={bx}, BY={by}) escapes plane (width={plane_w}, height={plane_h})"
+            ),
+            Error::ReconstructFramePlaneDimensionsOverflow {
+                pli,
+                plane_w,
+                plane_h,
+            } => write!(
+                f,
+                "oxideav-theora: §7.9.4 frame-driver pli={pli} plane dimensions overflow usize (width={plane_w}, height={plane_h})"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -6899,6 +7037,291 @@ fn uncoded_block_pred_res(
     // Step 2(e)vi: RES[by][bx] = 0 for every cell.
     let res = [[0i16; 8]; 8];
     Ok((pred, res))
+}
+
+/// Per-plane dimensions consumed by [`reconstruct_frame`].
+///
+/// `width` × `height` are the Y / Cb / Cr plane dimensions for the
+/// **output** reconstructed frame, in pixels. The Y plane is
+/// `(coded_width, coded_height)`; the Cb / Cr plane dimensions depend
+/// on `PF` per §4.4 (4:2:0 halves both; 4:2:2 halves only width;
+/// 4:4:4 keeps both at luma size).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaneDimensions {
+    /// Plane width in pixels.
+    pub width: u32,
+    /// Plane height in pixels.
+    pub height: u32,
+}
+
+/// The §7.9.4 output: three reconstructed planes tiled from the
+/// per-block [`ReconstructedBlock`] returns.
+///
+/// The frame-level driver writes `samples_y[BY + by][BX + bx]` for
+/// every coded block per step 2(f)iv-vi. Per §2.1 the coordinate
+/// origin is the **lower-left** corner; this crate stores each plane
+/// as a flat `Vec<u8>` in lower-left row-major order — `samples_y[
+/// y * dims.y.width + x]` is the pixel at `(x, y)` with `y` growing
+/// upward from the bottom.
+///
+/// Cells that are never written (because no block in the input
+/// covers them — possible on a fixture that omits some macro blocks
+/// for testing) keep their initial value of `0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructedFrame {
+    /// Y plane.
+    pub samples_y: Vec<u8>,
+    /// Cb plane.
+    pub samples_cb: Vec<u8>,
+    /// Cr plane.
+    pub samples_cr: Vec<u8>,
+    /// Y plane dimensions.
+    pub dims_y: PlaneDimensions,
+    /// Cb plane dimensions.
+    pub dims_cb: PlaneDimensions,
+    /// Cr plane dimensions.
+    pub dims_cr: PlaneDimensions,
+}
+
+/// Reconstruct an entire frame per §7.9.4 ("The Complete
+/// Reconstruction Algorithm") of the Xiph Theora I Specification.
+///
+/// This is the §7.9.4 step 2 driver — it walks `bi in 0..NBS`,
+/// dispatches each block to [`reconstruct_block`] (the per-block
+/// procedure body landed in round 23), and tiles the result into the
+/// three per-plane output buffers per step 2(f)iv-vi.
+///
+/// Inputs:
+///
+/// * `bcoded` — `BCODED[bi]` per §7.3 (length `nbs`).
+/// * `mb_modes` — `MBMODES[mbi]` per §7.4 (length `nmbs`). Indexed
+///   indirectly via `mbi_of_block`.
+/// * `mvects` — `MVECTS[bi]` per §7.5 (length `nbs`).
+/// * `coeffs` — `COEFFS[bi]` per §7.7 (length `nbs`).
+/// * `ncoeffs` — `NCOEFFS[bi]` per §7.7 (length `nbs`).
+/// * `qiis` — `QIIS[bi]` per §7.6 (length `nbs`).
+/// * `pli_of_block` — per-block plane index per §2.3, with the
+///   "indices are numbered continuously from Y to Cb to Cr"
+///   ordering rule. Length `nbs`; values `0..=2`.
+/// * `bx_of_block`, `by_of_block` — per-block `(BX, BY)` lower-left
+///   pixel coordinates within the block's plane per §7.9.4 step
+///   2(b) / 2(c). Each length `nbs`. Per-plane raster geometry from
+///   §2.3 is the caller's responsibility (this driver does not infer
+///   the coded-order Hilbert mapping; it consumes the resolved
+///   coordinates directly).
+/// * `mbi_of_block` — per-block macro-block index per §7.9.4 step
+///   2(d)i. Length `nbs`; values `< nmbs` for coded blocks.
+///   Uncoded blocks skip the macro-block lookup (step 2(d) is
+///   entered only when `BCODED[bi] != 0`), so their entries are
+///   ignored.
+/// * `qis` — frame-level `QIS` array per §7.1 (`NQIS` entries).
+/// * `params` — setup-header [`QuantizationParameters`] for §6.4.3.
+/// * `refs` — six reference-frame planes per Table 7.75.
+/// * `dims_y` / `dims_cb` / `dims_cr` — output-plane dimensions.
+///   Each plane is allocated as a flat `Vec<u8>` of
+///   `width * height` zero bytes before the per-block writes begin.
+///
+/// The output is a [`ReconstructedFrame`] with the three plane
+/// vectors populated by step 2(f). The frame is **pre-loop-filter**;
+/// §7.10 deblocking is the next step in the §7 pipeline.
+///
+/// Errors:
+///
+/// * [`Error::ReconstructFrameBlockLenMismatch`] if any per-block
+///   slice has a length other than `nbs`.
+/// * [`Error::ReconstructFramePliOutOfRange`] if `pli_of_block[bi]`
+///   is not in `0..=2`.
+/// * [`Error::ReconstructFrameMbIndexOutOfRange`] if
+///   `mbi_of_block[bi] >= nmbs` for a coded block.
+/// * [`Error::ReconstructFrameBlockOutOfPlane`] if the per-block
+///   `(BX, BY)` plus the 8×8 footprint escapes the destination
+///   plane.
+/// * [`Error::ReconstructFramePlaneDimensionsOverflow`] if any
+///   plane's `width * height` overflows `usize`.
+/// * Any error propagated from [`reconstruct_block`] (e.g. an empty
+///   `qis`, a `qii` past `qis.len()`, or a quant-matrix derivation
+///   reject).
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_frame(
+    bcoded: &[bool],
+    mb_modes: &[MacroBlockMode],
+    mvects: &[MotionVector],
+    coeffs: &[[i16; 64]],
+    ncoeffs: &[u32],
+    qiis: &[u8],
+    pli_of_block: &[u8],
+    bx_of_block: &[u32],
+    by_of_block: &[u32],
+    mbi_of_block: &[u32],
+    qis: &[u8],
+    params: &QuantizationParameters,
+    refs: &ReferencePlaneSet<'_>,
+    dims_y: PlaneDimensions,
+    dims_cb: PlaneDimensions,
+    dims_cr: PlaneDimensions,
+) -> Result<ReconstructedFrame, Error> {
+    let nbs = bcoded.len();
+    let nmbs = mb_modes.len();
+
+    // §7.9.4 step 2 expects every per-block array to agree on `nbs`.
+    check_block_slice_len(mvects.len(), nbs, ReconstructFrameBlockSlice::Mvects)?;
+    check_block_slice_len(coeffs.len(), nbs, ReconstructFrameBlockSlice::Coeffs)?;
+    check_block_slice_len(ncoeffs.len(), nbs, ReconstructFrameBlockSlice::Ncoeffs)?;
+    check_block_slice_len(qiis.len(), nbs, ReconstructFrameBlockSlice::Qiis)?;
+    check_block_slice_len(
+        pli_of_block.len(),
+        nbs,
+        ReconstructFrameBlockSlice::PliOfBlock,
+    )?;
+    check_block_slice_len(
+        bx_of_block.len(),
+        nbs,
+        ReconstructFrameBlockSlice::BxOfBlock,
+    )?;
+    check_block_slice_len(
+        by_of_block.len(),
+        nbs,
+        ReconstructFrameBlockSlice::ByOfBlock,
+    )?;
+    check_block_slice_len(
+        mbi_of_block.len(),
+        nbs,
+        ReconstructFrameBlockSlice::MbiOfBlock,
+    )?;
+
+    // Allocate the three destination planes. Each is `width * height`
+    // zero bytes; per-block writes overwrite cells covered by the
+    // input geometry.
+    let plane_y_len = plane_len(0, dims_y)?;
+    let plane_cb_len = plane_len(1, dims_cb)?;
+    let plane_cr_len = plane_len(2, dims_cr)?;
+    let mut samples_y = vec![0u8; plane_y_len];
+    let mut samples_cb = vec![0u8; plane_cb_len];
+    let mut samples_cr = vec![0u8; plane_cr_len];
+
+    for bi in 0..nbs {
+        // Step 2(a): pli — the index of the colour plane this block
+        // belongs to.
+        let pli_u8 = pli_of_block[bi];
+        if pli_u8 > 2 {
+            return Err(Error::ReconstructFramePliOutOfRange { bi, pli: pli_u8 });
+        }
+        let pli = pli_u8 as usize;
+
+        // Step 2(b) / 2(c): BX / BY — the lower-left pixel
+        // coordinates of this block in its plane.
+        let bx = bx_of_block[bi];
+        let by = by_of_block[bi];
+
+        // Resolve the destination plane + its dimensions so step 2(f)
+        // has a single place to write into.
+        let (samples, dims) = match pli {
+            0 => (&mut samples_y, dims_y),
+            1 => (&mut samples_cb, dims_cb),
+            2 => (&mut samples_cr, dims_cr),
+            // pli > 2 already rejected above.
+            _ => unreachable!(),
+        };
+
+        // Reject block origins whose 8×8 footprint would escape the
+        // destination plane. The step 2(f) write loop assumes
+        // `(BX + bx, BY + by)` is always in-bounds.
+        let plane_w = dims.width;
+        let plane_h = dims.height;
+        if bx.checked_add(8).map_or(true, |end| end > plane_w)
+            || by.checked_add(8).map_or(true, |end| end > plane_h)
+        {
+            return Err(Error::ReconstructFrameBlockOutOfPlane {
+                bi,
+                pli: pli_u8,
+                bx,
+                by,
+                plane_w,
+                plane_h,
+            });
+        }
+
+        // For coded blocks the §7.9.4 step 2(d) branch needs MBMODES[mbi],
+        // so the per-block macro index must be in range before we
+        // dispatch into reconstruct_block.
+        let mbi_raw = mbi_of_block[bi] as usize;
+        let mb_mode = if bcoded[bi] {
+            if mbi_raw >= nmbs {
+                return Err(Error::ReconstructFrameMbIndexOutOfRange {
+                    bi,
+                    mbi: mbi_raw,
+                    nmbs,
+                });
+            }
+            mb_modes[mbi_raw]
+        } else {
+            // Step 2(e) ignores MBMODES; supply a deterministic
+            // placeholder. Intra is a no-op on this path because the
+            // step 2(d) branch is skipped entirely for !bcoded.
+            MacroBlockMode::Intra
+        };
+
+        let inputs = ReconstructBlockInputs {
+            bcoded: bcoded[bi],
+            mb_mode,
+            mvect: mvects[bi],
+            coeffs_zz: coeffs[bi],
+            ncoeffs: ncoeffs[bi],
+            qii: qiis[bi],
+        };
+
+        let block = reconstruct_block(&inputs, pli, bx, by, qis, params, refs)?;
+
+        // Step 2(f)iv / 2(f)v / 2(f)vi: write the 8×8 tile into the
+        // resolved plane in lower-left row-major order. Sample
+        // values are already clamped to 0..=255 by step 2(f)ii /
+        // 2(f)iii inside reconstruct_block.
+        let stride = plane_w as usize;
+        for by_off in 0..8usize {
+            for bx_off in 0..8usize {
+                let row = by as usize + by_off;
+                let col = bx as usize + bx_off;
+                samples[row * stride + col] = block.samples[by_off][bx_off];
+            }
+        }
+    }
+
+    Ok(ReconstructedFrame {
+        samples_y,
+        samples_cb,
+        samples_cr,
+        dims_y,
+        dims_cb,
+        dims_cr,
+    })
+}
+
+/// Length check for a per-block input slice handed to
+/// [`reconstruct_frame`]. Returns
+/// [`Error::ReconstructFrameBlockLenMismatch`] on mismatch.
+fn check_block_slice_len(
+    got: usize,
+    nbs: usize,
+    which: ReconstructFrameBlockSlice,
+) -> Result<(), Error> {
+    if got != nbs {
+        return Err(Error::ReconstructFrameBlockLenMismatch { which, got, nbs });
+    }
+    Ok(())
+}
+
+/// `width * height` cast to `usize`, with an overflow reject. Returns
+/// [`Error::ReconstructFramePlaneDimensionsOverflow`] if the product
+/// would wrap.
+fn plane_len(pli: u8, dims: PlaneDimensions) -> Result<usize, Error> {
+    let w = dims.width as usize;
+    let h = dims.height as usize;
+    w.checked_mul(h)
+        .ok_or(Error::ReconstructFramePlaneDimensionsOverflow {
+            pli,
+            plane_w: dims.width,
+            plane_h: dims.height,
+        })
 }
 
 /// No-op codec registration. Decoder/encoder wiring will land in a
@@ -16397,6 +16820,562 @@ mod tests {
         let qis = [20u8, 30u8];
         let a = reconstruct_block(&inputs, 0, 4, 4, &qis, &params, &refs).unwrap();
         let b = reconstruct_block(&inputs, 0, 4, 4, &qis, &params, &refs).unwrap();
+        assert_eq!(a, b);
+    }
+
+    // ---- §7.9.4 frame-level driver (round 233) ----
+
+    /// Build a small four-block test geometry: an intra frame with a
+    /// 16×16 Y plane (four 8×8 luma blocks at corners) plus 8×8 Cb /
+    /// Cr planes (one chroma block each), 4:2:0 layout. Total NBS=6,
+    /// NMBS=1, all blocks coded.
+    #[allow(clippy::type_complexity)]
+    fn four_block_geometry() -> (
+        Vec<bool>,
+        Vec<MacroBlockMode>,
+        Vec<MotionVector>,
+        Vec<[i16; 64]>,
+        Vec<u32>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u32>,
+        Vec<u32>,
+        Vec<u32>,
+    ) {
+        let nbs = 6usize;
+        let bcoded = vec![true; nbs];
+        let mb_modes = vec![MacroBlockMode::Intra];
+        let mvects = vec![MotionVector::ZERO; nbs];
+        let coeffs = vec![[0i16; 64]; nbs];
+        let ncoeffs = vec![0u32; nbs];
+        let qiis = vec![0u8; nbs];
+        // §2.3 coded-order indexing is continuous from Y → Cb → Cr.
+        // 4 luma blocks (pli=0), then 1 Cb (pli=1), then 1 Cr (pli=2).
+        let pli_of_block = vec![0u8, 0, 0, 0, 1, 2];
+        // (BX, BY) in plane-local lower-left coordinates. Luma plane
+        // is 16×16 → four 8×8 corners. Chroma plane is 8×8 → one
+        // block at the origin.
+        let bx_of_block = vec![0u32, 8, 0, 8, 0, 0];
+        let by_of_block = vec![0u32, 0, 8, 8, 0, 0];
+        // One macro block contains all four luma blocks + the chroma
+        // co-located blocks.
+        let mbi_of_block = vec![0u32; nbs];
+        (
+            bcoded,
+            mb_modes,
+            mvects,
+            coeffs,
+            ncoeffs,
+            qiis,
+            pli_of_block,
+            bx_of_block,
+            by_of_block,
+            mbi_of_block,
+        )
+    }
+
+    /// §7.9.4 frame driver — an all-intra all-zero-coefficient frame
+    /// at a 16×16 luma + 8×8 chroma geometry should produce three
+    /// planes of all-128 (the §7.9.1.1 intra predictor + step 2(f)).
+    #[test]
+    fn reconstruct_frame_all_intra_zero_coeffs_is_all_128() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 0),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let (bcoded, mb_modes, mvects, coeffs, ncoeffs, qiis, pli, bx, by, mbi) =
+            four_block_geometry();
+        let qis = [10u8];
+        let out = reconstruct_frame(
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            PlaneDimensions {
+                width: 16,
+                height: 16,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.samples_y.len(), 256);
+        assert_eq!(out.samples_cb.len(), 64);
+        assert_eq!(out.samples_cr.len(), 64);
+        for &v in out.samples_y.iter() {
+            assert_eq!(v, 128);
+        }
+        for &v in out.samples_cb.iter() {
+            assert_eq!(v, 128);
+        }
+        for &v in out.samples_cr.iter() {
+            assert_eq!(v, 128);
+        }
+    }
+
+    /// §7.9.4 frame driver — an uncoded block samples the Previous
+    /// reference (step 2(e)i, rfi=1) at its co-located 8×8 footprint
+    /// with the zero MV. With ramp reference planes the output for
+    /// the uncoded block should match the ramp slice at `(BX, BY)`.
+    #[test]
+    fn reconstruct_frame_uncoded_block_copies_previous_reference() {
+        let params = make_recon_params();
+        // Four distinct ramps so the test can tell which plane was
+        // sampled. PREV* / GOLD* both differ from each other.
+        let planes = [
+            ramp_plane(16, 16, 0),  // PREV Y
+            ramp_plane(8, 8, 100),  // PREV Cb (constant offset)
+            ramp_plane(8, 8, 110),  // PREV Cr
+            ramp_plane(16, 16, 50), // GOLD Y
+            ramp_plane(8, 8, 120),  // GOLD Cb
+            ramp_plane(8, 8, 130),  // GOLD Cr
+        ];
+        let prev_y_ref = ReferencePlane::new(16, 16, &planes[0]).unwrap();
+        let refs = ReferencePlaneSet {
+            previous_y: prev_y_ref,
+            previous_cb: ReferencePlane::new(8, 8, &planes[1]).unwrap(),
+            previous_cr: ReferencePlane::new(8, 8, &planes[2]).unwrap(),
+            golden_y: ReferencePlane::new(16, 16, &planes[3]).unwrap(),
+            golden_cb: ReferencePlane::new(8, 8, &planes[4]).unwrap(),
+            golden_cr: ReferencePlane::new(8, 8, &planes[5]).unwrap(),
+        };
+        let (mut bcoded, mb_modes, mvects, coeffs, ncoeffs, qiis, pli, bx, by, mbi) =
+            four_block_geometry();
+        // Mark the first luma block (BX=0, BY=0) uncoded; the rest
+        // remain coded (intra all-zero → predict to 128).
+        bcoded[0] = false;
+        let qis = [10u8];
+        let out = reconstruct_frame(
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            PlaneDimensions {
+                width: 16,
+                height: 16,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap();
+        // The uncoded luma block at (BX=0, BY=0) should equal the
+        // PREVREFY ramp slice at the same coordinates.
+        for ry in 0..8u32 {
+            for rx in 0..8u32 {
+                let expected = ((rx + ry) % 256) as u8;
+                let idx = (ry * 16 + rx) as usize;
+                assert_eq!(
+                    out.samples_y[idx], expected,
+                    "uncoded luma block at (BX=0, BY=0) should sample PREVREFY"
+                );
+            }
+        }
+        // The other three luma blocks are coded intra with zero
+        // residual — all 128.
+        let coded_origins = [(8u32, 0u32), (0, 8), (8, 8)];
+        for (bx0, by0) in coded_origins {
+            for ry in 0..8u32 {
+                for rx in 0..8u32 {
+                    let idx = ((by0 + ry) * 16 + (bx0 + rx)) as usize;
+                    assert_eq!(out.samples_y[idx], 128);
+                }
+            }
+        }
+    }
+
+    /// §7.9.4 frame driver — `pli_of_block[bi] > 2` is rejected with
+    /// the [`Error::ReconstructFramePliOutOfRange`] variant.
+    #[test]
+    fn reconstruct_frame_rejects_pli_out_of_range() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(8, 8, 0),
+        ];
+        let refs = ReferencePlaneSet {
+            previous_y: ReferencePlane::new(16, 16, &planes[0]).unwrap(),
+            previous_cb: ReferencePlane::new(8, 8, &planes[1]).unwrap(),
+            previous_cr: ReferencePlane::new(8, 8, &planes[2]).unwrap(),
+            golden_y: ReferencePlane::new(16, 16, &planes[3]).unwrap(),
+            golden_cb: ReferencePlane::new(8, 8, &planes[4]).unwrap(),
+            golden_cr: ReferencePlane::new(8, 8, &planes[5]).unwrap(),
+        };
+        let (bcoded, mb_modes, mvects, coeffs, ncoeffs, qiis, mut pli, bx, by, mbi) =
+            four_block_geometry();
+        pli[4] = 3; // invalid
+        let qis = [10u8];
+        let err = reconstruct_frame(
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            PlaneDimensions {
+                width: 16,
+                height: 16,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::ReconstructFramePliOutOfRange { bi: 4, pli: 3 });
+    }
+
+    /// §7.9.4 frame driver — a per-block slice with the wrong length
+    /// is rejected by [`Error::ReconstructFrameBlockLenMismatch`].
+    #[test]
+    fn reconstruct_frame_rejects_block_slice_length_mismatch() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(8, 8, 0),
+        ];
+        let refs = ReferencePlaneSet {
+            previous_y: ReferencePlane::new(16, 16, &planes[0]).unwrap(),
+            previous_cb: ReferencePlane::new(8, 8, &planes[1]).unwrap(),
+            previous_cr: ReferencePlane::new(8, 8, &planes[2]).unwrap(),
+            golden_y: ReferencePlane::new(16, 16, &planes[3]).unwrap(),
+            golden_cb: ReferencePlane::new(8, 8, &planes[4]).unwrap(),
+            golden_cr: ReferencePlane::new(8, 8, &planes[5]).unwrap(),
+        };
+        let (bcoded, mb_modes, mut mvects, coeffs, ncoeffs, qiis, pli, bx, by, mbi) =
+            four_block_geometry();
+        mvects.truncate(3); // 3 instead of 6
+        let qis = [10u8];
+        let err = reconstruct_frame(
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            PlaneDimensions {
+                width: 16,
+                height: 16,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            Error::ReconstructFrameBlockLenMismatch {
+                which: ReconstructFrameBlockSlice::Mvects,
+                got: 3,
+                nbs: 6,
+            }
+        );
+    }
+
+    /// §7.9.4 frame driver — a block origin whose 8×8 footprint
+    /// escapes the destination plane is rejected by
+    /// [`Error::ReconstructFrameBlockOutOfPlane`].
+    #[test]
+    fn reconstruct_frame_rejects_block_out_of_plane() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(8, 8, 0),
+        ];
+        let refs = ReferencePlaneSet {
+            previous_y: ReferencePlane::new(16, 16, &planes[0]).unwrap(),
+            previous_cb: ReferencePlane::new(8, 8, &planes[1]).unwrap(),
+            previous_cr: ReferencePlane::new(8, 8, &planes[2]).unwrap(),
+            golden_y: ReferencePlane::new(16, 16, &planes[3]).unwrap(),
+            golden_cb: ReferencePlane::new(8, 8, &planes[4]).unwrap(),
+            golden_cr: ReferencePlane::new(8, 8, &planes[5]).unwrap(),
+        };
+        let (bcoded, mb_modes, mvects, coeffs, ncoeffs, qiis, pli, mut bx, by, mbi) =
+            four_block_geometry();
+        bx[3] = 10; // 10 + 8 = 18 > 16 (plane width)
+        let qis = [10u8];
+        let err = reconstruct_frame(
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            PlaneDimensions {
+                width: 16,
+                height: 16,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap_err();
+        match err {
+            Error::ReconstructFrameBlockOutOfPlane {
+                bi,
+                pli,
+                bx,
+                by,
+                plane_w,
+                plane_h,
+            } => {
+                assert_eq!(bi, 3);
+                assert_eq!(pli, 0);
+                assert_eq!(bx, 10);
+                assert_eq!(by, 8);
+                assert_eq!(plane_w, 16);
+                assert_eq!(plane_h, 16);
+            }
+            other => panic!("expected ReconstructFrameBlockOutOfPlane, got {other:?}"),
+        }
+    }
+
+    /// §7.9.4 frame driver — a coded block whose `mbi >= nmbs` is
+    /// rejected by [`Error::ReconstructFrameMbIndexOutOfRange`].
+    #[test]
+    fn reconstruct_frame_rejects_mbi_out_of_range() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 0),
+            ramp_plane(8, 8, 0),
+        ];
+        let refs = ReferencePlaneSet {
+            previous_y: ReferencePlane::new(16, 16, &planes[0]).unwrap(),
+            previous_cb: ReferencePlane::new(8, 8, &planes[1]).unwrap(),
+            previous_cr: ReferencePlane::new(8, 8, &planes[2]).unwrap(),
+            golden_y: ReferencePlane::new(16, 16, &planes[3]).unwrap(),
+            golden_cb: ReferencePlane::new(8, 8, &planes[4]).unwrap(),
+            golden_cr: ReferencePlane::new(8, 8, &planes[5]).unwrap(),
+        };
+        let (bcoded, mb_modes, mvects, coeffs, ncoeffs, qiis, pli, bx, by, mut mbi) =
+            four_block_geometry();
+        mbi[2] = 5; // nmbs is 1, so 5 >= 1 is out of range.
+        let qis = [10u8];
+        let err = reconstruct_frame(
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            PlaneDimensions {
+                width: 16,
+                height: 16,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            Error::ReconstructFrameMbIndexOutOfRange {
+                bi: 2,
+                mbi: 5,
+                nmbs: 1,
+            }
+        );
+    }
+
+    /// §7.9.4 frame driver — Display rendering of the four new
+    /// frame-level error variants should each carry a stable, distinct
+    /// §7.9.4 tag.
+    #[test]
+    fn reconstruct_frame_error_display_tags() {
+        let e = Error::ReconstructFrameBlockLenMismatch {
+            which: ReconstructFrameBlockSlice::Mvects,
+            got: 3,
+            nbs: 6,
+        };
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"));
+        assert!(s.contains("Mvects"));
+        assert!(s.contains("3"));
+        assert!(s.contains("6"));
+        let e = Error::ReconstructFramePliOutOfRange { bi: 4, pli: 3 };
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"));
+        assert!(s.contains("bi=4"));
+        assert!(s.contains("pli=3"));
+        let e = Error::ReconstructFrameMbIndexOutOfRange {
+            bi: 7,
+            mbi: 11,
+            nmbs: 5,
+        };
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"));
+        assert!(s.contains("bi=7"));
+        assert!(s.contains("mbi=11"));
+        assert!(s.contains("nmbs=5"));
+        let e = Error::ReconstructFrameBlockOutOfPlane {
+            bi: 1,
+            pli: 0,
+            bx: 24,
+            by: 8,
+            plane_w: 16,
+            plane_h: 16,
+        };
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"));
+        assert!(s.contains("bi=1"));
+        assert!(s.contains("BX=24"));
+        let e = Error::ReconstructFramePlaneDimensionsOverflow {
+            pli: 0,
+            plane_w: u32::MAX,
+            plane_h: u32::MAX,
+        };
+        let s = e.to_string();
+        assert!(s.contains("§7.9.4"));
+        assert!(s.contains("pli=0"));
+    }
+
+    /// §7.9.4 frame driver — calling with the same inputs twice
+    /// yields byte-identical output. Catches accidental mutable
+    /// state leaking through any of the chained helpers.
+    #[test]
+    fn reconstruct_frame_is_deterministic() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(8, 8, 100),
+            ramp_plane(8, 8, 110),
+            ramp_plane(16, 16, 50),
+            ramp_plane(8, 8, 120),
+            ramp_plane(8, 8, 130),
+        ];
+        let refs = ReferencePlaneSet {
+            previous_y: ReferencePlane::new(16, 16, &planes[0]).unwrap(),
+            previous_cb: ReferencePlane::new(8, 8, &planes[1]).unwrap(),
+            previous_cr: ReferencePlane::new(8, 8, &planes[2]).unwrap(),
+            golden_y: ReferencePlane::new(16, 16, &planes[3]).unwrap(),
+            golden_cb: ReferencePlane::new(8, 8, &planes[4]).unwrap(),
+            golden_cr: ReferencePlane::new(8, 8, &planes[5]).unwrap(),
+        };
+        let (mut bcoded, mb_modes, mvects, mut coeffs, mut ncoeffs, qiis, pli, bx, by, mbi) =
+            four_block_geometry();
+        // Mix of coded / uncoded + non-trivial coefficients.
+        bcoded[1] = false;
+        coeffs[0][0] = 30;
+        coeffs[2][0] = -20;
+        ncoeffs[0] = 1;
+        ncoeffs[2] = 1;
+        let qis = [10u8];
+        let dy = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dc = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let a = reconstruct_frame(
+            &bcoded, &mb_modes, &mvects, &coeffs, &ncoeffs, &qiis, &pli, &bx, &by, &mbi, &qis,
+            &params, &refs, dy, dc, dc,
+        )
+        .unwrap();
+        let b = reconstruct_frame(
+            &bcoded, &mb_modes, &mvects, &coeffs, &ncoeffs, &qiis, &pli, &bx, &by, &mbi, &qis,
+            &params, &refs, dy, dc, dc,
+        )
+        .unwrap();
         assert_eq!(a, b);
     }
 }

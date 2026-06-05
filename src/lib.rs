@@ -2,7 +2,28 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-06-04 (round 233 of clean-room rebuild)
+//! ## Status — 2026-06-05 (round 238 of clean-room rebuild)
+//!
+//! Round 238 lands the **§2.3 / §2.4 coded-order resolver** as
+//! [`PlaneBlockCodedOrder`] and [`PlaneMacroBlockCodedOrder`]:
+//! typed iterators that walk one colour plane in the spec's
+//! coded order (super-blocks in raster order, lower-left origin;
+//! Hilbert curve inside each super-block per Figure 2.4 for
+//! blocks and Figure 2.6 for macro-blocks). Each item carries
+//! the plane-local super-block index, the slot inside the
+//! super-block, and the plane-local `(bx, by)` (or `(mbx, mby)`)
+//! coordinates. Edge super-blocks (right / top of the plane)
+//! follow §2.3's "ordering still used, blocks outside the frame
+//! boundary omitted" rule: the iterator advances through every
+//! slot of the over-padded super-block and filters out the slots
+//! whose coordinates lie outside the plane's block extent.
+//! Plane geometry is carried by [`PlaneBlockDims`], built either
+//! by hand or via [`PlaneBlockDims::luma_from_ident`] /
+//! [`PlaneBlockDims::chroma_from_ident`] from a parsed
+//! [`TheoraIdentHeader`]. Unblocks any caller that needs to
+//! translate a coded-order block index back into plane-local
+//! raster coordinates without redoing the Hilbert-curve geometry
+//! by hand.
 //!
 //! Round 233 lands the **§7.9.4 frame-level driver** as
 //! [`reconstruct_frame`]: it walks `bi in 0..NBS`, dispatches each
@@ -7322,6 +7343,398 @@ fn plane_len(pli: u8, dims: PlaneDimensions) -> Result<usize, Error> {
             plane_w: dims.width,
             plane_h: dims.height,
         })
+}
+
+// -----------------------------------------------------------------------------
+// §2.3 / §2.4 coded-order resolver
+// -----------------------------------------------------------------------------
+
+/// Block position within its enclosing super block expressed as the
+/// (column, row) of the 8×8 block inside the 4×4 super-block grid.
+///
+/// Origin is the lower-left corner of the super block: column 0 is the
+/// left edge, row 0 is the bottom edge, matching the right-handed
+/// coordinate system specified in §2.1.
+///
+/// The 16 positions visited in coded order trace the Hilbert curve of
+/// Figure 2.4, starting at the lower-left block (0, 0) and ending at
+/// the lower-right block (3, 0).
+const BLOCK_IN_SB_HILBERT: [(u8, u8); 16] = [
+    (0, 0), // coded slot 0
+    (1, 0), // coded slot 1
+    (1, 1), // coded slot 2
+    (0, 1), // coded slot 3
+    (0, 2), // coded slot 4
+    (0, 3), // coded slot 5
+    (1, 3), // coded slot 6
+    (1, 2), // coded slot 7
+    (2, 2), // coded slot 8
+    (2, 3), // coded slot 9
+    (3, 3), // coded slot 10
+    (3, 2), // coded slot 11
+    (3, 1), // coded slot 12
+    (2, 1), // coded slot 13
+    (2, 0), // coded slot 14
+    (3, 0), // coded slot 15
+];
+
+/// Macro-block position within its enclosing super block expressed as
+/// the (column, row) of the 2×2 macro-block inside the super-block grid.
+///
+/// Origin is the lower-left macro block of the super block. The 4
+/// positions visited in coded order trace the smaller Hilbert curve of
+/// Figure 2.6.
+const MB_IN_SB_HILBERT: [(u8, u8); 4] = [
+    (0, 0), // coded slot 0
+    (0, 1), // coded slot 1
+    (1, 1), // coded slot 2
+    (1, 0), // coded slot 3
+];
+
+/// Plane geometry expressed in macroblocks, as consumed by the §2.3 /
+/// §2.4 coded-order resolver.
+///
+/// `mb_w` and `mb_h` give the plane's width and height in macroblocks
+/// (each macro block being a 2×2 grid of 8×8 blocks). They are derived
+/// from `TheoraIdentHeader::fmbw` / `fmbh` per the rules of §2.3:
+///
+/// * Luma plane: `mb_w = fmbw`, `mb_h = fmbh`.
+/// * Chroma plane: depends on `PF`. See
+///   [`PlaneBlockDims::chroma_from_ident`] / [`PlaneBlockDims::luma_from_ident`].
+///
+/// All counts derived from this struct (super-block dimensions, block
+/// dimensions) use `u32` because the largest legal frame
+/// (`fmbw = fmbh = 0xFFFF`) yields block counts beyond `u16` but within
+/// `u32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaneBlockDims {
+    /// Plane width in macroblocks.
+    pub mb_w: u32,
+    /// Plane height in macroblocks.
+    pub mb_h: u32,
+}
+
+impl PlaneBlockDims {
+    /// Build the luma-plane block dimensions from the identification
+    /// header. The luma plane is never subsampled, so its dimensions
+    /// are simply `(fmbw, fmbh)`.
+    pub fn luma_from_ident(ident: &TheoraIdentHeader) -> Self {
+        Self {
+            mb_w: ident.fmbw as u32,
+            mb_h: ident.fmbh as u32,
+        }
+    }
+
+    /// Build the chroma-plane block dimensions from the identification
+    /// header. Both chroma planes always share the same geometry, so
+    /// this returns the single dimensions that apply to either.
+    ///
+    /// * `PF=0` (4:2:0): both chroma axes are halved.
+    /// * `PF=2` (4:2:2): the horizontal axis is halved; the vertical
+    ///   axis matches luma.
+    /// * `PF=3` (4:4:4): chroma matches luma.
+    ///
+    /// Halving rounds up so the chroma plane covers the entire luma
+    /// area even when the luma plane has an odd macro-block count.
+    pub fn chroma_from_ident(ident: &TheoraIdentHeader) -> Self {
+        let lw = ident.fmbw as u32;
+        let lh = ident.fmbh as u32;
+        match ident.pf {
+            PixelFormat::Yuv420 => Self {
+                mb_w: lw.div_ceil(2),
+                mb_h: lh.div_ceil(2),
+            },
+            PixelFormat::Yuv422 => Self {
+                mb_w: lw.div_ceil(2),
+                mb_h: lh,
+            },
+            PixelFormat::Yuv444 => Self { mb_w: lw, mb_h: lh },
+        }
+    }
+
+    /// Plane width in 8×8 blocks (= `2 * mb_w`).
+    pub fn block_w(self) -> u32 {
+        self.mb_w * 2
+    }
+
+    /// Plane height in 8×8 blocks (= `2 * mb_h`).
+    pub fn block_h(self) -> u32 {
+        self.mb_h * 2
+    }
+
+    /// Number of super blocks along the plane's width
+    /// (`ceil(block_w / 4)` = `ceil(mb_w / 2)`).
+    pub fn sb_w(self) -> u32 {
+        self.mb_w.div_ceil(2)
+    }
+
+    /// Number of super blocks along the plane's height
+    /// (`ceil(block_h / 4)` = `ceil(mb_h / 2)`).
+    pub fn sb_h(self) -> u32 {
+        self.mb_h.div_ceil(2)
+    }
+
+    /// Total number of macro blocks in this plane (`mb_w * mb_h`).
+    pub fn mb_count(self) -> u64 {
+        (self.mb_w as u64) * (self.mb_h as u64)
+    }
+
+    /// Total number of 8×8 blocks in this plane
+    /// (`block_w * block_h`).
+    pub fn block_count(self) -> u64 {
+        (self.block_w() as u64) * (self.block_h() as u64)
+    }
+}
+
+/// One step of the §2.3 block-level coded-order walk.
+///
+/// Captures everything a caller needs to map a coded-order block index
+/// back to where the block sits in the plane: the super block it
+/// belongs to, its position inside that super block, and its plane-local
+/// raster coordinates (lower-left origin, in 8×8 blocks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodedBlockPosition {
+    /// Plane-local super-block index (raster order, lower-left origin).
+    /// In the range `0..sb_w * sb_h`.
+    pub sb_index: u32,
+    /// Coded slot of the block within its super block (`0..16`).
+    /// Equal to `4 * mb_in_sb + block_in_mb` because the Hilbert walk
+    /// inside the super block visits all four blocks of one macro
+    /// block before moving on to the next.
+    pub block_in_sb: u8,
+    /// Coded slot of the enclosing macro block within the super block
+    /// (`0..4`), following the smaller Hilbert curve of Figure 2.6.
+    pub mb_in_sb: u8,
+    /// Coded slot of the block within its macro block (`0..4`),
+    /// following the inner Hilbert curve of Figure 2.4 restricted to a
+    /// single macro-block quadrant.
+    pub block_in_mb: u8,
+    /// Block column inside the plane (`0..block_w`), lower-left origin.
+    pub bx: u32,
+    /// Block row inside the plane (`0..block_h`), lower-left origin.
+    pub by: u32,
+}
+
+/// Iterator that walks the blocks of one colour plane in §2.3 coded
+/// order. Blocks belonging to a super block that lies entirely outside
+/// the plane's macro-block extent are skipped (§2.3: "If a color plane
+/// does not contain a complete super block on the top or right sides,
+/// the same ordering is still used, simply with any blocks outside the
+/// frame boundary omitted.").
+///
+/// The iterator visits super blocks in raster order (lower-left
+/// origin), and within each super block walks the 16 blocks along the
+/// Hilbert curve of Figure 2.4. Blocks outside the plane's block
+/// extent are filtered out on the fly, so the total emitted item count
+/// is exactly the plane's [`PlaneBlockDims::block_count`].
+#[derive(Debug, Clone)]
+pub struct PlaneBlockCodedOrder {
+    dims: PlaneBlockDims,
+    sb_w: u32,
+    sb_h: u32,
+    block_w: u32,
+    block_h: u32,
+    /// Index of the next super block to visit in raster order.
+    next_sb: u32,
+    /// Next slot inside the current super block (`0..16`).
+    next_slot: u8,
+}
+
+impl PlaneBlockCodedOrder {
+    /// Build a new coded-order iterator for the given plane geometry.
+    ///
+    /// `dims.mb_w` and `dims.mb_h` may both be zero (degenerate
+    /// zero-block plane). The iterator yields no items in that case.
+    pub fn new(dims: PlaneBlockDims) -> Self {
+        Self {
+            dims,
+            sb_w: dims.sb_w(),
+            sb_h: dims.sb_h(),
+            block_w: dims.block_w(),
+            block_h: dims.block_h(),
+            next_sb: 0,
+            next_slot: 0,
+        }
+    }
+
+    /// Total number of items this iterator will yield from its current
+    /// position to exhaustion.
+    fn remaining_blocks(&self) -> u64 {
+        if self.next_sb >= self.sb_w * self.sb_h {
+            return 0;
+        }
+        // Pessimistic over-count is fine for size_hint; we tighten the
+        // exact value by re-counting from scratch using block_count.
+        // The caller already knows the total via PlaneBlockDims, so
+        // the tightening is mostly informational.
+        let total = self.dims.block_count();
+        let consumed = self.consumed_blocks_so_far();
+        total.saturating_sub(consumed)
+    }
+
+    fn consumed_blocks_so_far(&self) -> u64 {
+        // For the size_hint estimate we need to subtract every block
+        // already emitted (i.e. every (sb, slot) pair we have already
+        // advanced past, minus any that were filtered as out-of-plane).
+        // The cheapest way is to replay a zero-cost copy of self up to
+        // (next_sb, next_slot) but this is bounded by 16 per super
+        // block, so an exact count is fine.
+        let mut count: u64 = 0;
+        for sbi in 0..self.next_sb {
+            count += blocks_inside_plane(sbi, self.sb_w, self.block_w, self.block_h);
+        }
+        if self.next_slot > 0 && self.next_sb < self.sb_w * self.sb_h {
+            for slot in 0..self.next_slot {
+                let pos = sb_slot_to_plane_xy(self.next_sb, slot, self.sb_w);
+                if pos.0 < self.block_w && pos.1 < self.block_h {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+}
+
+impl Iterator for PlaneBlockCodedOrder {
+    type Item = CodedBlockPosition;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let total_sbs = self.sb_w * self.sb_h;
+        while self.next_sb < total_sbs {
+            while self.next_slot < 16 {
+                let slot = self.next_slot;
+                let (bx, by) = sb_slot_to_plane_xy(self.next_sb, slot, self.sb_w);
+                self.next_slot += 1;
+                if bx < self.block_w && by < self.block_h {
+                    let mb_in_sb = slot / 4;
+                    let block_in_mb = slot % 4;
+                    return Some(CodedBlockPosition {
+                        sb_index: self.next_sb,
+                        block_in_sb: slot,
+                        mb_in_sb,
+                        block_in_mb,
+                        bx,
+                        by,
+                    });
+                }
+            }
+            self.next_sb += 1;
+            self.next_slot = 0;
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining_blocks();
+        let upper = usize::try_from(remaining).ok();
+        let lower = upper.unwrap_or(usize::MAX);
+        (lower, upper)
+    }
+}
+
+/// Number of blocks a single super block contributes to the plane,
+/// accounting for clipping against the plane's block extent.
+fn blocks_inside_plane(sb_index: u32, sb_w: u32, block_w: u32, block_h: u32) -> u64 {
+    let sb_col = sb_index % sb_w;
+    let sb_row = sb_index / sb_w;
+    let bx0 = sb_col * 4;
+    let by0 = sb_row * 4;
+    let in_w = block_w.saturating_sub(bx0).min(4);
+    let in_h = block_h.saturating_sub(by0).min(4);
+    (in_w as u64) * (in_h as u64)
+}
+
+/// Resolve a (sb_index, slot) pair into the (bx, by) plane-local block
+/// coordinates of the corresponding block. Coordinates are
+/// lower-left-origin in 8×8 block units.
+fn sb_slot_to_plane_xy(sb_index: u32, slot: u8, sb_w: u32) -> (u32, u32) {
+    let sb_col = sb_index % sb_w;
+    let sb_row = sb_index / sb_w;
+    let (lx, ly) = BLOCK_IN_SB_HILBERT[slot as usize];
+    (sb_col * 4 + lx as u32, sb_row * 4 + ly as u32)
+}
+
+/// One step of the §2.4 macro-block-level coded-order walk.
+///
+/// Macro blocks are visited per the rule of §2.4 ("examining each super
+/// block in the luma plane in raster order, and traversing the four
+/// macro blocks inside using a smaller Hilbert curve"). Because frame
+/// dimensions are constrained to be a multiple of 16, there are never
+/// any partial macro blocks (§2.4 last sentence), so this walker emits
+/// exactly `nmbs = fmbw * fmbh` items for any luma plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodedMacroBlockPosition {
+    /// Luma-plane super-block index (raster order, lower-left origin).
+    pub sb_index: u32,
+    /// Coded slot of the macro block within its super block (`0..4`).
+    pub mb_in_sb: u8,
+    /// Macro-block column inside the plane (`0..mb_w`),
+    /// lower-left origin.
+    pub mbx: u32,
+    /// Macro-block row inside the plane (`0..mb_h`), lower-left origin.
+    pub mby: u32,
+}
+
+/// Iterator that walks the macro blocks of the luma plane in §2.4
+/// coded order.
+///
+/// `dims` carries the luma-plane macro-block extent (`mb_w`, `mb_h`).
+/// Macro blocks lying outside the plane's extent (which can only
+/// happen on the top or right edge of an over-padded super block) are
+/// skipped on the fly.
+#[derive(Debug, Clone)]
+pub struct PlaneMacroBlockCodedOrder {
+    sb_w: u32,
+    sb_h: u32,
+    mb_w: u32,
+    mb_h: u32,
+    next_sb: u32,
+    next_slot: u8,
+}
+
+impl PlaneMacroBlockCodedOrder {
+    /// Build a new macro-block coded-order iterator for the given
+    /// luma-plane geometry.
+    pub fn new(dims: PlaneBlockDims) -> Self {
+        Self {
+            sb_w: dims.sb_w(),
+            sb_h: dims.sb_h(),
+            mb_w: dims.mb_w,
+            mb_h: dims.mb_h,
+            next_sb: 0,
+            next_slot: 0,
+        }
+    }
+}
+
+impl Iterator for PlaneMacroBlockCodedOrder {
+    type Item = CodedMacroBlockPosition;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let total_sbs = self.sb_w * self.sb_h;
+        while self.next_sb < total_sbs {
+            while self.next_slot < 4 {
+                let slot = self.next_slot;
+                let sb_col = self.next_sb % self.sb_w;
+                let sb_row = self.next_sb / self.sb_w;
+                let (lx, ly) = MB_IN_SB_HILBERT[slot as usize];
+                let mbx = sb_col * 2 + lx as u32;
+                let mby = sb_row * 2 + ly as u32;
+                self.next_slot += 1;
+                if mbx < self.mb_w && mby < self.mb_h {
+                    return Some(CodedMacroBlockPosition {
+                        sb_index: self.next_sb,
+                        mb_in_sb: slot,
+                        mbx,
+                        mby,
+                    });
+                }
+            }
+            self.next_sb += 1;
+            self.next_slot = 0;
+        }
+        None
+    }
 }
 
 /// No-op codec registration. Decoder/encoder wiring will land in a
@@ -17377,5 +17790,345 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a, b);
+    }
+
+    // -----------------------------------------------------------------
+    // §2.3 / §2.4 coded-order resolver
+    // -----------------------------------------------------------------
+
+    /// §2.3 worked example: a 240×48-pixel luma plane has 30 blocks
+    /// per row, 6 rows of blocks, and 8 × 2 super blocks. Walking the
+    /// blocks in coded order yields the sequence of plane-local
+    /// indices laid out in the table on page 8 of the specification.
+    /// The bottom row of that table is:
+    ///
+    /// ```text
+    ///   0  1 14 15  …  112 113
+    /// ```
+    ///
+    /// — i.e. the lower-left block of every super block in SB-row 0
+    /// is reached at coded slot `16 * sb_col`, the next column's block
+    /// reaches it at `16 * sb_col + 1`, and the bottom-right block of
+    /// SB-column 0 is at coded slot 15.
+    ///
+    /// `mb_w = 240 / 16 = 15`, `mb_h = 48 / 16 = 3`.
+    #[test]
+    fn coded_order_block_240x48_matches_spec_worked_example() {
+        let dims = PlaneBlockDims { mb_w: 15, mb_h: 3 };
+        assert_eq!(dims.block_w(), 30);
+        assert_eq!(dims.block_h(), 6);
+        assert_eq!(dims.sb_w(), 8);
+        assert_eq!(dims.sb_h(), 2);
+
+        let walk: Vec<CodedBlockPosition> = PlaneBlockCodedOrder::new(dims).collect();
+
+        // Total emitted == plane block count.
+        assert_eq!(walk.len() as u64, dims.block_count());
+        assert_eq!(walk.len(), 180);
+
+        // Spec's bottom row (by = 0) — coded indices the spec lists.
+        // The bottom row of the table reads:
+        //   bx = 0 → 0      bx = 1  → 1
+        //   bx = 2 → 14     bx = 3  → 15
+        //   bx = 4 → 16     bx = 5  → 17
+        //   …
+        //   bx = 28 → 112   bx = 29 → 113
+        let coded_index_at = |bx: u32, by: u32| -> usize {
+            walk.iter()
+                .position(|p| p.bx == bx && p.by == by)
+                .expect("every plane-local block must appear exactly once")
+        };
+        assert_eq!(coded_index_at(0, 0), 0);
+        assert_eq!(coded_index_at(1, 0), 1);
+        assert_eq!(coded_index_at(2, 0), 14);
+        assert_eq!(coded_index_at(3, 0), 15);
+        assert_eq!(coded_index_at(28, 0), 112);
+        assert_eq!(coded_index_at(29, 0), 113);
+
+        // Spec's column-0 bottom super block — by = 0..=3 at bx = 0
+        // climbs the Hilbert curve through coded slots 0, 3, 4, 5.
+        assert_eq!(coded_index_at(0, 0), 0);
+        assert_eq!(coded_index_at(0, 1), 3);
+        assert_eq!(coded_index_at(0, 2), 4);
+        assert_eq!(coded_index_at(0, 3), 5);
+
+        // Second SB-row (by ∈ 4..=5) starts at coded slot 128.
+        // The bottom of SB-row 1 reads "120 121 126 127" then later
+        // "123 122 125 124" climbing.
+        assert_eq!(coded_index_at(0, 4), 120);
+        assert_eq!(coded_index_at(1, 4), 121);
+        assert_eq!(coded_index_at(2, 4), 126);
+        assert_eq!(coded_index_at(3, 4), 127);
+        assert_eq!(coded_index_at(0, 5), 123);
+        assert_eq!(coded_index_at(1, 5), 122);
+        assert_eq!(coded_index_at(2, 5), 125);
+        assert_eq!(coded_index_at(3, 5), 124);
+
+        // Right-edge super block in SB-row 1 finishes the plane: its
+        // four top blocks (bx = 28..=29, by = 4..=5) carry the largest
+        // coded indices 176..=179.
+        assert_eq!(coded_index_at(28, 5), 179);
+        assert_eq!(coded_index_at(29, 5), 178);
+        assert_eq!(coded_index_at(28, 4), 176);
+        assert_eq!(coded_index_at(29, 4), 177);
+
+        // Bijection sanity: each (bx, by) appears in the walk exactly
+        // once, and every emitted position falls inside the plane.
+        let mut seen = vec![false; (dims.block_w() * dims.block_h()) as usize];
+        for (slot, pos) in walk.iter().enumerate() {
+            assert!(pos.bx < dims.block_w());
+            assert!(pos.by < dims.block_h());
+            assert!(pos.block_in_sb < 16);
+            assert!(pos.mb_in_sb < 4);
+            assert!(pos.block_in_mb < 4);
+            assert_eq!(pos.block_in_sb, 4 * pos.mb_in_sb + pos.block_in_mb);
+            // Coded slot index in iteration order matches sb_index *
+            // 16 + block_in_sb only when no out-of-plane blocks were
+            // filtered earlier in the same super block. Tested below
+            // for the all-inside case separately. Here just confirm
+            // monotonic non-decreasing sb_index.
+            if slot > 0 {
+                assert!(walk[slot].sb_index >= walk[slot - 1].sb_index);
+            }
+            let raster = (pos.by * dims.block_w() + pos.bx) as usize;
+            assert!(
+                !seen[raster],
+                "duplicate visit at (bx={}, by={})",
+                pos.bx, pos.by
+            );
+            seen[raster] = true;
+        }
+        assert!(seen.iter().all(|&v| v));
+    }
+
+    /// Inside an all-inside-plane super block, the iterator emits 16
+    /// blocks per SB; the per-SB sequence of (column, row) coordinates
+    /// inside the super block traces the Hilbert curve of Figure 2.4
+    /// exactly. A 4×4-block, 1×1-SB plane (`mb_w = mb_h = 2`) makes
+    /// the trace observable directly without any clipping.
+    #[test]
+    fn coded_order_block_one_full_super_block_traces_figure_2_4() {
+        let dims = PlaneBlockDims { mb_w: 2, mb_h: 2 };
+        assert_eq!(dims.block_w(), 4);
+        assert_eq!(dims.block_h(), 4);
+        assert_eq!(dims.sb_w(), 1);
+        assert_eq!(dims.sb_h(), 1);
+
+        let walk: Vec<(u32, u32)> = PlaneBlockCodedOrder::new(dims)
+            .map(|p| (p.bx, p.by))
+            .collect();
+        // Figure 2.4 sequence (lower-left origin), straight from the
+        // §2.3 description.
+        let expected: [(u32, u32); 16] = [
+            (0, 0),
+            (1, 0),
+            (1, 1),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 3),
+            (1, 2),
+            (2, 2),
+            (2, 3),
+            (3, 3),
+            (3, 2),
+            (3, 1),
+            (2, 1),
+            (2, 0),
+            (3, 0),
+        ];
+        assert_eq!(walk, expected);
+    }
+
+    /// Partial super-block edge: a plane that is 3 macro blocks wide
+    /// by 3 macro blocks tall has block-extent 6×6 but its super
+    /// blocks span a 4×4-block grid (`sb_w = sb_h = 2`). The right and
+    /// top super-blocks each contain only a 2×4 (resp. 4×2) sliver of
+    /// in-plane blocks; the upper-right SB contains only a 2×2 corner.
+    ///
+    /// The Hilbert walk inside an over-padded super block visits its
+    /// 16 slots in the same order as a full super block, but the
+    /// iterator must drop any (bx, by) that falls outside the plane.
+    /// The total emitted item count must equal `block_w * block_h = 36`.
+    #[test]
+    fn coded_order_block_partial_super_block_filters_to_in_plane_only() {
+        let dims = PlaneBlockDims { mb_w: 3, mb_h: 3 };
+        assert_eq!(dims.block_w(), 6);
+        assert_eq!(dims.block_h(), 6);
+        assert_eq!(dims.sb_w(), 2);
+        assert_eq!(dims.sb_h(), 2);
+
+        let walk: Vec<CodedBlockPosition> = PlaneBlockCodedOrder::new(dims).collect();
+        assert_eq!(walk.len() as u64, dims.block_count());
+        assert_eq!(walk.len(), 36);
+
+        // Every emitted position must be inside the plane block extent.
+        for pos in &walk {
+            assert!(pos.bx < 6, "bx={} out of plane", pos.bx);
+            assert!(pos.by < 6, "by={} out of plane", pos.by);
+        }
+
+        // Bijection: each (bx, by) appears exactly once.
+        let mut seen = [false; 36];
+        for pos in &walk {
+            let r = (pos.by * 6 + pos.bx) as usize;
+            assert!(!seen[r]);
+            seen[r] = true;
+        }
+        assert!(seen.iter().all(|&v| v));
+
+        // SB ordering: items from sb_index = 0 (lower-left) come
+        // first, then sb_index = 1 (lower-right), then 2 (upper-left),
+        // then 3 (upper-right) — i.e. raster order over the 2×2 SB
+        // grid with lower-left origin.
+        let sb_run_lengths: Vec<u32> = {
+            let mut counts = [0u32; 4];
+            for pos in &walk {
+                counts[pos.sb_index as usize] += 1;
+            }
+            counts.to_vec()
+        };
+        // SB 0 (bx 0..=3, by 0..=3) — 16 in-plane blocks.
+        // SB 1 (bx 4..=5, by 0..=3) — 8 in-plane blocks (2 columns × 4 rows).
+        // SB 2 (bx 0..=3, by 4..=5) — 8 in-plane blocks.
+        // SB 3 (bx 4..=5, by 4..=5) — 4 in-plane blocks.
+        assert_eq!(sb_run_lengths, vec![16, 8, 8, 4]);
+
+        // Inside the iterator's output, all SB-0 items precede all
+        // SB-1 items, which precede all SB-2 items, etc.
+        let mut prev = 0u32;
+        for pos in &walk {
+            assert!(pos.sb_index >= prev);
+            prev = pos.sb_index;
+        }
+    }
+
+    /// §2.4 macro-block coded order: a 240×48 luma plane has 15 × 3
+    /// macro blocks and 8 × 2 super blocks. The spec's worked example
+    /// gives the per-macro-block indices laid out in the table on
+    /// page 11 of the specification:
+    ///
+    /// ```text
+    ///   30 31 32 33 … 42 43 44   (mb_row = 2, top)
+    ///    1  2  5  6 … 25 26 29   (mb_row = 1)
+    ///    0  3  4  7 … 24 27 28   (mb_row = 0, bottom)
+    /// ```
+    #[test]
+    fn coded_order_macroblock_240x48_matches_spec_worked_example() {
+        let dims = PlaneBlockDims { mb_w: 15, mb_h: 3 };
+        let walk: Vec<CodedMacroBlockPosition> = PlaneMacroBlockCodedOrder::new(dims).collect();
+        assert_eq!(walk.len() as u64, dims.mb_count());
+        assert_eq!(walk.len(), 45);
+
+        let coded_index_at = |mbx: u32, mby: u32| -> usize {
+            walk.iter()
+                .position(|p| p.mbx == mbx && p.mby == mby)
+                .expect("every macro block must appear exactly once")
+        };
+        // Spec table — bottom row (mby = 0).
+        assert_eq!(coded_index_at(0, 0), 0);
+        assert_eq!(coded_index_at(1, 0), 3);
+        assert_eq!(coded_index_at(2, 0), 4);
+        assert_eq!(coded_index_at(3, 0), 7);
+        // Spec table — middle row (mby = 1).
+        assert_eq!(coded_index_at(0, 1), 1);
+        assert_eq!(coded_index_at(1, 1), 2);
+        assert_eq!(coded_index_at(2, 1), 5);
+        assert_eq!(coded_index_at(3, 1), 6);
+        // Spec table — top row (mby = 2), an over-padded SB column.
+        // The right edge in this plane has mb_w = 15 but sb_w = 8, so
+        // SB-column 7 holds macro blocks (14, 0..=1) plus a single
+        // top macro block (14, 2) — and (15, *) macro blocks are
+        // entirely outside the plane.
+        assert_eq!(coded_index_at(0, 2), 30);
+        assert_eq!(coded_index_at(1, 2), 31);
+        assert_eq!(coded_index_at(2, 2), 32);
+        assert_eq!(coded_index_at(3, 2), 33);
+        // Right-edge macro blocks. SB(6,0) covers mbx ∈ {12, 13},
+        // mby ∈ {0, 1}; its four coded slots map to mb indices
+        // (12,0) → 24, (12,1) → 25, (13,1) → 26, (13,0) → 27.
+        // SB(7,0) is half-clipped on the right (mbx = 15 out of plane);
+        // its in-plane slots produce (14, 0) → 28, (14, 1) → 29.
+        assert_eq!(coded_index_at(12, 0), 24);
+        assert_eq!(coded_index_at(12, 1), 25);
+        assert_eq!(coded_index_at(13, 1), 26);
+        assert_eq!(coded_index_at(13, 0), 27);
+        assert_eq!(coded_index_at(14, 0), 28);
+        assert_eq!(coded_index_at(14, 1), 29);
+        // SB-row 1 right edge: SB(6,1) covers mbx ∈ {12, 13}, mby = 2
+        // only; emits (12,2) → 42 and (13,2) → 43. SB(7,1) emits the
+        // single in-plane MB (14, 2) → 44.
+        assert_eq!(coded_index_at(12, 2), 42);
+        assert_eq!(coded_index_at(13, 2), 43);
+        assert_eq!(coded_index_at(14, 2), 44);
+
+        // Bijection sanity.
+        let mut seen = [false; 45];
+        for pos in &walk {
+            assert!(pos.mbx < 15);
+            assert!(pos.mby < 3);
+            assert!(pos.mb_in_sb < 4);
+            let r = (pos.mby * 15 + pos.mbx) as usize;
+            assert!(!seen[r]);
+            seen[r] = true;
+        }
+        assert!(seen.iter().all(|&v| v));
+    }
+
+    /// `PlaneBlockDims::chroma_from_ident` honours the `PF` axis-by-axis
+    /// halving rules of Table 6.4 / §2.1, including the ceiling-divide
+    /// behaviour needed when the luma plane has an odd macro-block
+    /// count.
+    #[test]
+    fn coded_order_plane_block_dims_match_pf_subsampling_rules() {
+        // PF=0 (4:2:0): both chroma axes halved (rounded up).
+        let mut ident = TheoraIdentHeader {
+            vmaj: 3,
+            vmin: 2,
+            vrev: 1,
+            fmbw: 7,
+            fmbh: 5,
+            picw: 112,
+            pich: 80,
+            picx: 0,
+            picy: 0,
+            frn: 25,
+            frd: 1,
+            parn: 1,
+            pard: 1,
+            cs: ColorSpace::Undefined,
+            nombr: 0,
+            qual: 0,
+            kfgshift: 0,
+            pf: PixelFormat::Yuv420,
+        };
+        let luma = PlaneBlockDims::luma_from_ident(&ident);
+        assert_eq!(luma, PlaneBlockDims { mb_w: 7, mb_h: 5 });
+        let chroma = PlaneBlockDims::chroma_from_ident(&ident);
+        assert_eq!(chroma, PlaneBlockDims { mb_w: 4, mb_h: 3 });
+
+        // PF=2 (4:2:2): horizontal halved, vertical full.
+        ident.pf = PixelFormat::Yuv422;
+        let chroma = PlaneBlockDims::chroma_from_ident(&ident);
+        assert_eq!(chroma, PlaneBlockDims { mb_w: 4, mb_h: 5 });
+
+        // PF=3 (4:4:4): chroma == luma.
+        ident.pf = PixelFormat::Yuv444;
+        let chroma = PlaneBlockDims::chroma_from_ident(&ident);
+        assert_eq!(chroma, PlaneBlockDims { mb_w: 7, mb_h: 5 });
+    }
+
+    /// Iterator emits zero items when the plane is empty (defensive
+    /// edge case — a real header would reject `mb_w = 0` or `mb_h = 0`
+    /// at §6.2, but the iterator itself must remain well-defined for
+    /// degenerate inputs).
+    #[test]
+    fn coded_order_block_zero_dims_yields_empty_walk() {
+        let dims = PlaneBlockDims { mb_w: 0, mb_h: 0 };
+        let walk: Vec<CodedBlockPosition> = PlaneBlockCodedOrder::new(dims).collect();
+        assert!(walk.is_empty());
+
+        let mbs: Vec<CodedMacroBlockPosition> = PlaneMacroBlockCodedOrder::new(dims).collect();
+        assert!(mbs.is_empty());
     }
 }

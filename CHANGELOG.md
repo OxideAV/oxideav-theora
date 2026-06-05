@@ -6,6 +6,42 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §2.3 / §2.4 coded-order resolver (round 238). New public
+  iterators `PlaneBlockCodedOrder` and `PlaneMacroBlockCodedOrder`
+  walk one colour plane in spec-defined coded order: super-blocks
+  in raster order (lower-left origin), Hilbert curve inside each
+  super-block per Figure 2.4 (16 blocks) and Figure 2.6 (4 macro-
+  blocks). Each iterator item carries the plane-local
+  super-block index, the slot inside the super-block, and the
+  plane-local `(bx, by)` or `(mbx, mby)` coordinates. Edge
+  super-blocks (right / top of the plane) follow §2.3's
+  "ordering still used, blocks outside the frame boundary
+  omitted" rule: the iterator advances through every slot of the
+  over-padded super-block and filters out the slots whose
+  coordinates lie outside the plane's block extent.
+  Supporting types: `PlaneBlockDims { mb_w, mb_h }` (plane
+  geometry in macroblocks) with `luma_from_ident` /
+  `chroma_from_ident` constructors that derive the dimensions
+  from a parsed identification header per the `PF` rules of
+  Table 6.4, plus `sb_w`, `sb_h`, `block_w`, `block_h`,
+  `mb_count`, `block_count` accessors; `CodedBlockPosition`
+  (one §2.3 walk step: `sb_index`, `block_in_sb`, `mb_in_sb`,
+  `block_in_mb`, `bx`, `by`) and `CodedMacroBlockPosition` (one
+  §2.4 walk step: `sb_index`, `mb_in_sb`, `mbx`, `mby`).
+  Five new tests (total now 411): the 240×48 worked example of
+  §2.3 page 8 pinning the block walk against the spec's table
+  of plane-local coded indices (bottom row 0/1/14/15…112/113,
+  SB-row 1's bottom row 120/121/126/127…176/177, and SB-row 1
+  top corners 178/179); a 4×4-block single-super-block trace
+  pinning the inner Figure 2.4 Hilbert sequence verbatim; a
+  3×3-macroblock (6×6-block) plane exercising the edge-filter
+  on three over-padded super-blocks (right, top, and the
+  top-right corner SB that holds only 4 in-plane blocks); the
+  240×48 worked example of §2.4 page 11 pinning the macro-block
+  walk; the `PF` axis-by-axis halving rules of
+  `chroma_from_ident` across 4:2:0 / 4:2:2 / 4:4:4; and a
+  zero-dim degenerate-input guard.
+
 - §7.9.4 frame-level driver (round 233). New public entry point
   `reconstruct_frame(bcoded, mb_modes, mvects, coeffs, ncoeffs,
   qiis, pli_of_block, bx_of_block, by_of_block, mbi_of_block, qis,

@@ -2,7 +2,7 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-06-04
+## Status — 2026-06-05
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter
 limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
@@ -14,7 +14,7 @@ qi decode + §7.7.1 EOB token decode + §7.7.2 coefficient token decode +
 §7.8.2 DC prediction inversion driver + §7.9.1 predictors (intra /
 whole-pixel / half-pixel) + §7.9.2 dequantization + §7.9.3 inverse DCT
 (1D + 2D) + §7.9.4 per-block reconstruction + §7.9.4 frame-level
-driver (rounds 1–23, 233).** §6.1, §6.2
+driver + §2.3 / §2.4 coded-order resolver (rounds 1–23, 233, 238).** §6.1, §6.2
 (identification), §6.3 (comment), §6.4.5 step 1 (setup-header
 common-header guard), §6.4.1 (Loop Filter Limit Table Decode), §6.4.2
 (Quantization Parameters Decode), §6.4.3 (Computing a Quantization
@@ -1328,17 +1328,62 @@ hitting the intra path); the four reject paths
 new error variants; and a determinism guard over a mixed
 coded/uncoded input.
 
+### §2.3 / §2.4 coded-order resolver (round 238)
+
+`PlaneBlockCodedOrder` and `PlaneMacroBlockCodedOrder` are typed
+iterators that walk one colour plane in the spec's coded order:
+super-blocks in raster order (lower-left origin), Hilbert curve
+inside each super-block per Figure 2.4 (16 blocks) and Figure 2.6
+(4 macro-blocks). Each item carries the super-block index, the
+slot inside the super-block, and the plane-local `(bx, by)` (or
+`(mbx, mby)`) coordinates.
+
+`PlaneBlockDims { mb_w, mb_h }` carries the plane geometry in
+macroblocks. The two constructors derive the dimensions from a
+parsed identification header:
+
+* `PlaneBlockDims::luma_from_ident(&ident)` — luma plane:
+  `(fmbw, fmbh)`.
+* `PlaneBlockDims::chroma_from_ident(&ident)` — chroma plane:
+  axes scaled per `PF` (Table 6.4): both halved for 4:2:0, only
+  horizontal halved for 4:2:2, full size for 4:4:4. Halving
+  rounds up so the chroma plane covers the entire luma area even
+  when the luma macro-block count is odd.
+
+Edge super-blocks (those that straddle the right or top of the
+plane) follow §2.3's "the same ordering is still used, simply with
+any blocks outside the frame boundary omitted" rule: the iterator
+advances through all 16 (or 4) slots of the over-padded super-block
+but filters out the slots whose `(bx, by)` lies outside the plane's
+block extent. The 240×48 worked example of §2.3 page 8 / §2.4
+page 11 is reproduced as two unit tests, plus a 4×4-block single
+super-block test pinning the inner Hilbert sequence, a 6×6-block
+partial-super-block test pinning the edge-filter behaviour, the
+`PF` axis-by-axis subsampling rules of `chroma_from_ident`, and a
+zero-dim degenerate edge case.
+
+This is the standalone helper the roadmap below mentioned. It
+unblocks any caller that needs to translate a coded-order block
+index back into plane-local raster coordinates (or vice versa)
+without redoing the Hilbert-curve geometry by hand — for example,
+the upcoming §7.10 loop-filter driver and the §7.5 / §7.7 / §7.8
+chains that currently take pre-resolved raster orderings as
+caller-supplied arrays. Five new unit tests; whole-crate total now
+411 (was 406).
+
 ## Roadmap
 
 * Next: §7.10 Loop Filter — deblocking applied to the
   pre-loop-filter frame returned by [`reconstruct_frame`] using
   the §6.4.1 `LFLIMS[qi0]` table.
-* After §7.10: the §2.3 coded-order resolver — a standalone
-  helper that takes `(FMBW, FMBH, PF)` from the identification
-  header and returns the per-block `(pli, BX, BY, mbi)`
-  quadruple [`reconstruct_frame`] currently expects from the
-  caller. This is mostly Hilbert-curve geometry over the
-  super-block / macro-block / block hierarchy of §2.3 / §2.4.
+* The §2.3 / §2.4 coded-order resolver landed in round 238 as
+  `PlaneBlockCodedOrder` + `PlaneMacroBlockCodedOrder` over
+  `PlaneBlockDims`. Follow-ups that compose it into per-block
+  raster-order arrays (i.e. the `block_to_super_block`,
+  `block_to_macro_block`, and three per-plane raster orderings the
+  §7.3 / §7.5 / §7.8 drivers consume) can land alongside the
+  §7.10 driver in a later round, on top of the iterators that now
+  exist.
 * §7.9.3.3 (the 1D forward DCT) is explicitly non-normative per
   the spec ("the version of the transform used by Xiph.Org's
   Theora encoder, which is the same as that used by VP3") and is

@@ -2,7 +2,7 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
-## Status — 2026-06-05
+## Status — 2026-06-07
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter
 limits + §6.4.2 quant-params decode + §6.4.3 quant-matrix compute +
@@ -1446,12 +1446,71 @@ each coded block to one of these two primitives — is the natural
 next round: these primitives are the per-edge body it dispatches
 to.
 
+### §7.10.3 Complete Loop Filter raster-order driver (round 244)
+
+Round 244 lands the **§7.10.3 raster-order driver** as
+[`loop_filter_frame`]. The procedure is the per-frame composition
+of the §7.10.1 / §7.10.2 edge primitives that landed in round 241:
+
+1. Step 1 reads `L = LFLIMS[QIS[0]]` once per frame — the per-frame
+   loop-filter limit driving every `lflim()` call inside the walk.
+2. Step 2 walks every block in raster order (left-to-right within
+   a row, then bottom-to-top per the §2.1 lower-left convention)
+   over each of the three planes in turn. For every block whose
+   `BCODED[bi]` flag is set, the driver applies up to four edge
+   filters:
+   * step 2(a) v — left edge when `BX > 0` (the already-filtered
+     right edge of the left neighbour).
+   * step 2(a) vi — bottom edge when `BY > 0` (mirror of the above).
+   * step 2(a) vii — right edge when `BX + 8 < RPW` **and** the
+     right neighbour's `BCODED[bj]` is zero; the boundary needs
+     filtering here because the right neighbour, being uncoded, will
+     never visit it.
+   * step 2(a) viii — top edge under the same neighbour-handover
+     rule, rotated 90°.
+
+The driver's API takes the raster→coded-order index map per plane
+as `LoopFilterPlaneInput::grid_to_bi` (lower-left row-major,
+`block_w * block_h` entries) and the three plane buffers + their
+pixel dimensions as a single mutable `LoopFilterPlanes` struct.
+Per-block arrays (`bcoded`, `pli_of_block`, `bx_of_block`,
+`by_of_block`) are indexed by the coded-order `bi` the grid yields.
+
+Errors raised (eight new typed variants):
+
+* [`Error::LoopFilterFrameQisEmpty`] — `QIS` is empty so no `qi0`.
+* [`Error::LoopFilterFrameQiOutOfRange`] — `QIS[0] > 63`.
+* [`Error::LoopFilterFrameBlockLenMismatch`] — per-block slice
+  length disagrees with `nbs`. The `which` field discriminates
+  `BCODED` / `pli_of_block` / `bx_of_block` / `by_of_block`.
+* [`Error::LoopFilterFrameRasterLenMismatch`] — `grid_to_bi.len()`
+  disagrees with `block_w * block_h`.
+* [`Error::LoopFilterFrameRasterEntryOutOfRange`] — a grid entry's
+  `bi >= nbs`.
+* [`Error::LoopFilterFramePliOutOfRange`] — `pli_of_block[bi] > 2`.
+* [`Error::LoopFilterFrameBlockOutOfPlane`] — a coded block's
+  `(bx, by) + 8` escapes the plane handed in for its `pli`, *or*
+  the declared `block_w * 8 != plane_w` / `block_h * 8 != plane_h`.
+
+Seventeen new tests cover the per-frame round-trip: single-block
+identity (no neighbours, all four boundary tests short-circuit),
+two-block shared-edge filtered-exactly-once (horizontal + vertical
+mirror cases), step 2(a) vii / viii uncoded-neighbour boundary
+filtering, plane independence (a Cb-only delta leaves Y and Cr
+untouched), and all eight error variants exercised through their
+typed `Error::*` pattern matches plus their `Display` rendering.
+The driver is bit-exact against hand-computed `lflim()` deltas on
+each fixture.
+
 ## Roadmap
 
-* Next: §7.10.3 Complete Loop Filter — the raster-order driver
-  that walks coded blocks and dispatches the four per-block
-  edges to the §7.10.1 / §7.10.2 primitives that landed in
-  round 241.
+* Next: wire the §7.10.3 driver into the §7.9.4 frame reconstruction
+  pipeline so [`reconstruct_frame`] returns the post-loop-filter
+  buffer rather than the pre-loop-filter one. The blocker is the
+  per-plane raster-order to coded-order index map, which a follow-up
+  composition layer can build by iterating
+  `PlaneBlockCodedOrder::new(dims)` and bucketing the
+  `(bx, by)` → `bi` pairs into the raster grid.
 * The §2.3 / §2.4 coded-order resolver landed in round 238 as
   `PlaneBlockCodedOrder` + `PlaneMacroBlockCodedOrder` over
   `PlaneBlockDims`. Follow-ups that compose it into per-block

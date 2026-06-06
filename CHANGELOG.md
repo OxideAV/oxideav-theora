@@ -6,6 +6,41 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.10.3 Complete Loop Filter raster-order driver (round 244).
+  New public entry point `loop_filter_frame(lflims, qis, bcoded,
+  pli_of_block, bx_of_block, by_of_block, plane_y, plane_cb,
+  plane_cr, planes)` walks every coded block in raster order over
+  each plane and dispatches up to four edge filters per block via
+  the §7.10.1 / §7.10.2 primitives that landed in round 241. The
+  driver reads `L = LFLIMS[QIS[0]]` once per frame (step 1) and
+  honours the spec's neighbour-handover rule on the right / top
+  edges (step 2(a) vii / viii filter the boundary only when the
+  right / above neighbour has `BCODED[bj] == 0`, since a coded
+  neighbour would later filter the shared edge as its own left /
+  bottom edge in step 2(a) v / vi). The API exposes two new public
+  helpers: `LoopFilterPlaneInput` (per-plane raster→coded-order
+  block index map + plane block extent) and `LoopFilterPlanes`
+  (three plane buffers + `RPYW` / `RPYH` / `RPCW` / `RPCH`
+  dimensions). Eight new typed error variants —
+  `LoopFilterFrameQisEmpty`, `LoopFilterFrameQiOutOfRange`,
+  `LoopFilterFrameBlockLenMismatch` (discriminating
+  `BCODED` / `pli_of_block` / `bx_of_block` / `by_of_block` via
+  `LoopFilterFrameBlockSlice`), `LoopFilterFrameRasterLenMismatch`,
+  `LoopFilterFrameRasterEntryOutOfRange`,
+  `LoopFilterFramePliOutOfRange`, and
+  `LoopFilterFrameBlockOutOfPlane` — each with §7.10.3-tagged
+  Display strings. 17 new tests (total now 447): per-frame
+  identity on a single-block plane (all four boundary tests
+  short-circuit), shared-edge filtered-exactly-once for two
+  coded blocks (horizontal + vertical mirror cases, bit-exact
+  pre/post pixel deltas verified against hand-computed `lflim`
+  output), step 2(a) vii / viii triggered by an uncoded
+  middle neighbour, plane independence (Cb-only edits leave Y and
+  Cr untouched), and every error variant exercised through both
+  pattern-matching and `Display` rendering. Bit-exact against
+  hand-derived `lflim(R, L)` values for `R = 10, L = 30` ⇒
+  `lflim = 10` (linear segment) and `R = 15, L = 30` ⇒
+  `lflim = 15`.
 - §7.10.1 / §7.10.2 loop-filter edge primitives + `lflim()` response
   (round 241). New public entry points
   `lflim(r: i32, l: u8) -> i32` (the §7.10 piecewise non-linear

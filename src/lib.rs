@@ -2,7 +2,27 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-06-06 (round 241 of clean-room rebuild)
+//! ## Status — 2026-06-07 (round 244 of clean-room rebuild)
+//!
+//! Round 244 lands the **§7.10.3 Complete Loop Filter raster-order
+//! driver** as [`loop_filter_frame`]. The driver composes the
+//! round-241 §7.10.1 / §7.10.2 edge primitives into a per-frame
+//! pass: step 1 selects `L = LFLIMS[QIS[0]]` once per frame, then
+//! step 2 walks every block in raster order over Y, Cb, and Cr in
+//! turn; for each coded block it dispatches up to four edge filters
+//! per §7.10.3 step 2(a) v / vi / vii / viii. Step 2(a) v / vi
+//! filter the block's left / bottom edges when their respective
+//! coordinates `BX` / `BY` are positive (the edge shared with the
+//! already-walked left / bottom neighbour); step 2(a) vii / viii
+//! filter the right / top edges only when the corresponding
+//! neighbour is uncoded (`BCODED[bj] == 0`) — coded neighbours later
+//! filter the shared edge as their own left / bottom edge, so the
+//! handover prevents double-filtering. The driver accepts a
+//! per-plane raster→coded-order index map as
+//! [`LoopFilterPlaneInput::grid_to_bi`] and the three plane buffers
+//! plus their pixel dimensions as a single mutable
+//! [`LoopFilterPlanes`] struct; per-block arrays are indexed by the
+//! coded-order `bi` the grid yields.
 //!
 //! Round 241 lands the **§7.10.1 / §7.10.2 loop-filter edge
 //! primitives** plus the §7.10 `lflim()` non-linear response
@@ -21,8 +41,7 @@
 //! `RECP[fy+by][fx+1] += lflim(R, L)` /
 //! `RECP[fy+by][fx+2] -= lflim(R, L)` with a `0..=255` saturation
 //! per §7.10.1 step 1(c-e) / step 1(g-i); the vertical filter is
-//! the same shape rotated 90°. The §7.10.3 raster-order driver is
-//! the natural follow-up that dispatches into these primitives.
+//! the same shape rotated 90°. Round 244 composes them.
 //!
 //! Round 238 lands the **§2.3 / §2.4 coded-order resolver** as
 //! [`PlaneBlockCodedOrder`] and [`PlaneMacroBlockCodedOrder`]:
@@ -1017,9 +1036,116 @@ pub enum Error {
         /// Expected `plane_w * plane_h`.
         expected: usize,
     },
+    /// A per-block input slice handed to the §7.10.3 raster-order
+    /// driver had a length other than `nbs`. Every per-block array
+    /// (`BCODED`, `pli_of_block`, `bx_of_block`, `by_of_block`) must
+    /// agree on the universal `nbs` block count.
+    LoopFilterFrameBlockLenMismatch {
+        /// Which per-block slice failed the length check.
+        which: LoopFilterFrameBlockSlice,
+        /// Slice length the caller supplied.
+        got: usize,
+        /// Expected length (the universal `nbs`).
+        nbs: usize,
+    },
+    /// A raster-order entry handed to the §7.10.3 driver exceeded the
+    /// universal `nbs` bound, so it cannot be used as a coded-order
+    /// block index. The driver consumes `raster_to_coded[raster_idx]`
+    /// as a `bi` lookup; every value must be `< nbs`.
+    LoopFilterFrameRasterEntryOutOfRange {
+        /// Plane the offending entry belonged to (`0` = Y, `1` = Cb,
+        /// `2` = Cr).
+        pli: u8,
+        /// Raster-order position within that plane.
+        raster_idx: usize,
+        /// The offending coded-order block index.
+        bi: u32,
+        /// Universal block count.
+        nbs: usize,
+    },
+    /// `pli_of_block[bi]` was not in `0..=2`. The §7.10.3 driver routes
+    /// each block to one of the three reconstructed planes via this
+    /// index; values outside `0..=2` cannot be resolved.
+    LoopFilterFramePliOutOfRange {
+        /// Coded-order block index that carried the invalid `pli`.
+        bi: usize,
+        /// The invalid `pli` value.
+        pli: u8,
+    },
+    /// The §7.10.3 driver received a coded block whose `(BX, BY)`
+    /// origin would place the block outside the plane handed in for
+    /// its `pli`. The edge filters need an 8-pixel block footprint, so
+    /// `BX + 8 <= plane_w` and `BY + 8 <= plane_h` are both required.
+    LoopFilterFrameBlockOutOfPlane {
+        /// Coded-order block index.
+        bi: usize,
+        /// Plane index.
+        pli: u8,
+        /// Block's lower-left x in plane units.
+        bx: u32,
+        /// Block's lower-left y in plane units.
+        by: u32,
+        /// Width of the plane handed in.
+        plane_w: u32,
+        /// Height of the plane handed in.
+        plane_h: u32,
+    },
+    /// `qis` handed to the §7.10.3 driver was empty. The driver reads
+    /// `LFLIMS[QIS[0]]` once per frame; with `QIS` empty there is no
+    /// `qi0` and the per-frame limit `L` cannot be selected.
+    LoopFilterFrameQisEmpty,
+    /// `QIS[0]` was past the end of `LFLIMS`. The 64-element loop
+    /// filter limit table is indexed by `qi0 ∈ 0..=63`; values outside
+    /// that range cannot select a limit.
+    LoopFilterFrameQiOutOfRange {
+        /// The offending `QIS[0]` value.
+        qi0: u8,
+    },
+    /// The number of raster-order entries handed to the §7.10.3
+    /// driver for a plane did not match that plane's block-grid extent
+    /// (`block_w * block_h`). Each plane's raster walk must enumerate
+    /// every block exactly once.
+    LoopFilterFrameRasterLenMismatch {
+        /// Plane index the mismatch was found on.
+        pli: u8,
+        /// Number of raster entries supplied by the caller.
+        got: usize,
+        /// Expected `block_w * block_h` for the plane.
+        expected: usize,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
+}
+
+/// Identifies which per-block slice handed to the §7.10.3 raster-order
+/// driver failed a [`Error::LoopFilterFrameBlockLenMismatch`] check.
+///
+/// The driver requires every per-block array to have the same length
+/// (`nbs`), since each is indexed by the same `bi` coded-order index
+/// resolved from the raster walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopFilterFrameBlockSlice {
+    /// `BCODED[bi]` — true if the block is coded.
+    Bcoded,
+    /// `pli_of_block[bi]` — per-block plane index.
+    PliOfBlock,
+    /// `bx_of_block[bi]` — per-block `BX` from §2.3.
+    BxOfBlock,
+    /// `by_of_block[bi]` — per-block `BY` from §2.3.
+    ByOfBlock,
+}
+
+impl core::fmt::Display for LoopFilterFrameBlockSlice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            LoopFilterFrameBlockSlice::Bcoded => "BCODED",
+            LoopFilterFrameBlockSlice::PliOfBlock => "pli_of_block",
+            LoopFilterFrameBlockSlice::BxOfBlock => "bx_of_block",
+            LoopFilterFrameBlockSlice::ByOfBlock => "by_of_block",
+        };
+        f.write_str(s)
+    }
 }
 
 /// Identifies which per-block slice handed to the §7.9.4 frame-level
@@ -1497,6 +1623,50 @@ impl core::fmt::Display for Error {
             Error::LoopFilterPlaneBufferLenMismatch { got, expected } => write!(
                 f,
                 "oxideav-theora: §7.10 plane buffer length {got} != plane_w * plane_h ({expected})"
+            ),
+            Error::LoopFilterFrameBlockLenMismatch { which, got, nbs } => write!(
+                f,
+                "oxideav-theora: §7.10.3 per-block slice {which} has length {got}, expected {nbs}"
+            ),
+            Error::LoopFilterFrameRasterEntryOutOfRange {
+                pli,
+                raster_idx,
+                bi,
+                nbs,
+            } => write!(
+                f,
+                "oxideav-theora: §7.10.3 raster entry (pli={pli}, raster_idx={raster_idx}) maps to bi={bi}, exceeds nbs ({nbs})"
+            ),
+            Error::LoopFilterFramePliOutOfRange { bi, pli } => write!(
+                f,
+                "oxideav-theora: §7.10.3 pli_of_block[{bi}] = {pli}, expected 0..=2"
+            ),
+            Error::LoopFilterFrameBlockOutOfPlane {
+                bi,
+                pli,
+                bx,
+                by,
+                plane_w,
+                plane_h,
+            } => write!(
+                f,
+                "oxideav-theora: §7.10.3 block bi={bi} (pli={pli}) origin ({bx}, {by}) plus 8x8 footprint escapes plane ({plane_w} x {plane_h})"
+            ),
+            Error::LoopFilterFrameQisEmpty => write!(
+                f,
+                "oxideav-theora: §7.10.3 QIS is empty, cannot select qi0 for LFLIMS lookup"
+            ),
+            Error::LoopFilterFrameQiOutOfRange { qi0 } => write!(
+                f,
+                "oxideav-theora: §7.10.3 QIS[0] = {qi0} exceeds 6-bit LFLIMS index range 0..=63"
+            ),
+            Error::LoopFilterFrameRasterLenMismatch {
+                pli,
+                got,
+                expected,
+            } => write!(
+                f,
+                "oxideav-theora: §7.10.3 raster walk for pli={pli} has {got} entries, expected {expected}"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -8018,6 +8188,325 @@ fn check_plane_buffer_len(got: usize, plane_w: u32, plane_h: u32) -> Result<(), 
     let expected = (plane_w as usize).saturating_mul(plane_h as usize);
     if got != expected {
         return Err(Error::LoopFilterPlaneBufferLenMismatch { got, expected });
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// §7.10.3 — Complete Loop Filter (raster-order driver)
+// -----------------------------------------------------------------------------
+
+/// Per-plane raster-order walk handed to [`loop_filter_frame`].
+///
+/// Each plane needs a `block_w * block_h`-length sequence of
+/// coded-order block indices `bi`, walked **in raster order**
+/// (left-to-right within a row, then row-by-row bottom-to-top per the
+/// §2.1 lower-left convention). The driver looks up `BCODED[bi]`,
+/// `pli_of_block[bi]`, `bx_of_block[bi]`, `by_of_block[bi]` for each
+/// entry to find the block's plane-local origin; the per-plane
+/// neighbor-aware filter logic of §7.10.3 step 2 then uses the
+/// sequential `(BX, BY)` positions plus the raster pre-built grid
+/// `grid_to_bi` for the §7.10.3 step 2(a) vii / viii lookups (right
+/// neighbor `bj` at column `bx_grid + 1`, above neighbor `bj` at row
+/// `by_grid + 1`).
+///
+/// Per the spec text:
+///
+/// > For each block in raster order, with coded-order index bi
+///
+/// the iteration is over the *raster* sequence and `bi` indexes the
+/// per-block arrays. The caller must therefore provide:
+///
+/// * `block_w` / `block_h` — plane block extent (`8`-pixel grid units).
+/// * `grid_to_bi` — flat row-major (lower-left origin) `block_w *
+///   block_h` array mapping raster cell `(bx_grid, by_grid)` →
+///   coded-order index `bi`. Cell `(bx_grid, by_grid)` is stored at
+///   `grid_to_bi[by_grid * block_w + bx_grid]`.
+///
+/// Plane buffers (`recp`) are indexed `[y * plane_w + x]` in the same
+/// lower-left row-major layout the rest of the crate uses.
+#[derive(Debug, Clone)]
+pub struct LoopFilterPlaneInput<'a> {
+    /// Plane width in **block** units (`plane_w / 8`).
+    pub block_w: u32,
+    /// Plane height in **block** units (`plane_h / 8`).
+    pub block_h: u32,
+    /// Per-cell raster-order to coded-order map (length
+    /// `block_w * block_h`, row-major lower-left origin).
+    pub grid_to_bi: &'a [u32],
+}
+
+/// Per-plane mutable pixel buffers + their pixel dimensions, handed
+/// to [`loop_filter_frame`] as `RECY` / `RECCB` / `RECCR` with their
+/// matching `RPYW` / `RPYH` / `RPCW` / `RPCH` widths and heights.
+#[derive(Debug)]
+pub struct LoopFilterPlanes<'a> {
+    /// Y plane buffer (length `rpyw * rpyh`).
+    pub recy: &'a mut [u8],
+    /// Y plane width in pixels.
+    pub rpyw: u32,
+    /// Y plane height in pixels.
+    pub rpyh: u32,
+    /// Cb plane buffer (length `rpcw * rpch`).
+    pub reccb: &'a mut [u8],
+    /// Cr plane buffer (length `rpcw * rpch`).
+    pub reccr: &'a mut [u8],
+    /// Cb / Cr plane width in pixels.
+    pub rpcw: u32,
+    /// Cb / Cr plane height in pixels.
+    pub rpch: u32,
+}
+
+/// Apply the §7.10.3 "Complete Loop Filter" raster-order driver over
+/// the three reconstructed planes.
+///
+/// Per Theora I Specification §7.10.3 step 1: `L = LFLIMS[QIS[0]]`.
+/// Per step 2: walk every block in raster order; for each block whose
+/// `BCODED[bi]` flag is set, apply up to four edge filters via the
+/// §7.10.1 / §7.10.2 primitives:
+///
+/// * step 2(a) v — left edge, when `BX > 0` (right edge of the
+///   already-filtered left neighbor).
+/// * step 2(a) vi — bottom edge, when `BY > 0` (top edge of the
+///   already-filtered below neighbor).
+/// * step 2(a) vii — right edge, when `BX + 8 < RPW` AND the right
+///   neighbor's `BCODED[bj]` is zero. (The right neighbor, if coded,
+///   would later filter this shared edge as its own left edge per
+///   step 2(a) v; the current block handles the boundary only when
+///   the right neighbor is uncoded and so would skip the edge.)
+/// * step 2(a) viii — top edge, when `BY + 8 < RPH` AND the above
+///   neighbor's `BCODED[bj]` is zero. Same neighbour-handover rule
+///   as step 2(a) vii, rotated 90°.
+///
+/// Inputs:
+///
+/// * `lflims` — the 64-element loop-filter limit table from §6.4.1.
+/// * `qis` — the per-frame `QIS` array from §7.1. The driver reads
+///   `QIS[0]` to select the per-frame `L`; the remaining `qis`
+///   entries are reserved for per-block AC-bin selection elsewhere
+///   in §7 and are not consulted here.
+/// * `bcoded` — `BCODED[bi]` per §7.3 (length `nbs`).
+/// * `pli_of_block` — per-block plane index per §2.3 (length `nbs`,
+///   values `0..=2`).
+/// * `bx_of_block` — per-block `BX` (length `nbs`).
+/// * `by_of_block` — per-block `BY` (length `nbs`).
+/// * `plane_y` / `plane_cb` / `plane_cr` — `LoopFilterPlaneInput`s
+///   describing each plane's block grid and the raster→coded-order
+///   index map for that plane.
+/// * `planes` — mutable plane buffers + their pixel dimensions
+///   (`RECY`, `RECCB`, `RECCR` with `RPYW` / `RPYH` / `RPCW` /
+///   `RPCH`).
+///
+/// Errors:
+///
+/// * [`Error::LoopFilterFrameQisEmpty`] if `qis` is empty.
+/// * [`Error::LoopFilterFrameQiOutOfRange`] if `qis[0] > 63`.
+/// * [`Error::LoopFilterFrameBlockLenMismatch`] if any per-block
+///   slice's length disagrees with `nbs = bcoded.len()`.
+/// * [`Error::LoopFilterFrameRasterLenMismatch`] if a plane's
+///   `grid_to_bi` length disagrees with `block_w * block_h`.
+/// * [`Error::LoopFilterFrameRasterEntryOutOfRange`] if any
+///   `grid_to_bi[k]` is `>= nbs`.
+/// * [`Error::LoopFilterFramePliOutOfRange`] if a coded block's
+///   `pli_of_block[bi]` is outside `0..=2`.
+/// * [`Error::LoopFilterFrameBlockOutOfPlane`] if a coded block's
+///   `(bx, by)` plus the 8-pixel footprint escapes the plane named
+///   by its `pli`.
+/// * [`Error::LoopFilterPlaneBufferLenMismatch`] if any plane buffer
+///   length disagrees with its declared `plane_w * plane_h` (raised
+///   by the §7.10.1 / §7.10.2 primitives the driver calls).
+///
+/// The driver visits every plane (Y, Cb, Cr) in turn. Within each
+/// plane the raster walk runs row-by-row from `by_grid = 0` (bottom)
+/// up to `by_grid = block_h - 1` (top), and within each row from
+/// `bx_grid = 0` (left) up to `bx_grid = block_w - 1` (right) per the
+/// §2.1 lower-left convention. The neighbor-aware step 2(a) vii /
+/// viii rules consult `grid_to_bi[(by_grid)*block_w + (bx_grid + 1)]`
+/// and `grid_to_bi[(by_grid + 1)*block_w + bx_grid]` respectively;
+/// the destructive edge writes therefore happen on each shared edge
+/// exactly once per §7.10.3.
+#[allow(clippy::too_many_arguments)]
+pub fn loop_filter_frame(
+    lflims: &[u8; 64],
+    qis: &[u8],
+    bcoded: &[bool],
+    pli_of_block: &[u8],
+    bx_of_block: &[u32],
+    by_of_block: &[u32],
+    plane_y: &LoopFilterPlaneInput<'_>,
+    plane_cb: &LoopFilterPlaneInput<'_>,
+    plane_cr: &LoopFilterPlaneInput<'_>,
+    planes: &mut LoopFilterPlanes<'_>,
+) -> Result<(), Error> {
+    // Step 1: L = LFLIMS[QIS[0]].
+    let qi0 = *qis.first().ok_or(Error::LoopFilterFrameQisEmpty)?;
+    if qi0 > 63 {
+        return Err(Error::LoopFilterFrameQiOutOfRange { qi0 });
+    }
+    let l = lflims[qi0 as usize];
+
+    // Per-block slice length consistency. `bcoded` defines `nbs`.
+    let nbs = bcoded.len();
+    check_lfframe_block_slice_len(
+        pli_of_block.len(),
+        nbs,
+        LoopFilterFrameBlockSlice::PliOfBlock,
+    )?;
+    check_lfframe_block_slice_len(bx_of_block.len(), nbs, LoopFilterFrameBlockSlice::BxOfBlock)?;
+    check_lfframe_block_slice_len(by_of_block.len(), nbs, LoopFilterFrameBlockSlice::ByOfBlock)?;
+
+    // Per-plane raster grid + buffer pairs.
+    // pli=0 → Y, pli=1 → Cb, pli=2 → Cr.
+    let plane_inputs: [(u8, &LoopFilterPlaneInput<'_>, u32, u32); 3] = [
+        (0, plane_y, planes.rpyw, planes.rpyh),
+        (1, plane_cb, planes.rpcw, planes.rpch),
+        (2, plane_cr, planes.rpcw, planes.rpch),
+    ];
+
+    // Validate every plane's grid length up front, plus every
+    // raster entry's `bi < nbs`. Catching this before the walk
+    // means a defective grid handed in for Cr doesn't manifest
+    // only after Y has been partially filtered.
+    for &(pli, grid, plane_w, plane_h) in &plane_inputs {
+        let expected = (grid.block_w as usize).saturating_mul(grid.block_h as usize);
+        if grid.grid_to_bi.len() != expected {
+            return Err(Error::LoopFilterFrameRasterLenMismatch {
+                pli,
+                got: grid.grid_to_bi.len(),
+                expected,
+            });
+        }
+        // Check that the declared block grid fits the declared pixel
+        // plane. block_w * 8 must equal plane_w; block_h * 8 must
+        // equal plane_h. If not, the §7.10.3 step 2(a) v / vii
+        // boundary tests against `RPW` and `RPH` lose meaning.
+        let expected_plane_w = grid.block_w.saturating_mul(8);
+        let expected_plane_h = grid.block_h.saturating_mul(8);
+        if expected_plane_w != plane_w || expected_plane_h != plane_h {
+            return Err(Error::LoopFilterFrameBlockOutOfPlane {
+                bi: 0,
+                pli,
+                bx: 0,
+                by: 0,
+                plane_w,
+                plane_h,
+            });
+        }
+        for (raster_idx, &bi) in grid.grid_to_bi.iter().enumerate() {
+            if (bi as usize) >= nbs {
+                return Err(Error::LoopFilterFrameRasterEntryOutOfRange {
+                    pli,
+                    raster_idx,
+                    bi,
+                    nbs,
+                });
+            }
+        }
+    }
+
+    // Step 2: walk each plane in raster order.
+    for &(pli, grid, plane_w, plane_h) in &plane_inputs {
+        let block_w = grid.block_w;
+        let block_h = grid.block_h;
+        let recp: &mut [u8] = match pli {
+            0 => planes.recy,
+            1 => planes.reccb,
+            2 => planes.reccr,
+            _ => unreachable!(),
+        };
+        for by_grid in 0..block_h {
+            for bx_grid in 0..block_w {
+                let raster_idx = (by_grid as usize) * (block_w as usize) + bx_grid as usize;
+                let bi_u32 = grid.grid_to_bi[raster_idx];
+                let bi = bi_u32 as usize;
+                // Step 2(a): only act on coded blocks.
+                if !bcoded[bi] {
+                    continue;
+                }
+                // Step 2(a) i: pli — verify against the plane this
+                // raster walk belongs to. The per-plane raster grid
+                // is the authoritative source of plane membership;
+                // the per-block `pli_of_block[bi]` array must agree.
+                let pli_from_block = pli_of_block[bi];
+                if pli_from_block > 2 {
+                    return Err(Error::LoopFilterFramePliOutOfRange {
+                        bi,
+                        pli: pli_from_block,
+                    });
+                }
+                // Step 2(a) iii / iv: BX, BY from the per-block
+                // arrays.
+                let bx = bx_of_block[bi];
+                let by = by_of_block[bi];
+                // Bounds check: 8x8 block footprint must lie within
+                // the plane.
+                if bx.checked_add(8).map_or(true, |end| end > plane_w)
+                    || by.checked_add(8).map_or(true, |end| end > plane_h)
+                {
+                    return Err(Error::LoopFilterFrameBlockOutOfPlane {
+                        bi,
+                        pli,
+                        bx,
+                        by,
+                        plane_w,
+                        plane_h,
+                    });
+                }
+                // Step 2(a) v: left edge. Filter when BX > 0.
+                if bx > 0 {
+                    let fx = bx - 2;
+                    let fy = by;
+                    horizontal_loop_filter_edge(recp, plane_w, plane_h, fx, fy, l)?;
+                }
+                // Step 2(a) vi: bottom edge. Filter when BY > 0.
+                if by > 0 {
+                    let fx = bx;
+                    let fy = by - 2;
+                    vertical_loop_filter_edge(recp, plane_w, plane_h, fx, fy, l)?;
+                }
+                // Step 2(a) vii: right edge. Filter when BX + 8 <
+                // RPW AND the right neighbour `bj` has BCODED[bj]
+                // == 0. The right neighbour lives at grid cell
+                // (bx_grid + 1, by_grid).
+                if bx + 8 < plane_w {
+                    let right_raster_idx =
+                        (by_grid as usize) * (block_w as usize) + (bx_grid as usize + 1);
+                    let bj = grid.grid_to_bi[right_raster_idx] as usize;
+                    if !bcoded[bj] {
+                        let fx = bx + 6;
+                        let fy = by;
+                        horizontal_loop_filter_edge(recp, plane_w, plane_h, fx, fy, l)?;
+                    }
+                }
+                // Step 2(a) viii: top edge. Filter when BY + 8 <
+                // RPH AND the above neighbour `bj` has
+                // BCODED[bj] == 0. The above neighbour lives at grid
+                // cell (bx_grid, by_grid + 1).
+                if by + 8 < plane_h {
+                    let above_raster_idx =
+                        (by_grid as usize + 1) * (block_w as usize) + bx_grid as usize;
+                    let bj = grid.grid_to_bi[above_raster_idx] as usize;
+                    if !bcoded[bj] {
+                        let fx = bx;
+                        let fy = by + 6;
+                        vertical_loop_filter_edge(recp, plane_w, plane_h, fx, fy, l)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Per-block slice length check for the §7.10.3 raster-order driver.
+fn check_lfframe_block_slice_len(
+    got: usize,
+    nbs: usize,
+    which: LoopFilterFrameBlockSlice,
+) -> Result<(), Error> {
+    if got != nbs {
+        return Err(Error::LoopFilterFrameBlockLenMismatch { which, got, nbs });
     }
     Ok(())
 }
@@ -18870,5 +19359,1132 @@ mod tests {
         let mut plane = blank_plane(4, 4);
         fill_row(&mut plane, 4, 2, 7);
         assert_eq!(plane[4 * 2], 7);
+    }
+
+    // -------------------------------------------------------------------------
+    // §7.10.3 — Complete Loop Filter raster-order driver tests
+    // -------------------------------------------------------------------------
+
+    /// A 64-entry `LFLIMS` array used by the §7.10.3 driver tests. The
+    /// only entry actually consumed in any of these tests is the one
+    /// `qis[0]` points at; the rest are filled with a distinct
+    /// sentinel so a buggy index lookup would produce a noticeably
+    /// wrong filter result.
+    fn lflims_with_qi0(qi0: u8, value_at_qi0: u8) -> [u8; 64] {
+        let mut t = [0u8; 64];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = if i as u8 == qi0 { value_at_qi0 } else { 1 };
+        }
+        t
+    }
+
+    /// Build a row-major (lower-left-origin) raster→coded-order index
+    /// map for a `block_w x block_h` plane where the coded-order
+    /// index equals the raster index (each block its own bi, no
+    /// Hilbert shuffling). Useful for tiny single-plane tests where
+    /// we just want every block to have a distinct bi without
+    /// modelling the Hilbert curve.
+    fn identity_grid(block_w: u32, block_h: u32) -> Vec<u32> {
+        let mut g = Vec::with_capacity((block_w as usize) * (block_h as usize));
+        for idx in 0..(block_w * block_h) {
+            g.push(idx);
+        }
+        g
+    }
+
+    /// Single-plane (1 luma block, 0 chroma blocks) frame fixture
+    /// with `block_w=1, block_h=1` luma. There's nothing to filter —
+    /// the lone luma block has no neighbours and `BX = 0, BY = 0`
+    /// pins both the left and bottom edge tests to step 2(a) v / vi
+    /// no-ops, while `BX + 8 = plane_w` and `BY + 8 = plane_h` pin
+    /// the right and top tests at their boundary.
+    #[test]
+    fn loop_filter_frame_single_luma_block_is_identity() {
+        let mut recy = vec![128u8; 8 * 8];
+        let recy_snapshot = recy.clone();
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true];
+        let pli_of_block = vec![0u8];
+        let bx_of_block = vec![0u32];
+        let by_of_block = vec![0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &[0u32],
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap();
+        assert_eq!(recy, recy_snapshot);
+    }
+
+    /// Two horizontally-adjacent luma blocks (`block_w=2, block_h=1`),
+    /// both coded. The right block has `BX = 8 > 0` so step 2(a) v
+    /// must apply the horizontal filter to the shared edge. Step
+    /// 2(a) vii is not entered (the right block has `BX + 8 = 16 =
+    /// plane_w` which fails the `< RPW` test), and the left block's
+    /// step 2(a) vii is skipped because `bcoded[bj] = true` for its
+    /// right neighbour. The shared edge is therefore filtered
+    /// exactly once.
+    #[test]
+    fn loop_filter_frame_horizontal_shared_edge_filtered_once() {
+        // Plane is 16x8 pixels = 2x1 blocks.
+        let mut recy = vec![0u8; 16 * 8];
+        // Build a step across the block boundary at column 7..8.
+        for y in 0..8 {
+            for x in 0..8 {
+                recy[y * 16 + x] = 100;
+            }
+            for x in 8..16 {
+                recy[y * 16 + x] = 140;
+            }
+        }
+        // Snapshot pre-filter to compare against post-filter expected
+        // pixels: only the two middle pixels of the 4-wide window
+        // (`x = 7` and `x = 8`) on every row should be touched.
+        let pre = recy.clone();
+
+        let bcoded = vec![true, true];
+        let pli_of_block = vec![0u8, 0u8];
+        let bx_of_block = vec![0u32, 8u32];
+        let by_of_block = vec![0u32, 0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+
+        let grid = identity_grid(2, 1);
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 2,
+            block_h: 1,
+            grid_to_bi: &grid,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 16,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap();
+
+        // Confirm: only the two middle pixels per row (x = 7, x = 8)
+        // are different from the pre-filter buffer. Reference pixels
+        // (x = 6, x = 9) untouched; everything else untouched.
+        for y in 0..8 {
+            for x in 0..16 {
+                let idx = y * 16 + x;
+                if x == 7 || x == 8 {
+                    // Edge response: R = (100 - 3*100 + 3*140 - 140 +
+                    // 4) >> 3 = (100 - 300 + 420 - 140 + 4) >> 3 = 84
+                    // / 8 = 10. lflim(10, 30) = 10 (in the linear
+                    // segment -L < R < L). p1 = 100 + 10 = 110;
+                    // p2 = 140 - 10 = 130.
+                    if x == 7 {
+                        assert_eq!(recy[idx], 110, "x=7 y={y}");
+                    } else {
+                        assert_eq!(recy[idx], 130, "x=8 y={y}");
+                    }
+                } else {
+                    assert_eq!(recy[idx], pre[idx], "untouched pixel (x={x}, y={y})");
+                }
+            }
+        }
+    }
+
+    /// Two vertically-adjacent luma blocks (`block_w=1, block_h=2`),
+    /// both coded. The top block has `BY = 8 > 0`, so step 2(a) vi
+    /// applies the vertical filter to the shared horizontal edge.
+    /// Mirror of the horizontal case above.
+    #[test]
+    fn loop_filter_frame_vertical_shared_edge_filtered_once() {
+        // Plane is 8x16 pixels = 1x2 blocks.
+        let mut recy = vec![0u8; 8 * 16];
+        // Build a horizontal step at row 7..8.
+        for y in 0..8 {
+            for x in 0..8 {
+                recy[y * 8 + x] = 100;
+            }
+        }
+        for y in 8..16 {
+            for x in 0..8 {
+                recy[y * 8 + x] = 140;
+            }
+        }
+        let pre = recy.clone();
+
+        let bcoded = vec![true, true];
+        let pli_of_block = vec![0u8, 0u8];
+        let bx_of_block = vec![0u32, 0u32];
+        let by_of_block = vec![0u32, 8u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+
+        let grid = identity_grid(1, 2);
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 2,
+            grid_to_bi: &grid,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 16,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap();
+
+        // Same edge-response algebra as the horizontal case but
+        // rotated 90 degrees: rows y = 7 and y = 8 should be the only
+        // rows changed.
+        for y in 0..16 {
+            for x in 0..8 {
+                let idx = y * 8 + x;
+                if y == 7 || y == 8 {
+                    if y == 7 {
+                        assert_eq!(recy[idx], 110, "y=7 x={x}");
+                    } else {
+                        assert_eq!(recy[idx], 130, "y=8 x={x}");
+                    }
+                } else {
+                    assert_eq!(recy[idx], pre[idx], "untouched pixel (x={x}, y={y})");
+                }
+            }
+        }
+    }
+
+    /// Two horizontally-adjacent luma blocks where the **right
+    /// neighbour is uncoded**. Per §7.10.3 step 2(a) vii, the left
+    /// (coded) block must filter the shared edge because the
+    /// right-neighbour will never visit it. The edge is again
+    /// filtered exactly once (the right block is skipped entirely
+    /// since `BCODED[bj]` for it is zero).
+    #[test]
+    fn loop_filter_frame_uncoded_right_neighbour_triggers_step_vii() {
+        // 24-wide plane = 3 blocks; we use the rightmost block to
+        // satisfy the `(BX + 8) < RPW` test for the middle block.
+        let mut recy = vec![0u8; 24 * 8];
+        for y in 0..8 {
+            for x in 0..8 {
+                recy[y * 24 + x] = 100;
+            }
+            for x in 8..16 {
+                recy[y * 24 + x] = 140;
+            }
+            for x in 16..24 {
+                recy[y * 24 + x] = 200;
+            }
+        }
+        let pre = recy.clone();
+
+        // bi=0 is coded (left), bi=1 is uncoded (middle), bi=2 is
+        // coded (right). Step 2(a) vii fires on bi=0 because its
+        // right neighbour (bi=1) has BCODED[bj]==0 and `(BX + 8) =
+        // 8 < RPW = 24`. Step 2(a) v on bi=2 fires for the same
+        // boundary 8..9, but bi=1 is skipped entirely so the edge
+        // between 7..8 (bi=0/bi=1) is only filtered once by bi=0's
+        // step 2(a) vii.
+        let bcoded = vec![true, false, true];
+        let pli_of_block = vec![0u8, 0u8, 0u8];
+        let bx_of_block = vec![0u32, 8u32, 16u32];
+        let by_of_block = vec![0u32, 0u32, 0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+
+        let grid = identity_grid(3, 1);
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 3,
+            block_h: 1,
+            grid_to_bi: &grid,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 24,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap();
+
+        // Edge bi=0/bi=1 at x=7..8 — filtered by bi=0's step 2(a)
+        // vii (FX = 0 + 6 = 6 → window x=6..9, writes x=7 and x=8).
+        // Step 2(a) v on bi=2 with BX=16 writes FX = 16-2 = 14 →
+        // window x=14..17, writes x=15 and x=16, which is the
+        // bi=1/bi=2 boundary.
+        for y in 0..8 {
+            for x in 0..24 {
+                let idx = y * 24 + x;
+                if x == 7 || x == 8 {
+                    if x == 7 {
+                        assert_eq!(recy[idx], 110, "x=7 y={y}");
+                    } else {
+                        assert_eq!(recy[idx], 130, "x=8 y={y}");
+                    }
+                } else if x == 15 || x == 16 {
+                    // bi=2 step 2(a) v: BX=16, FX=14. Window
+                    // x=14..17 reads p0=140, p1=140, p2=200,
+                    // p3=200. R = (140 - 3*140 + 3*200 - 200 + 4)
+                    // >> 3 = (140 - 420 + 600 - 200 + 4) >> 3 = 124
+                    // >> 3 = 15. lflim(15, 30) is in the linear
+                    // segment -L < R < L, so returns R = 15.
+                    // p1 = 140 + 15 = 155; p2 = 200 - 15 = 185.
+                    if x == 15 {
+                        assert_eq!(recy[idx], 155, "x=15 y={y}");
+                    } else {
+                        assert_eq!(recy[idx], 185, "x=16 y={y}");
+                    }
+                } else {
+                    assert_eq!(recy[idx], pre[idx], "untouched pixel (x={x}, y={y})");
+                }
+            }
+        }
+    }
+
+    /// Mirror of the above for §7.10.3 step 2(a) viii (uncoded
+    /// **above** neighbour).
+    #[test]
+    fn loop_filter_frame_uncoded_above_neighbour_triggers_step_viii() {
+        // 8x24 plane = 1x3 vertical blocks.
+        let mut recy = vec![0u8; 8 * 24];
+        for y in 0..8 {
+            for x in 0..8 {
+                recy[y * 8 + x] = 100;
+            }
+        }
+        for y in 8..16 {
+            for x in 0..8 {
+                recy[y * 8 + x] = 140;
+            }
+        }
+        for y in 16..24 {
+            for x in 0..8 {
+                recy[y * 8 + x] = 200;
+            }
+        }
+        let pre = recy.clone();
+
+        // bi=0 (bottom, coded), bi=1 (middle, uncoded), bi=2 (top,
+        // coded). Raster order is bottom-to-top per lower-left
+        // convention, so bi=0 is visited first and its step 2(a)
+        // viii sees its above-neighbour (bi=1) uncoded.
+        let bcoded = vec![true, false, true];
+        let pli_of_block = vec![0u8, 0u8, 0u8];
+        let bx_of_block = vec![0u32, 0u32, 0u32];
+        let by_of_block = vec![0u32, 8u32, 16u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+
+        let grid = identity_grid(1, 3);
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 3,
+            grid_to_bi: &grid,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 24,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap();
+
+        // bi=0 step 2(a) viii: FY = 0 + 6 = 6 → window y=6..9,
+        // writes rows y=7 and y=8.
+        // bi=2 step 2(a) vi: FY = 16 - 2 = 14 → window y=14..17,
+        // writes rows y=15 and y=16.
+        for y in 0..24 {
+            for x in 0..8 {
+                let idx = y * 8 + x;
+                if y == 7 || y == 8 {
+                    if y == 7 {
+                        assert_eq!(recy[idx], 110, "y=7 x={x}");
+                    } else {
+                        assert_eq!(recy[idx], 130, "y=8 x={x}");
+                    }
+                } else if y == 15 || y == 16 {
+                    // bi=2 step 2(a) vi (vertical equivalent of the
+                    // horizontal block above): BY=16, FY=14.
+                    // R = 15, p1 = 155, p2 = 185.
+                    if y == 15 {
+                        assert_eq!(recy[idx], 155, "y=15 x={x}");
+                    } else {
+                        assert_eq!(recy[idx], 185, "y=16 x={x}");
+                    }
+                } else {
+                    assert_eq!(recy[idx], pre[idx], "untouched pixel (x={x}, y={y})");
+                }
+            }
+        }
+    }
+
+    /// A single uncoded block in a single-block plane: the driver
+    /// must skip step 2(a) entirely and leave the buffer unchanged.
+    #[test]
+    fn loop_filter_frame_uncoded_block_is_skipped() {
+        let mut recy = vec![123u8; 8 * 8];
+        let pre = recy.clone();
+        let bcoded = vec![false];
+        let pli_of_block = vec![0u8];
+        let bx_of_block = vec![0u32];
+        let by_of_block = vec![0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+        let grid = identity_grid(1, 1);
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap();
+        assert_eq!(recy, pre);
+    }
+
+    /// Each plane is filtered independently. A change to the Cb
+    /// plane should not affect Y or Cr.
+    #[test]
+    fn loop_filter_frame_planes_are_independent() {
+        let mut recy = vec![50u8; 8 * 8];
+        let pre_recy = recy.clone();
+        let mut reccb = vec![0u8; 16 * 8];
+        for y in 0..8 {
+            for x in 0..8 {
+                reccb[y * 16 + x] = 100;
+            }
+            for x in 8..16 {
+                reccb[y * 16 + x] = 140;
+            }
+        }
+        let mut reccr = vec![77u8; 16 * 8];
+        let pre_reccr = reccr.clone();
+
+        // bi=0 luma (1x1 luma); bi=1, bi=2 chroma Cb blocks (2x1);
+        // bi=3, bi=4 chroma Cr blocks (2x1).
+        let bcoded = vec![true, true, true, true, true];
+        let pli_of_block = vec![0u8, 1u8, 1u8, 2u8, 2u8];
+        let bx_of_block = vec![0u32, 0u32, 8u32, 0u32, 8u32];
+        let by_of_block = vec![0u32, 0u32, 0u32, 0u32, 0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+
+        let grid_y = vec![0u32];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let grid_cb = vec![1u32, 2u32];
+        let plane_cb = LoopFilterPlaneInput {
+            block_w: 2,
+            block_h: 1,
+            grid_to_bi: &grid_cb,
+        };
+        let grid_cr = vec![3u32, 4u32];
+        let plane_cr = LoopFilterPlaneInput {
+            block_w: 2,
+            block_h: 1,
+            grid_to_bi: &grid_cr,
+        };
+
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 16,
+            rpch: 8,
+        };
+        loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_cb,
+            &plane_cr,
+            &mut planes,
+        )
+        .unwrap();
+
+        // Y untouched (single block, no neighbours).
+        assert_eq!(recy, pre_recy);
+        // Cb shared edge at x=7..8 changed; rest untouched.
+        for y in 0..8 {
+            for x in 0..16 {
+                let idx = y * 16 + x;
+                let pre_val = if x < 8 { 100 } else { 140 };
+                if x == 7 {
+                    assert_eq!(reccb[idx], 110);
+                } else if x == 8 {
+                    assert_eq!(reccb[idx], 130);
+                } else {
+                    assert_eq!(reccb[idx], pre_val);
+                }
+            }
+        }
+        // Cr untouched (all 77 — flat input, R = 0 on every
+        // boundary, lflim(0, _) = 0, p1/p2 = 77 + 0 / 77 - 0).
+        assert_eq!(reccr, pre_reccr);
+    }
+
+    /// Empty `qis` triggers the expected error.
+    #[test]
+    fn loop_filter_frame_empty_qis_rejected() {
+        let mut recy = vec![0u8; 8 * 8];
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true];
+        let pli_of_block = vec![0u8];
+        let bx_of_block = vec![0u32];
+        let by_of_block = vec![0u32];
+        let lflims = [0u8; 64];
+        let qis: [u8; 0] = [];
+        let grid_y = vec![0u32];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        let err = loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::LoopFilterFrameQisEmpty));
+    }
+
+    /// `qis[0] > 63` triggers the expected error.
+    #[test]
+    fn loop_filter_frame_qi_out_of_range_rejected() {
+        let mut recy = vec![0u8; 8 * 8];
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true];
+        let pli_of_block = vec![0u8];
+        let bx_of_block = vec![0u32];
+        let by_of_block = vec![0u32];
+        let lflims = [0u8; 64];
+        let qis = [64u8];
+        let grid_y = vec![0u32];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        let err = loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::LoopFilterFrameQiOutOfRange { qi0: 64 }
+        ));
+    }
+
+    /// Length mismatch on one of the per-block arrays is reported
+    /// with the right `which` variant.
+    #[test]
+    fn loop_filter_frame_block_slice_len_mismatch_rejected() {
+        let mut recy = vec![0u8; 8 * 8];
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true]; // nbs = 1
+        let pli_of_block = vec![0u8, 0u8]; // wrong length
+        let bx_of_block = vec![0u32];
+        let by_of_block = vec![0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+        let grid_y = vec![0u32];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        let err = loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap_err();
+        match err {
+            Error::LoopFilterFrameBlockLenMismatch { which, got, nbs } => {
+                assert_eq!(which, LoopFilterFrameBlockSlice::PliOfBlock);
+                assert_eq!(got, 2);
+                assert_eq!(nbs, 1);
+            }
+            other => panic!("expected LoopFilterFrameBlockLenMismatch, got {other:?}"),
+        }
+    }
+
+    /// `grid_to_bi[k] >= nbs` is rejected before any pixel write.
+    #[test]
+    fn loop_filter_frame_raster_entry_out_of_range_rejected() {
+        let mut recy = vec![0u8; 8 * 8];
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true];
+        let pli_of_block = vec![0u8];
+        let bx_of_block = vec![0u32];
+        let by_of_block = vec![0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+        // grid entry 99 exceeds nbs = 1.
+        let grid_y = vec![99u32];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        let err = loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap_err();
+        match err {
+            Error::LoopFilterFrameRasterEntryOutOfRange {
+                pli,
+                raster_idx,
+                bi,
+                nbs,
+            } => {
+                assert_eq!(pli, 0);
+                assert_eq!(raster_idx, 0);
+                assert_eq!(bi, 99);
+                assert_eq!(nbs, 1);
+            }
+            other => panic!("expected LoopFilterFrameRasterEntryOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// A plane whose `block_w * 8 != plane_w` is rejected with the
+    /// LoopFilterFrameBlockOutOfPlane variant (signalling the grid /
+    /// plane size disagreement).
+    #[test]
+    fn loop_filter_frame_block_grid_pixel_mismatch_rejected() {
+        let mut recy = vec![0u8; 16 * 8]; // plane_w = 16, expects block_w = 2
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true];
+        let pli_of_block = vec![0u8];
+        let bx_of_block = vec![0u32];
+        let by_of_block = vec![0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+        let grid_y = vec![0u32];
+        // Declares block_w = 1 → block_w * 8 = 8 != plane_w = 16.
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 16,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        let err = loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::LoopFilterFrameBlockOutOfPlane { .. }));
+    }
+
+    /// Coded block whose `(bx, by) + 8` exceeds the plane is
+    /// rejected with the LoopFilterFrameBlockOutOfPlane variant.
+    /// Driver checks `bx_of_block` independently of the grid
+    /// pre-check, because a per-block array could lie about the
+    /// origin even if the grid is well-formed.
+    #[test]
+    fn loop_filter_frame_block_origin_overruns_plane_rejected() {
+        let mut recy = vec![0u8; 8 * 8];
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true];
+        let pli_of_block = vec![0u8];
+        // bx = 1 means the 8x8 block runs x=1..=8, escaping the
+        // plane (plane_w = 8 supports only bx = 0).
+        let bx_of_block = vec![1u32];
+        let by_of_block = vec![0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+        let grid_y = vec![0u32];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        let err = loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap_err();
+        match err {
+            Error::LoopFilterFrameBlockOutOfPlane {
+                bi, pli, bx, by, ..
+            } => {
+                assert_eq!(bi, 0);
+                assert_eq!(pli, 0);
+                assert_eq!(bx, 1);
+                assert_eq!(by, 0);
+            }
+            other => panic!("expected LoopFilterFrameBlockOutOfPlane, got {other:?}"),
+        }
+    }
+
+    /// `pli_of_block[bi] > 2` is rejected.
+    #[test]
+    fn loop_filter_frame_pli_out_of_range_rejected() {
+        let mut recy = vec![0u8; 8 * 8];
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true];
+        let pli_of_block = vec![3u8]; // out of range
+        let bx_of_block = vec![0u32];
+        let by_of_block = vec![0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+        let grid_y = vec![0u32];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 1,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 8,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        let err = loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::LoopFilterFramePliOutOfRange { bi: 0, pli: 3 }
+        ));
+    }
+
+    /// `grid_to_bi.len()` not matching `block_w * block_h` is
+    /// rejected.
+    #[test]
+    fn loop_filter_frame_raster_len_mismatch_rejected() {
+        let mut recy = vec![0u8; 16 * 8];
+        let mut reccb = vec![0u8; 0];
+        let mut reccr = vec![0u8; 0];
+        let bcoded = vec![true, true];
+        let pli_of_block = vec![0u8, 0u8];
+        let bx_of_block = vec![0u32, 8u32];
+        let by_of_block = vec![0u32, 0u32];
+        let lflims = lflims_with_qi0(5, 30);
+        let qis = [5u8];
+        // block_w=2, block_h=1 expects 2 entries; we pass 3.
+        let grid_y = vec![0u32, 1u32, 0u32];
+        let plane_y = LoopFilterPlaneInput {
+            block_w: 2,
+            block_h: 1,
+            grid_to_bi: &grid_y,
+        };
+        let plane_chroma = LoopFilterPlaneInput {
+            block_w: 0,
+            block_h: 0,
+            grid_to_bi: &[],
+        };
+        let mut planes = LoopFilterPlanes {
+            recy: &mut recy,
+            rpyw: 16,
+            rpyh: 8,
+            reccb: &mut reccb,
+            reccr: &mut reccr,
+            rpcw: 0,
+            rpch: 0,
+        };
+        let err = loop_filter_frame(
+            &lflims,
+            &qis,
+            &bcoded,
+            &pli_of_block,
+            &bx_of_block,
+            &by_of_block,
+            &plane_y,
+            &plane_chroma,
+            &plane_chroma,
+            &mut planes,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::LoopFilterFrameRasterLenMismatch {
+                pli: 0,
+                got: 3,
+                expected: 2
+            }
+        ));
+    }
+
+    /// Display formatting for each new error variant renders a
+    /// stable, distinct §7.10.3 tag.
+    #[test]
+    fn loop_filter_frame_error_display_includes_section() {
+        let e = Error::LoopFilterFrameQisEmpty;
+        let s = format!("{e}");
+        assert!(s.contains("§7.10.3"));
+        assert!(s.contains("QIS"));
+
+        let e = Error::LoopFilterFrameQiOutOfRange { qi0: 64 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.10.3"));
+        assert!(s.contains("64"));
+
+        let e = Error::LoopFilterFrameBlockLenMismatch {
+            which: LoopFilterFrameBlockSlice::Bcoded,
+            got: 5,
+            nbs: 4,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.10.3"));
+        assert!(s.contains("BCODED"));
+
+        let e = Error::LoopFilterFramePliOutOfRange { bi: 7, pli: 9 };
+        let s = format!("{e}");
+        assert!(s.contains("§7.10.3"));
+        assert!(s.contains("7"));
+        assert!(s.contains("9"));
+
+        let e = Error::LoopFilterFrameBlockOutOfPlane {
+            bi: 1,
+            pli: 0,
+            bx: 8,
+            by: 0,
+            plane_w: 8,
+            plane_h: 8,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.10.3"));
+        assert!(s.contains("escapes plane"));
+
+        let e = Error::LoopFilterFrameRasterEntryOutOfRange {
+            pli: 1,
+            raster_idx: 3,
+            bi: 99,
+            nbs: 10,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.10.3"));
+        assert!(s.contains("99"));
+
+        let e = Error::LoopFilterFrameRasterLenMismatch {
+            pli: 2,
+            got: 8,
+            expected: 4,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("§7.10.3"));
+        assert!(s.contains("pli=2"));
+    }
+
+    /// `LoopFilterFrameBlockSlice` Display matches its on-wire enum
+    /// names, which is what error messages quote.
+    #[test]
+    fn loop_filter_frame_block_slice_display_names() {
+        assert_eq!(format!("{}", LoopFilterFrameBlockSlice::Bcoded), "BCODED");
+        assert_eq!(
+            format!("{}", LoopFilterFrameBlockSlice::PliOfBlock),
+            "pli_of_block"
+        );
+        assert_eq!(
+            format!("{}", LoopFilterFrameBlockSlice::BxOfBlock),
+            "bx_of_block"
+        );
+        assert_eq!(
+            format!("{}", LoopFilterFrameBlockSlice::ByOfBlock),
+            "by_of_block"
+        );
     }
 }

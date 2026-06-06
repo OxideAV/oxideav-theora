@@ -2,7 +2,27 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-06-05 (round 238 of clean-room rebuild)
+//! ## Status — 2026-06-06 (round 241 of clean-room rebuild)
+//!
+//! Round 241 lands the **§7.10.1 / §7.10.2 loop-filter edge
+//! primitives** plus the §7.10 `lflim()` non-linear response
+//! function as [`lflim`], [`horizontal_loop_filter_edge`], and
+//! [`vertical_loop_filter_edge`]. The piecewise function rises
+//! to peaks at `(±L, ±L)` and falls back to zero at `±2 * L`,
+//! attenuating only those `R` values that lie inside a `2 * L`
+//! window of zero — genuine edges (`|R| >= 2 * L`) are left
+//! untouched. Both edge primitives operate on a single block
+//! edge of the plane buffer emitted by the round-233
+//! [`reconstruct_frame`] driver: the horizontal filter consumes a
+//! 4-wide × 8-tall footprint anchored at `(fx, fy)`, computes
+//! `R = (RECP[fy+by][fx] - 3*RECP[fy+by][fx+1]
+//!      + 3*RECP[fy+by][fx+2] - RECP[fy+by][fx+3] + 4) >> 3` for
+//! each of 8 rows, and writes
+//! `RECP[fy+by][fx+1] += lflim(R, L)` /
+//! `RECP[fy+by][fx+2] -= lflim(R, L)` with a `0..=255` saturation
+//! per §7.10.1 step 1(c-e) / step 1(g-i); the vertical filter is
+//! the same shape rotated 90°. The §7.10.3 raster-order driver is
+//! the natural follow-up that dispatches into these primitives.
 //!
 //! Round 238 lands the **§2.3 / §2.4 coded-order resolver** as
 //! [`PlaneBlockCodedOrder`] and [`PlaneMacroBlockCodedOrder`]:
@@ -954,6 +974,49 @@ pub enum Error {
         /// The plane height.
         plane_h: u32,
     },
+    /// The §7.10.1 horizontal edge filter's 4×8 footprint
+    /// (`fx + 4 > plane_w` or `fy + 8 > plane_h`) would escape the
+    /// plane handed in by the caller. Step 1 reads
+    /// `RECP[fy+by][fx+0..=3]` for `by ∈ 0..=7` and writes
+    /// `RECP[fy+by][fx+1..=2]`, so the 4×8 window must lie entirely
+    /// within `0..plane_w × 0..plane_h`.
+    LoopFilterHorizontalFootprintOutOfPlane {
+        /// Left edge of the footprint.
+        fx: u32,
+        /// Bottom edge of the footprint.
+        fy: u32,
+        /// Plane width carried in by the caller.
+        plane_w: u32,
+        /// Plane height carried in by the caller.
+        plane_h: u32,
+    },
+    /// The §7.10.2 vertical edge filter's 8×4 footprint
+    /// (`fx + 8 > plane_w` or `fy + 4 > plane_h`) would escape the
+    /// plane handed in by the caller. Step 1 reads
+    /// `RECP[fy+0..=3][fx+bx]` for `bx ∈ 0..=7` and writes
+    /// `RECP[fy+1..=2][fx+bx]`, so the 8×4 window must lie entirely
+    /// within `0..plane_w × 0..plane_h`.
+    LoopFilterVerticalFootprintOutOfPlane {
+        /// Left edge of the footprint.
+        fx: u32,
+        /// Bottom edge of the footprint.
+        fy: u32,
+        /// Plane width carried in by the caller.
+        plane_w: u32,
+        /// Plane height carried in by the caller.
+        plane_h: u32,
+    },
+    /// The §7.10 plane buffer length did not match `plane_w * plane_h`.
+    /// Both [`horizontal_loop_filter_edge`] and
+    /// [`vertical_loop_filter_edge`] index the buffer with
+    /// `[y * plane_w + x]` and require it to cover exactly the
+    /// rectangle declared by `(plane_w, plane_h)`.
+    LoopFilterPlaneBufferLenMismatch {
+        /// Actual buffer length.
+        got: usize,
+        /// Expected `plane_w * plane_h`.
+        expected: usize,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -1412,6 +1475,28 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-theora: §7.9.4 frame-driver pli={pli} plane dimensions overflow usize (width={plane_w}, height={plane_h})"
+            ),
+            Error::LoopFilterHorizontalFootprintOutOfPlane {
+                fx,
+                fy,
+                plane_w,
+                plane_h,
+            } => write!(
+                f,
+                "oxideav-theora: §7.10.1 horizontal-filter footprint at (fx={fx}, fy={fy}) escapes plane (width={plane_w}, height={plane_h})"
+            ),
+            Error::LoopFilterVerticalFootprintOutOfPlane {
+                fx,
+                fy,
+                plane_w,
+                plane_h,
+            } => write!(
+                f,
+                "oxideav-theora: §7.10.2 vertical-filter footprint at (fx={fx}, fy={fy}) escapes plane (width={plane_w}, height={plane_h})"
+            ),
+            Error::LoopFilterPlaneBufferLenMismatch { got, expected } => write!(
+                f,
+                "oxideav-theora: §7.10 plane buffer length {got} != plane_w * plane_h ({expected})"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -7735,6 +7820,206 @@ impl Iterator for PlaneMacroBlockCodedOrder {
         }
         None
     }
+}
+
+// -----------------------------------------------------------------------------
+// §7.10.1 / §7.10.2 — Loop-filter edge primitives + lflim() response
+// -----------------------------------------------------------------------------
+
+/// §7.10 loop-filter non-linear response function `lflim(R, L)`.
+///
+/// `R` is the signed 4-tap edge-detector response; `L` is the per-frame
+/// loop-filter limit value taken from `LFLIMS[qi0]`. The function is
+/// piecewise-linear with peaks at `(±L, ±L)` and zero-crossings at
+/// `±2 * L`:
+///
+/// ```text
+///                     0,                    R <= -2 * L
+///                    -R - 2 * L,    -2 * L < R <= -L
+/// lflim(R, L) =       R,                -L < R <  L
+///                    -R + 2 * L,        L <= R <  2 * L
+///                     0,             2 * L <= R
+/// ```
+///
+/// `L` is non-negative (the 7-bit `LFLIMS[]` array) and is treated as an
+/// `i32` here so the four comparisons against `R` are done in one signed
+/// type. Inputs follow the §7.10 variable widths: `R` is 9-bit signed,
+/// `L` is 7-bit unsigned.
+///
+/// Reference: Theora I Specification §7.10 (the piecewise function
+/// preceding §7.10.1 in the published PDF, page 127), restated in
+/// `docs/video/theora/Theora.pdf`.
+pub fn lflim(r: i32, l: u8) -> i32 {
+    let l = l as i32;
+    let two_l = 2 * l;
+    if r <= -two_l {
+        0
+    } else if r <= -l {
+        -r - two_l
+    } else if r < l {
+        r
+    } else if r < two_l {
+        -r + two_l
+    } else {
+        0
+    }
+}
+
+/// Apply the §7.10.1 horizontal block-edge loop filter to one column of
+/// the reconstructed plane.
+///
+/// `recp` is a flat plane buffer of length `plane_w * plane_h`, indexed
+/// `recp[y * plane_w + x]` per the §2.1 lower-left row-major layout
+/// already used by [`reconstruct_frame`]. `(fx, fy)` is the lower-left
+/// corner of the 4×8 filter footprint per §7.10.1's `FX` / `FY` input
+/// parameters; `l` is the per-frame loop-filter limit value
+/// `LFLIMS[qi0]`.
+///
+/// The procedure (§7.10.1 step 1) walks `by ∈ 0..=7` and at each row:
+///
+/// 1. Computes the 4-tap edge detector response
+///    `R = (recp[fy+by][fx] - 3 * recp[fy+by][fx+1]
+///         + 3 * recp[fy+by][fx+2] - recp[fy+by][fx+3] + 4) >> 3`.
+/// 2. Updates `recp[fy+by][fx+1]` to `clamp(0, 255, recp[fy+by][fx+1] + lflim(R, L))`.
+/// 3. Updates `recp[fy+by][fx+2]` to `clamp(0, 255, recp[fy+by][fx+2] - lflim(R, L))`.
+///
+/// The 4-tap window read at offsets `fx+0..=fx+3` straddles the block
+/// edge sitting between offsets `fx+1` and `fx+2`. The 4 reference
+/// pixels (`fx+0` and `fx+3`) are unchanged by the filter; only the two
+/// middle pixels are written.
+///
+/// Reference: Theora I Specification §7.10.1, page 128.
+pub fn horizontal_loop_filter_edge(
+    recp: &mut [u8],
+    plane_w: u32,
+    plane_h: u32,
+    fx: u32,
+    fy: u32,
+    l: u8,
+) -> Result<(), Error> {
+    check_plane_buffer_len(recp.len(), plane_w, plane_h)?;
+    // Footprint guard — read four pixels along x, write two of them;
+    // step 8 rows along y.
+    if fx.checked_add(4).map_or(true, |e| e > plane_w)
+        || fy.checked_add(8).map_or(true, |e| e > plane_h)
+    {
+        return Err(Error::LoopFilterHorizontalFootprintOutOfPlane {
+            fx,
+            fy,
+            plane_w,
+            plane_h,
+        });
+    }
+    let stride = plane_w as usize;
+    let fx = fx as usize;
+    let fy = fy as usize;
+    for by in 0..8usize {
+        let row = fy + by;
+        let base = row * stride;
+        // Step 1(a): R = (RECP[fy+by][fx] - 3*RECP[fy+by][fx+1]
+        //                  + 3*RECP[fy+by][fx+2] - RECP[fy+by][fx+3] + 4) >> 3
+        let p0 = recp[base + fx] as i32;
+        let p1 = recp[base + fx + 1] as i32;
+        let p2 = recp[base + fx + 2] as i32;
+        let p3 = recp[base + fx + 3] as i32;
+        let r = (p0 - 3 * p1 + 3 * p2 - p3 + 4) >> 3;
+        let delta = lflim(r, l);
+        // Step 1(b–e): RECP[fy+by][fx+1] = clamp(0..=255, p1 + lflim(R, L))
+        recp[base + fx + 1] = clamp_to_u8(p1 + delta);
+        // Step 1(f–i): RECP[fy+by][fx+2] = clamp(0..=255, p2 - lflim(R, L))
+        recp[base + fx + 2] = clamp_to_u8(p2 - delta);
+    }
+    Ok(())
+}
+
+/// Apply the §7.10.2 vertical block-edge loop filter to one row of the
+/// reconstructed plane.
+///
+/// `recp` is a flat plane buffer of length `plane_w * plane_h`, indexed
+/// `recp[y * plane_w + x]` per the §2.1 lower-left row-major layout.
+/// `(fx, fy)` is the lower-left corner of the 8×4 filter footprint per
+/// §7.10.2's `FX` / `FY` input parameters; `l` is the per-frame
+/// loop-filter limit value `LFLIMS[qi0]`.
+///
+/// The procedure (§7.10.2 step 1) walks `bx ∈ 0..=7` and at each column:
+///
+/// 1. Computes the 4-tap edge detector response
+///    `R = (recp[fy][fx+bx] - 3 * recp[fy+1][fx+bx]
+///         + 3 * recp[fy+2][fx+bx] - recp[fy+3][fx+bx] + 4) >> 3`.
+/// 2. Updates `recp[fy+1][fx+bx]` to `clamp(0, 255, recp[fy+1][fx+bx] + lflim(R, L))`.
+/// 3. Updates `recp[fy+2][fx+bx]` to `clamp(0, 255, recp[fy+2][fx+bx] - lflim(R, L))`.
+///
+/// The 4-tap window reads four rows (`fy+0..=fy+3`) straddling the
+/// horizontal block edge between rows `fy+1` and `fy+2`. The two outer
+/// reference rows are unchanged; only the two middle rows are written.
+///
+/// Reference: Theora I Specification §7.10.2, pages 129–130.
+pub fn vertical_loop_filter_edge(
+    recp: &mut [u8],
+    plane_w: u32,
+    plane_h: u32,
+    fx: u32,
+    fy: u32,
+    l: u8,
+) -> Result<(), Error> {
+    check_plane_buffer_len(recp.len(), plane_w, plane_h)?;
+    // Footprint guard — step 8 columns along x, read four rows / write
+    // two of them along y.
+    if fx.checked_add(8).map_or(true, |e| e > plane_w)
+        || fy.checked_add(4).map_or(true, |e| e > plane_h)
+    {
+        return Err(Error::LoopFilterVerticalFootprintOutOfPlane {
+            fx,
+            fy,
+            plane_w,
+            plane_h,
+        });
+    }
+    let stride = plane_w as usize;
+    let fx = fx as usize;
+    let fy = fy as usize;
+    for bx in 0..8usize {
+        let col = fx + bx;
+        let p0 = recp[fy * stride + col] as i32;
+        let p1 = recp[(fy + 1) * stride + col] as i32;
+        let p2 = recp[(fy + 2) * stride + col] as i32;
+        let p3 = recp[(fy + 3) * stride + col] as i32;
+        // Step 1(a): R = (RECP[fy][fx+bx] - 3*RECP[fy+1][fx+bx]
+        //                  + 3*RECP[fy+2][fx+bx] - RECP[fy+3][fx+bx] + 4) >> 3
+        let r = (p0 - 3 * p1 + 3 * p2 - p3 + 4) >> 3;
+        let delta = lflim(r, l);
+        // Step 1(b–e): RECP[fy+1][fx+bx] = clamp(0..=255, p1 + lflim(R, L))
+        recp[(fy + 1) * stride + col] = clamp_to_u8(p1 + delta);
+        // Step 1(f–i): RECP[fy+2][fx+bx] = clamp(0..=255, p2 - lflim(R, L))
+        recp[(fy + 2) * stride + col] = clamp_to_u8(p2 - delta);
+    }
+    Ok(())
+}
+
+/// Saturating cast from a §7.10.1 / §7.10.2 step-(b–e) / step-(f–i)
+/// intermediate `P` value (`i32`, may exceed `0..=255` after the
+/// `lflim(R, L)` add or subtract) into the plane's `u8` storage.
+///
+/// The spec's three-way branch reads:
+///
+/// > If P is less than zero, assign RECP[…] the value zero. Otherwise,
+/// > if P is greater than 255, assign RECP[…] the value 255. Otherwise,
+/// > assign RECP[…] the value P.
+///
+/// — i.e. saturate to `0..=255`.
+#[inline]
+fn clamp_to_u8(p: i32) -> u8 {
+    p.clamp(0, 255) as u8
+}
+
+/// Plane-buffer length check shared by the §7.10.1 / §7.10.2
+/// primitives.
+fn check_plane_buffer_len(got: usize, plane_w: u32, plane_h: u32) -> Result<(), Error> {
+    let expected = (plane_w as usize).saturating_mul(plane_h as usize);
+    if got != expected {
+        return Err(Error::LoopFilterPlaneBufferLenMismatch { got, expected });
+    }
+    Ok(())
 }
 
 /// No-op codec registration. Decoder/encoder wiring will land in a
@@ -18130,5 +18415,460 @@ mod tests {
 
         let mbs: Vec<CodedMacroBlockPosition> = PlaneMacroBlockCodedOrder::new(dims).collect();
         assert!(mbs.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // §7.10 loop-filter primitives
+    // -----------------------------------------------------------------
+
+    /// `lflim(R, L)` value at every distinguished breakpoint of the
+    /// piecewise function: zero outside `[-2L, 2L]`, the rising
+    /// `-R - 2L` ramp on `(-2L, -L]`, the through-origin `R` segment
+    /// on `(-L, L)`, the falling `-R + 2L` ramp on `[L, 2L)`, and zero
+    /// again. All five branches plus the (0, L) and (L, L) peaks are
+    /// pinned for `L = 5`.
+    #[test]
+    fn lflim_piecewise_breakpoints_at_l5() {
+        let l = 5u8;
+        // Outside-of-band: |R| >= 2L → 0.
+        assert_eq!(lflim(-100, l), 0);
+        assert_eq!(lflim(-11, l), 0);
+        assert_eq!(lflim(-10, l), 0);
+        assert_eq!(lflim(10, l), 0);
+        assert_eq!(lflim(11, l), 0);
+        assert_eq!(lflim(100, l), 0);
+        // Lower ramp: -2L < R <= -L → -R - 2L.
+        assert_eq!(lflim(-9, l), -(-9) - 10); // = -1
+        assert_eq!(lflim(-7, l), -(-7) - 10); // = -3
+        assert_eq!(lflim(-5, l), -(-5) - 10); // = -5 (the -L peak)
+                                              // Through-origin segment: -L < R < L → R.
+        assert_eq!(lflim(-4, l), -4);
+        assert_eq!(lflim(0, l), 0);
+        assert_eq!(lflim(4, l), 4);
+        // Upper ramp: L <= R < 2L → -R + 2L.
+        assert_eq!(lflim(5, l), -5 + 10); // = 5 (the +L peak)
+        assert_eq!(lflim(7, l), -7 + 10); // = 3
+        assert_eq!(lflim(9, l), -9 + 10); // = 1
+    }
+
+    /// `lflim(R, 0)` collapses the function to identically zero: with
+    /// `L = 0` both ramp segments have zero width and the through-origin
+    /// segment is empty (`-0 < R < 0` is unsatisfiable), so every input
+    /// falls into one of the two outside-of-band arms.
+    #[test]
+    fn lflim_zero_limit_is_identically_zero() {
+        for r in -300..=300 {
+            assert_eq!(lflim(r, 0), 0, "lflim({r}, 0) must be zero");
+        }
+    }
+
+    /// `lflim(R, L)` is anti-symmetric in `R` for any `L`. This pins
+    /// the figure 7.3 reflection symmetry quoted by §7.10.
+    #[test]
+    fn lflim_is_antisymmetric_in_r() {
+        for l in [0u8, 1, 3, 7, 25, 127] {
+            for r in -300..=300i32 {
+                assert_eq!(lflim(r, l), -lflim(-r, l), "antisymmetry at R={r}, L={l}");
+            }
+        }
+    }
+
+    /// Build a flat plane buffer of `plane_w * plane_h` zero bytes.
+    fn blank_plane(w: u32, h: u32) -> Vec<u8> {
+        vec![0u8; (w as usize) * (h as usize)]
+    }
+
+    /// Fill row `y` of a plane with `value`.
+    fn fill_row(plane: &mut [u8], w: u32, y: u32, value: u8) {
+        let stride = w as usize;
+        for x in 0..(w as usize) {
+            plane[(y as usize) * stride + x] = value;
+        }
+    }
+
+    /// Set pixel `(x, y)` in a plane.
+    fn set_px(plane: &mut [u8], w: u32, x: u32, y: u32, value: u8) {
+        plane[(y as usize) * (w as usize) + (x as usize)] = value;
+    }
+
+    /// Read pixel `(x, y)` from a plane.
+    fn get_px(plane: &[u8], w: u32, x: u32, y: u32) -> u8 {
+        plane[(y as usize) * (w as usize) + (x as usize)]
+    }
+
+    /// A flat (constant-valued) 4-wide tap window has edge response
+    /// `R = (V - 3V + 3V - V + 4) >> 3 = (0 + 4) >> 3 = 0`, so
+    /// `lflim(0, L) = 0`. The horizontal filter must therefore leave
+    /// the two middle pixels unchanged on a constant input.
+    #[test]
+    fn horizontal_loop_filter_constant_window_is_identity() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = vec![128u8; (w as usize) * (h as usize)];
+        let before = plane.clone();
+        horizontal_loop_filter_edge(&mut plane, w, h, 4, 0, 30).unwrap();
+        assert_eq!(plane, before, "constant input must be unchanged");
+    }
+
+    /// A constant column input has vertical edge response zero in the
+    /// same way, so the vertical filter is also identity on flat data.
+    #[test]
+    fn vertical_loop_filter_constant_window_is_identity() {
+        let w = 8u32;
+        let h = 16u32;
+        let mut plane = vec![64u8; (w as usize) * (h as usize)];
+        let before = plane.clone();
+        vertical_loop_filter_edge(&mut plane, w, h, 0, 4, 30).unwrap();
+        assert_eq!(plane, before);
+    }
+
+    /// A horizontal step edge from `90` to `110` across `(fx+1, fx+2)`
+    /// gives `R = (90 - 3*90 + 3*110 - 110 + 4) >> 3 = (40 + 4) >> 3
+    /// = 5` per the §7.10.1 step 1(a) algebra. With `L = 30`, `R = 5`
+    /// lies in the central `(-L, L)` segment of `lflim`, so the
+    /// returned delta is `R` itself (5). Step 1(b): `P = 90 + 5 = 95`;
+    /// step 1(f): `P = 110 - 5 = 105`. Step edge softened by 5 LSBs at
+    /// the inner two columns, the two reference columns left alone.
+    #[test]
+    fn horizontal_loop_filter_step_edge_central_lflim_range() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = blank_plane(w, h);
+        // Build a 4×8 footprint anchored at fx=4, fy=0. Columns 4 and
+        // 5 hold the low side (90); columns 6 and 7 hold the high side
+        // (110). All 8 rows carry the same step.
+        for y in 0..h {
+            set_px(&mut plane, w, 4, y, 90);
+            set_px(&mut plane, w, 5, y, 90);
+            set_px(&mut plane, w, 6, y, 110);
+            set_px(&mut plane, w, 7, y, 110);
+        }
+        horizontal_loop_filter_edge(&mut plane, w, h, 4, 0, 30).unwrap();
+        // For each row, columns 4 and 7 unchanged; column 5 becomes 95;
+        // column 6 becomes 105.
+        for y in 0..h {
+            assert_eq!(get_px(&plane, w, 4, y), 90, "col 4 (reference) row {y}");
+            assert_eq!(get_px(&plane, w, 5, y), 95, "col 5 row {y}");
+            assert_eq!(get_px(&plane, w, 6, y), 105, "col 6 row {y}");
+            assert_eq!(get_px(&plane, w, 7, y), 110, "col 7 (reference) row {y}");
+        }
+    }
+
+    /// Vertical mirror of the previous test. A step edge from row
+    /// `fy+1` (value 90) to row `fy+2` (value 110), with rows fy=fy
+    /// and fy+3 sharing the matching sides, gives the same `R = 5`
+    /// per §7.10.2 step 1(a) and the same `delta = 5`. The two middle
+    /// rows close by 5 LSBs; the outer rows are unchanged.
+    #[test]
+    fn vertical_loop_filter_step_edge_central_lflim_range() {
+        let w = 8u32;
+        let h = 16u32;
+        let mut plane = blank_plane(w, h);
+        // 8×4 footprint at (fx=0, fy=4). Rows 4–5 are the low side
+        // (90); rows 6–7 are the high side (110).
+        for x in 0..w {
+            set_px(&mut plane, w, x, 4, 90);
+            set_px(&mut plane, w, x, 5, 90);
+            set_px(&mut plane, w, x, 6, 110);
+            set_px(&mut plane, w, x, 7, 110);
+        }
+        vertical_loop_filter_edge(&mut plane, w, h, 0, 4, 30).unwrap();
+        for x in 0..w {
+            assert_eq!(get_px(&plane, w, x, 4), 90, "row 4 (reference) col {x}");
+            assert_eq!(get_px(&plane, w, x, 5), 95, "row 5 col {x}");
+            assert_eq!(get_px(&plane, w, x, 6), 105, "row 6 col {x}");
+            assert_eq!(get_px(&plane, w, x, 7), 110, "row 7 (reference) col {x}");
+        }
+    }
+
+    /// A sharp step at `L = 0` keeps `delta = 0` because the
+    /// piecewise function is identically zero, so both middle pixels
+    /// are left untouched even when `R` is large. Crosschecks the
+    /// "filter disabled by `LFLIMS[qi0] = 0`" property documented in
+    /// §B.2 (the VP3 hardcoded `LFLIMS` ends with zeros for high `qi`).
+    #[test]
+    fn horizontal_loop_filter_lflims_zero_disables_filter() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = blank_plane(w, h);
+        // Strong edge: 0 → 255 between columns 5 and 6.
+        for y in 0..h {
+            set_px(&mut plane, w, 4, y, 0);
+            set_px(&mut plane, w, 5, y, 0);
+            set_px(&mut plane, w, 6, y, 255);
+            set_px(&mut plane, w, 7, y, 255);
+        }
+        let before = plane.clone();
+        horizontal_loop_filter_edge(&mut plane, w, h, 4, 0, 0).unwrap();
+        assert_eq!(plane, before);
+    }
+
+    /// A horizontal step beyond `|R| >= 2L` is dropped to `delta = 0`
+    /// by the outer arms of `lflim`. With `L = 5`, choose a step large
+    /// enough that `R >= 10` so the filter declines to soften it —
+    /// matching §7.10's intent that genuine edges (not block
+    /// artifacts) survive untouched.
+    #[test]
+    fn horizontal_loop_filter_outside_lflim_band_is_identity() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = blank_plane(w, h);
+        // Build a step where R = (0 - 3*0 + 3*255 - 255 + 4) >> 3
+        // = (510 + 4) >> 3 = 64. With L = 5, |R| = 64 > 2L = 10, so
+        // delta = 0.
+        for y in 0..h {
+            set_px(&mut plane, w, 4, y, 0);
+            set_px(&mut plane, w, 5, y, 0);
+            set_px(&mut plane, w, 6, y, 255);
+            set_px(&mut plane, w, 7, y, 255);
+        }
+        let before = plane.clone();
+        horizontal_loop_filter_edge(&mut plane, w, h, 4, 0, 5).unwrap();
+        assert_eq!(plane, before);
+    }
+
+    /// The §7.10.1 step 1(c-e) / step 1(g-i) clamps pin the writes at
+    /// the `0..=255` range. Contrive a setup where the algebra gives
+    /// a `(p2 - delta)` that exceeds 255 so the upper clamp fires.
+    ///
+    /// Take p0 = 0, p1 = 250, p2 = 250, p3 = 200. The edge response is
+    ///
+    ///   R = (0 - 3*250 + 3*250 - 200 + 4) >> 3
+    ///     = (-200 + 4) >> 3
+    ///     = -196 >> 3 (arithmetic, floor) = -25.
+    ///
+    /// With L = 200, lflim(-25, 200) lies in the through-origin segment
+    /// so delta = -25.
+    ///
+    /// Step 1(b): p1 + delta = 250 + (-25) = 225 (in-range, no clamp).
+    /// Step 1(f): p2 - delta = 250 - (-25) = 275 → clamped to 255.
+    #[test]
+    fn horizontal_loop_filter_clamps_at_plane_bounds() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = blank_plane(w, h);
+        for y in 0..h {
+            set_px(&mut plane, w, 4, y, 0);
+            set_px(&mut plane, w, 5, y, 250);
+            set_px(&mut plane, w, 6, y, 250);
+            set_px(&mut plane, w, 7, y, 200);
+        }
+        horizontal_loop_filter_edge(&mut plane, w, h, 4, 0, 200).unwrap();
+        for y in 0..h {
+            // col 4 (reference) unchanged
+            assert_eq!(get_px(&plane, w, 4, y), 0);
+            // col 5: 250 + (-25) = 225
+            assert_eq!(get_px(&plane, w, 5, y), 225);
+            // col 6: 250 - (-25) = 275 → clamped to 255
+            assert_eq!(get_px(&plane, w, 6, y), 255);
+            // col 7 (reference) unchanged
+            assert_eq!(get_px(&plane, w, 7, y), 200);
+        }
+    }
+
+    /// The §7.10.1 filter only writes the two middle pixels of its 4×8
+    /// footprint. Pixels outside the four columns it reads must stay
+    /// at whatever the caller put there (the spec is silent on them).
+    #[test]
+    fn horizontal_loop_filter_does_not_touch_outside_footprint() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = blank_plane(w, h);
+        // Sentinel values everywhere except the 4×8 footprint anchored
+        // at (fx=4, fy=0).
+        for y in 0..h {
+            for x in 0..w {
+                set_px(&mut plane, w, x, y, (x + y) as u8 ^ 0x5a);
+            }
+        }
+        // Save the original outside the footprint.
+        let saved = plane.clone();
+        horizontal_loop_filter_edge(&mut plane, w, h, 4, 0, 30).unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                if x == 5 || x == 6 {
+                    // The two middle columns: writable.
+                    continue;
+                }
+                assert_eq!(
+                    get_px(&plane, w, x, y),
+                    get_px(&saved, w, x, y),
+                    "untouched at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// The §7.10.2 filter only writes rows `fy+1` and `fy+2` of its
+    /// 8×4 footprint. Pixels outside the four rows must stay
+    /// unchanged.
+    #[test]
+    fn vertical_loop_filter_does_not_touch_outside_footprint() {
+        let w = 8u32;
+        let h = 16u32;
+        let mut plane = blank_plane(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                set_px(&mut plane, w, x, y, (x + y) as u8 ^ 0xa5);
+            }
+        }
+        let saved = plane.clone();
+        vertical_loop_filter_edge(&mut plane, w, h, 0, 4, 30).unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                if y == 5 || y == 6 {
+                    // Middle rows are writable.
+                    continue;
+                }
+                assert_eq!(
+                    get_px(&plane, w, x, y),
+                    get_px(&saved, w, x, y),
+                    "untouched at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// Horizontal filter rejects an `(fx, fy)` whose 4×8 footprint
+    /// would step past the plane on the right edge.
+    #[test]
+    fn horizontal_loop_filter_rejects_right_oob_footprint() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = blank_plane(w, h);
+        // fx + 4 > plane_w → out of plane.
+        let err = horizontal_loop_filter_edge(&mut plane, w, h, 13, 0, 30).unwrap_err();
+        assert_eq!(
+            err,
+            Error::LoopFilterHorizontalFootprintOutOfPlane {
+                fx: 13,
+                fy: 0,
+                plane_w: 16,
+                plane_h: 8,
+            }
+        );
+    }
+
+    /// Horizontal filter rejects an `(fx, fy)` whose 4×8 footprint
+    /// would step past the top of the plane.
+    #[test]
+    fn horizontal_loop_filter_rejects_top_oob_footprint() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = blank_plane(w, h);
+        // fy + 8 > plane_h → out of plane.
+        let err = horizontal_loop_filter_edge(&mut plane, w, h, 4, 1, 30).unwrap_err();
+        assert_eq!(
+            err,
+            Error::LoopFilterHorizontalFootprintOutOfPlane {
+                fx: 4,
+                fy: 1,
+                plane_w: 16,
+                plane_h: 8,
+            }
+        );
+    }
+
+    /// Vertical filter rejects an `(fx, fy)` whose 8×4 footprint would
+    /// step past the right edge of the plane.
+    #[test]
+    fn vertical_loop_filter_rejects_right_oob_footprint() {
+        let w = 16u32;
+        let h = 16u32;
+        let mut plane = blank_plane(w, h);
+        // fx + 8 > plane_w → out of plane.
+        let err = vertical_loop_filter_edge(&mut plane, w, h, 9, 4, 30).unwrap_err();
+        assert_eq!(
+            err,
+            Error::LoopFilterVerticalFootprintOutOfPlane {
+                fx: 9,
+                fy: 4,
+                plane_w: 16,
+                plane_h: 16,
+            }
+        );
+    }
+
+    /// Vertical filter rejects an `(fx, fy)` whose 8×4 footprint would
+    /// step past the top edge of the plane.
+    #[test]
+    fn vertical_loop_filter_rejects_top_oob_footprint() {
+        let w = 16u32;
+        let h = 8u32;
+        let mut plane = blank_plane(w, h);
+        // fy + 4 > plane_h → out of plane.
+        let err = vertical_loop_filter_edge(&mut plane, w, h, 0, 5, 30).unwrap_err();
+        assert_eq!(
+            err,
+            Error::LoopFilterVerticalFootprintOutOfPlane {
+                fx: 0,
+                fy: 5,
+                plane_w: 16,
+                plane_h: 8,
+            }
+        );
+    }
+
+    /// Plane buffer length mismatch is rejected before either filter
+    /// dereferences the buffer.
+    #[test]
+    fn loop_filter_rejects_plane_buffer_len_mismatch() {
+        let w = 16u32;
+        let h = 8u32;
+        // Buffer one byte short.
+        let mut plane = vec![0u8; (w as usize) * (h as usize) - 1];
+        let err = horizontal_loop_filter_edge(&mut plane, w, h, 4, 0, 30).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::LoopFilterPlaneBufferLenMismatch { .. }
+        ));
+        let err = vertical_loop_filter_edge(&mut plane, w, h, 0, 0, 30).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::LoopFilterPlaneBufferLenMismatch { .. }
+        ));
+    }
+
+    /// Each new §7.10 error variant should render a stable, distinct
+    /// §7.10 tag through `Display`.
+    #[test]
+    fn loop_filter_error_display_tags() {
+        let e = Error::LoopFilterHorizontalFootprintOutOfPlane {
+            fx: 4,
+            fy: 0,
+            plane_w: 8,
+            plane_h: 8,
+        };
+        let s = e.to_string();
+        assert!(s.contains("§7.10.1"));
+        assert!(s.contains("fx=4"));
+        assert!(s.contains("fy=0"));
+
+        let e = Error::LoopFilterVerticalFootprintOutOfPlane {
+            fx: 0,
+            fy: 5,
+            plane_w: 8,
+            plane_h: 8,
+        };
+        let s = e.to_string();
+        assert!(s.contains("§7.10.2"));
+        assert!(s.contains("fy=5"));
+
+        let e = Error::LoopFilterPlaneBufferLenMismatch {
+            got: 63,
+            expected: 64,
+        };
+        let s = e.to_string();
+        assert!(s.contains("§7.10"));
+        assert!(s.contains("63"));
+        assert!(s.contains("64"));
+    }
+
+    // Silence dead-code warning if a helper is only used in one test.
+    #[test]
+    fn loop_filter_helpers_compile() {
+        let mut plane = blank_plane(4, 4);
+        fill_row(&mut plane, 4, 2, 7);
+        assert_eq!(plane[4 * 2], 7);
     }
 }

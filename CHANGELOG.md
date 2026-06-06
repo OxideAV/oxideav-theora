@@ -6,6 +6,43 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.10.1 / §7.10.2 loop-filter edge primitives + `lflim()` response
+  (round 241). New public entry points
+  `lflim(r: i32, l: u8) -> i32` (the §7.10 piecewise non-linear
+  response function with peaks at `(±L, ±L)` and zero-crossings at
+  `±2 * L`),
+  `horizontal_loop_filter_edge(recp, plane_w, plane_h, fx, fy, l)`
+  (§7.10.1 — applies the 4-tap horizontal edge filter to a 4×8
+  footprint, writing the two middle columns), and
+  `vertical_loop_filter_edge(recp, plane_w, plane_h, fx, fy, l)`
+  (§7.10.2 — applies the 4-tap vertical edge filter to an 8×4
+  footprint, writing the two middle rows). Both edge primitives
+  operate on the same lower-left row-major plane buffer layout
+  emitted by `reconstruct_frame` (§7.9.4 round-233 driver) and use
+  the central `lflim` response so a `LFLIMS[qi0] = 0` limit value
+  collapses the filter to identity (matching §B.2's VP3 high-`qi`
+  trailing zeros). Three new `Error` variants — 
+  `LoopFilterHorizontalFootprintOutOfPlane`,
+  `LoopFilterVerticalFootprintOutOfPlane`, and
+  `LoopFilterPlaneBufferLenMismatch` — pin the footprint /
+  buffer-length guards with §7.10-tagged Display strings. 19 new
+  tests (total now 430): `lflim` piecewise breakpoints at `L = 5`
+  covering every distinguished arm of the function, `lflim` with
+  `L = 0` collapses to identically zero, antisymmetry of `lflim` in
+  its first argument across `L ∈ {0, 1, 3, 7, 25, 127}` and
+  `R ∈ [-300, 300]`, constant-input identity for both edge filters,
+  step-edge softening with `R = 5` / delta 5 inside the central
+  segment (both horizontal and vertical), `LFLIMS = 0` disables the
+  filter on a strong step, outside-of-band `|R| >= 2L` returns
+  identity, plane-bounds clamp at 255 with `(p2 - delta) = 275`,
+  outside-footprint pixels left untouched for both filters, all
+  four out-of-plane footprint rejects (right / top for each filter),
+  plane-buffer-length mismatch rejected before either filter
+  dereferences the buffer, and `Display` rendering of the three new
+  error variants. The §7.10.3 ordering driver (raster-order walk
+  consuming `BCODED` + `(BX, BY)` per block) is the natural next
+  round: these primitives are the per-edge body it dispatches to.
+
 - §2.3 / §2.4 coded-order resolver (round 238). New public
   iterators `PlaneBlockCodedOrder` and `PlaneMacroBlockCodedOrder`
   walk one colour plane in spec-defined coded order: super-blocks

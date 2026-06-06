@@ -1371,11 +1371,87 @@ chains that currently take pre-resolved raster orderings as
 caller-supplied arrays. Five new unit tests; whole-crate total now
 411 (was 406).
 
+### §7.10.1 / §7.10.2 loop-filter edge primitives + `lflim()` (round 241)
+
+The §7.10 deblocking step is built around a piecewise non-linear
+response function
+
+```text
+                  0,                  R <= -2 * L
+                  -R - 2 * L,    -2L < R <= -L
+lflim(R, L) =      R,              -L < R <  L
+                  -R + 2 * L,       L <= R <  2 * L
+                  0,                  R >=  2 * L
+```
+
+with peaks at `(±L, ±L)` and zero-crossings at `R = ±2 * L`. `L`
+is the per-frame loop-filter limit value `LFLIMS[qi0]` — the entry
+of the §6.4.1 `LFLIMS` array indexed by the frame's first
+quantization index. The response declines to soften genuine edges
+(`|R| >= 2L`) while attenuating small block-artifact differences
+(`|R| < L` is passed through unchanged, `L <= |R| < 2L` is
+attenuated linearly to zero).
+
+[`lflim`] returns the signed delta as an `i32`. The two edge
+primitives — [`horizontal_loop_filter_edge`] (§7.10.1) and
+[`vertical_loop_filter_edge`] (§7.10.2) — apply this delta to a
+single block edge of the reconstructed plane:
+
+* The horizontal filter consumes a 4-wide × 8-tall footprint
+  anchored at `(fx, fy)`. For each of 8 rows it computes
+  `R = (recp[fy+by][fx+0] - 3*recp[fy+by][fx+1]
+       + 3*recp[fy+by][fx+2] - recp[fy+by][fx+3] + 4) >> 3` and
+  writes the two middle columns: `recp[fy+by][fx+1] +=
+  lflim(R, L)` and `recp[fy+by][fx+2] -= lflim(R, L)`, each
+  clamped to `0..=255` per §7.10.1 step 1(c-e) / step 1(g-i).
+  The two outer reference columns `(fx, fx+3)` are untouched.
+* The vertical filter is the same shape rotated 90°: an 8-wide
+  × 4-tall footprint, walking 8 columns and writing rows
+  `fy+1` / `fy+2`, with the two outer reference rows `(fy, fy+3)`
+  left untouched per §7.10.2 step 1(c-e) / step 1(g-i).
+
+Both primitives operate directly on the same lower-left
+row-major plane buffer layout emitted by the round-233
+[`reconstruct_frame`] driver, so the §7.10.3 raster-order ordering
+driver (the natural follow-up) can dispatch into them without
+re-shaping the per-plane storage.
+
+Three new `Error` variants pin the rejects:
+[`Error::LoopFilterHorizontalFootprintOutOfPlane`] /
+[`Error::LoopFilterVerticalFootprintOutOfPlane`] reject any
+`(fx, fy)` whose footprint would escape the plane; 
+[`Error::LoopFilterPlaneBufferLenMismatch`] rejects a plane buffer
+whose length does not match `plane_w * plane_h`. The §7.10 Display
+strings carry the procedure tag so the source of a reject is
+obvious at a `to_string()`.
+
+19 new unit tests bring the whole-crate total to 430: `lflim`
+piecewise breakpoints at `L = 5` covering every distinguished arm,
+`lflim(R, 0)` collapses to identically zero, antisymmetry of
+`lflim` in its first argument across `L ∈ {0, 1, 3, 7, 25, 127}`,
+constant-input identity for both edge filters, step-edge softening
+inside the central `lflim` segment for both filters (R = 5, delta
+= 5), `LFLIMS = 0` disabling the filter on a strong step,
+outside-of-band `|R| >= 2L` returning identity, plane-bounds clamp
+at 255 with a contrived `(p2 - delta) = 275` setup, outside-
+footprint pixels left untouched for both filters, the four
+out-of-plane footprint rejects (right / top for each filter), the
+plane-buffer-length-mismatch reject before either filter
+dereferences the buffer, and `Display` rendering of the three new
+error variants.
+
+The §7.10.3 ordering driver — the raster-order walk that reads
+`BCODED` and dispatches the left / bottom / right / top edge of
+each coded block to one of these two primitives — is the natural
+next round: these primitives are the per-edge body it dispatches
+to.
+
 ## Roadmap
 
-* Next: §7.10 Loop Filter — deblocking applied to the
-  pre-loop-filter frame returned by [`reconstruct_frame`] using
-  the §6.4.1 `LFLIMS[qi0]` table.
+* Next: §7.10.3 Complete Loop Filter — the raster-order driver
+  that walks coded blocks and dispatches the four per-block
+  edges to the §7.10.1 / §7.10.2 primitives that landed in
+  round 241.
 * The §2.3 / §2.4 coded-order resolver landed in round 238 as
   `PlaneBlockCodedOrder` + `PlaneMacroBlockCodedOrder` over
   `PlaneBlockDims`. Follow-ups that compose it into per-block

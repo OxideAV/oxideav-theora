@@ -6,6 +6,34 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.11 Complete Frame Decode entry-shape primitives (round 250).
+  Two new public entry points wire the first plumbing for the
+  §7.11 driver: `reference_plane_dimensions_from_ident(ident:
+  &TheoraIdentHeader) -> ReferencePlaneDimensions` implements
+  step 3 (`RPYW = 16 * FMBW`, `RPYH = 16 * FMBH`) and step 4 /
+  Table 7.89 (chroma keyed by `PF`: `PF=0 → 8*FMBW × 8*FMBH`,
+  `PF=2 → 8*FMBW × 16*FMBH`, `PF=3 → 16*FMBW × 16*FMBH`), and
+  `classify_frame_decode_packet(packet: &[u8]) -> FrameDecodePacket`
+  implements the step 1 / step 2 branch — a zero-byte packet
+  becomes `FrameDecodePacket::Empty` (step 2: synthesise `FTYPE =
+  1`, `NQIS = 1`, `QIS[0] = 63`, all-zero `BCODED`; consume no
+  bits), a non-empty packet becomes `FrameDecodePacket::Data` for
+  the §7.1 → §7.3 → §7.4 → (§7.5.2) → §7.6 → §7.7.3 → §7.8.2
+  chain that subsequent rounds will wire together. Both helpers
+  are pure functions with no per-frame state. New public types:
+  `ReferencePlaneDimensions { rpyw, rpyh, rpcw, rpch }` carrying
+  the spec mnemonics one-for-one, and `FrameDecodePacket<'a> {
+  Empty, Data(&'a [u8]) }` with `is_empty()` / `data()`
+  inspectors. 9 new tests (total now 456): luma extent across
+  all three `PF` values, each Table 7.89 row by chroma shape
+  (`PF=0` halved both axes, `PF=2` horizontal-only, `PF=3`
+  unscaled), `u16::MAX` boundary on `FMBW` / `FMBH` (no `u32`
+  overflow), independence from the picture-region offsets
+  (`PICW` / `PICH` / `PICX` / `PICY` do not affect reference-plane
+  geometry — those govern display-time cropping per §A.1, not
+  reconstruction), zero-byte vs non-empty packet classification,
+  and the single-byte boundary case (any `len >= 1` is the
+  step 1 path).
 - §7.10.3 Complete Loop Filter raster-order driver (round 244).
   New public entry point `loop_filter_frame(lflims, qis, bcoded,
   pli_of_block, bx_of_block, by_of_block, plane_y, plane_cb,

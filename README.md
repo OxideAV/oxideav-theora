@@ -1502,6 +1502,57 @@ typed `Error::*` pattern matches plus their `Display` rendering.
 The driver is bit-exact against hand-computed `lflim()` deltas on
 each fixture.
 
+### §7.11 Complete Frame Decode entry-shape primitives (round 250)
+
+Round 250 lands the first plumbing for the **§7.11 frame-decode
+driver**: two public entry points implementing the geometry
+derivation (steps 3-4) and the empty-packet branch (step 1 / step 2):
+
+* [`reference_plane_dimensions_from_ident`] returns a typed
+  [`ReferencePlaneDimensions { rpyw, rpyh, rpcw, rpch }`]. Step 3
+  computes luma as `RPYW = 16 * FMBW`, `RPYH = 16 * FMBH`. Step 4
+  picks chroma from Table 7.89:
+
+  | PF | RPCW         | RPCH         | Format |
+  |----|--------------|--------------|--------|
+  | 0  | `8 * FMBW`   | `8 * FMBH`   | 4:2:0  |
+  | 2  | `8 * FMBW`   | `16 * FMBH`  | 4:2:2  |
+  | 3  | `16 * FMBW`  | `16 * FMBH`  | 4:4:4  |
+
+  The reserved `PF = 1` row is unreachable: the identification
+  header parser rejects it at construction time, so the
+  `PixelFormat` variant set is `{Yuv420, Yuv422, Yuv444}` and the
+  Table 7.89 match is total. Both dimensions are `u32`;
+  `16 * 0xFFFF = 0x000F_FFF0` fits comfortably so no overflow check
+  is needed.
+
+* [`classify_frame_decode_packet`] returns
+  [`FrameDecodePacket::Empty`] for a zero-byte packet (step 2
+  special case: synthesise `FTYPE = 1`, `NQIS = 1`, `QIS[0] = 63`,
+  all-zero `BCODED`, consume no bits) and
+  [`FrameDecodePacket::Data`] otherwise (step 1 chain over the
+  packet body). The enum exposes `is_empty()` and
+  `data() -> Option<&[u8]>` inspectors. The classifier is a pure
+  predicate — it does not read the packet body — so a follow-up
+  round can chain it into the §7.1 → §7.3 → §7.4 → (§7.5.2) →
+  §7.6 → §7.7.3 → §7.8.2 walk against the same shared bit reader
+  the existing decoders already use.
+
+Both entries are pure functions; nine new tests cover the per-PF
+chroma rows, the `u16::MAX` boundary on `FMBW` / `FMBH`,
+independence from the picture-region offsets (the reference plane
+is always macroblock-aligned; cropping to `(PICW, PICH)` at
+`(PICX, PICY)` is a §A.1 / display-time concern), the zero-byte
+vs non-empty packet split, and the single-byte boundary case
+(any `len >= 1` takes the step 1 path).
+
+These primitives slot into the §7.11 driver alongside the
+already-shipping §7.9.4 step-5 reconstruction
+([`reconstruct_frame`]) and the §7.10.3 step-6 loop-filter pass
+([`loop_filter_frame`]); step 1 (the per-procedure chaining) and
+steps 7/8 (reference-frame carry-forward of `GOLDREF*` / `PREVREF*`)
+remain for subsequent rounds.
+
 ## Roadmap
 
 * Next: wire the §7.10.3 driver into the §7.9.4 frame reconstruction

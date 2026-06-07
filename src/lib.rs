@@ -2,7 +2,27 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-06-07 (round 244 of clean-room rebuild)
+//! ## Status — 2026-06-07 (round 250 of clean-room rebuild)
+//!
+//! Round 250 lands the **§7.11 Complete Frame Decode entry-shape
+//! primitives** as [`ReferencePlaneDimensions`] +
+//! [`reference_plane_dimensions_from_ident`] +
+//! [`FrameDecodePacket`] + [`classify_frame_decode_packet`]. The
+//! geometry helper computes the four reference-plane pixel widths /
+//! heights (`RPYW` / `RPYH` / `RPCW` / `RPCH`) directly from the
+//! identification header per §7.11 step 3
+//! (`RPYW = 16 * FMBW`, `RPYH = 16 * FMBH`) and step 4 / Table 7.89
+//! (chroma keyed by `PF`: `PF=0 → 8*FMBW × 8*FMBH`,
+//! `PF=2 → 8*FMBW × 16*FMBH`, `PF=3 → 16*FMBW × 16*FMBH`). The
+//! classifier implements the §7.11 step 1 / step 2 branch — a
+//! zero-byte packet is the step 2 special case (synthesise `FTYPE
+//! = 1`, `NQIS = 1`, `QIS[0] = 63`, all-zero `BCODED`; consume no
+//! bits), a non-empty packet is the step 1 chain that will run
+//! §7.1 → §7.3 → §7.4 → (§7.5.2) → §7.6 → §7.7.3 → §7.8.2 once
+//! subsequent rounds wire them together. Both helpers are pure
+//! functions with no per-frame state; subsequent rounds will chain
+//! them into the §7.9.4 reconstruction (step 5) and §7.10.3 loop
+//! filter (step 6) drivers landed earlier.
 //!
 //! Round 244 lands the **§7.10.3 Complete Loop Filter raster-order
 //! driver** as [`loop_filter_frame`]. The driver composes the
@@ -8509,6 +8529,149 @@ fn check_lfframe_block_slice_len(
         return Err(Error::LoopFilterFrameBlockLenMismatch { which, got, nbs });
     }
     Ok(())
+}
+
+/// Reference-plane pixel dimensions per §7.11 step 3 / step 4.
+///
+/// The §7.11 "Complete Frame Decode" driver sizes the six reference
+/// planes (`RECY` / `RECCB` / `RECCR` for the new output, plus
+/// `GOLDREF*` / `PREVREF*` for the carried references) from the
+/// identification-header geometry once: luma at the full
+/// `(16 * FMBW, 16 * FMBH)` macroblock extent (step 3), chroma per
+/// Table 7.89 keyed by `PF` (step 4).
+///
+/// Note these are the **reference-plane** dimensions, not the
+/// **picture-region** dimensions: §7.11 reconstructs the uncropped
+/// macroblock-aligned frame; cropping to `(PICW, PICH)` at offset
+/// `(PICX, PICY)` is a §A.1 / display-time concern that happens
+/// after step 8.
+///
+/// Field naming mirrors the spec mnemonics verbatim so a reader can
+/// translate `RPYW`/`RPYH`/`RPCW`/`RPCH` one-for-one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferencePlaneDimensions {
+    /// `RPYW` — Y plane width in pixels (= `16 * FMBW`).
+    pub rpyw: u32,
+    /// `RPYH` — Y plane height in pixels (= `16 * FMBH`).
+    pub rpyh: u32,
+    /// `RPCW` — Cb / Cr plane width in pixels. From Table 7.89.
+    pub rpcw: u32,
+    /// `RPCH` — Cb / Cr plane height in pixels. From Table 7.89.
+    pub rpch: u32,
+}
+
+/// Build the reference-plane pixel dimensions from a parsed
+/// identification header per §7.11 step 3 / step 4.
+///
+/// Step 3 sets `RPYW = 16 * FMBW`, `RPYH = 16 * FMBH`. Step 4 reads
+/// `(RPCW, RPCH)` from the row of Table 7.89 keyed by `PF`:
+///
+/// | PF | RPCW          | RPCH          | Format |
+/// |----|---------------|---------------|--------|
+/// | 0  | `8 * FMBW`    | `8 * FMBH`    | 4:2:0  |
+/// | 2  | `8 * FMBW`    | `16 * FMBH`   | 4:2:2  |
+/// | 3  | `16 * FMBW`   | `16 * FMBH`   | 4:4:4  |
+///
+/// `PF = 1` (the reserved row) is unreachable: the identification
+/// header parser rejects it as [`Error::ReservedPixelFormat`] before
+/// a [`TheoraIdentHeader`] can be constructed, so the [`PixelFormat`]
+/// variant set is `{Yuv420, Yuv422, Yuv444}` and the match here is
+/// total.
+///
+/// Both dimensions are `u32`; `FMBW` / `FMBH` are `u16` so
+/// `16 * FMBW` peaks at `16 * 0xFFFF = 0x000FFFF0`, which is well
+/// inside `u32` range. No overflow check is needed.
+///
+/// This is a pure function over the identification header; it
+/// consults no per-frame state and is therefore safe to call once
+/// at stream-setup time and cache for the lifetime of the
+/// identification header.
+pub fn reference_plane_dimensions_from_ident(
+    ident: &TheoraIdentHeader,
+) -> ReferencePlaneDimensions {
+    let fmbw = ident.fmbw as u32;
+    let fmbh = ident.fmbh as u32;
+    // Step 3: luma is always at the full macroblock extent.
+    let rpyw = 16 * fmbw;
+    let rpyh = 16 * fmbh;
+    // Step 4: chroma per Table 7.89.
+    let (rpcw, rpch) = match ident.pf {
+        // 4:2:0 — both axes halved relative to luma.
+        PixelFormat::Yuv420 => (8 * fmbw, 8 * fmbh),
+        // 4:2:2 — horizontal halved, vertical matches luma.
+        PixelFormat::Yuv422 => (8 * fmbw, 16 * fmbh),
+        // 4:4:4 — chroma matches luma.
+        PixelFormat::Yuv444 => (16 * fmbw, 16 * fmbh),
+    };
+    ReferencePlaneDimensions {
+        rpyw,
+        rpyh,
+        rpcw,
+        rpch,
+    }
+}
+
+/// Classification of a video-data packet for the §7.11 step 1 /
+/// step 2 branch.
+///
+/// §7.11 reads "If the size of the data packet is non-zero" (step 1)
+/// vs "Otherwise" (step 2). The two branches behave very differently:
+/// step 1 chains §7.1 → §7.3 → §7.4 → (§7.5.2) → §7.6 → §7.7.3 →
+/// §7.8.2 over the packet body, whereas step 2 synthesises a
+/// minimal per-frame state with no bitstream reads at all (`FTYPE =
+/// 1`, `NQIS = 1`, `QIS[0] = 63`, `BCODED[bi] = 0` for every
+/// block).
+///
+/// This enum lets a future §7.11 driver dispatch the branch off a
+/// typed value rather than re-checking `packet.is_empty()` at every
+/// call site, and lets callers test the classifier in isolation
+/// before the full driver lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameDecodePacket<'a> {
+    /// Step 2 path: a zero-byte packet, treated exactly like an
+    /// inter frame with no coded blocks. The driver synthesises
+    /// `FTYPE = 1`, `NQIS = 1`, `QIS[0] = 63`, and `BCODED` is
+    /// all zero; no bitstream is consumed.
+    Empty,
+    /// Step 1 path: a non-empty packet whose body is to be decoded
+    /// through the §7.1 → §7.3 → §7.4 → (§7.5.2) → §7.6 → §7.7.3 →
+    /// §7.8.2 chain.
+    Data(&'a [u8]),
+}
+
+impl<'a> FrameDecodePacket<'a> {
+    /// True when this is the step 2 zero-byte branch.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, FrameDecodePacket::Empty)
+    }
+
+    /// The packet body, if any. `None` for the step 2 branch.
+    pub fn data(&self) -> Option<&'a [u8]> {
+        match self {
+            FrameDecodePacket::Empty => None,
+            FrameDecodePacket::Data(bytes) => Some(bytes),
+        }
+    }
+}
+
+/// Classify a video-data packet for the §7.11 step 1 / step 2
+/// branch.
+///
+/// Returns [`FrameDecodePacket::Empty`] for a zero-length packet
+/// (step 2 special case) and [`FrameDecodePacket::Data`] otherwise
+/// (step 1). The classifier is a pure predicate; it does not read
+/// the packet body.
+///
+/// This is the first piece of the §7.11 frame-decode driver to
+/// land; subsequent rounds will chain the §7.1 / §7.3 / §7.4 /
+/// §7.5.2 / §7.6 / §7.7.3 / §7.8.2 / §7.9.4 / §7.10.3 procedures
+/// behind it.
+pub fn classify_frame_decode_packet(packet: &[u8]) -> FrameDecodePacket<'_> {
+    if packet.is_empty() {
+        FrameDecodePacket::Empty
+    } else {
+        FrameDecodePacket::Data(packet)
+    }
 }
 
 /// No-op codec registration. Decoder/encoder wiring will land in a
@@ -20486,5 +20649,157 @@ mod tests {
             format!("{}", LoopFilterFrameBlockSlice::ByOfBlock),
             "by_of_block"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // §7.11 reference-plane geometry + packet classifier (round 250).
+    // ----------------------------------------------------------------
+
+    /// Build a minimal [`TheoraIdentHeader`] for the §7.11 helpers.
+    /// The §7.11 step 3 / 4 derivations consult only `fmbw`, `fmbh`,
+    /// and `pf`; the other fields carry deterministic defaults so the
+    /// helper-under-test is isolated from unrelated header fields.
+    fn ident_geometry(fmbw: u16, fmbh: u16, pf: PixelFormat) -> TheoraIdentHeader {
+        TheoraIdentHeader {
+            vmaj: 3,
+            vmin: 2,
+            vrev: 1,
+            fmbw,
+            fmbh,
+            picw: (fmbw as u32) * 16,
+            pich: (fmbh as u32) * 16,
+            picx: 0,
+            picy: 0,
+            frn: 25,
+            frd: 1,
+            parn: 1,
+            pard: 1,
+            cs: ColorSpace::Undefined,
+            nombr: 0,
+            qual: 0,
+            kfgshift: 0,
+            pf,
+        }
+    }
+
+    /// §7.11 step 3: `RPYW = 16 * FMBW`, `RPYH = 16 * FMBH` regardless
+    /// of `PF`. Tested across all three legal `PF` values.
+    #[test]
+    fn reference_plane_dims_luma_is_macroblock_extent() {
+        for pf in [
+            PixelFormat::Yuv420,
+            PixelFormat::Yuv422,
+            PixelFormat::Yuv444,
+        ] {
+            let h = ident_geometry(2, 2, pf);
+            let d = reference_plane_dimensions_from_ident(&h);
+            assert_eq!(d.rpyw, 32, "{pf:?}: rpyw");
+            assert_eq!(d.rpyh, 32, "{pf:?}: rpyh");
+        }
+    }
+
+    /// §7.11 step 4 / Table 7.89: `PF = 0` (4:2:0) → chroma halved on
+    /// both axes.
+    #[test]
+    fn reference_plane_dims_chroma_pf_420() {
+        let h = ident_geometry(4, 6, PixelFormat::Yuv420);
+        let d = reference_plane_dimensions_from_ident(&h);
+        assert_eq!(d.rpyw, 64);
+        assert_eq!(d.rpyh, 96);
+        assert_eq!(d.rpcw, 32);
+        assert_eq!(d.rpch, 48);
+    }
+
+    /// §7.11 step 4 / Table 7.89: `PF = 2` (4:2:2) → chroma halved
+    /// horizontally, full vertical extent.
+    #[test]
+    fn reference_plane_dims_chroma_pf_422() {
+        let h = ident_geometry(4, 6, PixelFormat::Yuv422);
+        let d = reference_plane_dimensions_from_ident(&h);
+        assert_eq!(d.rpyw, 64);
+        assert_eq!(d.rpyh, 96);
+        assert_eq!(d.rpcw, 32);
+        assert_eq!(d.rpch, 96);
+    }
+
+    /// §7.11 step 4 / Table 7.89: `PF = 3` (4:4:4) → chroma matches
+    /// luma.
+    #[test]
+    fn reference_plane_dims_chroma_pf_444() {
+        let h = ident_geometry(4, 6, PixelFormat::Yuv444);
+        let d = reference_plane_dimensions_from_ident(&h);
+        assert_eq!(d.rpyw, 64);
+        assert_eq!(d.rpyh, 96);
+        assert_eq!(d.rpcw, 64);
+        assert_eq!(d.rpch, 96);
+    }
+
+    /// Verify the largest legal `FMBW` / `FMBH` (`u16::MAX`) does not
+    /// overflow `u32` when multiplied by 16. The result is
+    /// `16 * 0xFFFF = 0x000F_FFF0`.
+    #[test]
+    fn reference_plane_dims_max_fmbw_fmbh_no_overflow() {
+        let h = ident_geometry(u16::MAX, u16::MAX, PixelFormat::Yuv444);
+        let d = reference_plane_dimensions_from_ident(&h);
+        assert_eq!(d.rpyw, 16 * (u16::MAX as u32));
+        assert_eq!(d.rpyh, 16 * (u16::MAX as u32));
+        assert_eq!(d.rpcw, 16 * (u16::MAX as u32));
+        assert_eq!(d.rpch, 16 * (u16::MAX as u32));
+    }
+
+    /// The reference-plane dimensions are intentionally distinct from
+    /// the picture region (`picw` / `pich`). A header whose visible
+    /// region is smaller than the macroblock extent still yields
+    /// macroblock-aligned reference planes.
+    #[test]
+    fn reference_plane_dims_independent_of_picture_region() {
+        // Coded 32×32, visible 26×18 — the picture-region-non-mb-aligned
+        // fixture shape.
+        let mut h = ident_geometry(2, 2, PixelFormat::Yuv420);
+        h.picw = 26;
+        h.pich = 18;
+        h.picx = 0;
+        h.picy = 14;
+        let d = reference_plane_dimensions_from_ident(&h);
+        // RPYW/RPYH stay 32×32 — the macroblock extent.
+        assert_eq!(d.rpyw, 32);
+        assert_eq!(d.rpyh, 32);
+        assert_eq!(d.rpcw, 16);
+        assert_eq!(d.rpch, 16);
+    }
+
+    /// §7.11 step 1 / step 2 branch: a zero-byte packet classifies as
+    /// [`FrameDecodePacket::Empty`].
+    #[test]
+    fn classify_frame_decode_packet_zero_bytes_is_empty() {
+        let p = classify_frame_decode_packet(&[]);
+        assert_eq!(p, FrameDecodePacket::Empty);
+        assert!(p.is_empty());
+        assert_eq!(p.data(), None);
+    }
+
+    /// §7.11 step 1 / step 2 branch: a non-empty packet classifies as
+    /// [`FrameDecodePacket::Data`] carrying the packet bytes.
+    #[test]
+    fn classify_frame_decode_packet_nonempty_is_data() {
+        let bytes: &[u8] = &[0x00, 0x01, 0x02];
+        let p = classify_frame_decode_packet(bytes);
+        assert!(!p.is_empty());
+        assert_eq!(p.data(), Some(bytes));
+        match p {
+            FrameDecodePacket::Data(b) => assert_eq!(b, bytes),
+            _ => panic!("expected Data, got {p:?}"),
+        }
+    }
+
+    /// §7.11 step 1 / step 2 branch: a single-byte packet still
+    /// classifies as `Data`. Only `len == 0` triggers the step 2 path
+    /// per the spec wording "If the size of the data packet is
+    /// non-zero".
+    #[test]
+    fn classify_frame_decode_packet_one_byte_is_data() {
+        let p = classify_frame_decode_packet(&[0x55]);
+        assert!(!p.is_empty());
+        assert_eq!(p.data(), Some(&[0x55][..]));
     }
 }

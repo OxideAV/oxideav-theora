@@ -6,6 +6,42 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.11 step 7 + step 8 reference-frame promotion (round 256).
+  New owned `ReferenceFrameStore` wraps the six long-lived
+  reference-frame planes (`GOLDREFY` / `GOLDREFCB` / `GOLDREFCR`
+  + `PREVREFY` / `PREVREFCB` / `PREVREFCR`) the §7.11 driver hands
+  forward to the next frame's §7.9.4 reconstruction call. Three
+  constructors: `zeroed(dims_y, dims_c)` for fresh allocation,
+  `from_reference_plane_dimensions(ref_dims)` for the convenience
+  bridge from the round-250 `reference_plane_dimensions_from_ident`
+  output, and `new(...)` for buffer-recycling decoders that bring
+  their own allocations. The `promote_from_reconstructed(rec,
+  ftype)` method executes step 7 (`if FTYPE == 0 then GOLDREF* :=
+  REC*`) and step 8 (`PREVREF* := REC*` unconditionally) via
+  `copy_from_slice`, with shape + length validation against the
+  store's declared `(RPYW, RPYH)` / `(RPCW, RPCH)` geometry.
+  `as_reference_plane_set()` returns a borrowed
+  `ReferencePlaneSet<'_>` ready for the next frame's §7.9.4 call.
+  Companion helpers `frame_type_from_ftype(ftype: u8) ->
+  Result<FrameType, Error>` and `frame_type_as_ftype(ft: FrameType)
+  -> u8` decode the §7.1 / §7.11-step-2 raw 1-bit `FTYPE` field
+  into the existing `FrameType` enum with a typed
+  `Error::FrameTypeOutOfRange` reject for out-of-range bytes. Four
+  new `Error` variants: `FrameTypeOutOfRange`,
+  `ReferenceFrameStoreDimensionsOverflow`,
+  `ReferenceFrameStorePlaneLenMismatch`,
+  `ReferenceFrameStoreDimensionMismatch`. 13 new tests (total now
+  469): FrameType round-trip + 254 rejected raw values; zeroed +
+  from-ref-dims allocation; `new` rejects on Y-plane and Cb-plane
+  length mismatch; intra promotion writes both Golden and Previous;
+  inter promotion writes only Previous (Golden preserved);
+  intra-then-inter sequence matches spec semantics (Golden frozen
+  at intra-frame pixels, Previous tracking latest); Y / Cr
+  dimension mismatch errors carry the right `plane` tag;
+  reconstructed-plane `len()` mismatch surfaces as `rec_y`;
+  `as_reference_plane_set` round-trip exposes the promoted bytes
+  to the next frame's §7.9.4 driver; promotion reuses existing
+  buffers without reallocating (pointer equality before/after).
 - §7.11 Complete Frame Decode entry-shape primitives (round 250).
   Two new public entry points wire the first plumbing for the
   §7.11 driver: `reference_plane_dimensions_from_ident(ident:

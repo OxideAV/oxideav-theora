@@ -1133,6 +1133,60 @@ pub enum Error {
         /// Expected `block_w * block_h` for the plane.
         expected: usize,
     },
+    /// The §7.11 step 1 / step 2 / step 7 dispatcher was given a
+    /// `FTYPE` outside its 1-bit range. §7.1 step 2 decodes `FTYPE`
+    /// as a single bit (`0` = intra, `1` = inter), so values above
+    /// `1` indicate a caller bug.
+    FrameTypeOutOfRange {
+        /// The offending `FTYPE` value.
+        ftype: u8,
+    },
+    /// A [`ReferenceFrameStore`] plane dimension overflowed `usize`
+    /// when computing `width * height`. The store backs each plane
+    /// with a flat `Vec<u8>`; the product must fit in `usize` to
+    /// allocate the buffer.
+    ReferenceFrameStoreDimensionsOverflow {
+        /// Plane width.
+        width: u32,
+        /// Plane height.
+        height: u32,
+    },
+    /// A plane buffer handed to [`ReferenceFrameStore::new`] (or a
+    /// reconstructed-frame plane passed to
+    /// [`ReferenceFrameStore::promote_from_reconstructed`]) had a
+    /// `len()` other than `width * height`. The plane is stored as
+    /// a flat row-major buffer, so the length must match the
+    /// declared shape exactly.
+    ReferenceFrameStorePlaneLenMismatch {
+        /// Which plane tripped the check. One of
+        /// `"golden_y"`, `"golden_cb"`, `"golden_cr"`,
+        /// `"previous_y"`, `"previous_cb"`, `"previous_cr"`,
+        /// `"rec_y"`, `"rec_cb"`, `"rec_cr"`.
+        plane: &'static str,
+        /// Buffer length the caller supplied.
+        got: usize,
+        /// Expected length (`width * height`).
+        expected: usize,
+    },
+    /// A reconstructed-frame plane handed to
+    /// [`ReferenceFrameStore::promote_from_reconstructed`] had a
+    /// `(width, height)` shape that did not match the store's
+    /// declared reference-plane shape. §7.11 reconstructs at
+    /// `(RPYW, RPYH)` and `(RPCW, RPCH)`; the promotion step's
+    /// `copy_from_slice` requires equal sizes.
+    ReferenceFrameStoreDimensionMismatch {
+        /// Which plane tripped the check. One of `"y"`, `"cb"`,
+        /// `"cr"`.
+        plane: &'static str,
+        /// Reconstructed-plane width supplied.
+        got_w: u32,
+        /// Reconstructed-plane height supplied.
+        got_h: u32,
+        /// Store's declared width for this plane.
+        expected_w: u32,
+        /// Store's declared height for this plane.
+        expected_h: u32,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -1687,6 +1741,32 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-theora: §7.10.3 raster walk for pli={pli} has {got} entries, expected {expected}"
+            ),
+            Error::FrameTypeOutOfRange { ftype } => write!(
+                f,
+                "oxideav-theora: §7.11 FTYPE = {ftype} outside 1-bit range 0..=1"
+            ),
+            Error::ReferenceFrameStoreDimensionsOverflow { width, height } => write!(
+                f,
+                "oxideav-theora: §7.11 reference-frame store dimensions {width}x{height} overflow usize"
+            ),
+            Error::ReferenceFrameStorePlaneLenMismatch {
+                plane,
+                got,
+                expected,
+            } => write!(
+                f,
+                "oxideav-theora: §7.11 reference-frame store plane {plane} has {got} bytes, expected {expected}"
+            ),
+            Error::ReferenceFrameStoreDimensionMismatch {
+                plane,
+                got_w,
+                got_h,
+                expected_w,
+                expected_h,
+            } => write!(
+                f,
+                "oxideav-theora: §7.11 reconstructed-frame plane {plane} is {got_w}x{got_h}, store expects {expected_w}x{expected_h}"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -8671,6 +8751,330 @@ pub fn classify_frame_decode_packet(packet: &[u8]) -> FrameDecodePacket<'_> {
         FrameDecodePacket::Empty
     } else {
         FrameDecodePacket::Data(packet)
+    }
+}
+
+/// Decode a `FrameType` from the raw 1-bit `FTYPE` value the §7.1
+/// frame-header parser produces (and the §7.11 step 2 special case
+/// synthesises as `1`).
+///
+/// The existing [`FrameType`] enum (defined alongside §7.1) carries
+/// the `0` / `1` discriminants of the Theora spec one-for-one; this
+/// helper is the §7.11 dispatcher's typed-bit decoder, returning
+/// [`Error::FrameTypeOutOfRange`] for any value other than 0 / 1
+/// rather than panicking on a hand-built fixture.
+pub fn frame_type_from_ftype(ftype: u8) -> Result<FrameType, Error> {
+    match ftype {
+        0 => Ok(FrameType::Intra),
+        1 => Ok(FrameType::Inter),
+        other => Err(Error::FrameTypeOutOfRange { ftype: other }),
+    }
+}
+
+/// The raw 1-bit `FTYPE` value (`0` for intra, `1` for inter) a
+/// `FrameType` corresponds to. Inverse of [`frame_type_from_ftype`].
+pub fn frame_type_as_ftype(ft: FrameType) -> u8 {
+    match ft {
+        FrameType::Intra => 0,
+        FrameType::Inter => 1,
+    }
+}
+
+/// Owned reference-frame storage for the §7.11 step 7 / step 8
+/// promotion path.
+///
+/// §7.11's procedure produces three reconstructed planes (`RECY` /
+/// `RECCB` / `RECCR`, output of step 6) and then promotes them into
+/// two long-lived reference slots that the **next** frame's §7.9.4
+/// driver will read through Table 7.75:
+///
+/// * **Golden** (`GOLDREFY` / `GOLDREFCB` / `GOLDREFCR`) — only
+///   updated on intra frames (§7.11 step 7).
+/// * **Previous** (`PREVREFY` / `PREVREFCB` / `PREVREFCR`) — updated
+///   on every frame (§7.11 step 8).
+///
+/// Whereas [`ReferencePlaneSet`] is a borrowed view consumed by a
+/// **single** §7.9.4 call, `ReferenceFrameStore` is the owned
+/// counterpart that survives across frames — it persists the bytes
+/// from frame *N*'s reconstruction so frame *N+1*'s reconstruction
+/// driver can read them as `PREVREF*` / `GOLDREF*`.
+///
+/// Layout matches [`ReconstructedFrame`]: each plane is a flat
+/// `Vec<u8>` in lower-left row-major order. The Y plane has
+/// `dims_y.width * dims_y.height` bytes; Cb / Cr each have
+/// `dims_c.width * dims_c.height` bytes, where the chroma
+/// dimensions follow Table 7.89 keyed by `PF`.
+///
+/// Construction is intentionally explicit — callers must allocate
+/// the six plane buffers themselves (sized from
+/// [`reference_plane_dimensions_from_ident`] or by other means) and
+/// pass them to [`ReferenceFrameStore::new`], or use
+/// [`ReferenceFrameStore::zeroed`] / `from_reference_plane_dimensions`
+/// to allocate fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceFrameStore {
+    /// `GOLDREFY` plane.
+    pub golden_y: Vec<u8>,
+    /// `GOLDREFCB` plane.
+    pub golden_cb: Vec<u8>,
+    /// `GOLDREFCR` plane.
+    pub golden_cr: Vec<u8>,
+    /// `PREVREFY` plane.
+    pub previous_y: Vec<u8>,
+    /// `PREVREFCB` plane.
+    pub previous_cb: Vec<u8>,
+    /// `PREVREFCR` plane.
+    pub previous_cr: Vec<u8>,
+    /// Y-plane dimensions (`RPYW` × `RPYH` per §7.11 step 3).
+    pub dims_y: PlaneDimensions,
+    /// Cb / Cr plane dimensions (`RPCW` × `RPCH` per §7.11 step 4 /
+    /// Table 7.89). Cb and Cr always share the same shape.
+    pub dims_c: PlaneDimensions,
+}
+
+impl ReferenceFrameStore {
+    /// Allocate a zero-filled reference store sized from
+    /// `dims_y` / `dims_c`.
+    ///
+    /// The §7.11 driver invokes this once at stream-setup time
+    /// (after parsing the identification header) and then keeps the
+    /// store alive for the lifetime of the stream, mutating it via
+    /// [`ReferenceFrameStore::promote_from_reconstructed`] after
+    /// each §7.11 invocation.
+    ///
+    /// Returns [`Error::ReferenceFrameStoreDimensionsOverflow`] if
+    /// `width * height` overflows `usize` on either plane.
+    pub fn zeroed(dims_y: PlaneDimensions, dims_c: PlaneDimensions) -> Result<Self, Error> {
+        let len_y = Self::plane_len(dims_y)?;
+        let len_c = Self::plane_len(dims_c)?;
+        Ok(Self {
+            golden_y: vec![0u8; len_y],
+            golden_cb: vec![0u8; len_c],
+            golden_cr: vec![0u8; len_c],
+            previous_y: vec![0u8; len_y],
+            previous_cb: vec![0u8; len_c],
+            previous_cr: vec![0u8; len_c],
+            dims_y,
+            dims_c,
+        })
+    }
+
+    /// Build a store from caller-provided plane buffers, validating
+    /// each plane's length against the declared dimensions.
+    ///
+    /// Use this when the caller is recycling existing allocations
+    /// (e.g. a streaming decoder reusing buffer pools across
+    /// frames). The dimensions are authoritative; each plane's
+    /// `len()` must equal `width * height`.
+    ///
+    /// Errors:
+    /// * [`Error::ReferenceFrameStoreDimensionsOverflow`] if
+    ///   `width * height` overflows `usize` on either plane shape.
+    /// * [`Error::ReferenceFrameStorePlaneLenMismatch`] for any
+    ///   plane whose `len()` differs from the expected product.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        golden_y: Vec<u8>,
+        golden_cb: Vec<u8>,
+        golden_cr: Vec<u8>,
+        previous_y: Vec<u8>,
+        previous_cb: Vec<u8>,
+        previous_cr: Vec<u8>,
+        dims_y: PlaneDimensions,
+        dims_c: PlaneDimensions,
+    ) -> Result<Self, Error> {
+        let len_y = Self::plane_len(dims_y)?;
+        let len_c = Self::plane_len(dims_c)?;
+        // Order matters: report the first mismatched plane in the
+        // (GoldY, GoldCb, GoldCr, PrevY, PrevCb, PrevCr) sequence so
+        // callers can pinpoint the bad buffer.
+        let pairs: [(&'static str, usize, usize); 6] = [
+            ("golden_y", golden_y.len(), len_y),
+            ("golden_cb", golden_cb.len(), len_c),
+            ("golden_cr", golden_cr.len(), len_c),
+            ("previous_y", previous_y.len(), len_y),
+            ("previous_cb", previous_cb.len(), len_c),
+            ("previous_cr", previous_cr.len(), len_c),
+        ];
+        for (name, got, expected) in pairs {
+            if got != expected {
+                return Err(Error::ReferenceFrameStorePlaneLenMismatch {
+                    plane: name,
+                    got,
+                    expected,
+                });
+            }
+        }
+        Ok(Self {
+            golden_y,
+            golden_cb,
+            golden_cr,
+            previous_y,
+            previous_cb,
+            previous_cr,
+            dims_y,
+            dims_c,
+        })
+    }
+
+    /// Allocate a fresh store from reference-plane dimensions —
+    /// the convenience path that wires
+    /// [`reference_plane_dimensions_from_ident`] directly into
+    /// [`ReferenceFrameStore::zeroed`].
+    pub fn from_reference_plane_dimensions(
+        ref_dims: ReferencePlaneDimensions,
+    ) -> Result<Self, Error> {
+        let dims_y = PlaneDimensions {
+            width: ref_dims.rpyw,
+            height: ref_dims.rpyh,
+        };
+        let dims_c = PlaneDimensions {
+            width: ref_dims.rpcw,
+            height: ref_dims.rpch,
+        };
+        Self::zeroed(dims_y, dims_c)
+    }
+
+    /// Execute §7.11 step 7 + step 8 on the freshly reconstructed
+    /// frame.
+    ///
+    /// Step 7 (intra only): copy `RECY` / `RECCB` / `RECCR` into
+    /// `GOLDREFY` / `GOLDREFCB` / `GOLDREFCR`.
+    ///
+    /// Step 8 (every frame): copy `RECY` / `RECCB` / `RECCR` into
+    /// `PREVREFY` / `PREVREFCB` / `PREVREFCR`.
+    ///
+    /// The reconstructed-frame plane dimensions must match this
+    /// store's reference-plane dimensions exactly — §7.11 step 5
+    /// produces the reconstructed frame at `(RPYW, RPYH)` and
+    /// `(RPCW, RPCH)`, the same shape this store was sized for.
+    ///
+    /// Errors:
+    /// * [`Error::ReferenceFrameStoreDimensionMismatch`] if any
+    ///   reconstructed-plane dimension disagrees with the store's
+    ///   declared shape.
+    /// * [`Error::ReferenceFrameStorePlaneLenMismatch`] if a
+    ///   reconstructed plane's `len()` is inconsistent with its
+    ///   declared `width * height` (a malformed
+    ///   [`ReconstructedFrame`]; same guard as
+    ///   [`ReferenceFrameStore::new`]).
+    pub fn promote_from_reconstructed(
+        &mut self,
+        rec: &ReconstructedFrame,
+        ftype: FrameType,
+    ) -> Result<(), Error> {
+        // Validate that the reconstructed-frame plane shapes match
+        // the store's declared shapes — Y first, then chroma. The
+        // earliest mismatched plane wins so the diagnostic surfaces
+        // the first geometry disagreement.
+        if rec.dims_y != self.dims_y {
+            return Err(Error::ReferenceFrameStoreDimensionMismatch {
+                plane: "y",
+                got_w: rec.dims_y.width,
+                got_h: rec.dims_y.height,
+                expected_w: self.dims_y.width,
+                expected_h: self.dims_y.height,
+            });
+        }
+        if rec.dims_cb != self.dims_c {
+            return Err(Error::ReferenceFrameStoreDimensionMismatch {
+                plane: "cb",
+                got_w: rec.dims_cb.width,
+                got_h: rec.dims_cb.height,
+                expected_w: self.dims_c.width,
+                expected_h: self.dims_c.height,
+            });
+        }
+        if rec.dims_cr != self.dims_c {
+            return Err(Error::ReferenceFrameStoreDimensionMismatch {
+                plane: "cr",
+                got_w: rec.dims_cr.width,
+                got_h: rec.dims_cr.height,
+                expected_w: self.dims_c.width,
+                expected_h: self.dims_c.height,
+            });
+        }
+        // Validate the reconstructed-frame plane vector lengths.
+        // `ReconstructedFrame`'s invariants normally guarantee these
+        // but the type is `pub`-constructed so a hand-built fixture
+        // could violate them — surface a typed error rather than
+        // panicking inside `copy_from_slice`.
+        let len_y = Self::plane_len(self.dims_y)?;
+        let len_c = Self::plane_len(self.dims_c)?;
+        for (name, got, expected) in [
+            ("rec_y", rec.samples_y.len(), len_y),
+            ("rec_cb", rec.samples_cb.len(), len_c),
+            ("rec_cr", rec.samples_cr.len(), len_c),
+        ] {
+            if got != expected {
+                return Err(Error::ReferenceFrameStorePlaneLenMismatch {
+                    plane: name,
+                    got,
+                    expected,
+                });
+            }
+        }
+        // Step 7 (intra only): copy reconstructed planes into the
+        // Golden slot. `copy_from_slice` matches the spec's
+        // element-by-element "Assign GOLDREFY the value RECY"
+        // wording for `u8` buffers of equal length.
+        if matches!(ftype, FrameType::Intra) {
+            self.golden_y.copy_from_slice(&rec.samples_y);
+            self.golden_cb.copy_from_slice(&rec.samples_cb);
+            self.golden_cr.copy_from_slice(&rec.samples_cr);
+        }
+        // Step 8 (every frame): copy reconstructed planes into the
+        // Previous slot.
+        self.previous_y.copy_from_slice(&rec.samples_y);
+        self.previous_cb.copy_from_slice(&rec.samples_cb);
+        self.previous_cr.copy_from_slice(&rec.samples_cr);
+        Ok(())
+    }
+
+    /// Borrowed-plane view suitable for handing to the next frame's
+    /// §7.9.4 driver — the typed bridge from this owned store back
+    /// to a [`ReferencePlaneSet<'_>`].
+    ///
+    /// Returns [`Error::ReferencePlaneZeroDimension`] or
+    /// [`Error::ReferencePlaneLenMismatch`] from the underlying
+    /// [`ReferencePlane::new`] checks if the store's dimensions or
+    /// plane lengths somehow disagree (impossible on a store built
+    /// via [`ReferenceFrameStore::new`] or
+    /// [`ReferenceFrameStore::zeroed`], but the `pub` fields make
+    /// post-construction mutation possible).
+    pub fn as_reference_plane_set(&self) -> Result<ReferencePlaneSet<'_>, Error> {
+        Ok(ReferencePlaneSet {
+            previous_y: ReferencePlane::new(
+                self.dims_y.width,
+                self.dims_y.height,
+                &self.previous_y,
+            )?,
+            previous_cb: ReferencePlane::new(
+                self.dims_c.width,
+                self.dims_c.height,
+                &self.previous_cb,
+            )?,
+            previous_cr: ReferencePlane::new(
+                self.dims_c.width,
+                self.dims_c.height,
+                &self.previous_cr,
+            )?,
+            golden_y: ReferencePlane::new(self.dims_y.width, self.dims_y.height, &self.golden_y)?,
+            golden_cb: ReferencePlane::new(self.dims_c.width, self.dims_c.height, &self.golden_cb)?,
+            golden_cr: ReferencePlane::new(self.dims_c.width, self.dims_c.height, &self.golden_cr)?,
+        })
+    }
+
+    /// Compute `width * height` as a `usize`, returning
+    /// [`Error::ReferenceFrameStoreDimensionsOverflow`] if the
+    /// product would wrap.
+    fn plane_len(dims: PlaneDimensions) -> Result<usize, Error> {
+        (dims.width as usize)
+            .checked_mul(dims.height as usize)
+            .ok_or(Error::ReferenceFrameStoreDimensionsOverflow {
+                width: dims.width,
+                height: dims.height,
+            })
     }
 }
 
@@ -20801,5 +21205,441 @@ mod tests {
         let p = classify_frame_decode_packet(&[0x55]);
         assert!(!p.is_empty());
         assert_eq!(p.data(), Some(&[0x55][..]));
+    }
+
+    // -----------------------------------------------------------------
+    // §7.11 step 7 + step 8 — reference-frame promotion
+    // -----------------------------------------------------------------
+
+    /// Build a `ReconstructedFrame` of the given shape with each
+    /// plane filled by a per-plane fill byte so the §7.11 step 7 /
+    /// step 8 copy can be checked byte-for-byte.
+    fn synth_reconstructed(
+        dims_y: PlaneDimensions,
+        dims_c: PlaneDimensions,
+        fill_y: u8,
+        fill_cb: u8,
+        fill_cr: u8,
+    ) -> ReconstructedFrame {
+        let len_y = (dims_y.width as usize) * (dims_y.height as usize);
+        let len_c = (dims_c.width as usize) * (dims_c.height as usize);
+        ReconstructedFrame {
+            samples_y: vec![fill_y; len_y],
+            samples_cb: vec![fill_cb; len_c],
+            samples_cr: vec![fill_cr; len_c],
+            dims_y,
+            dims_cb: dims_c,
+            dims_cr: dims_c,
+        }
+    }
+
+    /// `frame_type_from_ftype` round-trips both spec values and
+    /// rejects everything else.
+    #[test]
+    fn frame_type_from_ftype_round_trips() {
+        assert_eq!(frame_type_from_ftype(0).unwrap(), FrameType::Intra);
+        assert_eq!(frame_type_from_ftype(1).unwrap(), FrameType::Inter);
+        assert_eq!(frame_type_as_ftype(FrameType::Intra), 0);
+        assert_eq!(frame_type_as_ftype(FrameType::Inter), 1);
+        for ftype in 2u8..=255 {
+            match frame_type_from_ftype(ftype) {
+                Err(Error::FrameTypeOutOfRange { ftype: got }) => assert_eq!(got, ftype),
+                other => panic!("expected FrameTypeOutOfRange for {ftype}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `ReferenceFrameStore::zeroed` allocates all six plane buffers
+    /// at the declared dimensions and zero-fills them.
+    #[test]
+    fn reference_frame_store_zeroed_allocates_correct_sizes() {
+        let dims_y = PlaneDimensions {
+            width: 32,
+            height: 32,
+        };
+        let dims_c = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        assert_eq!(store.dims_y, dims_y);
+        assert_eq!(store.dims_c, dims_c);
+        assert_eq!(store.golden_y.len(), 32 * 32);
+        assert_eq!(store.previous_y.len(), 32 * 32);
+        assert_eq!(store.golden_cb.len(), 16 * 16);
+        assert_eq!(store.golden_cr.len(), 16 * 16);
+        assert_eq!(store.previous_cb.len(), 16 * 16);
+        assert_eq!(store.previous_cr.len(), 16 * 16);
+        assert!(store.golden_y.iter().all(|&b| b == 0));
+        assert!(store.previous_y.iter().all(|&b| b == 0));
+        assert!(store.golden_cb.iter().all(|&b| b == 0));
+        assert!(store.golden_cr.iter().all(|&b| b == 0));
+        assert!(store.previous_cb.iter().all(|&b| b == 0));
+        assert!(store.previous_cr.iter().all(|&b| b == 0));
+    }
+
+    /// `from_reference_plane_dimensions` mirrors the Table 7.89 4:2:0
+    /// row: chroma planes are halved on both axes.
+    #[test]
+    fn reference_frame_store_from_ref_dims_4_2_0() {
+        let ref_dims = ReferencePlaneDimensions {
+            rpyw: 32,
+            rpyh: 32,
+            rpcw: 16,
+            rpch: 16,
+        };
+        let store = ReferenceFrameStore::from_reference_plane_dimensions(ref_dims).unwrap();
+        assert_eq!(store.dims_y.width, 32);
+        assert_eq!(store.dims_y.height, 32);
+        assert_eq!(store.dims_c.width, 16);
+        assert_eq!(store.dims_c.height, 16);
+        assert_eq!(store.golden_y.len(), 32 * 32);
+        assert_eq!(store.golden_cb.len(), 16 * 16);
+    }
+
+    /// `ReferenceFrameStore::new` rejects a Y-plane buffer that's the
+    /// wrong size.
+    #[test]
+    fn reference_frame_store_new_rejects_wrong_y_len() {
+        let dims_y = PlaneDimensions {
+            width: 32,
+            height: 32,
+        };
+        let dims_c = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let bad_y = vec![0u8; 100]; // not 32*32 = 1024
+        let ok_y = vec![0u8; 32 * 32];
+        let ok_c = vec![0u8; 16 * 16];
+        let err = ReferenceFrameStore::new(
+            bad_y,
+            ok_c.clone(),
+            ok_c.clone(),
+            ok_y.clone(),
+            ok_c.clone(),
+            ok_c.clone(),
+            dims_y,
+            dims_c,
+        )
+        .unwrap_err();
+        match err {
+            Error::ReferenceFrameStorePlaneLenMismatch {
+                plane,
+                got,
+                expected,
+            } => {
+                assert_eq!(plane, "golden_y");
+                assert_eq!(got, 100);
+                assert_eq!(expected, 1024);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `ReferenceFrameStore::new` rejects a chroma-plane buffer
+    /// mismatch on the second slot (`golden_cb`).
+    #[test]
+    fn reference_frame_store_new_rejects_wrong_cb_len() {
+        let dims_y = PlaneDimensions {
+            width: 32,
+            height: 32,
+        };
+        let dims_c = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let ok_y = vec![0u8; 32 * 32];
+        let ok_c = vec![0u8; 16 * 16];
+        let bad_cb = vec![0u8; 7];
+        let err = ReferenceFrameStore::new(
+            ok_y.clone(),
+            bad_cb,
+            ok_c.clone(),
+            ok_y.clone(),
+            ok_c.clone(),
+            ok_c.clone(),
+            dims_y,
+            dims_c,
+        )
+        .unwrap_err();
+        match err {
+            Error::ReferenceFrameStorePlaneLenMismatch { plane, got, .. } => {
+                assert_eq!(plane, "golden_cb");
+                assert_eq!(got, 7);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// §7.11 step 7 + step 8: an intra frame promotes the
+    /// reconstructed planes to BOTH the Golden and Previous slots,
+    /// overwriting whatever was there.
+    #[test]
+    fn promote_intra_writes_both_golden_and_previous() {
+        let dims_y = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dims_c = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let mut store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        // Pre-populate Golden with 0x42 and Previous with 0xAA so we
+        // can prove they're overwritten.
+        store.golden_y.fill(0x42);
+        store.golden_cb.fill(0x42);
+        store.golden_cr.fill(0x42);
+        store.previous_y.fill(0xAA);
+        store.previous_cb.fill(0xAA);
+        store.previous_cr.fill(0xAA);
+        let rec = synth_reconstructed(dims_y, dims_c, 0x10, 0x20, 0x30);
+        store
+            .promote_from_reconstructed(&rec, FrameType::Intra)
+            .unwrap();
+        // Step 7: Golden overwritten with the reconstructed bytes.
+        assert!(store.golden_y.iter().all(|&b| b == 0x10));
+        assert!(store.golden_cb.iter().all(|&b| b == 0x20));
+        assert!(store.golden_cr.iter().all(|&b| b == 0x30));
+        // Step 8: Previous overwritten with the reconstructed bytes.
+        assert!(store.previous_y.iter().all(|&b| b == 0x10));
+        assert!(store.previous_cb.iter().all(|&b| b == 0x20));
+        assert!(store.previous_cr.iter().all(|&b| b == 0x30));
+    }
+
+    /// §7.11 step 7 + step 8: an inter frame promotes to Previous
+    /// only; Golden is left intact from the prior intra frame.
+    #[test]
+    fn promote_inter_writes_only_previous_leaves_golden() {
+        let dims_y = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dims_c = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let mut store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        // Stage prior-intra Golden state (0x77) and stale Previous
+        // state (0xAA) we expect to be overwritten.
+        store.golden_y.fill(0x77);
+        store.golden_cb.fill(0x77);
+        store.golden_cr.fill(0x77);
+        store.previous_y.fill(0xAA);
+        store.previous_cb.fill(0xAA);
+        store.previous_cr.fill(0xAA);
+        let rec = synth_reconstructed(dims_y, dims_c, 0x11, 0x22, 0x33);
+        store
+            .promote_from_reconstructed(&rec, FrameType::Inter)
+            .unwrap();
+        // Step 7 NOT executed: Golden still 0x77.
+        assert!(store.golden_y.iter().all(|&b| b == 0x77));
+        assert!(store.golden_cb.iter().all(|&b| b == 0x77));
+        assert!(store.golden_cr.iter().all(|&b| b == 0x77));
+        // Step 8 executed: Previous now matches the reconstructed
+        // planes.
+        assert!(store.previous_y.iter().all(|&b| b == 0x11));
+        assert!(store.previous_cb.iter().all(|&b| b == 0x22));
+        assert!(store.previous_cr.iter().all(|&b| b == 0x33));
+    }
+
+    /// A two-frame sequence of `Intra` then `Inter` lands the
+    /// canonical reference-state pattern: Golden frozen at the
+    /// intra-frame pixels; Previous tracking the latest reconstructed
+    /// frame.
+    #[test]
+    fn promote_intra_then_inter_sequence_matches_spec_semantics() {
+        let dims_y = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dims_c = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let mut store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        // Frame 0: intra with samples = 0xC8 (luma), 0x40, 0x80.
+        let rec0 = synth_reconstructed(dims_y, dims_c, 0xC8, 0x40, 0x80);
+        store
+            .promote_from_reconstructed(&rec0, FrameType::Intra)
+            .unwrap();
+        // Frame 1: inter with samples = 0xFE (luma), 0x55, 0xAA.
+        let rec1 = synth_reconstructed(dims_y, dims_c, 0xFE, 0x55, 0xAA);
+        store
+            .promote_from_reconstructed(&rec1, FrameType::Inter)
+            .unwrap();
+        // Golden snapshot of frame 0 must be preserved.
+        assert!(store.golden_y.iter().all(|&b| b == 0xC8));
+        assert!(store.golden_cb.iter().all(|&b| b == 0x40));
+        assert!(store.golden_cr.iter().all(|&b| b == 0x80));
+        // Previous reflects frame 1.
+        assert!(store.previous_y.iter().all(|&b| b == 0xFE));
+        assert!(store.previous_cb.iter().all(|&b| b == 0x55));
+        assert!(store.previous_cr.iter().all(|&b| b == 0xAA));
+    }
+
+    /// §7.11 promotion rejects a reconstructed-frame whose Y-plane
+    /// dimensions disagree with the store's reference-plane shape.
+    #[test]
+    fn promote_rejects_y_dimension_mismatch() {
+        let dims_y = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dims_c = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let mut store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        // Reconstructed frame at the wrong luma shape.
+        let bad_dims_y = PlaneDimensions {
+            width: 32,
+            height: 16,
+        };
+        let rec = synth_reconstructed(bad_dims_y, dims_c, 0x10, 0x20, 0x30);
+        let err = store
+            .promote_from_reconstructed(&rec, FrameType::Intra)
+            .unwrap_err();
+        match err {
+            Error::ReferenceFrameStoreDimensionMismatch {
+                plane,
+                got_w,
+                got_h,
+                expected_w,
+                expected_h,
+            } => {
+                assert_eq!(plane, "y");
+                assert_eq!(got_w, 32);
+                assert_eq!(got_h, 16);
+                assert_eq!(expected_w, 16);
+                assert_eq!(expected_h, 16);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// §7.11 promotion rejects a Cr-plane shape mismatch (and
+    /// surfaces it as `plane = "cr"` rather than `"cb"`).
+    #[test]
+    fn promote_rejects_cr_dimension_mismatch() {
+        let dims_y = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dims_c = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let mut store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        // Cb matches; Cr does not.
+        let mut rec = synth_reconstructed(dims_y, dims_c, 0x01, 0x02, 0x03);
+        rec.dims_cr = PlaneDimensions {
+            width: 16,
+            height: 8,
+        };
+        rec.samples_cr = vec![0x03; 16 * 8];
+        let err = store
+            .promote_from_reconstructed(&rec, FrameType::Intra)
+            .unwrap_err();
+        match err {
+            Error::ReferenceFrameStoreDimensionMismatch { plane, .. } => {
+                assert_eq!(plane, "cr");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// §7.11 promotion rejects a malformed reconstructed Y plane
+    /// whose `len()` doesn't match its declared dimensions.
+    #[test]
+    fn promote_rejects_reconstructed_plane_len_mismatch() {
+        let dims_y = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dims_c = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let mut store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        let mut rec = synth_reconstructed(dims_y, dims_c, 0x01, 0x02, 0x03);
+        // Corrupt the Y plane so its declared (16x16) doesn't match
+        // its actual byte count.
+        rec.samples_y.truncate(100);
+        let err = store
+            .promote_from_reconstructed(&rec, FrameType::Intra)
+            .unwrap_err();
+        match err {
+            Error::ReferenceFrameStorePlaneLenMismatch {
+                plane,
+                got,
+                expected,
+            } => {
+                assert_eq!(plane, "rec_y");
+                assert_eq!(got, 100);
+                assert_eq!(expected, 256);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `as_reference_plane_set` exposes the same bytes the next
+    /// frame's §7.9.4 driver will read through Table 7.75.
+    #[test]
+    fn as_reference_plane_set_round_trip() {
+        let dims_y = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dims_c = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let mut store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        let rec = synth_reconstructed(dims_y, dims_c, 0xC0, 0x60, 0xA0);
+        store
+            .promote_from_reconstructed(&rec, FrameType::Intra)
+            .unwrap();
+        let refs = store.as_reference_plane_set().unwrap();
+        assert_eq!(refs.previous_y.rpw, 16);
+        assert_eq!(refs.previous_y.rph, 16);
+        assert_eq!(refs.golden_y.rpw, 16);
+        assert_eq!(refs.golden_y.rph, 16);
+        assert!(refs.previous_y.samples.iter().all(|&b| b == 0xC0));
+        assert!(refs.golden_y.samples.iter().all(|&b| b == 0xC0));
+        assert!(refs.previous_cb.samples.iter().all(|&b| b == 0x60));
+        assert!(refs.golden_cr.samples.iter().all(|&b| b == 0xA0));
+    }
+
+    /// The store survives plane-dimension changes between frames as
+    /// long as both frames stay at the original shape. Verifies the
+    /// `copy_from_slice` path doesn't accidentally re-allocate the
+    /// plane buffers.
+    #[test]
+    fn promote_reuses_existing_buffers_no_realloc() {
+        let dims_y = PlaneDimensions {
+            width: 16,
+            height: 16,
+        };
+        let dims_c = PlaneDimensions {
+            width: 8,
+            height: 8,
+        };
+        let mut store = ReferenceFrameStore::zeroed(dims_y, dims_c).unwrap();
+        let ptr_golden_y = store.golden_y.as_ptr();
+        let ptr_previous_y = store.previous_y.as_ptr();
+        let ptr_golden_cb = store.golden_cb.as_ptr();
+        let ptr_previous_cr = store.previous_cr.as_ptr();
+        let rec = synth_reconstructed(dims_y, dims_c, 0xA0, 0xB0, 0xC0);
+        store
+            .promote_from_reconstructed(&rec, FrameType::Intra)
+            .unwrap();
+        // Buffer addresses unchanged — copy_from_slice writes
+        // in-place into the existing allocation.
+        assert_eq!(store.golden_y.as_ptr(), ptr_golden_y);
+        assert_eq!(store.previous_y.as_ptr(), ptr_previous_y);
+        assert_eq!(store.golden_cb.as_ptr(), ptr_golden_cb);
+        assert_eq!(store.previous_cr.as_ptr(), ptr_previous_cr);
     }
 }

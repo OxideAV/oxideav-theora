@@ -2,6 +2,25 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-08
+
+Round 256 wires §7.11 step 7 + step 8 — the reference-frame
+promotion that closes the §7 frame-decode loop. New owned
+`ReferenceFrameStore` carries the six long-lived planes
+(`GOLDREFY` / `GOLDREFCB` / `GOLDREFCR` + `PREVREFY` / `PREVREFCB`
+/ `PREVREFCR`) across frames; `promote_from_reconstructed(rec,
+ftype)` executes step 7 (`if FTYPE == 0 then GOLDREF* := REC*`)
+and step 8 (`PREVREF* := REC*` always) via `copy_from_slice` with
+shape and length validation against the store's declared `(RPYW,
+RPYH)` / `(RPCW, RPCH)` geometry. Three constructors cover
+fresh-allocation, ref-dims-bridge, and buffer-recycling decoders;
+`as_reference_plane_set()` bridges the owned store back to a
+borrowed `ReferencePlaneSet<'_>` for the next frame's §7.9.4 call.
+Companion helpers `frame_type_from_ftype` / `frame_type_as_ftype`
+decode the §7.1 / §7.11-step-2 raw 1-bit `FTYPE` into the existing
+`FrameType` enum with a typed reject for out-of-range bytes.
++13 tests (456 → 469).
+
 ## Status — 2026-06-07
 
 **Identification + comment + setup-entrypoint + §6.4.1 loop-filter

@@ -1187,6 +1187,12 @@ pub enum Error {
         /// Store's declared height for this plane.
         expected_h: u32,
     },
+    /// The §7.11 step 2 empty-packet synthesiser was given an `nbs`
+    /// of zero. The synthesised state's `BCODED` array is sized
+    /// exactly `NBS`, and a zero-block frame is structurally invalid
+    /// (§6.2 step 23 derives `NBS` from `FMBW * FMBH` and both are
+    /// `>= 1`, so `NBS >= 1` for any well-formed Theora stream).
+    EmptyPacketFrameStateZeroNbs,
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -1767,6 +1773,10 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-theora: §7.11 reconstructed-frame plane {plane} is {got_w}x{got_h}, store expects {expected_w}x{expected_h}"
+            ),
+            Error::EmptyPacketFrameStateZeroNbs => write!(
+                f,
+                "oxideav-theora: §7.11 step 2 empty-packet synthesis requires NBS >= 1 (got 0)"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -8780,6 +8790,138 @@ pub fn frame_type_as_ftype(ft: FrameType) -> u8 {
     }
 }
 
+/// The §7.11 step 2 "zero-byte packet" frame state.
+///
+/// §7.11 step 2 (the "Otherwise" branch) handles the special case of
+/// a zero-byte video-data packet by synthesising a deterministic
+/// per-frame state without consuming any bitstream:
+///
+/// * step 2(a): `FTYPE := 1` (inter frame)
+/// * step 2(b): `NQIS := 1`
+/// * step 2(c): `QIS[0] := 63`
+/// * step 2(d): `BCODED[bi] := 0` for every block `bi ∈ 0..NBS`
+///
+/// Subsequent §7.11 steps (3 through 8) then run unchanged: the §7.4
+/// macroblock-modes / §7.5.2 motion-vectors / §7.6 block-level qi /
+/// §7.7.3 DCT-coefficients / §7.8.2 DC-prediction steps all
+/// short-circuit on an all-zero `BCODED` (no coded blocks to walk),
+/// and §7.9.4 reconstructs each uncoded block by copying from the
+/// Previous reference per its step 2(e)i path (§7.9.4 has no §7.5.2
+/// dependency once `BCODED` is empty). The net effect is that an
+/// empty packet emits a frame that is bit-identical to the previous
+/// reference, exactly as the spec narrative describes.
+///
+/// This typed state is the §7.11 step 2 output — distinct from
+/// [`TheoraFrameHeader`] which carries only the §7.1 fields
+/// (`FTYPE` + `QIS`), because step 2 also pre-populates `BCODED`,
+/// whereas step 1's chain leaves `BCODED` to §7.3.
+///
+/// The `bcoded` vector is owned (rather than a borrowed slice)
+/// because the §7.11 driver's subsequent steps mutate it through
+/// shared references — keeping the synthesised state owned matches
+/// the lifecycle of the step 1 chain's outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmptyPacketFrameState {
+    /// `FTYPE` synthesised by §7.11 step 2(a). Always
+    /// [`FrameType::Inter`] (the spec hard-codes `1`).
+    pub ftype: FrameType,
+    /// `NQIS` synthesised by §7.11 step 2(b). Always `1`.
+    pub nqis: u8,
+    /// `QIS` synthesised by §7.11 step 2(b)+(c). Always `[63]`.
+    /// Kept as a `Vec<u8>` (rather than `[u8; 1]`) so the field
+    /// shape matches [`TheoraFrameHeader::qis`] and the §7.9.4 /
+    /// §7.10.3 callers that read `QIS[0]` need no per-branch
+    /// adaptation.
+    pub qis: Vec<u8>,
+    /// `BCODED` synthesised by §7.11 step 2(d). Length is `NBS`;
+    /// every entry is `0` (no block coded).
+    pub bcoded: Vec<u8>,
+}
+
+impl EmptyPacketFrameState {
+    /// Convenience accessor for `QIS[0]` — always `63` for a step 2
+    /// state but exposed so call sites can stay symmetric with the
+    /// step 1 branch (which selects `QIS[0]` dynamically from the
+    /// §7.1 frame header).
+    pub fn qi0(&self) -> u8 {
+        // Step 2(c) guarantees `QIS[0] = 63`, but pull from the
+        // vector rather than hardcoding so a caller mutating `qis`
+        // after construction sees the mutation.
+        self.qis[0]
+    }
+
+    /// `NBS` — number of blocks the synthesised `BCODED` covers.
+    pub fn nbs(&self) -> usize {
+        self.bcoded.len()
+    }
+}
+
+/// Convert the §7.11 step 2 output to a [`TheoraFrameHeader`] view
+/// (`FTYPE` + `QIS` only). The `BCODED` array is not part of the
+/// frame header and is therefore discarded by this conversion;
+/// callers needing `BCODED` should hold onto the
+/// [`EmptyPacketFrameState`] directly.
+impl From<&EmptyPacketFrameState> for TheoraFrameHeader {
+    fn from(state: &EmptyPacketFrameState) -> Self {
+        TheoraFrameHeader {
+            ftype: state.ftype,
+            qis: state.qis.clone(),
+        }
+    }
+}
+
+/// Execute the §7.11 step 2 ("Otherwise" / zero-byte packet) branch,
+/// synthesising the deterministic per-frame state of an empty
+/// packet without consuming any bitstream.
+///
+/// Returns the four hard-coded values per §7.11 step 2 wrapped in
+/// an [`EmptyPacketFrameState`]:
+///
+/// * `FTYPE = 1` (`FrameType::Inter`)
+/// * `NQIS = 1`
+/// * `QIS = [63]`
+/// * `BCODED = [0; NBS]`
+///
+/// `nbs` is the frame's total block count — the same `NBS` derived
+/// from the identification header per §6.2 step 23 (and surfaced as
+/// [`TheoraIdentHeader::nbs`]). It is passed in rather than
+/// re-derived here so the synthesiser can be exercised in unit
+/// tests without building a full identification header.
+///
+/// Errors:
+/// * [`Error::EmptyPacketFrameStateZeroNbs`] if `nbs == 0`. A
+///   zero-block frame is structurally invalid (§6.2 step 23 derives
+///   `NBS` from `FMBW * FMBH`, both `>= 1`), so the synthesiser
+///   surfaces a typed reject for the caller-supplied bound rather
+///   than silently producing an empty `BCODED`.
+///
+/// This is the third piece of the §7.11 frame-decode driver to
+/// land (after [`classify_frame_decode_packet`] and the
+/// [`ReferenceFrameStore`] promotion path); the step 1 chain
+/// (§7.1 → §7.3 → §7.4 → §7.5.2 → §7.6 → §7.7.3 → §7.8.2 on a
+/// shared bit reader) is still pending.
+pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFrameState, Error> {
+    if nbs == 0 {
+        return Err(Error::EmptyPacketFrameStateZeroNbs);
+    }
+    // Step 2(a): FTYPE = 1 — inter frame.
+    let ftype = FrameType::Inter;
+    // Step 2(b): NQIS = 1.
+    let nqis = 1u8;
+    // Step 2(c): QIS[0] = 63.
+    let qis = vec![63u8];
+    // Step 2(d): BCODED[bi] = 0 for every block. `vec![0u8; nbs]`
+    // matches the spec's element-by-element "assign BCODED[bi] the
+    // value zero" wording in a single allocation.
+    let bcoded = vec![0u8; nbs];
+    Ok(EmptyPacketFrameState {
+        ftype,
+        nqis,
+        qis,
+        bcoded,
+    })
+}
+
 /// Owned reference-frame storage for the §7.11 step 7 / step 8
 /// promotion path.
 ///
@@ -9567,6 +9709,7 @@ mod tests {
                 field: CommentField::Comment { index: 7 }
             }
         );
+        let _ = format!("{}", Error::EmptyPacketFrameStateZeroNbs);
         let _ = format!("{}", Error::NotImplemented);
     }
 
@@ -21205,6 +21348,90 @@ mod tests {
         let p = classify_frame_decode_packet(&[0x55]);
         assert!(!p.is_empty());
         assert_eq!(p.data(), Some(&[0x55][..]));
+    }
+
+    // -----------------------------------------------------------------
+    // §7.11 step 2 — empty-packet (zero-byte) state synthesis
+    // -----------------------------------------------------------------
+
+    /// §7.11 step 2(a)+(b)+(c): a synthesised state carries
+    /// `FTYPE=Inter`, `NQIS=1`, `QIS=[63]` regardless of `nbs`.
+    #[test]
+    fn synth_empty_state_has_step2_hardcoded_values() {
+        for nbs in [1usize, 24, 48960] {
+            let state = synthesize_empty_packet_frame_state(nbs).unwrap();
+            assert_eq!(state.ftype, FrameType::Inter, "nbs={nbs}: ftype");
+            assert_eq!(state.nqis, 1, "nbs={nbs}: nqis");
+            assert_eq!(state.qis, vec![63u8], "nbs={nbs}: qis");
+            assert_eq!(state.qi0(), 63, "nbs={nbs}: qi0()");
+        }
+    }
+
+    /// §7.11 step 2(d): `BCODED` is all-zero and exactly `nbs` long.
+    #[test]
+    fn synth_empty_state_bcoded_is_all_zero_sized_nbs() {
+        for nbs in [1usize, 7, 24, 48960] {
+            let state = synthesize_empty_packet_frame_state(nbs).unwrap();
+            assert_eq!(state.bcoded.len(), nbs, "nbs={nbs}: len");
+            assert_eq!(state.nbs(), nbs, "nbs={nbs}: nbs()");
+            assert!(
+                state.bcoded.iter().all(|&b| b == 0),
+                "nbs={nbs}: not all zero"
+            );
+        }
+    }
+
+    /// `synthesize_empty_packet_frame_state(0)` is a structural
+    /// reject — §6.2 step 23 derives `NBS >= 1` for any well-formed
+    /// Theora stream.
+    #[test]
+    fn synth_empty_state_rejects_zero_nbs() {
+        let err = synthesize_empty_packet_frame_state(0).unwrap_err();
+        assert!(matches!(err, Error::EmptyPacketFrameStateZeroNbs));
+    }
+
+    /// The `From<&EmptyPacketFrameState>` conversion projects the
+    /// `FTYPE` + `QIS` slice into a [`TheoraFrameHeader`] view,
+    /// dropping the `BCODED` array. The frame-header view is
+    /// indistinguishable from one parsed from a §7.1 inter-frame
+    /// packet whose `NQIS=1`, `QIS[0]=63`.
+    #[test]
+    fn synth_empty_state_projects_to_frame_header() {
+        let state = synthesize_empty_packet_frame_state(24).unwrap();
+        let header: TheoraFrameHeader = (&state).into();
+        assert_eq!(header.ftype, FrameType::Inter);
+        assert_eq!(header.qis, vec![63u8]);
+        assert_eq!(header.nqis(), 1);
+    }
+
+    /// The classifier-then-synthesiser chain models the §7.11 entry
+    /// step end-to-end for the step 2 branch: an empty packet
+    /// classifies as `Empty`, which the driver feeds to the
+    /// synthesiser along with the identification-header's `NBS`.
+    #[test]
+    fn synth_empty_state_threads_off_classifier_empty_branch() {
+        let packet: &[u8] = &[];
+        let cls = classify_frame_decode_packet(packet);
+        assert_eq!(cls, FrameDecodePacket::Empty);
+        // The §6.2-derived NBS for the tiny-i-only-16x16 fixture is
+        // 24 (coded 32×32 → 2×2 macroblocks → 4 super-blocks's worth
+        // of luma + 4:2:0 chroma).
+        let nbs_tiny = 24usize;
+        let state = synthesize_empty_packet_frame_state(nbs_tiny).unwrap();
+        assert_eq!(state.bcoded.len(), nbs_tiny);
+        assert!(state.bcoded.iter().all(|&b| b == 0));
+    }
+
+    /// `qi0()` reflects post-construction mutation of the `qis`
+    /// vector, confirming it reads from the field rather than
+    /// hardcoding `63`. This guards against a future refactor that
+    /// might inline the constant.
+    #[test]
+    fn synth_empty_state_qi0_tracks_qis_mutation() {
+        let mut state = synthesize_empty_packet_frame_state(7).unwrap();
+        assert_eq!(state.qi0(), 63);
+        state.qis[0] = 12;
+        assert_eq!(state.qi0(), 12);
     }
 
     // -----------------------------------------------------------------

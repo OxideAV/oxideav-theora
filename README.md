@@ -2,6 +2,27 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-08 (round 260)
+
+Round 260 lands §7.11 step 2 — the "Otherwise" / zero-byte packet
+branch — as the standalone synthesiser
+`synthesize_empty_packet_frame_state(nbs)`. Returns a typed
+`EmptyPacketFrameState { ftype, nqis, qis, bcoded }` carrying the
+four hard-coded outputs the spec mandates: step 2(a) `FTYPE := 1`
+(`FrameType::Inter`), step 2(b) `NQIS := 1`, step 2(c) `QIS[0] :=
+63`, and step 2(d) `BCODED[bi] := 0` for every block. `nbs == 0`
+is a structural reject via the new `Error::EmptyPacketFrameStateZeroNbs`
+variant (§6.2 step 23 derives `NBS >= 1` for any well-formed
+stream). A `From<&EmptyPacketFrameState>` projection emits a
+[`TheoraFrameHeader`] view for the §7.9.4 / §7.10.3 callers that
+read only `FTYPE` / `QIS`. Two convenience accessors `qi0()` and
+`nbs()` keep step-1 / step-2 call sites symmetric. +6 tests
+(469 → 475). The §7.11 entry-shape now covers steps 2 / 3 / 4 /
+7 / 8 end-to-end; the step 1 chain (§7.1 → §7.3 → §7.4 →
+(§7.5.2) → §7.6 → §7.7.3 → §7.8.2 on a shared bit reader) and
+the step 5 / step 6 dispatch into the existing `reconstruct_frame`
+/ `loop_filter_frame` drivers remain pending.
+
 ## Status — 2026-06-08
 
 Round 256 wires §7.11 step 7 + step 8 — the reference-frame

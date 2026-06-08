@@ -6,6 +6,33 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.11 step 2 (empty / zero-byte packet) state synthesiser (round
+  260). New public function
+  `synthesize_empty_packet_frame_state(nbs: usize) ->
+  Result<EmptyPacketFrameState, Error>` materialises the four
+  deterministic outputs the spec mandates for the "Otherwise"
+  branch — step 2(a) `FTYPE := 1` (`FrameType::Inter`), step 2(b)
+  `NQIS := 1`, step 2(c) `QIS[0] := 63`, step 2(d) `BCODED[bi] := 0`
+  for every block — without consuming any bitstream. The typed
+  `EmptyPacketFrameState { ftype, nqis, qis, bcoded }` carries
+  ownership of the synthesised arrays so the §7.11 driver's
+  downstream steps can mutate `BCODED` through shared references
+  the same way the step 1 chain's outputs do. Convenience methods
+  `qi0()` (always `63`) and `nbs()` keep step 1 / step 2 call sites
+  symmetric. `From<&EmptyPacketFrameState>` projects to the existing
+  [`TheoraFrameHeader`] view (`FTYPE` + `QIS` slice) for callers
+  that only need the §7.1 surface. `nbs == 0` is a structural reject
+  via the new `Error::EmptyPacketFrameStateZeroNbs` variant (§6.2
+  step 23 derives `NBS >= 1` for any well-formed Theora stream).
+  6 new tests (total now 475): step-2 hard-coded values across
+  multiple `nbs`; `BCODED` all-zero sized to `nbs`; zero-NBS reject;
+  `TheoraFrameHeader` projection; classifier-then-synthesiser entry
+  chain; `qi0()` tracks post-construction `qis` mutation. The §7.11
+  entry-shape now covers steps 2 / 3 / 4 / 7 / 8 end-to-end; step 1
+  chain wiring (§7.1 → §7.3 → §7.4 → (§7.5.2) → §7.6 → §7.7.3 →
+  §7.8.2 on a shared bit reader) and step 5 / step 6 dispatch into
+  the existing `reconstruct_frame` / `loop_filter_frame` drivers
+  remain pending.
 - §7.11 step 7 + step 8 reference-frame promotion (round 256).
   New owned `ReferenceFrameStore` wraps the six long-lived
   reference-frame planes (`GOLDREFY` / `GOLDREFCB` / `GOLDREFCR`

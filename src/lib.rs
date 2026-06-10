@@ -277,8 +277,7 @@
 //! Theora I Specification), the spec's own LaTeX source as transcribed
 //! into `docs/video/theora/theora-6.4.1-lflims.md` (the staged §6.4.1
 //! procedure body that the published PDF omits), and the fixture corpus
-//! under `docs/video/theora/fixtures/`. No libtheora, no FFmpeg vp3.c,
-//! no theora-rs.
+//! under `docs/video/theora/fixtures/`.
 //!
 //! ## §6.4.1 — recovered procedure body (round 15)
 //!
@@ -410,8 +409,7 @@ pub enum Error {
     /// The vendor string or a `COMMENTS[i]` payload was not valid
     /// UTF-8. §6.3.3 says the comment value is "encoded as a UTF-8
     /// string"; the vendor string is described as a "vector" but is
-    /// also UTF-8 in every libtheora-emitted stream we observe and the
-    /// reference implementations expose it as a C string.
+    /// also UTF-8 in every encoded stream observed in the fixture corpus.
     CommentNotUtf8 {
         /// Which vector failed UTF-8 decoding.
         field: CommentField,
@@ -1814,7 +1812,7 @@ pub enum FrameRateField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     /// `PF=0`. 4:2:0 chroma subsampling (one chroma sample per 2×2
-    /// luma block). The only format libtheora 1.x will emit.
+    /// luma block). The most common format in the fixture corpus.
     Yuv420 = 0,
     /// `PF=2`. 4:2:2 chroma subsampling (one chroma sample per 1×2
     /// luma column).
@@ -1866,7 +1864,7 @@ pub struct TheoraIdentHeader {
     pub vmaj: u8,
     /// `VMIN` — minor version (always 2 for Theora I).
     pub vmin: u8,
-    /// `VREV` — revision; libtheora 1.x emits 1 (i.e. Theora 3.2.1).
+    /// `VREV` — revision; encoders emit 1 (i.e. Theora 3.2.1).
     pub vrev: u8,
     /// `FMBW` — coded frame width in macroblocks (always > 0).
     pub fmbw: u16,
@@ -1910,7 +1908,7 @@ pub struct TheoraIdentHeader {
 impl TheoraIdentHeader {
     /// Combined 24-bit version field `(VMAJ << 16) | (VMIN << 8) | VREV`.
     ///
-    /// libtheora 1.x always emits `0x030201`; values `>= 0x030200` are
+    /// Encoders emit `0x030201`; values `>= 0x030200` are
     /// the alpha3+ feature set required by §6.2.
     pub fn version(&self) -> u32 {
         ((self.vmaj as u32) << 16) | ((self.vmin as u32) << 8) | (self.vrev as u32)
@@ -2134,7 +2132,7 @@ pub fn decode_identification_header(packet: &[u8]) -> Result<TheoraIdentHeader, 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TheoraCommentHeader {
     /// Vendor string from Figure 6.4 (the first vector of the comment
-    /// header). libtheora-via-FFmpeg writes the muxer name here
+    /// header). Encoders write a muxer/encoder identifier here
     /// (e.g. `"Lavf62.13.102"`).
     pub vendor: String,
     /// User comments from §6.3.3. Each entry is a parsed
@@ -9350,7 +9348,7 @@ mod tests {
     /// Bytes extracted from
     /// `docs/video/theora/fixtures/tiny-i-only-16x16/input.ogv`: first
     /// Ogg packet payload, framing already stripped. Coded 32×32,
-    /// visible 32×32, libtheora 1.x defaults.
+    /// visible 32×32, the common encoder defaults.
     const TINY_HEADER: [u8; 42] = [
         0x80, 0x74, 0x68, 0x65, 0x6f, 0x72, 0x61, // 0x80 + "theora"
         0x03, 0x02, 0x01, // VMAJ=3 VMIN=2 VREV=1
@@ -9836,8 +9834,7 @@ mod tests {
     /// emitted vendor `"Lavf62.13.102"` and one comment
     /// `"encoder=Lavc62.30.100 libtheora"`. Every fixture currently
     /// in the corpus carries the same comment header byte-for-byte
-    /// because all of them came out of the same FFmpeg / libtheora
-    /// build.
+    /// because all of them were produced by the same encoder build.
     const TINY_COMMENT: [u8; 63] = [
         0x81, 0x74, 0x68, 0x65, 0x6f, 0x72, 0x61, // 0x81 + "theora"
         0x0d, 0x00, 0x00, 0x00, // vendor_len = 13 (LE)

@@ -6,6 +6,24 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.11 step 1(a) + step 1(b) chain — the first composed link of the
+  "size of the data packet is non-zero" branch (round 267). New
+  public function `decode_data_packet_header_and_blocks(packet,
+  first_frame, nsbs, nbs, block_to_super_block) ->
+  Result<DataPacketHeaderAndBlocks, Error>` decodes the §7.1 frame
+  header (step 1(a)) and the §7.3 coded block flags (step 1(b))
+  against a **single shared** `BitReader`, honouring the
+  shared-reader contract the standalone byte-aligned entry points
+  cannot: §7.3's run-length streams resume at the bit position
+  immediately after the §7.1 header with no re-alignment. The typed
+  `DataPacketHeaderAndBlocks { header, bcoded }` exposes `ftype()`,
+  `nqis()`, and `nbs()` accessors for the downstream step 1(c)..1(g)
+  links. All §7.1 and §7.3 reject paths propagate unchanged. +7
+  tests (475 → 482): intra all-coded, two inter shared-reader paths
+  (all-coded and mixed `BCODED` via the per-block short-run stream),
+  the header-packet / first-frame-must-be-intra / block-map-length
+  rejects, and an accessor-consistency check.
+
 - §7.11 step 2 (empty / zero-byte packet) state synthesiser (round
   260). New public function
   `synthesize_empty_packet_frame_state(nbs: usize) ->

@@ -2,6 +2,32 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-10 (round 267)
+
+Round 267 lands the first composed link of the §7.11 step 1 chain —
+the "If the size of the data packet is non-zero" branch — as
+[`decode_data_packet_header_and_blocks`]. The driver decodes the §7.1
+frame header (step 1(a)) followed by the §7.3 coded block flags (step
+1(b)) against a **single shared** `BitReader`, which is the whole
+point of the round: §7.3's run-length-coded `SBPCODED` / `SBFCODED`
+streams begin at the bit position immediately after the §7.1 header's
+last bit, mid-byte, with no re-alignment — so the two procedures must
+run on one cursor, something the byte-aligned standalone entry points
+[`decode_frame_header`] / [`decode_coded_block_flags`] cannot model.
+The typed `DataPacketHeaderAndBlocks { header, bcoded }` carries
+`ftype()` / `nqis()` / `nbs()` accessors for the downstream step
+1(c)..1(g) links (§7.4 modes → §7.5.2 MVs → §7.6 qi → §7.7.3 coeffs →
+§7.8.2 DC inversion), each of which resumes on the same reader in
+later rounds. All §7.1 and §7.3 reject paths propagate unchanged.
++7 tests (475 → 482): intra all-coded short-circuit, two inter
+shared-reader paths (fully-coded and a genuinely mixed `BCODED` that
+exercises the per-block §7.2.2 short-run stream after the two §7.2.1
+long-run passes), the header-packet / first-frame-must-be-intra /
+block-map-length-mismatch rejects, and an accessor-consistency check.
+The step 1 chain now covers steps 1(a)+1(b); steps 1(c)..1(g) and the
+step 5 / step 6 dispatch into `reconstruct_frame` / `loop_filter_frame`
+remain pending.
+
 ## Status — 2026-06-08 (round 260)
 
 Round 260 lands §7.11 step 2 — the "Otherwise" / zero-byte packet

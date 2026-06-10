@@ -8922,6 +8922,121 @@ pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFram
     })
 }
 
+/// The first two links of the §7.11 step 1 ("size of the data packet
+/// is non-zero") chain: the §7.1 frame header plus the §7.3 coded
+/// block flags, decoded together off a single shared bit reader.
+///
+/// §7.11 step 1 decodes a non-empty video-data packet through the
+/// chain §7.1 (a) → §7.3 (b) → §7.4 (c) → §7.5.2 (d) → §7.6 (e) →
+/// §7.7.3 (f) → §7.8.2 (g). The sub-procedures share one bit cursor
+/// — §7.3's run-length streams resume immediately after the §7.1
+/// header bits with no re-alignment — so the chain has to be built
+/// over a single [`BitReader`], not by handing each procedure a
+/// fresh byte-aligned slice. [`decode_data_packet_header_and_blocks`]
+/// is the first composed link: it threads steps 1(a) and 1(b) over
+/// one reader and surfaces the two outputs as a typed pair.
+///
+/// `header` carries §7.1's `FTYPE` + `QIS` (so the later 1(d) motion-
+/// vector branch can test `FTYPE != 0` and 1(e)'s block-level `qi`
+/// decode can read `NQIS`). `bcoded` is §7.3's `NBS`-element coded-
+/// block-flag array feeding steps 1(c) / 1(d) / 1(e) / 1(f) / 1(g).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataPacketHeaderAndBlocks {
+    /// §7.11 step 1(a) output — the §7.1 frame header (`FTYPE` +
+    /// `QIS`). `FrameType::Intra` corresponds to `FTYPE = 0`.
+    pub header: TheoraFrameHeader,
+    /// §7.11 step 1(b) output — the `NBS`-element `BCODED` array. On
+    /// an intra frame every entry is `1` (§7.3 step 1, no bits
+    /// consumed); on an inter frame the bits come off the shared
+    /// reader after the §7.1 header.
+    pub bcoded: Vec<u8>,
+}
+
+impl DataPacketHeaderAndBlocks {
+    /// The frame type decoded in §7.11 step 1(a).
+    pub fn ftype(&self) -> FrameType {
+        self.header.ftype
+    }
+
+    /// `NQIS` — the number of `qi` values §7.1 decoded (always
+    /// `1..=3`). §7.11 step 1(e) feeds this into the §7.6 block-level
+    /// `qi` decode.
+    pub fn nqis(&self) -> usize {
+        self.header.nqis()
+    }
+
+    /// `NBS` — the number of blocks the §7.3 `BCODED` array covers.
+    pub fn nbs(&self) -> usize {
+        self.bcoded.len()
+    }
+}
+
+/// Execute §7.11 step 1(a) + step 1(b): decode the §7.1 frame header
+/// and the §7.3 coded block flags from a non-empty video-data packet,
+/// sharing a single bit reader between the two procedures.
+///
+/// This is the entry of the §7.11 step 1 chain — the "If the size of
+/// the data packet is non-zero" branch. The shared-reader contract is
+/// the whole point: §7.3's run-length-coded `SBPCODED` / `SBFCODED`
+/// streams begin at the bit position immediately after the §7.1
+/// header's last bit, with no byte re-alignment, so the two
+/// procedures must run against one [`BitReader`]. The byte-aligned
+/// standalone entry points [`decode_frame_header`] and
+/// [`decode_coded_block_flags`] cannot be composed for the real
+/// stream because each would re-start the cursor at a byte boundary.
+///
+/// Inputs:
+///
+/// * `packet` — the full video-data packet body. The §7.11 step 1
+///   branch is reached only for a non-zero-length packet; a zero-byte
+///   packet is the step 2 special case handled by
+///   [`synthesize_empty_packet_frame_state`]. An empty `packet` here
+///   surfaces as [`Error::TruncatedHeader`] from §7.1 step 1 (no
+///   packet-type bit to read).
+/// * `first_frame` — §7.1 step 2 mandates the first decoded frame be
+///   intra (`FTYPE = 0`); propagated to [`decode_frame_header`].
+/// * `nsbs` / `nbs` — the §6.2-derived super-block / block counts
+///   (`NSBS` / `NBS`) from the identification header. §7.3 reads
+///   `NSBS` bits for `SBPCODED` and validates the per-block mapping
+///   against `NBS`.
+/// * `block_to_super_block` — the `NBS`-element coded-order
+///   block → super-block map §7.3 step 2 looks up; same contract as
+///   [`decode_coded_block_flags`].
+///
+/// The §7.1 header is decoded first (step 1(a)); its `FTYPE`
+/// determines whether §7.3 (step 1(b)) short-circuits the intra path
+/// (every block coded, no bits read) or runs the inter run-length
+/// chain on the same reader.
+///
+/// Any §7.1 reject ([`Error::NotDataPacket`],
+/// [`Error::FirstFrameMustBeIntra`], [`Error::FrameReservedBitsNonZero`],
+/// [`Error::TruncatedHeader`]) or §7.3 reject
+/// ([`Error::BlockSuperBlockMapLenMismatch`],
+/// [`Error::BlockSuperBlockIndexOutOfRange`], a run-length overrun, or
+/// truncation) propagates unchanged.
+///
+/// This lands steps 1(a) and 1(b) of the §7.11 step 1 chain; the
+/// remaining links — §7.4 modes (1(c)), §7.5.2 motion vectors (1(d)),
+/// §7.6 block-level qi (1(e)), §7.7.3 DCT coefficients (1(f)), §7.8.2
+/// DC-prediction inversion (1(g)) — extend this driver in later
+/// rounds, each resuming on the same reader.
+pub fn decode_data_packet_header_and_blocks(
+    packet: &[u8],
+    first_frame: bool,
+    nsbs: u32,
+    nbs: u32,
+    block_to_super_block: &[u32],
+) -> Result<DataPacketHeaderAndBlocks, Error> {
+    let mut r = BitReader::new(packet);
+    // Step 1(a): §7.1 frame header off the shared reader.
+    let header = decode_frame_header_inner(&mut r, first_frame)?;
+    // Step 1(b): §7.3 coded block flags resume on the same reader,
+    // immediately after the header bits — no re-alignment.
+    let bcoded =
+        decode_coded_block_flags_inner(&mut r, header.ftype, nsbs, nbs, block_to_super_block)?;
+    Ok(DataPacketHeaderAndBlocks { header, bcoded })
+}
+
 /// Owned reference-frame storage for the §7.11 step 7 / step 8
 /// promotion path.
 ///
@@ -21432,6 +21547,157 @@ mod tests {
         assert_eq!(state.qi0(), 63);
         state.qis[0] = 12;
         assert_eq!(state.qi0(), 12);
+    }
+
+    // -----------------------------------------------------------------
+    // §7.11 step 1(a) + step 1(b) — header + coded-block-flags chain
+    // -----------------------------------------------------------------
+
+    /// §7.11 step 1(a)+(b) intra path: a one-shot decode of an intra
+    /// frame header followed by §7.3's all-coded short-circuit. The
+    /// §7.3 step 1 intra path reads no bits, so the byte-aligned
+    /// `build_frame_header` packet feeds straight in.
+    #[test]
+    fn data_header_and_blocks_intra_all_coded() {
+        // 3 super blocks, 8 blocks each → NBS=24 (the tiny-i fixture
+        // shape used elsewhere in the §7.3 tests).
+        let nsbs = 3u32;
+        let nbs = 24u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let packet = build_frame_header(0, &[12], 0);
+        let out = decode_data_packet_header_and_blocks(&packet, true, nsbs, nbs, &map).unwrap();
+        assert_eq!(out.ftype(), FrameType::Intra);
+        assert_eq!(out.header.qis, vec![12]);
+        assert_eq!(out.nqis(), 1);
+        // §7.3 step 1: every block coded on an intra frame.
+        assert_eq!(out.bcoded, vec![1u8; 24]);
+        assert_eq!(out.nbs(), 24);
+    }
+
+    /// §7.11 step 1(a)+(b) inter path: the shared-reader contract —
+    /// §7.3's run-length streams must resume at the bit position
+    /// immediately after the §7.1 header, with no re-alignment. The
+    /// test writes both the header bits and the §7.3 `SBPCODED` /
+    /// `SBFCODED` streams into one `BitWriter` (a single bitstream,
+    /// byte-aligned only at the very end), then confirms the composed
+    /// driver recovers both the header and an all-coded `BCODED`.
+    #[test]
+    fn data_header_and_blocks_inter_shared_reader_all_coded() {
+        let nsbs = 2u32;
+        let nbs = 16u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mut w = BitWriter::new();
+        // §7.1 inter header (FTYPE=1, NQIS=1, QIS=[7]); no reserved
+        // trailer on an inter frame.
+        w.put(0, 1); // data-packet flag
+        w.put(1, 1); // FTYPE = inter
+        w.put(7, 6); // QIS[0]
+        w.put(0, 1); // MOREQIS = 0
+                     // §7.3 resumes on the SAME bitstream, mid-byte: every super
+                     // block fully coded (SBPCODED=0, SBFCODED=1), no per-block
+                     // stream.
+        encode_long_run_runs(&mut w, &[0, 0]);
+        encode_long_run_runs(&mut w, &[1, 1]);
+        let packet = w.finish();
+        let out = decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, &map).unwrap();
+        assert_eq!(out.ftype(), FrameType::Inter);
+        assert_eq!(out.header.qis, vec![7]);
+        assert_eq!(out.bcoded, vec![1u8; 16]);
+    }
+
+    /// §7.11 step 1(a)+(b) inter path with a genuinely mixed `BCODED`,
+    /// confirming the per-block short-run stream is decoded off the
+    /// shared reader after the two long-run passes — the bit cursor
+    /// stays continuous across all of §7.1 + §7.3.
+    #[test]
+    fn data_header_and_blocks_inter_shared_reader_mixed_bcoded() {
+        // 2 super blocks of 8 blocks each → NBS=16. SB 0 is partially
+        // coded, SB 1 fully coded.
+        let nsbs = 2u32;
+        let nbs = 16u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        // The per-block bits inside the partially-coded SB 0.
+        let sb0_blocks = [1u8, 1, 0, 0, 1, 0, 1, 1];
+        let mut w = BitWriter::new();
+        // §7.1 inter header (three qi values to push the §7.3 start
+        // well off a byte boundary).
+        w.put(0, 1); // data-packet flag
+        w.put(1, 1); // FTYPE = inter
+        w.put(5, 6); // QIS[0]
+        w.put(1, 1); // MOREQIS = 1
+        w.put(9, 6); // QIS[1]
+        w.put(1, 1); // MOREQIS = 1
+        w.put(40, 6); // QIS[2]
+                      // §7.3: SBPCODED = [1, 0] (SB 0 partial), SBFCODED over the
+                      // non-partial subset = [1] (SB 1 fully coded), then the
+                      // per-block short-run stream for SB 0.
+        encode_long_run_runs(&mut w, &[1, 0]);
+        encode_long_run_runs(&mut w, &[1]);
+        encode_short_run_runs(&mut w, &sb0_blocks);
+        let packet = w.finish();
+        let out = decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, &map).unwrap();
+        assert_eq!(out.ftype(), FrameType::Inter);
+        assert_eq!(out.header.qis, vec![5, 9, 40]);
+        assert_eq!(out.nqis(), 3);
+        let mut expected = sb0_blocks.to_vec();
+        expected.extend_from_slice(&[1u8; 8]); // SB 1 fully coded
+        assert_eq!(out.bcoded, expected);
+        assert_eq!(out.nbs(), 16);
+    }
+
+    /// §7.11 step 1(a) reject: a header packet (high bit set)
+    /// propagates §7.1's [`Error::NotDataPacket`] through the composed
+    /// driver before §7.3 ever runs.
+    #[test]
+    fn data_header_and_blocks_rejects_header_packet() {
+        let map = vec![0u32; 24];
+        let err = decode_data_packet_header_and_blocks(&[0x80], true, 3, 24, &map).unwrap_err();
+        assert!(matches!(err, Error::NotDataPacket));
+    }
+
+    /// §7.11 step 1(a) reject: the first frame must be intra
+    /// (§7.1 step 2). An inter header with `first_frame = true`
+    /// surfaces [`Error::FirstFrameMustBeIntra`] from the §7.1 link.
+    #[test]
+    fn data_header_and_blocks_rejects_inter_first_frame() {
+        let packet = build_frame_header(1, &[7], 0);
+        let map = vec![0u32; 16];
+        let err = decode_data_packet_header_and_blocks(&packet, true, 2, 16, &map).unwrap_err();
+        assert!(matches!(err, Error::FirstFrameMustBeIntra { ftype: 1 }));
+    }
+
+    /// §7.11 step 1(b) reject: a malformed block→super-block map
+    /// (wrong length) propagates §7.3's
+    /// [`Error::BlockSuperBlockMapLenMismatch`] — the header decodes
+    /// fine but the §7.3 link rejects the geometry.
+    #[test]
+    fn data_header_and_blocks_propagates_block_map_len_mismatch() {
+        let packet = build_frame_header(0, &[3], 0);
+        // Map is one short of NBS.
+        let map = vec![0u32; 23];
+        let err = decode_data_packet_header_and_blocks(&packet, true, 3, 24, &map).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BlockSuperBlockMapLenMismatch {
+                map_len: 23,
+                nbs: 24
+            }
+        ));
+    }
+
+    /// `ftype()` / `nqis()` / `nbs()` accessors mirror the underlying
+    /// header + `BCODED` state for an intra decode.
+    #[test]
+    fn data_header_and_blocks_accessors_match_state() {
+        let nbs = 24u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let packet = build_frame_header(0, &[1, 2], 0);
+        let out = decode_data_packet_header_and_blocks(&packet, true, 3, nbs, &map).unwrap();
+        assert_eq!(out.ftype(), out.header.ftype);
+        assert_eq!(out.nqis(), out.header.qis.len());
+        assert_eq!(out.nbs(), out.bcoded.len());
+        assert_eq!(out.nqis(), 2);
+        assert_eq!(out.nbs(), 24);
     }
 
     // -----------------------------------------------------------------

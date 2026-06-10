@@ -6,6 +6,30 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.11 step 1(c) — the §7.4 macro-block coding modes now extend the
+  composed step 1 chain a third link (round 274).
+  `decode_data_packet_header_and_blocks` gains two inputs — `nmbs`
+  (the macro-block count `NMBS`) and `macro_block_to_luma_blocks`
+  (the `NMBS`-element luma-block map §7.4 step 2(d)i reads `BCODED`
+  through) — and threads the §7.4 modes procedure onto the same
+  shared `BitReader` immediately after the §7.3 streams, with no
+  re-alignment. The typed `DataPacketHeaderAndBlocks` gains an
+  `mbmodes: Vec<MacroBlockMode>` field (the `MBMODES` array) and an
+  `nmbs()` accessor. On an intra frame every mode is `Intra` (§7.4
+  step 1, no bits read); on an inter frame the `MSCHEME` / alphabet /
+  mode stream is decoded on the shared cursor, including §7.4 step
+  2(d)ii's no-bits `INTER_NOMV` for a wholly-uncoded macro block. All
+  §7.4 reject paths (`MacroBlockLumaMapLenMismatch`,
+  `MacroBlockLumaBlockIndexOutOfRange`, `UnknownMacroBlockModeCode`,
+  truncation) propagate unchanged. +2 net tests (482 → 484): a §7.4
+  luma-map-length reject and an inter path where one macro block is
+  wholly uncoded (mode skipped, shared reader stays aligned for its
+  coded neighbours). The seven existing step-1(a)+(b) tests were
+  extended to assert the new `MBMODES` output. The step 1 chain now
+  covers 1(a)+1(b)+1(c); steps 1(d)..1(g) and the step 5 / step 6
+  dispatch into `reconstruct_frame` / `loop_filter_frame` remain
+  pending.
+
 - §7.11 step 1(a) + step 1(b) chain — the first composed link of the
   "size of the data packet is non-zero" branch (round 267). New
   public function `decode_data_packet_header_and_blocks(packet,

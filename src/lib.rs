@@ -8920,24 +8920,28 @@ pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFram
     })
 }
 
-/// The first two links of the §7.11 step 1 ("size of the data packet
-/// is non-zero") chain: the §7.1 frame header plus the §7.3 coded
-/// block flags, decoded together off a single shared bit reader.
+/// The first three links of the §7.11 step 1 ("size of the data
+/// packet is non-zero") chain: the §7.1 frame header, the §7.3 coded
+/// block flags, and the §7.4 macro-block coding modes, decoded
+/// together off a single shared bit reader.
 ///
 /// §7.11 step 1 decodes a non-empty video-data packet through the
 /// chain §7.1 (a) → §7.3 (b) → §7.4 (c) → §7.5.2 (d) → §7.6 (e) →
 /// §7.7.3 (f) → §7.8.2 (g). The sub-procedures share one bit cursor
 /// — §7.3's run-length streams resume immediately after the §7.1
-/// header bits with no re-alignment — so the chain has to be built
-/// over a single [`BitReader`], not by handing each procedure a
-/// fresh byte-aligned slice. [`decode_data_packet_header_and_blocks`]
-/// is the first composed link: it threads steps 1(a) and 1(b) over
-/// one reader and surfaces the two outputs as a typed pair.
+/// header bits with no re-alignment, and §7.4's mode stream resumes
+/// immediately after §7.3's — so the chain has to be built over a
+/// single [`BitReader`], not by handing each procedure a fresh
+/// byte-aligned slice. [`decode_data_packet_header_and_blocks`]
+/// threads steps 1(a), 1(b), and 1(c) over one reader and surfaces
+/// the three outputs as a typed bundle.
 ///
-/// `header` carries §7.1's `FTYPE` + `QIS` (so the later 1(d) motion-
-/// vector branch can test `FTYPE != 0` and 1(e)'s block-level `qi`
-/// decode can read `NQIS`). `bcoded` is §7.3's `NBS`-element coded-
-/// block-flag array feeding steps 1(c) / 1(d) / 1(e) / 1(f) / 1(g).
+/// `header` carries §7.1's `FTYPE` + `QIS` (so the 1(d) motion-vector
+/// branch can test `FTYPE != 0` and 1(e)'s block-level `qi` decode can
+/// read `NQIS`). `bcoded` is §7.3's `NBS`-element coded-block-flag
+/// array feeding steps 1(c) / 1(d) / 1(e) / 1(f) / 1(g). `mbmodes` is
+/// §7.4's `NMBS`-element coding-mode array (step 1(c)), which the 1(d)
+/// motion-vector branch and 1(g) DC-prediction inversion both consume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPacketHeaderAndBlocks {
     /// §7.11 step 1(a) output — the §7.1 frame header (`FTYPE` +
@@ -8948,6 +8952,11 @@ pub struct DataPacketHeaderAndBlocks {
     /// consumed); on an inter frame the bits come off the shared
     /// reader after the §7.1 header.
     pub bcoded: Vec<u8>,
+    /// §7.11 step 1(c) output — the `NMBS`-element `MBMODES` array.
+    /// On an intra frame every entry is [`MacroBlockMode::Intra`]
+    /// (§7.4 step 1, no bits consumed); on an inter frame the modes
+    /// come off the shared reader immediately after the §7.3 streams.
+    pub mbmodes: Vec<MacroBlockMode>,
 }
 
 impl DataPacketHeaderAndBlocks {
@@ -8967,21 +8976,30 @@ impl DataPacketHeaderAndBlocks {
     pub fn nbs(&self) -> usize {
         self.bcoded.len()
     }
+
+    /// `NMBS` — the number of macro blocks the §7.4 `MBMODES` array
+    /// covers.
+    pub fn nmbs(&self) -> usize {
+        self.mbmodes.len()
+    }
 }
 
-/// Execute §7.11 step 1(a) + step 1(b): decode the §7.1 frame header
-/// and the §7.3 coded block flags from a non-empty video-data packet,
-/// sharing a single bit reader between the two procedures.
+/// Execute §7.11 step 1(a) + step 1(b) + step 1(c): decode the §7.1
+/// frame header, the §7.3 coded block flags, and the §7.4 macro-block
+/// coding modes from a non-empty video-data packet, sharing a single
+/// bit reader across all three procedures.
 ///
 /// This is the entry of the §7.11 step 1 chain — the "If the size of
 /// the data packet is non-zero" branch. The shared-reader contract is
 /// the whole point: §7.3's run-length-coded `SBPCODED` / `SBFCODED`
 /// streams begin at the bit position immediately after the §7.1
-/// header's last bit, with no byte re-alignment, so the two
-/// procedures must run against one [`BitReader`]. The byte-aligned
-/// standalone entry points [`decode_frame_header`] and
-/// [`decode_coded_block_flags`] cannot be composed for the real
-/// stream because each would re-start the cursor at a byte boundary.
+/// header's last bit, with no byte re-alignment, and §7.4's `MSCHEME`
+/// / `MALPHABET` / mode stream resumes immediately after §7.3's, so
+/// all three procedures must run against one [`BitReader`]. The
+/// byte-aligned standalone entry points [`decode_frame_header`],
+/// [`decode_coded_block_flags`], and [`decode_macroblock_modes`]
+/// cannot be composed for the real stream because each would re-start
+/// the cursor at a byte boundary.
 ///
 /// Inputs:
 ///
@@ -8997,33 +9015,46 @@ impl DataPacketHeaderAndBlocks {
 ///   (`NSBS` / `NBS`) from the identification header. §7.3 reads
 ///   `NSBS` bits for `SBPCODED` and validates the per-block mapping
 ///   against `NBS`.
+/// * `nmbs` — the §6.2-derived macro-block count (`NMBS`). §7.4 emits
+///   one `MBMODES` entry per macro block.
 /// * `block_to_super_block` — the `NBS`-element coded-order
 ///   block → super-block map §7.3 step 2 looks up; same contract as
 ///   [`decode_coded_block_flags`].
+/// * `macro_block_to_luma_blocks` — the `NMBS`-element map giving each
+///   macro block's four coded-order luma-block indices; same contract
+///   as [`decode_macroblock_modes`]. §7.4 step 2(d)i reads
+///   `BCODED[bi]` for these to decide whether a mode is on the wire.
 ///
 /// The §7.1 header is decoded first (step 1(a)); its `FTYPE`
-/// determines whether §7.3 (step 1(b)) short-circuits the intra path
-/// (every block coded, no bits read) or runs the inter run-length
-/// chain on the same reader.
+/// determines whether §7.3 (step 1(b)) and §7.4 (step 1(c))
+/// short-circuit the intra path (every block coded, every mode
+/// `INTRA`, no bits read) or run the inter chains on the same reader.
 ///
 /// Any §7.1 reject ([`Error::NotDataPacket`],
 /// [`Error::FirstFrameMustBeIntra`], [`Error::FrameReservedBitsNonZero`],
-/// [`Error::TruncatedHeader`]) or §7.3 reject
+/// [`Error::TruncatedHeader`]), §7.3 reject
 /// ([`Error::BlockSuperBlockMapLenMismatch`],
 /// [`Error::BlockSuperBlockIndexOutOfRange`], a run-length overrun, or
-/// truncation) propagates unchanged.
+/// truncation), or §7.4 reject
+/// ([`Error::MacroBlockLumaMapLenMismatch`],
+/// [`Error::MacroBlockLumaBlockIndexOutOfRange`],
+/// [`Error::UnknownMacroBlockModeCode`], or truncation) propagates
+/// unchanged.
 ///
-/// This lands steps 1(a) and 1(b) of the §7.11 step 1 chain; the
-/// remaining links — §7.4 modes (1(c)), §7.5.2 motion vectors (1(d)),
-/// §7.6 block-level qi (1(e)), §7.7.3 DCT coefficients (1(f)), §7.8.2
+/// This lands steps 1(a), 1(b), and 1(c) of the §7.11 step 1 chain;
+/// the remaining links — §7.5.2 motion vectors (1(d)), §7.6
+/// block-level qi (1(e)), §7.7.3 DCT coefficients (1(f)), §7.8.2
 /// DC-prediction inversion (1(g)) — extend this driver in later
 /// rounds, each resuming on the same reader.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_data_packet_header_and_blocks(
     packet: &[u8],
     first_frame: bool,
     nsbs: u32,
     nbs: u32,
+    nmbs: u32,
     block_to_super_block: &[u32],
+    macro_block_to_luma_blocks: &[[u32; 4]],
 ) -> Result<DataPacketHeaderAndBlocks, Error> {
     let mut r = BitReader::new(packet);
     // Step 1(a): §7.1 frame header off the shared reader.
@@ -9032,7 +9063,21 @@ pub fn decode_data_packet_header_and_blocks(
     // immediately after the header bits — no re-alignment.
     let bcoded =
         decode_coded_block_flags_inner(&mut r, header.ftype, nsbs, nbs, block_to_super_block)?;
-    Ok(DataPacketHeaderAndBlocks { header, bcoded })
+    // Step 1(c): §7.4 macro-block coding modes resume on the same
+    // reader, immediately after the §7.3 streams — no re-alignment.
+    let mbmodes = decode_macroblock_modes_inner(
+        &mut r,
+        header.ftype,
+        nmbs,
+        nbs,
+        &bcoded,
+        macro_block_to_luma_blocks,
+    )?;
+    Ok(DataPacketHeaderAndBlocks {
+        header,
+        bcoded,
+        mbmodes,
+    })
 }
 
 /// Owned reference-frame storage for the §7.11 step 7 / step 8
@@ -21560,15 +21605,27 @@ mod tests {
         // shape used elsewhere in the §7.3 tests).
         let nsbs = 3u32;
         let nbs = 24u32;
+        // 4 luma macro blocks: each owns four luma blocks (0..16 are
+        // luma; 16..24 are chroma in this synthetic shape).
+        let nmbs = 4u32;
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mb_map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
+            .collect();
         let packet = build_frame_header(0, &[12], 0);
-        let out = decode_data_packet_header_and_blocks(&packet, true, nsbs, nbs, &map).unwrap();
+        let out =
+            decode_data_packet_header_and_blocks(&packet, true, nsbs, nbs, nmbs, &map, &mb_map)
+                .unwrap();
         assert_eq!(out.ftype(), FrameType::Intra);
         assert_eq!(out.header.qis, vec![12]);
         assert_eq!(out.nqis(), 1);
         // §7.3 step 1: every block coded on an intra frame.
         assert_eq!(out.bcoded, vec![1u8; 24]);
         assert_eq!(out.nbs(), 24);
+        // §7.4 step 1: every macro block INTRA on an intra frame, no
+        // bits read.
+        assert_eq!(out.mbmodes, vec![MacroBlockMode::Intra; 4]);
+        assert_eq!(out.nmbs(), 4);
     }
 
     /// §7.11 step 1(a)+(b) inter path: the shared-reader contract —
@@ -21582,7 +21639,12 @@ mod tests {
     fn data_header_and_blocks_inter_shared_reader_all_coded() {
         let nsbs = 2u32;
         let nbs = 16u32;
+        // 4 macro blocks, each owning four luma blocks 0..16.
+        let nmbs = 4u32;
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mb_map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
+            .collect();
         let mut w = BitWriter::new();
         // §7.1 inter header (FTYPE=1, NQIS=1, QIS=[7]); no reserved
         // trailer on an inter frame.
@@ -21595,11 +21657,28 @@ mod tests {
                      // stream.
         encode_long_run_runs(&mut w, &[0, 0]);
         encode_long_run_runs(&mut w, &[1, 1]);
+        // §7.4 resumes on the SAME bitstream: MSCHEME=7 (direct 3-bit
+        // modes). Every MB has coded luma blocks, so one mode is read
+        // per MB.
+        let modes = [
+            MacroBlockMode::InterMv,
+            MacroBlockMode::InterNoMv,
+            MacroBlockMode::InterMvFour,
+            MacroBlockMode::InterGoldenNoMv,
+        ];
+        w.put(7, 3); // MSCHEME = 7
+        for m in &modes {
+            w.put(m.to_index() as u32, 3);
+        }
         let packet = w.finish();
-        let out = decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, &map).unwrap();
+        let out =
+            decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, nmbs, &map, &mb_map)
+                .unwrap();
         assert_eq!(out.ftype(), FrameType::Inter);
         assert_eq!(out.header.qis, vec![7]);
         assert_eq!(out.bcoded, vec![1u8; 16]);
+        assert_eq!(out.mbmodes, modes.to_vec());
+        assert_eq!(out.nmbs(), 4);
     }
 
     /// §7.11 step 1(a)+(b) inter path with a genuinely mixed `BCODED`,
@@ -21612,7 +21691,12 @@ mod tests {
         // coded, SB 1 fully coded.
         let nsbs = 2u32;
         let nbs = 16u32;
+        // 4 macro blocks, each owning four consecutive luma blocks.
+        let nmbs = 4u32;
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mb_map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
+            .collect();
         // The per-block bits inside the partially-coded SB 0.
         let sb0_blocks = [1u8, 1, 0, 0, 1, 0, 1, 1];
         let mut w = BitWriter::new();
@@ -21631,8 +21715,24 @@ mod tests {
         encode_long_run_runs(&mut w, &[1, 0]);
         encode_long_run_runs(&mut w, &[1]);
         encode_short_run_runs(&mut w, &sb0_blocks);
+        // §7.4 resumes on the SAME bitstream after the short-run
+        // stream. With BCODED = sb0_blocks ++ [1;8] every MB owns at
+        // least one coded luma block, so all four read modes.
+        // MSCHEME=7 → direct 3-bit modes.
+        let modes = [
+            MacroBlockMode::InterMvLast,
+            MacroBlockMode::InterMv,
+            MacroBlockMode::Intra,
+            MacroBlockMode::InterGoldenMv,
+        ];
+        w.put(7, 3); // MSCHEME = 7
+        for m in &modes {
+            w.put(m.to_index() as u32, 3);
+        }
         let packet = w.finish();
-        let out = decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, &map).unwrap();
+        let out =
+            decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, nmbs, &map, &mb_map)
+                .unwrap();
         assert_eq!(out.ftype(), FrameType::Inter);
         assert_eq!(out.header.qis, vec![5, 9, 40]);
         assert_eq!(out.nqis(), 3);
@@ -21640,6 +21740,7 @@ mod tests {
         expected.extend_from_slice(&[1u8; 8]); // SB 1 fully coded
         assert_eq!(out.bcoded, expected);
         assert_eq!(out.nbs(), 16);
+        assert_eq!(out.mbmodes, modes.to_vec());
     }
 
     /// §7.11 step 1(a) reject: a header packet (high bit set)
@@ -21648,7 +21749,9 @@ mod tests {
     #[test]
     fn data_header_and_blocks_rejects_header_packet() {
         let map = vec![0u32; 24];
-        let err = decode_data_packet_header_and_blocks(&[0x80], true, 3, 24, &map).unwrap_err();
+        let mb_map = vec![[0u32; 4]; 4];
+        let err = decode_data_packet_header_and_blocks(&[0x80], true, 3, 24, 4, &map, &mb_map)
+            .unwrap_err();
         assert!(matches!(err, Error::NotDataPacket));
     }
 
@@ -21659,7 +21762,9 @@ mod tests {
     fn data_header_and_blocks_rejects_inter_first_frame() {
         let packet = build_frame_header(1, &[7], 0);
         let map = vec![0u32; 16];
-        let err = decode_data_packet_header_and_blocks(&packet, true, 2, 16, &map).unwrap_err();
+        let mb_map = vec![[0u32; 4]; 4];
+        let err = decode_data_packet_header_and_blocks(&packet, true, 2, 16, 4, &map, &mb_map)
+            .unwrap_err();
         assert!(matches!(err, Error::FirstFrameMustBeIntra { ftype: 1 }));
     }
 
@@ -21672,7 +21777,9 @@ mod tests {
         let packet = build_frame_header(0, &[3], 0);
         // Map is one short of NBS.
         let map = vec![0u32; 23];
-        let err = decode_data_packet_header_and_blocks(&packet, true, 3, 24, &map).unwrap_err();
+        let mb_map = vec![[0u32; 4]; 4];
+        let err = decode_data_packet_header_and_blocks(&packet, true, 3, 24, 4, &map, &mb_map)
+            .unwrap_err();
         assert!(matches!(
             err,
             Error::BlockSuperBlockMapLenMismatch {
@@ -21682,19 +21789,116 @@ mod tests {
         ));
     }
 
-    /// `ftype()` / `nqis()` / `nbs()` accessors mirror the underlying
-    /// header + `BCODED` state for an intra decode.
+    /// `ftype()` / `nqis()` / `nbs()` / `nmbs()` accessors mirror the
+    /// underlying header + `BCODED` + `MBMODES` state for an intra
+    /// decode.
     #[test]
     fn data_header_and_blocks_accessors_match_state() {
         let nbs = 24u32;
+        let nmbs = 4u32;
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mb_map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
+            .collect();
         let packet = build_frame_header(0, &[1, 2], 0);
-        let out = decode_data_packet_header_and_blocks(&packet, true, 3, nbs, &map).unwrap();
+        let out = decode_data_packet_header_and_blocks(&packet, true, 3, nbs, nmbs, &map, &mb_map)
+            .unwrap();
         assert_eq!(out.ftype(), out.header.ftype);
         assert_eq!(out.nqis(), out.header.qis.len());
         assert_eq!(out.nbs(), out.bcoded.len());
+        assert_eq!(out.nmbs(), out.mbmodes.len());
         assert_eq!(out.nqis(), 2);
         assert_eq!(out.nbs(), 24);
+        assert_eq!(out.nmbs(), 4);
+    }
+
+    /// §7.11 step 1(c) reject: a §7.4 luma-block map of the wrong
+    /// length propagates [`Error::MacroBlockLumaMapLenMismatch`] — the
+    /// §7.1 header and §7.3 flags decode fine, but the §7.4 link
+    /// rejects the macro-block geometry. Uses an inter frame so §7.4
+    /// actually reaches its argument checks (the intra path validates
+    /// the map too, but exercising it on an inter frame confirms the
+    /// reject fires before any mode bit is consumed).
+    #[test]
+    fn data_header_and_blocks_propagates_mb_luma_map_len_mismatch() {
+        let nsbs = 2u32;
+        let nbs = 16u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(1, 1); // FTYPE = inter
+        w.put(7, 6); // QIS[0]
+        w.put(0, 1); // MOREQIS = 0
+        encode_long_run_runs(&mut w, &[0, 0]); // SBPCODED all 0
+        encode_long_run_runs(&mut w, &[1, 1]); // SBFCODED all coded
+        let packet = w.finish();
+        // NMBS claimed as 4 but the map carries only 3 entries.
+        let mb_map = vec![[0u32, 1, 2, 3]; 3];
+        let err = decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, 4, &map, &mb_map)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MacroBlockLumaMapLenMismatch {
+                map_len: 3,
+                nmbs: 4
+            }
+        ));
+    }
+
+    /// §7.11 step 1(c) inter path exercising §7.4 step 2(d)ii: a macro
+    /// block whose four luma blocks are all uncoded gets
+    /// [`MacroBlockMode::InterNoMv`] with **no** mode bits read, while
+    /// its coded neighbours read a mode each. Confirms the shared
+    /// reader stays aligned when §7.4 skips bits for an uncoded MB.
+    #[test]
+    fn data_header_and_blocks_inter_uncoded_mb_reads_no_mode_bits() {
+        // 2 super blocks of 8 blocks → NBS=16. SB 0 partially coded so
+        // that MB 0's luma blocks (0..4) are all uncoded.
+        let nsbs = 2u32;
+        let nbs = 16u32;
+        let nmbs = 4u32;
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let mb_map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
+            .collect();
+        // BCODED for SB 0: blocks 0..4 uncoded, 4..8 coded. SB 1 fully
+        // coded. So MB 0 (blocks 0..4) is wholly uncoded → step 2(d)ii.
+        let sb0_blocks = [0u8, 0, 0, 0, 1, 1, 1, 1];
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(1, 1); // FTYPE = inter
+        w.put(7, 6); // QIS[0]
+        w.put(0, 1); // MOREQIS = 0
+        encode_long_run_runs(&mut w, &[1, 0]); // SBPCODED = [1, 0]
+        encode_long_run_runs(&mut w, &[1]); // SBFCODED for SB 1 = coded
+        encode_short_run_runs(&mut w, &sb0_blocks);
+        // §7.4: MSCHEME=7. MB 0 is wholly uncoded → no bits, INTER_NOMV.
+        // MBs 1, 2, 3 each read a direct 3-bit mode.
+        let coded_modes = [
+            MacroBlockMode::InterMv,
+            MacroBlockMode::InterMvFour,
+            MacroBlockMode::InterGoldenMv,
+        ];
+        w.put(7, 3); // MSCHEME = 7
+        for m in &coded_modes {
+            w.put(m.to_index() as u32, 3);
+        }
+        let packet = w.finish();
+        let out =
+            decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, nmbs, &map, &mb_map)
+                .unwrap();
+        let mut expected_bcoded = sb0_blocks.to_vec();
+        expected_bcoded.extend_from_slice(&[1u8; 8]);
+        assert_eq!(out.bcoded, expected_bcoded);
+        assert_eq!(
+            out.mbmodes,
+            vec![
+                MacroBlockMode::InterNoMv, // step 2(d)ii, no bits read
+                MacroBlockMode::InterMv,
+                MacroBlockMode::InterMvFour,
+                MacroBlockMode::InterGoldenMv,
+            ]
+        );
     }
 
     // -----------------------------------------------------------------

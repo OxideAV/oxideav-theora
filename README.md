@@ -2,6 +2,32 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-11 (round 274)
+
+Round 274 extends the §7.11 step 1 chain a third link —
+**step 1(c)**, the §7.4 macro-block coding modes — onto the same
+shared `BitReader`. `decode_data_packet_header_and_blocks` now takes
+`nmbs` and the `NMBS`-element `macro_block_to_luma_blocks` map (the
+luma-block indices §7.4 step 2(d)i reads `BCODED` through), decodes
+the §7.1 header (1(a)) and §7.3 coded-block flags (1(b)) as before,
+then threads the §7.4 modes procedure on the same cursor — §7.4's
+`MSCHEME` / `MALPHABET` / mode stream resumes immediately after the
+§7.3 run-length streams with no byte re-alignment, exactly as §7.3
+resumed after §7.1. The typed `DataPacketHeaderAndBlocks` gains an
+`mbmodes: Vec<MacroBlockMode>` field and an `nmbs()` accessor. Intra
+frames short-circuit to all-`Intra` with no mode bits (§7.4 step 1);
+inter frames decode the on-wire modes, including step 2(d)ii's
+no-bits `INTER_NOMV` for a wholly-uncoded macro block. All §7.4
+reject paths propagate unchanged. +2 net tests (482 → 484): a §7.4
+luma-map-length reject and an inter path where one macro block is
+wholly uncoded (its mode is skipped yet the shared reader stays
+aligned for the coded neighbours); the seven prior step-1(a)+(b)
+tests were extended to assert the new `MBMODES` output. The step 1
+chain now covers 1(a)+1(b)+1(c); steps 1(d) (§7.5.2 motion vectors),
+1(e) (§7.6 qi), 1(f) (§7.7.3 coeffs), 1(g) (§7.8.2 DC inversion) and
+the step 5 / step 6 dispatch into `reconstruct_frame` /
+`loop_filter_frame` remain pending.
+
 ## Status — 2026-06-10 (round 267)
 
 Round 267 lands the first composed link of the §7.11 step 1 chain —

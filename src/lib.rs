@@ -8920,21 +8920,23 @@ pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFram
     })
 }
 
-/// The first three links of the §7.11 step 1 ("size of the data
+/// The first four links of the §7.11 step 1 ("size of the data
 /// packet is non-zero") chain: the §7.1 frame header, the §7.3 coded
-/// block flags, and the §7.4 macro-block coding modes, decoded
-/// together off a single shared bit reader.
+/// block flags, the §7.4 macro-block coding modes, and the §7.5.2
+/// motion vectors, decoded together off a single shared bit reader.
 ///
 /// §7.11 step 1 decodes a non-empty video-data packet through the
 /// chain §7.1 (a) → §7.3 (b) → §7.4 (c) → §7.5.2 (d) → §7.6 (e) →
 /// §7.7.3 (f) → §7.8.2 (g). The sub-procedures share one bit cursor
 /// — §7.3's run-length streams resume immediately after the §7.1
-/// header bits with no re-alignment, and §7.4's mode stream resumes
-/// immediately after §7.3's — so the chain has to be built over a
-/// single [`BitReader`], not by handing each procedure a fresh
-/// byte-aligned slice. [`decode_data_packet_header_and_blocks`]
-/// threads steps 1(a), 1(b), and 1(c) over one reader and surfaces
-/// the three outputs as a typed bundle.
+/// header bits with no re-alignment, §7.4's mode stream resumes
+/// immediately after §7.3's, and §7.5.2's `MVMODE` / MV stream
+/// resumes immediately after §7.4's — so the chain has to be built
+/// over a single [`BitReader`], not by handing each procedure a
+/// fresh byte-aligned slice.
+/// [`decode_data_packet_header_and_blocks`] threads steps 1(a),
+/// 1(b), 1(c), and 1(d) over one reader and surfaces the four
+/// outputs as a typed bundle.
 ///
 /// `header` carries §7.1's `FTYPE` + `QIS` (so the 1(d) motion-vector
 /// branch can test `FTYPE != 0` and 1(e)'s block-level `qi` decode can
@@ -8942,6 +8944,8 @@ pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFram
 /// array feeding steps 1(c) / 1(d) / 1(e) / 1(f) / 1(g). `mbmodes` is
 /// §7.4's `NMBS`-element coding-mode array (step 1(c)), which the 1(d)
 /// motion-vector branch and 1(g) DC-prediction inversion both consume.
+/// `mvects` is §7.5.2's `NBS`-element per-block motion-vector array
+/// (step 1(d)), which the step 5 §7.9.4 reconstruction call consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPacketHeaderAndBlocks {
     /// §7.11 step 1(a) output — the §7.1 frame header (`FTYPE` +
@@ -8957,6 +8961,17 @@ pub struct DataPacketHeaderAndBlocks {
     /// (§7.4 step 1, no bits consumed); on an inter frame the modes
     /// come off the shared reader immediately after the §7.3 streams.
     pub mbmodes: Vec<MacroBlockMode>,
+    /// §7.11 step 1(d) output — the `NBS`-element `MVECTS` array.
+    /// Step 1(d) gates the §7.5.2 decode on `FTYPE` being non-zero
+    /// (inter frame); on an intra frame no bits are consumed and
+    /// every entry is [`MotionVector::ZERO`] (§7.5's opening sentence
+    /// states intra frames carry no motion vectors, so the gate and
+    /// §7.5.2's own intra short-circuit coincide). On an inter frame
+    /// the `MVMODE` bit and the per-macro-block MV stream come off
+    /// the shared reader immediately after the §7.4 mode stream.
+    /// Blocks that receive no MV from §7.5.2 (uncoded blocks, blocks
+    /// in `NOMV` / `INTRA` macro blocks) carry the `(0, 0)` default.
+    pub mvects: Vec<MotionVector>,
 }
 
 impl DataPacketHeaderAndBlocks {
@@ -8984,22 +8999,25 @@ impl DataPacketHeaderAndBlocks {
     }
 }
 
-/// Execute §7.11 step 1(a) + step 1(b) + step 1(c): decode the §7.1
-/// frame header, the §7.3 coded block flags, and the §7.4 macro-block
-/// coding modes from a non-empty video-data packet, sharing a single
-/// bit reader across all three procedures.
+/// Execute §7.11 step 1(a) + step 1(b) + step 1(c) + step 1(d):
+/// decode the §7.1 frame header, the §7.3 coded block flags, the
+/// §7.4 macro-block coding modes, and the §7.5.2 motion vectors from
+/// a non-empty video-data packet, sharing a single bit reader across
+/// all four procedures.
 ///
 /// This is the entry of the §7.11 step 1 chain — the "If the size of
 /// the data packet is non-zero" branch. The shared-reader contract is
 /// the whole point: §7.3's run-length-coded `SBPCODED` / `SBFCODED`
 /// streams begin at the bit position immediately after the §7.1
-/// header's last bit, with no byte re-alignment, and §7.4's `MSCHEME`
-/// / `MALPHABET` / mode stream resumes immediately after §7.3's, so
-/// all three procedures must run against one [`BitReader`]. The
-/// byte-aligned standalone entry points [`decode_frame_header`],
-/// [`decode_coded_block_flags`], and [`decode_macroblock_modes`]
-/// cannot be composed for the real stream because each would re-start
-/// the cursor at a byte boundary.
+/// header's last bit, with no byte re-alignment, §7.4's `MSCHEME`
+/// / `MALPHABET` / mode stream resumes immediately after §7.3's, and
+/// §7.5.2's `MVMODE` bit plus MV stream resumes immediately after
+/// §7.4's, so all four procedures must run against one [`BitReader`].
+/// The byte-aligned standalone entry points [`decode_frame_header`],
+/// [`decode_coded_block_flags`], [`decode_macroblock_modes`], and
+/// [`decode_macroblock_motion_vectors`] cannot be composed for the
+/// real stream because each would re-start the cursor at a byte
+/// boundary.
 ///
 /// Inputs:
 ///
@@ -9011,6 +9029,9 @@ impl DataPacketHeaderAndBlocks {
 ///   packet-type bit to read).
 /// * `first_frame` — §7.1 step 2 mandates the first decoded frame be
 ///   intra (`FTYPE = 0`); propagated to [`decode_frame_header`].
+/// * `pf` — the pixel format from the identification header. §7.11
+///   step 1(d) hands `PF` to §7.5.2, which uses it for the
+///   `INTER_MV_FOUR` chroma-MV averaging (steps 3(a)x..3(a)xii).
 /// * `nsbs` / `nbs` — the §6.2-derived super-block / block counts
 ///   (`NSBS` / `NBS`) from the identification header. §7.3 reads
 ///   `NSBS` bits for `SBPCODED` and validates the per-block mapping
@@ -9023,38 +9044,58 @@ impl DataPacketHeaderAndBlocks {
 /// * `macro_block_to_luma_blocks` — the `NMBS`-element map giving each
 ///   macro block's four coded-order luma-block indices; same contract
 ///   as [`decode_macroblock_modes`]. §7.4 step 2(d)i reads
-///   `BCODED[bi]` for these to decide whether a mode is on the wire.
+///   `BCODED[bi]` for these to decide whether a mode is on the wire,
+///   and §7.5.2 reads the same map for its per-luma-block MV writes.
+/// * `chroma_map` — the per-macro-block chroma-block layout §7.5.2
+///   writes chroma MVs through; same contract as
+///   [`decode_macroblock_motion_vectors`] (per-plane outer length
+///   `nmbs`; inner length `1` for PF=0, `2` for PF=2, `4` for PF=3).
 ///
 /// The §7.1 header is decoded first (step 1(a)); its `FTYPE`
-/// determines whether §7.3 (step 1(b)) and §7.4 (step 1(c))
-/// short-circuit the intra path (every block coded, every mode
-/// `INTRA`, no bits read) or run the inter chains on the same reader.
+/// determines whether §7.3 (step 1(b)), §7.4 (step 1(c)), and §7.5.2
+/// (step 1(d)) short-circuit the intra path (every block coded, every
+/// mode `INTRA`, every MV `(0, 0)`, no bits read) or run the inter
+/// chains on the same reader. Step 1(d)'s spec wording gates the
+/// §7.5.2 call on `FTYPE` being non-zero; §7.5's opening sentence
+/// makes the procedure itself a no-bit no-op on intra frames, so the
+/// driver delegates the gate to §7.5.2 — identical bit consumption
+/// and output, with the §7.5.2 shape validation applied uniformly
+/// across frame types (matching how the step 1(c) link validates the
+/// luma map on intra frames too).
 ///
 /// Any §7.1 reject ([`Error::NotDataPacket`],
 /// [`Error::FirstFrameMustBeIntra`], [`Error::FrameReservedBitsNonZero`],
 /// [`Error::TruncatedHeader`]), §7.3 reject
 /// ([`Error::BlockSuperBlockMapLenMismatch`],
 /// [`Error::BlockSuperBlockIndexOutOfRange`], a run-length overrun, or
-/// truncation), or §7.4 reject
+/// truncation), §7.4 reject
 /// ([`Error::MacroBlockLumaMapLenMismatch`],
 /// [`Error::MacroBlockLumaBlockIndexOutOfRange`],
-/// [`Error::UnknownMacroBlockModeCode`], or truncation) propagates
-/// unchanged.
+/// [`Error::UnknownMacroBlockModeCode`], or truncation), or §7.5.2
+/// reject ([`Error::MotionVectorMbModesLenMismatch`],
+/// [`Error::MotionVectorLumaMapLenMismatch`],
+/// [`Error::MotionVectorLumaBlockIndexOutOfRange`],
+/// [`Error::MotionVectorChromaMapLenMismatch`],
+/// [`Error::MotionVectorChromaMacroBlockSlotLenMismatch`],
+/// [`Error::MotionVectorChromaBlockIndexOutOfRange`], or truncation)
+/// propagates unchanged.
 ///
-/// This lands steps 1(a), 1(b), and 1(c) of the §7.11 step 1 chain;
-/// the remaining links — §7.5.2 motion vectors (1(d)), §7.6
-/// block-level qi (1(e)), §7.7.3 DCT coefficients (1(f)), §7.8.2
-/// DC-prediction inversion (1(g)) — extend this driver in later
-/// rounds, each resuming on the same reader.
+/// This lands steps 1(a), 1(b), 1(c), and 1(d) of the §7.11 step 1
+/// chain; the remaining links — §7.6 block-level qi (1(e)), §7.7.3
+/// DCT coefficients (1(f)), §7.8.2 DC-prediction inversion (1(g)) —
+/// extend this driver in later rounds, each resuming on the same
+/// reader.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_data_packet_header_and_blocks(
     packet: &[u8],
     first_frame: bool,
+    pf: PixelFormat,
     nsbs: u32,
     nbs: u32,
     nmbs: u32,
     block_to_super_block: &[u32],
     macro_block_to_luma_blocks: &[[u32; 4]],
+    chroma_map: ChromaBlockLayout<'_>,
 ) -> Result<DataPacketHeaderAndBlocks, Error> {
     let mut r = BitReader::new(packet);
     // Step 1(a): §7.1 frame header off the shared reader.
@@ -9073,10 +9114,31 @@ pub fn decode_data_packet_header_and_blocks(
         &bcoded,
         macro_block_to_luma_blocks,
     )?;
+    // Step 1(d): "If FTYPE is non-zero (inter frame), using PF,
+    // NMBS, MBMODES, NBS, and BCODED, decode the motion vectors
+    // into MVECTS using the procedure given in Section 7.5.2." The
+    // §7.5.2 procedure resumes on the same reader, immediately after
+    // the §7.4 mode stream — no re-alignment. The FTYPE gate is
+    // delegated to §7.5.2's own intra short-circuit (§7.5 opening
+    // sentence: intra frames carry no motion vectors and consume no
+    // bits), which yields the all-zero `MVECTS` and leaves the
+    // cursor untouched, exactly as if the gate skipped the call.
+    let mvects = decode_macroblock_motion_vectors_inner(
+        &mut r,
+        header.ftype,
+        pf,
+        nbs,
+        nmbs,
+        &bcoded,
+        &mbmodes,
+        macro_block_to_luma_blocks,
+        chroma_map,
+    )?;
     Ok(DataPacketHeaderAndBlocks {
         header,
         bcoded,
         mbmodes,
+        mvects,
     })
 }
 
@@ -21598,24 +21660,35 @@ mod tests {
     /// §7.11 step 1(a)+(b) intra path: a one-shot decode of an intra
     /// frame header followed by §7.3's all-coded short-circuit. The
     /// §7.3 step 1 intra path reads no bits, so the byte-aligned
-    /// `build_frame_header` packet feeds straight in.
+    /// `build_frame_header` packet feeds straight in. The step 1(d)
+    /// gate ("If FTYPE is non-zero") skips the §7.5.2 decode wholesale
+    /// on an intra frame: no `MVMODE` bit is consumed (any read past
+    /// the exact-length header packet would surface as truncation) and
+    /// every `MVECTS` entry is `(0, 0)`.
     #[test]
     fn data_header_and_blocks_intra_all_coded() {
         // 3 super blocks, 8 blocks each → NBS=24 (the tiny-i fixture
-        // shape used elsewhere in the §7.3 tests).
+        // shape used elsewhere in the §7.3 tests): 16 luma blocks
+        // (4 MBs × 4), 4 Cb, 4 Cr per the 4:2:0 uniform layout.
         let nsbs = 3u32;
-        let nbs = 24u32;
-        // 4 luma macro blocks: each owns four luma blocks (0..16 are
-        // luma; 16..24 are chroma in this synthetic shape).
         let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
-        let mb_map: Vec<[u32; 4]> = (0..nmbs)
-            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
-            .collect();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
         let packet = build_frame_header(0, &[12], 0);
-        let out =
-            decode_data_packet_header_and_blocks(&packet, true, nsbs, nbs, nmbs, &map, &mb_map)
-                .unwrap();
+        let out = decode_data_packet_header_and_blocks(
+            &packet,
+            true,
+            PixelFormat::Yuv420,
+            nsbs,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
         assert_eq!(out.ftype(), FrameType::Intra);
         assert_eq!(out.header.qis, vec![12]);
         assert_eq!(out.nqis(), 1);
@@ -21626,25 +21699,30 @@ mod tests {
         // bits read.
         assert_eq!(out.mbmodes, vec![MacroBlockMode::Intra; 4]);
         assert_eq!(out.nmbs(), 4);
+        // §7.11 step 1(d) gate: intra frame → no §7.5.2 bits, all-zero
+        // MVECTS sized NBS.
+        assert_eq!(out.mvects, vec![MotionVector::ZERO; 24]);
     }
 
-    /// §7.11 step 1(a)+(b) inter path: the shared-reader contract —
-    /// §7.3's run-length streams must resume at the bit position
-    /// immediately after the §7.1 header, with no re-alignment. The
-    /// test writes both the header bits and the §7.3 `SBPCODED` /
-    /// `SBFCODED` streams into one `BitWriter` (a single bitstream,
-    /// byte-aligned only at the very end), then confirms the composed
-    /// driver recovers both the header and an all-coded `BCODED`.
+    /// §7.11 step 1(a)+(b)+(c)+(d) inter path: the shared-reader
+    /// contract — §7.3's run-length streams must resume at the bit
+    /// position immediately after the §7.1 header, §7.4's mode stream
+    /// after §7.3's, and §7.5.2's `MVMODE` + MV stream after §7.4's,
+    /// with no re-alignment anywhere. The test writes all four
+    /// sections into one `BitWriter` (a single bitstream, byte-aligned
+    /// only at the very end), then confirms the composed driver
+    /// recovers the header, an all-coded `BCODED`, the modes, and the
+    /// motion vectors — including `INTER_MV_FOUR`'s four per-luma MVs
+    /// plus the 4:2:0 chroma average.
     #[test]
     fn data_header_and_blocks_inter_shared_reader_all_coded() {
-        let nsbs = 2u32;
-        let nbs = 16u32;
-        // 4 macro blocks, each owning four luma blocks 0..16.
+        // 4 MBs × 4 luma + 4 Cb + 4 Cr = NBS 24 over 3 super blocks.
+        let nsbs = 3u32;
         let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
-        let mb_map: Vec<[u32; 4]> = (0..nmbs)
-            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
-            .collect();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
         let mut w = BitWriter::new();
         // §7.1 inter header (FTYPE=1, NQIS=1, QIS=[7]); no reserved
         // trailer on an inter frame.
@@ -21655,8 +21733,8 @@ mod tests {
                      // §7.3 resumes on the SAME bitstream, mid-byte: every super
                      // block fully coded (SBPCODED=0, SBFCODED=1), no per-block
                      // stream.
-        encode_long_run_runs(&mut w, &[0, 0]);
-        encode_long_run_runs(&mut w, &[1, 1]);
+        encode_long_run_runs(&mut w, &[0, 0, 0]);
+        encode_long_run_runs(&mut w, &[1, 1, 1]);
         // §7.4 resumes on the SAME bitstream: MSCHEME=7 (direct 3-bit
         // modes). Every MB has coded luma blocks, so one mode is read
         // per MB.
@@ -21670,33 +21748,76 @@ mod tests {
         for m in &modes {
             w.put(m.to_index() as u32, 3);
         }
+        // §7.5.2 resumes on the SAME bitstream: MVMODE=1 (5+1-bit
+        // fixed-length components). MB 0 (INTER_MV) reads one MV;
+        // MB 1 (INTER_NOMV) reads none; MB 2 (INTER_MV_FOUR) reads
+        // four (all four luma blocks coded); MB 3 (INTER_GOLDEN_NOMV)
+        // reads none.
+        w.put(1, 1); // MVMODE = 1
+        write_mv_fixed_component(&mut w, 2); // MB 0 MVX
+        write_mv_fixed_component(&mut w, -3); // MB 0 MVY
+        let four = [
+            MotionVector { x: 1, y: 1 },
+            MotionVector { x: 3, y: 1 },
+            MotionVector { x: 5, y: 3 },
+            MotionVector { x: 7, y: 3 },
+        ];
+        for mv in &four {
+            write_mv_fixed_component(&mut w, mv.x);
+            write_mv_fixed_component(&mut w, mv.y);
+        }
         let packet = w.finish();
-        let out =
-            decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, nmbs, &map, &mb_map)
-                .unwrap();
+        let out = decode_data_packet_header_and_blocks(
+            &packet,
+            false,
+            PixelFormat::Yuv420,
+            nsbs,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
         assert_eq!(out.ftype(), FrameType::Inter);
         assert_eq!(out.header.qis, vec![7]);
-        assert_eq!(out.bcoded, vec![1u8; 16]);
+        assert_eq!(out.bcoded, vec![1u8; 24]);
         assert_eq!(out.mbmodes, modes.to_vec());
         assert_eq!(out.nmbs(), 4);
+        // Step 1(d) output. MB 0's MV propagates to its luma (0..4) +
+        // chroma (Cb 16, Cr 20). MB 1 / MB 3 carry (0, 0). MB 2's four
+        // luma MVs land per block (8..12); its 4:2:0 chroma average is
+        // (round(16/4), round(8/4)) = (4, 2) at Cb 18 / Cr 22.
+        let mv0 = MotionVector { x: 2, y: -3 };
+        let avg = MotionVector { x: 4, y: 2 };
+        let z = MotionVector::ZERO;
+        let expected = vec![
+            mv0, mv0, mv0, mv0, // MB 0 luma
+            z, z, z, z, // MB 1 luma (INTER_NOMV)
+            four[0], four[1], four[2], four[3], // MB 2 luma
+            z, z, z, z, // MB 3 luma (INTER_GOLDEN_NOMV)
+            mv0, z, avg, z, // Cb plane, MBs 0..4
+            mv0, z, avg, z, // Cr plane, MBs 0..4
+        ];
+        assert_eq!(out.mvects, expected);
     }
 
-    /// §7.11 step 1(a)+(b) inter path with a genuinely mixed `BCODED`,
-    /// confirming the per-block short-run stream is decoded off the
-    /// shared reader after the two long-run passes — the bit cursor
-    /// stays continuous across all of §7.1 + §7.3.
+    /// §7.11 step 1(a)+(b)+(c)+(d) inter path with a genuinely mixed
+    /// `BCODED`, confirming the per-block short-run stream is decoded
+    /// off the shared reader after the two long-run passes, and that
+    /// §7.5.2's step 3(g) writes the decoded MV only to the *coded*
+    /// blocks of each macro block — the bit cursor stays continuous
+    /// across all of §7.1 + §7.3 + §7.4 + §7.5.2.
     #[test]
     fn data_header_and_blocks_inter_shared_reader_mixed_bcoded() {
-        // 2 super blocks of 8 blocks each → NBS=16. SB 0 is partially
-        // coded, SB 1 fully coded.
-        let nsbs = 2u32;
-        let nbs = 16u32;
-        // 4 macro blocks, each owning four consecutive luma blocks.
+        // 3 super blocks of 8 blocks each → NBS=24 (16 luma + 4 Cb +
+        // 4 Cr). SB 0 is partially coded, SBs 1 and 2 fully coded.
+        let nsbs = 3u32;
         let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
-        let mb_map: Vec<[u32; 4]> = (0..nmbs)
-            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
-            .collect();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
         // The per-block bits inside the partially-coded SB 0.
         let sb0_blocks = [1u8, 1, 0, 0, 1, 0, 1, 1];
         let mut w = BitWriter::new();
@@ -21709,14 +21830,14 @@ mod tests {
         w.put(9, 6); // QIS[1]
         w.put(1, 1); // MOREQIS = 1
         w.put(40, 6); // QIS[2]
-                      // §7.3: SBPCODED = [1, 0] (SB 0 partial), SBFCODED over the
-                      // non-partial subset = [1] (SB 1 fully coded), then the
-                      // per-block short-run stream for SB 0.
-        encode_long_run_runs(&mut w, &[1, 0]);
-        encode_long_run_runs(&mut w, &[1]);
+                      // §7.3: SBPCODED = [1, 0, 0] (SB 0 partial), SBFCODED over
+                      // the non-partial subset = [1, 1] (SBs 1 and 2 fully
+                      // coded), then the per-block short-run stream for SB 0.
+        encode_long_run_runs(&mut w, &[1, 0, 0]);
+        encode_long_run_runs(&mut w, &[1, 1]);
         encode_short_run_runs(&mut w, &sb0_blocks);
         // §7.4 resumes on the SAME bitstream after the short-run
-        // stream. With BCODED = sb0_blocks ++ [1;8] every MB owns at
+        // stream. With BCODED = sb0_blocks ++ [1;16] every MB owns at
         // least one coded luma block, so all four read modes.
         // MSCHEME=7 → direct 3-bit modes.
         let modes = [
@@ -21729,18 +21850,53 @@ mod tests {
         for m in &modes {
             w.put(m.to_index() as u32, 3);
         }
+        // §7.5.2 resumes on the SAME bitstream. MVMODE=1. MB 0
+        // (INTER_MV_LAST) reuses LAST1 = (0, 0), no bits. MB 1
+        // (INTER_MV) reads one MV. MB 2 (INTRA) emits zero, no bits.
+        // MB 3 (INTER_GOLDEN_MV) reads one MV without a LAST update.
+        w.put(1, 1); // MVMODE = 1
+        write_mv_fixed_component(&mut w, -5); // MB 1 MVX
+        write_mv_fixed_component(&mut w, 6); // MB 1 MVY
+        write_mv_fixed_component(&mut w, 1); // MB 3 MVX
+        write_mv_fixed_component(&mut w, 0); // MB 3 MVY
         let packet = w.finish();
-        let out =
-            decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, nmbs, &map, &mb_map)
-                .unwrap();
+        let out = decode_data_packet_header_and_blocks(
+            &packet,
+            false,
+            PixelFormat::Yuv420,
+            nsbs,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
         assert_eq!(out.ftype(), FrameType::Inter);
         assert_eq!(out.header.qis, vec![5, 9, 40]);
         assert_eq!(out.nqis(), 3);
         let mut expected = sb0_blocks.to_vec();
-        expected.extend_from_slice(&[1u8; 8]); // SB 1 fully coded
+        expected.extend_from_slice(&[1u8; 16]); // SBs 1 + 2 fully coded
         assert_eq!(out.bcoded, expected);
-        assert_eq!(out.nbs(), 16);
+        assert_eq!(out.nbs(), 24);
         assert_eq!(out.mbmodes, modes.to_vec());
+        // Step 1(d) output. MB 1's MV lands on its coded luma blocks
+        // only (4, 6, 7 — block 5 is uncoded and keeps (0, 0)) plus
+        // its coded chroma (Cb 17, Cr 21). MB 3's MV covers blocks
+        // 12..16 + Cb 19 / Cr 23. MB 0 (LAST1 = (0, 0)) and MB 2
+        // (INTRA) leave zeros.
+        let mv1 = MotionVector { x: -5, y: 6 };
+        let mv3 = MotionVector { x: 1, y: 0 };
+        let z = MotionVector::ZERO;
+        let expected_mvs = vec![
+            z, z, z, z, // MB 0 luma (INTER_MV_LAST reusing zero LAST1)
+            mv1, z, mv1, mv1, // MB 1 luma — block 5 uncoded stays zero
+            z, z, z, z, // MB 2 luma (INTRA)
+            mv3, mv3, mv3, mv3, // MB 3 luma
+            z, mv1, z, mv3, // Cb plane, MBs 0..4
+            z, mv1, z, mv3, // Cr plane, MBs 0..4
+        ];
+        assert_eq!(out.mvects, expected_mvs);
     }
 
     /// §7.11 step 1(a) reject: a header packet (high bit set)
@@ -21750,8 +21906,22 @@ mod tests {
     fn data_header_and_blocks_rejects_header_packet() {
         let map = vec![0u32; 24];
         let mb_map = vec![[0u32; 4]; 4];
-        let err = decode_data_packet_header_and_blocks(&[0x80], true, 3, 24, 4, &map, &mb_map)
-            .unwrap_err();
+        let chroma = vec![&[0u32][..]; 4];
+        let err = decode_data_packet_header_and_blocks(
+            &[0x80],
+            true,
+            PixelFormat::Yuv420,
+            3,
+            24,
+            4,
+            &map,
+            &mb_map,
+            ChromaBlockLayout {
+                cb: &chroma,
+                cr: &chroma,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::NotDataPacket));
     }
 
@@ -21763,8 +21933,22 @@ mod tests {
         let packet = build_frame_header(1, &[7], 0);
         let map = vec![0u32; 16];
         let mb_map = vec![[0u32; 4]; 4];
-        let err = decode_data_packet_header_and_blocks(&packet, true, 2, 16, 4, &map, &mb_map)
-            .unwrap_err();
+        let chroma = vec![&[0u32][..]; 4];
+        let err = decode_data_packet_header_and_blocks(
+            &packet,
+            true,
+            PixelFormat::Yuv420,
+            2,
+            16,
+            4,
+            &map,
+            &mb_map,
+            ChromaBlockLayout {
+                cb: &chroma,
+                cr: &chroma,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::FirstFrameMustBeIntra { ftype: 1 }));
     }
 
@@ -21778,8 +21962,22 @@ mod tests {
         // Map is one short of NBS.
         let map = vec![0u32; 23];
         let mb_map = vec![[0u32; 4]; 4];
-        let err = decode_data_packet_header_and_blocks(&packet, true, 3, 24, 4, &map, &mb_map)
-            .unwrap_err();
+        let chroma = vec![&[0u32][..]; 4];
+        let err = decode_data_packet_header_and_blocks(
+            &packet,
+            true,
+            PixelFormat::Yuv420,
+            3,
+            24,
+            4,
+            &map,
+            &mb_map,
+            ChromaBlockLayout {
+                cb: &chroma,
+                cr: &chroma,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             Error::BlockSuperBlockMapLenMismatch {
@@ -21791,22 +21989,32 @@ mod tests {
 
     /// `ftype()` / `nqis()` / `nbs()` / `nmbs()` accessors mirror the
     /// underlying header + `BCODED` + `MBMODES` state for an intra
-    /// decode.
+    /// decode, and the `mvects` array is sized `NBS` like `bcoded`.
     #[test]
     fn data_header_and_blocks_accessors_match_state() {
-        let nbs = 24u32;
         let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
-        let mb_map: Vec<[u32; 4]> = (0..nmbs)
-            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
-            .collect();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
         let packet = build_frame_header(0, &[1, 2], 0);
-        let out = decode_data_packet_header_and_blocks(&packet, true, 3, nbs, nmbs, &map, &mb_map)
-            .unwrap();
+        let out = decode_data_packet_header_and_blocks(
+            &packet,
+            true,
+            PixelFormat::Yuv420,
+            3,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
         assert_eq!(out.ftype(), out.header.ftype);
         assert_eq!(out.nqis(), out.header.qis.len());
         assert_eq!(out.nbs(), out.bcoded.len());
         assert_eq!(out.nmbs(), out.mbmodes.len());
+        assert_eq!(out.mvects.len(), out.bcoded.len());
         assert_eq!(out.nqis(), 2);
         assert_eq!(out.nbs(), 24);
         assert_eq!(out.nmbs(), 4);
@@ -21834,8 +22042,22 @@ mod tests {
         let packet = w.finish();
         // NMBS claimed as 4 but the map carries only 3 entries.
         let mb_map = vec![[0u32, 1, 2, 3]; 3];
-        let err = decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, 4, &map, &mb_map)
-            .unwrap_err();
+        let chroma = vec![&[0u32][..]; 4];
+        let err = decode_data_packet_header_and_blocks(
+            &packet,
+            false,
+            PixelFormat::Yuv420,
+            nsbs,
+            nbs,
+            4,
+            &map,
+            &mb_map,
+            ChromaBlockLayout {
+                cb: &chroma,
+                cr: &chroma,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             Error::MacroBlockLumaMapLenMismatch {
@@ -21849,28 +22071,32 @@ mod tests {
     /// block whose four luma blocks are all uncoded gets
     /// [`MacroBlockMode::InterNoMv`] with **no** mode bits read, while
     /// its coded neighbours read a mode each. Confirms the shared
-    /// reader stays aligned when §7.4 skips bits for an uncoded MB.
+    /// reader stays aligned when §7.4 skips bits for an uncoded MB —
+    /// the §7.5.2 stream that follows decodes correctly, including the
+    /// `INTER_MV_FOUR` chroma rounding (`round(2/4) = 1`, ties away
+    /// from zero).
     #[test]
     fn data_header_and_blocks_inter_uncoded_mb_reads_no_mode_bits() {
-        // 2 super blocks of 8 blocks → NBS=16. SB 0 partially coded so
-        // that MB 0's luma blocks (0..4) are all uncoded.
-        let nsbs = 2u32;
-        let nbs = 16u32;
+        // 3 super blocks of 8 blocks → NBS=24 (16 luma + 4 Cb + 4 Cr).
+        // SB 0 partially coded so that MB 0's luma blocks (0..4) are
+        // all uncoded.
+        let nsbs = 3u32;
         let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
-        let mb_map: Vec<[u32; 4]> = (0..nmbs)
-            .map(|m| [m * 4, m * 4 + 1, m * 4 + 2, m * 4 + 3])
-            .collect();
-        // BCODED for SB 0: blocks 0..4 uncoded, 4..8 coded. SB 1 fully
-        // coded. So MB 0 (blocks 0..4) is wholly uncoded → step 2(d)ii.
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        // BCODED for SB 0: blocks 0..4 uncoded, 4..8 coded. SBs 1 + 2
+        // fully coded. So MB 0 (blocks 0..4) is wholly uncoded →
+        // step 2(d)ii.
         let sb0_blocks = [0u8, 0, 0, 0, 1, 1, 1, 1];
         let mut w = BitWriter::new();
         w.put(0, 1); // data-packet flag
         w.put(1, 1); // FTYPE = inter
         w.put(7, 6); // QIS[0]
         w.put(0, 1); // MOREQIS = 0
-        encode_long_run_runs(&mut w, &[1, 0]); // SBPCODED = [1, 0]
-        encode_long_run_runs(&mut w, &[1]); // SBFCODED for SB 1 = coded
+        encode_long_run_runs(&mut w, &[1, 0, 0]); // SBPCODED = [1, 0, 0]
+        encode_long_run_runs(&mut w, &[1, 1]); // SBFCODED for SBs 1 + 2
         encode_short_run_runs(&mut w, &sb0_blocks);
         // §7.4: MSCHEME=7. MB 0 is wholly uncoded → no bits, INTER_NOMV.
         // MBs 1, 2, 3 each read a direct 3-bit mode.
@@ -21883,12 +22109,40 @@ mod tests {
         for m in &coded_modes {
             w.put(m.to_index() as u32, 3);
         }
+        // §7.5.2 resumes on the SAME bitstream. MVMODE=1. MB 0
+        // (INTER_NOMV) emits zero, no bits. MB 1 (INTER_MV) reads one
+        // MV. MB 2 (INTER_MV_FOUR) reads four (all four luma coded).
+        // MB 3 (INTER_GOLDEN_MV) reads one.
+        w.put(1, 1); // MVMODE = 1
+        write_mv_fixed_component(&mut w, 3); // MB 1 MVX
+        write_mv_fixed_component(&mut w, 3); // MB 1 MVY
+        let four = [
+            MotionVector { x: 2, y: 0 },
+            MotionVector { x: 2, y: 0 },
+            MotionVector { x: 2, y: 0 },
+            MotionVector { x: 2, y: 2 },
+        ];
+        for mv in &four {
+            write_mv_fixed_component(&mut w, mv.x);
+            write_mv_fixed_component(&mut w, mv.y);
+        }
+        write_mv_fixed_component(&mut w, 0); // MB 3 MVX
+        write_mv_fixed_component(&mut w, -1); // MB 3 MVY
         let packet = w.finish();
-        let out =
-            decode_data_packet_header_and_blocks(&packet, false, nsbs, nbs, nmbs, &map, &mb_map)
-                .unwrap();
+        let out = decode_data_packet_header_and_blocks(
+            &packet,
+            false,
+            PixelFormat::Yuv420,
+            nsbs,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
         let mut expected_bcoded = sb0_blocks.to_vec();
-        expected_bcoded.extend_from_slice(&[1u8; 8]);
+        expected_bcoded.extend_from_slice(&[1u8; 16]);
         assert_eq!(out.bcoded, expected_bcoded);
         assert_eq!(
             out.mbmodes,
@@ -21899,6 +22153,141 @@ mod tests {
                 MacroBlockMode::InterGoldenMv,
             ]
         );
+        // Step 1(d) output. MB 2's 4:2:0 chroma average is
+        // (round(8/4), round(2/4)) = (2, 1) — the y component
+        // exercises the spec's ties-away-from-zero `round()`.
+        let mv1 = MotionVector { x: 3, y: 3 };
+        let avg = MotionVector { x: 2, y: 1 };
+        let mv3 = MotionVector { x: 0, y: -1 };
+        let z = MotionVector::ZERO;
+        let expected_mvs = vec![
+            z, z, z, z, // MB 0 luma (uncoded, INTER_NOMV)
+            mv1, mv1, mv1, mv1, // MB 1 luma
+            four[0], four[1], four[2], four[3], // MB 2 luma
+            mv3, mv3, mv3, mv3, // MB 3 luma
+            z, mv1, avg, mv3, // Cb plane, MBs 0..4
+            z, mv1, avg, mv3, // Cr plane, MBs 0..4
+        ];
+        assert_eq!(out.mvects, expected_mvs);
+    }
+
+    /// §7.11 step 1(d) reject: a §7.5.2 chroma-block map of the wrong
+    /// outer length propagates [`Error::MotionVectorChromaMapLenMismatch`]
+    /// — the §7.1 / §7.3 / §7.4 links decode fine, but the §7.5.2 link
+    /// rejects the chroma geometry before reading the `MVMODE` bit
+    /// (the packet deliberately ends right after the §7.4 modes; any
+    /// §7.5.2 bit read would surface as truncation instead).
+    #[test]
+    fn data_header_and_blocks_propagates_chroma_map_len_mismatch() {
+        let nsbs = 3u32;
+        let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        // Cb outer map is one short of NMBS; Cr is correct.
+        let cb_full = slice_outer(&cb_o);
+        let cb = &cb_full[..3];
+        let cr = slice_outer(&cr_o);
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(1, 1); // FTYPE = inter
+        w.put(7, 6); // QIS[0]
+        w.put(0, 1); // MOREQIS = 0
+        encode_long_run_runs(&mut w, &[0, 0, 0]); // SBPCODED all 0
+        encode_long_run_runs(&mut w, &[1, 1, 1]); // SBFCODED all coded
+        w.put(7, 3); // MSCHEME = 7
+        for _ in 0..4 {
+            w.put(MacroBlockMode::InterNoMv.to_index() as u32, 3);
+        }
+        let packet = w.finish();
+        let err = decode_data_packet_header_and_blocks(
+            &packet,
+            false,
+            PixelFormat::Yuv420,
+            nsbs,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb, cr: &cr },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MotionVectorChromaMapLenMismatch {
+                plane: 0,
+                map_len: 3,
+                expected: 4
+            }
+        ));
+    }
+
+    /// §7.11 step 1(d) inter path pinning the §7.5.2 `LAST1` / `LAST2`
+    /// register file through the composed driver, with `MVMODE=0`
+    /// Table 7.23 Huffman MV components on the shared reader:
+    /// `INTER_MV` seeds `LAST1`, `INTER_MV_LAST` reuses it with no
+    /// bits, `INTER_MV_LAST2` swaps in the older register (still
+    /// `(0, 0)`), and a final `INTER_MV` reads a fresh MV.
+    #[test]
+    fn data_header_and_blocks_inter_mv_last_registers_on_shared_reader() {
+        let nsbs = 3u32;
+        let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(1, 1); // FTYPE = inter
+        w.put(7, 6); // QIS[0]
+        w.put(0, 1); // MOREQIS = 0
+        encode_long_run_runs(&mut w, &[0, 0, 0]); // SBPCODED all 0
+        encode_long_run_runs(&mut w, &[1, 1, 1]); // SBFCODED all coded
+        let modes = [
+            MacroBlockMode::InterMv,
+            MacroBlockMode::InterMvLast,
+            MacroBlockMode::InterMvLast2,
+            MacroBlockMode::InterMv,
+        ];
+        w.put(7, 3); // MSCHEME = 7
+        for m in &modes {
+            w.put(m.to_index() as u32, 3);
+        }
+        // §7.5.2: MVMODE=0 (Table 7.23 Huffman). Only MBs 0 and 3 read
+        // MV bits; MBs 1 and 2 work the LAST registers.
+        w.put(0, 1); // MVMODE = 0
+        write_mv_huffman_component(&mut w, 4); // MB 0 MVX
+        write_mv_huffman_component(&mut w, 1); // MB 0 MVY
+        write_mv_huffman_component(&mut w, 7); // MB 3 MVX
+        write_mv_huffman_component(&mut w, -7); // MB 3 MVY
+        let packet = w.finish();
+        let out = decode_data_packet_header_and_blocks(
+            &packet,
+            false,
+            PixelFormat::Yuv420,
+            nsbs,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+        )
+        .unwrap();
+        assert_eq!(out.mbmodes, modes.to_vec());
+        // MB 0: (4, 1), LAST1 = (4, 1). MB 1 (INTER_MV_LAST): reuses
+        // LAST1 = (4, 1). MB 2 (INTER_MV_LAST2): swaps LAST1/LAST2 →
+        // emits the pre-MB-0 LAST2 = (0, 0). MB 3: fresh (7, -7).
+        let mv0 = MotionVector { x: 4, y: 1 };
+        let mv3 = MotionVector { x: 7, y: -7 };
+        let z = MotionVector::ZERO;
+        let expected = vec![
+            mv0, mv0, mv0, mv0, // MB 0 luma
+            mv0, mv0, mv0, mv0, // MB 1 luma (LAST1 reuse)
+            z, z, z, z, // MB 2 luma (LAST2 = (0, 0))
+            mv3, mv3, mv3, mv3, // MB 3 luma
+            mv0, mv0, z, mv3, // Cb plane, MBs 0..4
+            mv0, mv0, z, mv3, // Cr plane, MBs 0..4
+        ];
+        assert_eq!(out.mvects, expected);
     }
 
     // -----------------------------------------------------------------

@@ -2,6 +2,35 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-11 (round 278)
+
+Round 278 extends the §7.11 step 1 chain a fourth link — **step
+1(d)**, the §7.5.2 motion vectors — onto the same shared `BitReader`.
+`decode_data_packet_header_and_blocks` now takes `pf` (the pixel
+format, which §7.5.2 needs for `INTER_MV_FOUR` chroma-MV averaging)
+and the per-macro-block `ChromaBlockLayout`, decodes the §7.1 header
+(1(a)), §7.3 coded-block flags (1(b)), and §7.4 modes (1(c)) as
+before, then threads §7.5.2 on the same cursor — the `MVMODE` bit and
+per-macro-block MV stream resume immediately after the §7.4 mode
+stream with no byte re-alignment, exactly as each earlier link
+resumed after its predecessor. The typed `DataPacketHeaderAndBlocks`
+gains an `mvects: Vec<MotionVector>` field (the `NBS`-element
+`MVECTS` array §7.9.4 consumes at step 5). Step 1(d)'s "If FTYPE is
+non-zero" gate is realised through §7.5.2's own intra short-circuit
+(§7.5 opening sentence) — identical bit consumption (none) and output
+(all-zero `MVECTS`) on intra frames, with the §7.5.2 shape validation
+applied uniformly. All §7.5.2 reject paths propagate unchanged.
++2 net tests (484 → 486): a §7.5.2 chroma-map-length reject through
+the driver and a `LAST1`/`LAST2` register-file walk (`INTER_MV` seed →
+`INTER_MV_LAST` reuse → `INTER_MV_LAST2` swap → fresh `INTER_MV`)
+under `MVMODE=0` Table 7.23 Huffman components; the prior step-1
+tests were extended to assert the new `MVECTS` output, including the
+4:2:0 `INTER_MV_FOUR` chroma average with a ties-away-from-zero
+`round()` case. The step 1 chain now covers 1(a)+1(b)+1(c)+1(d);
+steps 1(e) (§7.6 qi), 1(f) (§7.7.3 coeffs), 1(g) (§7.8.2 DC
+inversion) and the step 5 / step 6 dispatch into `reconstruct_frame`
+/ `loop_filter_frame` remain pending.
+
 ## Status — 2026-06-11 (round 274)
 
 Round 274 extends the §7.11 step 1 chain a third link —

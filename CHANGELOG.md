@@ -6,6 +6,43 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.11 step 1(d) — the §7.5.2 motion vectors now extend the composed
+  step 1 chain a fourth link (round 278).
+  `decode_data_packet_header_and_blocks` gains two inputs — `pf` (the
+  pixel format §7.5.2 needs for the `INTER_MV_FOUR` chroma-MV
+  averaging of steps 3(a)x..3(a)xii) and `chroma_map` (the
+  per-macro-block `ChromaBlockLayout` §7.5.2 writes chroma MVs
+  through) — and threads the §7.5.2 procedure onto the same shared
+  `BitReader` immediately after the §7.4 mode stream, with no
+  re-alignment. The typed `DataPacketHeaderAndBlocks` gains an
+  `mvects: Vec<MotionVector>` field (the `NBS`-element `MVECTS` array
+  the §7.11 step 5 / §7.9.4 reconstruction call consumes). Step
+  1(d)'s spec wording gates the §7.5.2 call on `FTYPE` being non-zero
+  (inter frame); the driver realises the gate through §7.5.2's own
+  intra short-circuit (§7.5 opening sentence: intra frames carry no
+  motion vectors and consume no bits), which yields identical bit
+  consumption (none) and output (all-zero `MVECTS`) while keeping the
+  §7.5.2 shape validation uniform across frame types — matching how
+  the step 1(c) link validates the luma map on intra frames. All
+  §7.5.2 reject paths (`MotionVectorMbModesLenMismatch`,
+  `MotionVectorLumaMapLenMismatch`,
+  `MotionVectorLumaBlockIndexOutOfRange`,
+  `MotionVectorChromaMapLenMismatch`,
+  `MotionVectorChromaMacroBlockSlotLenMismatch`,
+  `MotionVectorChromaBlockIndexOutOfRange`, truncation) propagate
+  unchanged. +2 net tests (484 → 486): a §7.5.2 chroma-map-length
+  reject through the driver (fires before the `MVMODE` bit is read)
+  and a `LAST1`/`LAST2` register-file walk (`INTER_MV` seed →
+  `INTER_MV_LAST` reuse → `INTER_MV_LAST2` swap → fresh `INTER_MV`)
+  under `MVMODE=0` Table 7.23 Huffman components. The prior step-1
+  tests were extended to assert the new `MVECTS` output, including
+  per-luma `INTER_MV_FOUR` writes, the 4:2:0 chroma average with a
+  ties-away-from-zero `round()` case (`round(2/4) = 1`), and
+  coded-blocks-only step 3(g) propagation. The step 1 chain now
+  covers 1(a)+1(b)+1(c)+1(d); steps 1(e)..1(g) and the step 5 / step
+  6 dispatch into `reconstruct_frame` / `loop_filter_frame` remain
+  pending.
+
 - §7.11 step 1(c) — the §7.4 macro-block coding modes now extend the
   composed step 1 chain a third link (round 274).
   `decode_data_packet_header_and_blocks` gains two inputs — `nmbs`

@@ -2,6 +2,39 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-12 (round 281)
+
+Round 281 completes the §7.11 step 1 chain — **steps 1(e), 1(f), and
+1(g)** land on the composed driver in one stroke.
+`decode_data_packet_header_and_blocks` now threads the §7.6
+block-level `qi` decode (1(e)) and the §7.7.3 DCT coefficient decode
+(1(f)) onto the same shared `BitReader` — §7.6's `NQIS − 1` long-run
+passes resume immediately after the §7.5.2 MV stream, and §7.7.3's
+`htiL` / `htiC` reads plus Huffman token stream resume immediately
+after §7.6's, with no byte re-alignment anywhere — then applies the
+§7.8.2 DC-prediction inversion (1(g), which consumes no bits) to the
+decoded coefficients in place. Two new inputs: `hts` (the 80-element
+§6.4.4 Huffman table array §7.11 lists among its inputs) and
+`dc_geometry` (new public `DcPredictionGeometry` bundling the §7.8.2
+`bi → mbi` map, raster-neighbour table, and per-plane raster
+orderings, mirroring the `ChromaBlockLayout` precedent for
+caller-resolved geometry). The typed `DataPacketHeaderAndBlocks`
+gains `qiis` / `coeffs` / `ncoeffs` fields, with the DC slot of every
+coded block already carrying the reconstructed (prediction-inverted)
+value. Step 1(f)'s spec sentence "decode the DCT coefficients into
+NCOEFFS and NCOEFFS" is a documented spec typo — §7.7.3's outputs are
+`COEFFS` **and** `NCOEFFS`. All §7.6 / §7.7.x / §7.8.x reject paths
+propagate unchanged. +3 net tests (486 → 489): a mid-§7.6 truncation
+through the driver (pinning that 1(e) really consumes bits and is not
+gated on `FTYPE`), an empty-Huffman-table reject whose table index
+comes off the shared cursor's `htiL` nibble, and a
+`DcInversionPlaneCount` reject through the no-bit 1(g) link; the
+prior step-1 tests were extended to assert the new outputs, including
+a token-9 intra decode whose §7.8.1-step-11 `LASTDC` fallback chains
+DCs 1..=16 across the Y plane and resets per plane. The step 1 chain
+now covers 1(a)–1(g) end-to-end; only the step 5 / step 6 dispatch
+into `reconstruct_frame` / `loop_filter_frame` remains pending.
+
 ## Status — 2026-06-11 (round 278)
 
 Round 278 extends the §7.11 step 1 chain a fourth link — **step

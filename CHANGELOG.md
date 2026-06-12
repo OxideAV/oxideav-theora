@@ -6,6 +6,27 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.11 steps 1(e) + 1(f) + 1(g) — the step 1 chain is complete
+  (round 281). `decode_data_packet_header_and_blocks` now threads the
+  §7.6 block-level `qi` decode (step 1(e)) and the §7.7.3 DCT
+  coefficient decode (step 1(f)) onto the same shared `BitReader` —
+  §7.6's `NQIS − 1` long-run passes resume immediately after the
+  §7.5.2 MV stream and §7.7.3's `htiL` / `htiC` / token stream
+  immediately after §7.6's, with no byte re-alignment anywhere — then
+  applies the §7.8.2 DC-prediction inversion (step 1(g), which reads
+  no bits) to the decoded coefficients in place. Two new inputs:
+  `hts` (the 80-element §6.4.4 Huffman table array §7.11 lists among
+  its inputs) and `dc_geometry` (the new public
+  `DcPredictionGeometry` bundling the §7.8.2 `bi → mbi` map,
+  raster-neighbour table, and per-plane raster orderings, mirroring
+  the `ChromaBlockLayout` precedent). The typed
+  `DataPacketHeaderAndBlocks` gains `qiis: Vec<u8>`,
+  `coeffs: Vec<[i16; 64]>` (DC already reconstructed per 1(g)), and
+  `ncoeffs: Vec<u8>` fields. Step 1(f)'s spec sentence "decode the
+  DCT coefficients into NCOEFFS and NCOEFFS" carries a documented
+  typo note (§7.7.3's outputs are `COEFFS` and `NCOEFFS`). All §7.6 /
+  §7.7.x / §7.8.x reject paths propagate unchanged through the
+  driver.
 - §7.11 step 1(d) — the §7.5.2 motion vectors now extend the composed
   step 1 chain a fourth link (round 278).
   `decode_data_packet_header_and_blocks` gains two inputs — `pf` (the

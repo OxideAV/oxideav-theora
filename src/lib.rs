@@ -8920,23 +8920,27 @@ pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFram
     })
 }
 
-/// The first four links of the §7.11 step 1 ("size of the data
-/// packet is non-zero") chain: the §7.1 frame header, the §7.3 coded
-/// block flags, the §7.4 macro-block coding modes, and the §7.5.2
-/// motion vectors, decoded together off a single shared bit reader.
+/// The complete §7.11 step 1 ("size of the data packet is non-zero")
+/// chain: the §7.1 frame header, the §7.3 coded block flags, the
+/// §7.4 macro-block coding modes, the §7.5.2 motion vectors, the
+/// §7.6 block-level `qi` values, and the §7.7.3 DCT coefficients,
+/// decoded together off a single shared bit reader, with the §7.8.2
+/// DC-prediction inversion applied to the decoded coefficients.
 ///
 /// §7.11 step 1 decodes a non-empty video-data packet through the
 /// chain §7.1 (a) → §7.3 (b) → §7.4 (c) → §7.5.2 (d) → §7.6 (e) →
-/// §7.7.3 (f) → §7.8.2 (g). The sub-procedures share one bit cursor
-/// — §7.3's run-length streams resume immediately after the §7.1
-/// header bits with no re-alignment, §7.4's mode stream resumes
-/// immediately after §7.3's, and §7.5.2's `MVMODE` / MV stream
-/// resumes immediately after §7.4's — so the chain has to be built
-/// over a single [`BitReader`], not by handing each procedure a
-/// fresh byte-aligned slice.
-/// [`decode_data_packet_header_and_blocks`] threads steps 1(a),
-/// 1(b), 1(c), and 1(d) over one reader and surfaces the four
-/// outputs as a typed bundle.
+/// §7.7.3 (f) → §7.8.2 (g). The bit-consuming sub-procedures share
+/// one bit cursor — §7.3's run-length streams resume immediately
+/// after the §7.1 header bits with no re-alignment, §7.4's mode
+/// stream resumes immediately after §7.3's, §7.5.2's `MVMODE` / MV
+/// stream resumes immediately after §7.4's, §7.6's long-run passes
+/// resume immediately after §7.5.2's, and §7.7.3's `htiL` / `htiC` /
+/// token stream resumes immediately after §7.6's — so the chain has
+/// to be built over a single [`BitReader`], not by handing each
+/// procedure a fresh byte-aligned slice. Step 1(g) consumes no bits:
+/// §7.8.2 is a pure transform over the step 1(f) `COEFFS` output.
+/// [`decode_data_packet_header_and_blocks`] threads steps 1(a)
+/// through 1(g) and surfaces the outputs as a typed bundle.
 ///
 /// `header` carries §7.1's `FTYPE` + `QIS` (so the 1(d) motion-vector
 /// branch can test `FTYPE != 0` and 1(e)'s block-level `qi` decode can
@@ -8946,6 +8950,11 @@ pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFram
 /// motion-vector branch and 1(g) DC-prediction inversion both consume.
 /// `mvects` is §7.5.2's `NBS`-element per-block motion-vector array
 /// (step 1(d)), which the step 5 §7.9.4 reconstruction call consumes.
+/// `qiis` is §7.6's `NBS`-element per-block `qi`-index array (step
+/// 1(e)), also a §7.9.4 input. `coeffs` / `ncoeffs` are §7.7.3's
+/// `NBS × 64` quantized-DCT array and per-block coefficient count
+/// (step 1(f)), with the DC slot of every coded block already carrying
+/// the reconstructed (prediction-inverted) value per step 1(g).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPacketHeaderAndBlocks {
     /// §7.11 step 1(a) output — the §7.1 frame header (`FTYPE` +
@@ -8972,6 +8981,25 @@ pub struct DataPacketHeaderAndBlocks {
     /// Blocks that receive no MV from §7.5.2 (uncoded blocks, blocks
     /// in `NOMV` / `INTRA` macro blocks) carry the `(0, 0)` default.
     pub mvects: Vec<MotionVector>,
+    /// §7.11 step 1(e) output — the `NBS`-element `QIIS` array of
+    /// per-block `qi`-index values (each in `0..NQIS`). When `NQIS ==
+    /// 1` (the VP3-compatibility case) §7.6's main loop is empty: no
+    /// bits are consumed and every entry is `0`. Uncoded blocks always
+    /// carry `0`.
+    pub qiis: Vec<u8>,
+    /// §7.11 step 1(f) + 1(g) output — the `NBS × 64` array of
+    /// quantized DCT coefficient values for each block in zig-zag
+    /// order (§7.7.3), with the DC coefficient (slot `0`) of every
+    /// coded block already reconstructed by the §7.8.2 DC-prediction
+    /// inversion of step 1(g). Uncoded blocks are all-zero.
+    pub coeffs: Vec<[i16; 64]>,
+    /// §7.11 step 1(f) output — the `NBS`-element `NCOEFFS` array of
+    /// per-block coefficient counts from §7.7.3. (The spec's step
+    /// 1(f) sentence reads "decode the DCT coefficients into NCOEFFS
+    /// and NCOEFFS"; the §7.7.3 procedure it invokes outputs `COEFFS`
+    /// **and** `NCOEFFS`, so the first occurrence is a spec typo for
+    /// `COEFFS`.)
+    pub ncoeffs: Vec<u8>,
 }
 
 impl DataPacketHeaderAndBlocks {
@@ -8999,25 +9027,62 @@ impl DataPacketHeaderAndBlocks {
     }
 }
 
-/// Execute §7.11 step 1(a) + step 1(b) + step 1(c) + step 1(d):
-/// decode the §7.1 frame header, the §7.3 coded block flags, the
-/// §7.4 macro-block coding modes, and the §7.5.2 motion vectors from
-/// a non-empty video-data packet, sharing a single bit reader across
-/// all four procedures.
+/// The caller-supplied per-plane raster geometry the §7.8.2
+/// DC-prediction inversion (§7.11 step 1(g)) consumes.
 ///
-/// This is the entry of the §7.11 step 1 chain — the "If the size of
-/// the data packet is non-zero" branch. The shared-reader contract is
-/// the whole point: §7.3's run-length-coded `SBPCODED` / `SBFCODED`
+/// §7.8.2 visits the coded blocks of each colour plane in plane-local
+/// raster order and forms each block's DC predictor from up to four
+/// already-visited raster neighbours (§7.8.1). The spec's procedure
+/// relies on the §2.x frame-layout geometry for both; like the
+/// `block_to_super_block` / `macro_block_to_luma_blocks` /
+/// [`ChromaBlockLayout`] maps the earlier links take, the resolved
+/// geometry is supplied by the caller. The three fields have the
+/// exact contracts of the corresponding [`invert_dc_prediction`]
+/// parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct DcPredictionGeometry<'a> {
+    /// `NBS`-element `bi → mbi` lookup (every block, luma and chroma,
+    /// to its macro block). §7.8.1 reads it to compare reference
+    /// frames between neighbours; §7.8.2 step 1(d)i.E reads it for
+    /// the `LASTDC` update.
+    pub block_to_macro_block: &'a [u32],
+    /// `NBS`-element [`DcPredictorNeighbors`] array giving each
+    /// block's left / lower-left / lower / lower-right neighbours in
+    /// plane-local raster geometry (coded-order indices), `None` at
+    /// plane edges.
+    pub neighbors: &'a [DcPredictorNeighbors],
+    /// Exactly three slices (Y, Cb, Cr); each lists the coded-order
+    /// block indices of that plane in plane-local raster order. No
+    /// index may appear in two plane slices.
+    pub plane_raster_order: &'a [&'a [u32]],
+}
+
+/// Execute §7.11 step 1 in full — steps 1(a) through 1(g): decode
+/// the §7.1 frame header, the §7.3 coded block flags, the §7.4
+/// macro-block coding modes, the §7.5.2 motion vectors, the §7.6
+/// block-level `qi` values, and the §7.7.3 DCT coefficients from a
+/// non-empty video-data packet, sharing a single bit reader across
+/// all six bit-consuming procedures, then undo the DC prediction on
+/// the decoded coefficients per §7.8.2.
+///
+/// This is the §7.11 step 1 chain — the "If the size of the data
+/// packet is non-zero" branch. The shared-reader contract is the
+/// whole point: §7.3's run-length-coded `SBPCODED` / `SBFCODED`
 /// streams begin at the bit position immediately after the §7.1
 /// header's last bit, with no byte re-alignment, §7.4's `MSCHEME`
-/// / `MALPHABET` / mode stream resumes immediately after §7.3's, and
+/// / `MALPHABET` / mode stream resumes immediately after §7.3's,
 /// §7.5.2's `MVMODE` bit plus MV stream resumes immediately after
-/// §7.4's, so all four procedures must run against one [`BitReader`].
+/// §7.4's, §7.6's `NQIS − 1` long-run passes resume immediately
+/// after §7.5.2's, and §7.7.3's `htiL` / `htiC` reads plus
+/// Huffman-coded token stream resume immediately after §7.6's, so
+/// all six procedures must run against one [`BitReader`].
 /// The byte-aligned standalone entry points [`decode_frame_header`],
-/// [`decode_coded_block_flags`], [`decode_macroblock_modes`], and
-/// [`decode_macroblock_motion_vectors`] cannot be composed for the
+/// [`decode_coded_block_flags`], [`decode_macroblock_modes`],
+/// [`decode_macroblock_motion_vectors`], [`decode_block_level_qi`],
+/// and [`decode_dct_coefficients`] cannot be composed for the
 /// real stream because each would re-start the cursor at a byte
-/// boundary.
+/// boundary. Step 1(g) reads no bits — §7.8.2 transforms the step
+/// 1(f) `COEFFS` output in place after the bitstream work is done.
 ///
 /// Inputs:
 ///
@@ -9050,6 +9115,13 @@ impl DataPacketHeaderAndBlocks {
 ///   writes chroma MVs through; same contract as
 ///   [`decode_macroblock_motion_vectors`] (per-plane outer length
 ///   `nmbs`; inner length `1` for PF=0, `2` for PF=2, `4` for PF=3).
+/// * `hts` — the 80-element §6.4.4 Huffman table array from the setup
+///   header ([`decode_dct_token_huffman_tables`] output). §7.11 lists
+///   `HTS` among its inputs and step 1(f) hands it to §7.7.3 for the
+///   DCT-token decode.
+/// * `dc_geometry` — the per-plane raster geometry (`bi → mbi` map,
+///   raster-neighbour table, plane raster orderings) the step 1(g)
+///   §7.8.2 inversion walks; see [`DcPredictionGeometry`].
 ///
 /// The §7.1 header is decoded first (step 1(a)); its `FTYPE`
 /// determines whether §7.3 (step 1(b)), §7.4 (step 1(c)), and §7.5.2
@@ -9077,14 +9149,25 @@ impl DataPacketHeaderAndBlocks {
 /// [`Error::MotionVectorLumaBlockIndexOutOfRange`],
 /// [`Error::MotionVectorChromaMapLenMismatch`],
 /// [`Error::MotionVectorChromaMacroBlockSlotLenMismatch`],
-/// [`Error::MotionVectorChromaBlockIndexOutOfRange`], or truncation)
+/// [`Error::MotionVectorChromaBlockIndexOutOfRange`], or truncation),
+/// §7.6 reject (a run-length overrun or truncation; the §7.6
+/// argument gates cannot fire here because `bcoded` is sized `nbs`
+/// by §7.3 and §7.1 bounds `NQIS` to `1..=3`), §7.7.3 reject
+/// ([`Error::DctCoefficientNlbsExceedsNbs`],
+/// [`Error::DctCoefficientEmptyHuffmanTable`],
+/// [`Error::DctCoefficientHuffmanWalkOffTree`],
+/// [`Error::DctCoefficientLeftoverEobs`],
+/// [`Error::DctCoefficientBlockNotClosed`], any §7.7.1 / §7.7.2
+/// variant, or truncation), or §7.8.2 reject
+/// ([`Error::DcInversionPlaneCount`],
+/// [`Error::DcInversionLenMismatch`],
+/// [`Error::DcInversionBlockIndexOutOfRange`],
+/// [`Error::DcInversionDuplicateBlockIndex`], or any §7.8.1 variant)
 /// propagates unchanged.
 ///
-/// This lands steps 1(a), 1(b), 1(c), and 1(d) of the §7.11 step 1
-/// chain; the remaining links — §7.6 block-level qi (1(e)), §7.7.3
-/// DCT coefficients (1(f)), §7.8.2 DC-prediction inversion (1(g)) —
-/// extend this driver in later rounds, each resuming on the same
-/// reader.
+/// This completes the §7.11 step 1 chain — steps 1(a) through 1(g).
+/// The step 5 / step 6 dispatch into [`reconstruct_frame`] /
+/// [`loop_filter_frame`] consumes this bundle in a later round.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_data_packet_header_and_blocks(
     packet: &[u8],
@@ -9096,6 +9179,8 @@ pub fn decode_data_packet_header_and_blocks(
     block_to_super_block: &[u32],
     macro_block_to_luma_blocks: &[[u32; 4]],
     chroma_map: ChromaBlockLayout<'_>,
+    hts: &[HuffmanTable],
+    dc_geometry: DcPredictionGeometry<'_>,
 ) -> Result<DataPacketHeaderAndBlocks, Error> {
     let mut r = BitReader::new(packet);
     // Step 1(a): §7.1 frame header off the shared reader.
@@ -9134,11 +9219,41 @@ pub fn decode_data_packet_header_and_blocks(
         macro_block_to_luma_blocks,
         chroma_map,
     )?;
+    // Step 1(e): "Using NBS, BCODED, and NQIS, decode the block-level
+    // qi values into QIIS using the procedure given in Section 7.6."
+    // §7.6's `NQIS − 1` long-run passes resume on the same reader,
+    // immediately after the §7.5.2 MV stream — no re-alignment. When
+    // NQIS == 1 the §7.6 main loop is empty (the VP3-compatibility
+    // path the spec note calls out) and no bits are consumed.
+    let qiis = decode_block_level_qi_inner(&mut r, nbs, &bcoded, header.nqis())?;
+    // Step 1(f): "Using NBS, NMBS, BCODED, and HTS, decode the DCT
+    // coefficients into NCOEFFS and NCOEFFS using the procedure given
+    // in Section 7.7.3." (The first "NCOEFFS" is a spec typo: §7.7.3's
+    // outputs are COEFFS and NCOEFFS.) The §7.7.3 `htiL` / `htiC`
+    // reads plus token stream resume on the same reader, immediately
+    // after the §7.6 passes — no re-alignment.
+    let (mut coeffs, ncoeffs) = decode_dct_coefficients_inner(&mut r, nbs, nmbs, &bcoded, hts)?;
+    // Step 1(g): "Using BCODED and MBMODES, undo the DC prediction on
+    // the DC coefficients stored in COEFFS using the procedure given
+    // in Section 7.8.2." No bits are read — §7.8.2 rewrites the DC
+    // slot of each coded block in place against the caller-supplied
+    // per-plane raster geometry.
+    invert_dc_prediction(
+        &bcoded,
+        &mbmodes,
+        dc_geometry.block_to_macro_block,
+        dc_geometry.neighbors,
+        dc_geometry.plane_raster_order,
+        &mut coeffs,
+    )?;
     Ok(DataPacketHeaderAndBlocks {
         header,
         bcoded,
         mbmodes,
         mvects,
+        qiis,
+        coeffs,
+        ncoeffs,
     })
 }
 
@@ -13686,6 +13801,49 @@ mod tests {
     /// passed to `ChromaBlockLayout`.
     fn slice_outer(outer: &[Vec<u32>]) -> Vec<&[u32]> {
         outer.iter().map(|v| v.as_slice()).collect()
+    }
+
+    /// Build the §7.8.2 per-plane raster geometry matching
+    /// [`build_uniform_layout`]: every block maps to its macro block
+    /// (`bi / 4` for luma, slot arithmetic for chroma), every
+    /// neighbour slot is `None` (each block forms its predictor from
+    /// `LASTDC[rfi]` via the §7.8.1 step 11 fallback), and the three
+    /// plane raster orderings list the luma / Cb / Cr coded-order
+    /// regions in ascending order. Returns `(block_to_macro_block,
+    /// neighbors, [y, cb, cr])`; pass the planes through
+    /// [`slice_outer`] to build the [`DcPredictionGeometry`].
+    #[allow(clippy::type_complexity)]
+    fn build_uniform_dc_geometry(
+        nmbs: u32,
+        pf: PixelFormat,
+    ) -> (Vec<u32>, Vec<DcPredictorNeighbors>, Vec<Vec<u32>>) {
+        let luma_count = nmbs * 4;
+        let chroma_per_mb: u32 = match pf {
+            PixelFormat::Yuv420 => 1,
+            PixelFormat::Yuv422 => 2,
+            PixelFormat::Yuv444 => 4,
+        };
+        let cb_base = luma_count;
+        let cr_base = luma_count + nmbs * chroma_per_mb;
+        let nbs = cr_base + nmbs * chroma_per_mb;
+        let b2m: Vec<u32> = (0..nbs)
+            .map(|bi| {
+                if bi < luma_count {
+                    bi / 4
+                } else if bi < cr_base {
+                    (bi - cb_base) / chroma_per_mb
+                } else {
+                    (bi - cr_base) / chroma_per_mb
+                }
+            })
+            .collect();
+        let neighbors = vec![DcPredictorNeighbors::default(); nbs as usize];
+        let planes = vec![
+            (0..luma_count).collect::<Vec<u32>>(),
+            (cb_base..cr_base).collect(),
+            (cr_base..nbs).collect(),
+        ];
+        (b2m, neighbors, planes)
     }
 
     #[test]
@@ -21657,14 +21815,20 @@ mod tests {
     // §7.11 step 1(a) + step 1(b) — header + coded-block-flags chain
     // -----------------------------------------------------------------
 
-    /// §7.11 step 1(a)+(b) intra path: a one-shot decode of an intra
-    /// frame header followed by §7.3's all-coded short-circuit. The
-    /// §7.3 step 1 intra path reads no bits, so the byte-aligned
-    /// `build_frame_header` packet feeds straight in. The step 1(d)
-    /// gate ("If FTYPE is non-zero") skips the §7.5.2 decode wholesale
-    /// on an intra frame: no `MVMODE` bit is consumed (any read past
-    /// the exact-length header packet would surface as truncation) and
-    /// every `MVECTS` entry is `(0, 0)`.
+    /// §7.11 step 1 intra path through all seven sub-steps: a one-shot
+    /// decode of an intra frame header followed by §7.3's all-coded
+    /// short-circuit (1(b)), §7.4's all-`INTRA` short-circuit (1(c)),
+    /// the 1(d) gate ("If FTYPE is non-zero") skipping §7.5.2 (no
+    /// `MVMODE` bit consumed, every `MVECTS` entry `(0, 0)`), §7.6's
+    /// `NQIS=1` zero-bit short-circuit (1(e)), the §7.7.3 coefficient
+    /// decode off the shared reader (1(f)), and the §7.8.2
+    /// DC-prediction inversion (1(g)). The single-leaf token-9 table
+    /// set fills every coefficient of every coded block with `+1`
+    /// while consuming only the four `htiL` / `htiC` nibbles, so the
+    /// 1(g) inversion is observable: with all-default (`None`)
+    /// neighbours every block's predictor is `LASTDC[0]` (§7.8.1 step
+    /// 11), which chains 1 → 2 → 3 → … down each plane's raster walk
+    /// and resets at each plane boundary (§7.8.2 steps 1(a)–(c)).
     #[test]
     fn data_header_and_blocks_intra_all_coded() {
         // 3 super blocks, 8 blocks each → NBS=24 (the tiny-i fixture
@@ -21676,7 +21840,27 @@ mod tests {
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
         let cb = slice_outer(&cb_o);
         let cr = slice_outer(&cr_o);
-        let packet = build_frame_header(0, &[12], 0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
+        // Token 9 is the fixed `+1` single-coefficient token
+        // (Table 7.38, zero extra bits); a single-leaf table consumes
+        // no Huffman bits, so §7.7.3 reads exactly the 16 htiL/htiC
+        // bits at ti ∈ {0, 1} and fills all 64 slots of all 24 blocks.
+        let hts = make_uniform_hts(9);
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(0, 1); // FTYPE = intra
+        w.put(12, 6); // QIS[0]
+        w.put(0, 1); // MOREQIS = 0
+        w.put(0, 3); // §7.1 step 7 reserved trailer
+                     // 1(b) / 1(c) / 1(d) / 1(e) all read zero bits on this frame
+                     // (intra short-circuits; NQIS=1). §7.7.3 resumes on the SAME
+                     // bitstream, mid-byte: htiL + htiC at ti=0 and ti=1.
+        w.put(0, 4); // htiL at ti=0
+        w.put(0, 4); // htiC at ti=0
+        w.put(0, 4); // htiL at ti=1
+        w.put(0, 4); // htiC at ti=1
+        let packet = w.finish();
         let out = decode_data_packet_header_and_blocks(
             &packet,
             true,
@@ -21687,6 +21871,12 @@ mod tests {
             &map,
             &mb_map,
             ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
         )
         .unwrap();
         assert_eq!(out.ftype(), FrameType::Intra);
@@ -21702,6 +21892,25 @@ mod tests {
         // §7.11 step 1(d) gate: intra frame → no §7.5.2 bits, all-zero
         // MVECTS sized NBS.
         assert_eq!(out.mvects, vec![MotionVector::ZERO; 24]);
+        // Step 1(e): NQIS=1 → §7.6's main loop is empty; QIIS all 0.
+        assert_eq!(out.qiis, vec![0u8; 24]);
+        // Step 1(f): every block fully populated by token 9.
+        assert_eq!(out.ncoeffs, vec![64u8; 24]);
+        // Step 1(g): the §7.7.3 residual DC of every block is +1; with
+        // all-`None` neighbours the predictor for the k-th block of a
+        // plane's raster walk is the (k-1)-th block's reconstructed DC
+        // (carried through LASTDC[0]), so DCs run 1..=16 across the Y
+        // plane and 1..=4 across each chroma plane. AC coefficients
+        // are untouched by §7.8.2 and stay +1.
+        for bi in 0..24usize {
+            let plane_pos = if bi < 16 { bi } else { (bi - 16) % 4 };
+            assert_eq!(
+                out.coeffs[bi][0],
+                (plane_pos + 1) as i16,
+                "DC of block {bi}"
+            );
+            assert_eq!(out.coeffs[bi][1..], [1i16; 63], "AC of block {bi}");
+        }
     }
 
     /// §7.11 step 1(a)+(b)+(c)+(d) inter path: the shared-reader
@@ -21766,7 +21975,18 @@ mod tests {
             write_mv_fixed_component(&mut w, mv.x);
             write_mv_fixed_component(&mut w, mv.y);
         }
+        // §7.6 reads zero bits (NQIS=1). §7.7.3 resumes on the SAME
+        // bitstream: htiL/htiC at ti=0 and ti=1; the single-leaf
+        // token-0 tables close every coded block at ti=0 with no
+        // further bits (EOB run of one block each).
+        w.put(0, 4); // htiL at ti=0
+        w.put(0, 4); // htiC at ti=0
+        w.put(0, 4); // htiL at ti=1
+        w.put(0, 4); // htiC at ti=1
         let packet = w.finish();
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
         let out = decode_data_packet_header_and_blocks(
             &packet,
             false,
@@ -21777,6 +21997,12 @@ mod tests {
             &map,
             &mb_map,
             ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
         )
         .unwrap();
         assert_eq!(out.ftype(), FrameType::Inter);
@@ -21800,6 +22026,14 @@ mod tests {
             mv0, z, avg, z, // Cr plane, MBs 0..4
         ];
         assert_eq!(out.mvects, expected);
+        // Step 1(e): NQIS=1 → all-zero QIIS, no bits read.
+        assert_eq!(out.qiis, vec![0u8; 24]);
+        // Step 1(f): token 0 closes each block at ti=0 — all-zero
+        // residuals, NCOEFFS=0. Step 1(g): zero residual + zero
+        // predictor (LASTDC stays 0 on every reference row) leaves
+        // every DC at zero.
+        assert_eq!(out.coeffs, vec![[0i16; 64]; 24]);
+        assert_eq!(out.ncoeffs, vec![0u8; 24]);
     }
 
     /// §7.11 step 1(a)+(b)+(c)+(d) inter path with a genuinely mixed
@@ -21859,7 +22093,27 @@ mod tests {
         write_mv_fixed_component(&mut w, 6); // MB 1 MVY
         write_mv_fixed_component(&mut w, 1); // MB 3 MVX
         write_mv_fixed_component(&mut w, 0); // MB 3 MVY
+                                             // §7.6 resumes on the SAME bitstream. NQIS=3 → two §7.2.1
+                                             // long-run passes. The 21 coded blocks (5 in SB 0 + 16 in
+                                             // SBs 1/2) are visited in ascending bi; pass 0 promotes the
+                                             // first two (bi 0 and 1) to qii=1, pass 1 (NBITS=2, only the
+                                             // promoted pair) promotes bi 0 again to qii=2.
+        let mut qi_pass0 = vec![0u8; 21];
+        qi_pass0[0] = 1;
+        qi_pass0[1] = 1;
+        encode_long_run_runs(&mut w, &qi_pass0);
+        encode_long_run_runs(&mut w, &[1, 0]);
+        // §7.7.3 resumes on the SAME bitstream: htiL/htiC at ti ∈
+        // {0, 1}; single-leaf token-0 tables close every coded block
+        // at ti=0 with no further bits.
+        w.put(0, 4); // htiL at ti=0
+        w.put(0, 4); // htiC at ti=0
+        w.put(0, 4); // htiL at ti=1
+        w.put(0, 4); // htiC at ti=1
         let packet = w.finish();
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
         let out = decode_data_packet_header_and_blocks(
             &packet,
             false,
@@ -21870,6 +22124,12 @@ mod tests {
             &map,
             &mb_map,
             ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
         )
         .unwrap();
         assert_eq!(out.ftype(), FrameType::Inter);
@@ -21897,6 +22157,17 @@ mod tests {
             z, mv1, z, mv3, // Cr plane, MBs 0..4
         ];
         assert_eq!(out.mvects, expected_mvs);
+        // Step 1(e): the two §7.6 passes ran mid-stream. Coded block
+        // bi=0 took a 1 in both passes (qii=2), bi=1 only in pass 0
+        // (qii=1); every other block (coded or not) stays at 0.
+        let mut expected_qiis = vec![0u8; 24];
+        expected_qiis[0] = 2;
+        expected_qiis[1] = 1;
+        assert_eq!(out.qiis, expected_qiis);
+        // Step 1(f) + 1(g): token 0 closes each coded block at ti=0;
+        // zero residuals + zero predictors keep every DC at zero.
+        assert_eq!(out.coeffs, vec![[0i16; 64]; 24]);
+        assert_eq!(out.ncoeffs, vec![0u8; 24]);
     }
 
     /// §7.11 step 1(a) reject: a header packet (high bit set)
@@ -21907,6 +22178,9 @@ mod tests {
         let map = vec![0u32; 24];
         let mb_map = vec![[0u32; 4]; 4];
         let chroma = vec![&[0u32][..]; 4];
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(4, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
         let err = decode_data_packet_header_and_blocks(
             &[0x80],
             true,
@@ -21919,6 +22193,12 @@ mod tests {
             ChromaBlockLayout {
                 cb: &chroma,
                 cr: &chroma,
+            },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
             },
         )
         .unwrap_err();
@@ -21934,6 +22214,11 @@ mod tests {
         let map = vec![0u32; 16];
         let mb_map = vec![[0u32; 4]; 4];
         let chroma = vec![&[0u32][..]; 4];
+        let hts = make_uniform_hts(0);
+        let b2m = vec![0u32; 16];
+        let neigh = vec![DcPredictorNeighbors::default(); 16];
+        let y_plane: Vec<u32> = (0..16).collect();
+        let planes: Vec<&[u32]> = vec![&y_plane, &[], &[]];
         let err = decode_data_packet_header_and_blocks(
             &packet,
             true,
@@ -21946,6 +22231,12 @@ mod tests {
             ChromaBlockLayout {
                 cb: &chroma,
                 cr: &chroma,
+            },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
             },
         )
         .unwrap_err();
@@ -21963,6 +22254,9 @@ mod tests {
         let map = vec![0u32; 23];
         let mb_map = vec![[0u32; 4]; 4];
         let chroma = vec![&[0u32][..]; 4];
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(4, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
         let err = decode_data_packet_header_and_blocks(
             &packet,
             true,
@@ -21975,6 +22269,12 @@ mod tests {
             ChromaBlockLayout {
                 cb: &chroma,
                 cr: &chroma,
+            },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
             },
         )
         .unwrap_err();
@@ -21989,7 +22289,12 @@ mod tests {
 
     /// `ftype()` / `nqis()` / `nbs()` / `nmbs()` accessors mirror the
     /// underlying header + `BCODED` + `MBMODES` state for an intra
-    /// decode, and the `mvects` array is sized `NBS` like `bcoded`.
+    /// decode, and the `mvects` / `qiis` / `coeffs` / `ncoeffs`
+    /// arrays are sized `NBS` like `bcoded`. With `NQIS=2` on an
+    /// intra frame the §7.6 link reads one long-run pass over all 24
+    /// (all-coded) blocks — this also pins that step 1(e) is *not*
+    /// gated on `FTYPE` (only 1(d) is): intra frames with `NQIS > 1`
+    /// carry block-level qi bits.
     #[test]
     fn data_header_and_blocks_accessors_match_state() {
         let nmbs = 4u32;
@@ -21997,7 +22302,28 @@ mod tests {
         let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
         let cb = slice_outer(&cb_o);
         let cr = slice_outer(&cr_o);
-        let packet = build_frame_header(0, &[1, 2], 0);
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(0, 1); // FTYPE = intra
+        w.put(1, 6); // QIS[0]
+        w.put(1, 1); // MOREQIS = 1
+        w.put(2, 6); // QIS[1]
+        w.put(0, 1); // MOREQIS = 0
+        w.put(0, 3); // §7.1 step 7 reserved trailer
+                     // §7.6 (step 1(e)): one pass over the 24 coded blocks;
+                     // promote block 5 to qii=1.
+        let mut qi_pass0 = vec![0u8; 24];
+        qi_pass0[5] = 1;
+        encode_long_run_runs(&mut w, &qi_pass0);
+        // §7.7.3 (step 1(f)): htiL/htiC at ti ∈ {0, 1}.
+        w.put(0, 4);
+        w.put(0, 4);
+        w.put(0, 4);
+        w.put(0, 4);
+        let packet = w.finish();
         let out = decode_data_packet_header_and_blocks(
             &packet,
             true,
@@ -22008,6 +22334,12 @@ mod tests {
             &map,
             &mb_map,
             ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
         )
         .unwrap();
         assert_eq!(out.ftype(), out.header.ftype);
@@ -22015,9 +22347,15 @@ mod tests {
         assert_eq!(out.nbs(), out.bcoded.len());
         assert_eq!(out.nmbs(), out.mbmodes.len());
         assert_eq!(out.mvects.len(), out.bcoded.len());
+        assert_eq!(out.qiis.len(), out.bcoded.len());
+        assert_eq!(out.coeffs.len(), out.bcoded.len());
+        assert_eq!(out.ncoeffs.len(), out.bcoded.len());
         assert_eq!(out.nqis(), 2);
         assert_eq!(out.nbs(), 24);
         assert_eq!(out.nmbs(), 4);
+        let mut expected_qiis = vec![0u8; 24];
+        expected_qiis[5] = 1;
+        assert_eq!(out.qiis, expected_qiis);
     }
 
     /// §7.11 step 1(c) reject: a §7.4 luma-block map of the wrong
@@ -22043,6 +22381,11 @@ mod tests {
         // NMBS claimed as 4 but the map carries only 3 entries.
         let mb_map = vec![[0u32, 1, 2, 3]; 3];
         let chroma = vec![&[0u32][..]; 4];
+        let hts = make_uniform_hts(0);
+        let b2m = vec![0u32; 16];
+        let neigh = vec![DcPredictorNeighbors::default(); 16];
+        let y_plane: Vec<u32> = (0..16).collect();
+        let planes: Vec<&[u32]> = vec![&y_plane, &[], &[]];
         let err = decode_data_packet_header_and_blocks(
             &packet,
             false,
@@ -22055,6 +22398,12 @@ mod tests {
             ChromaBlockLayout {
                 cb: &chroma,
                 cr: &chroma,
+            },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
             },
         )
         .unwrap_err();
@@ -22128,7 +22477,16 @@ mod tests {
         }
         write_mv_fixed_component(&mut w, 0); // MB 3 MVX
         write_mv_fixed_component(&mut w, -1); // MB 3 MVY
+                                              // §7.6 reads zero bits (NQIS=1); §7.7.3 reads htiL/htiC at
+                                              // ti ∈ {0, 1} and token-0-closes the 20 coded blocks.
+        w.put(0, 4);
+        w.put(0, 4);
+        w.put(0, 4);
+        w.put(0, 4);
         let packet = w.finish();
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
         let out = decode_data_packet_header_and_blocks(
             &packet,
             false,
@@ -22139,6 +22497,12 @@ mod tests {
             &map,
             &mb_map,
             ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
         )
         .unwrap();
         let mut expected_bcoded = sb0_blocks.to_vec();
@@ -22169,6 +22533,12 @@ mod tests {
             z, mv1, avg, mv3, // Cr plane, MBs 0..4
         ];
         assert_eq!(out.mvects, expected_mvs);
+        // Steps 1(e)/(f)/(g): NQIS=1 → all-zero QIIS; token 0 closes
+        // every coded block with zero residuals; zero predictors keep
+        // every DC at zero. Uncoded blocks 0..4 are never visited.
+        assert_eq!(out.qiis, vec![0u8; 24]);
+        assert_eq!(out.coeffs, vec![[0i16; 64]; 24]);
+        assert_eq!(out.ncoeffs, vec![0u8; 24]);
     }
 
     /// §7.11 step 1(d) reject: a §7.5.2 chroma-block map of the wrong
@@ -22199,6 +22569,9 @@ mod tests {
             w.put(MacroBlockMode::InterNoMv.to_index() as u32, 3);
         }
         let packet = w.finish();
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
         let err = decode_data_packet_header_and_blocks(
             &packet,
             false,
@@ -22209,6 +22582,12 @@ mod tests {
             &map,
             &mb_map,
             ChromaBlockLayout { cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
         )
         .unwrap_err();
         assert!(matches!(
@@ -22259,7 +22638,16 @@ mod tests {
         write_mv_huffman_component(&mut w, 1); // MB 0 MVY
         write_mv_huffman_component(&mut w, 7); // MB 3 MVX
         write_mv_huffman_component(&mut w, -7); // MB 3 MVY
+                                                // §7.6 reads zero bits (NQIS=1); §7.7.3 reads htiL/htiC at
+                                                // ti ∈ {0, 1} and token-0-closes the 24 coded blocks.
+        w.put(0, 4);
+        w.put(0, 4);
+        w.put(0, 4);
+        w.put(0, 4);
         let packet = w.finish();
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
         let out = decode_data_packet_header_and_blocks(
             &packet,
             false,
@@ -22270,6 +22658,12 @@ mod tests {
             &map,
             &mb_map,
             ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
         )
         .unwrap();
         assert_eq!(out.mbmodes, modes.to_vec());
@@ -22288,6 +22682,161 @@ mod tests {
             mv0, mv0, z, mv3, // Cr plane, MBs 0..4
         ];
         assert_eq!(out.mvects, expected);
+        // Steps 1(e)/(f)/(g) ride the same reader after the MV bits.
+        assert_eq!(out.qiis, vec![0u8; 24]);
+        assert_eq!(out.coeffs, vec![[0i16; 64]; 24]);
+        assert_eq!(out.ncoeffs, vec![0u8; 24]);
+    }
+
+    /// §7.11 step 1(e) is genuinely wired to the bitstream: an intra
+    /// frame with `NQIS=2` requires a §7.6 long-run pass over all 24
+    /// coded blocks, and a packet that ends right after the §7.1
+    /// header (only `finish()` byte-padding follows) runs the reader
+    /// dry mid-pass — surfacing §7.2.1's truncation reject through
+    /// the composed driver. Were 1(e) not consuming bits, this packet
+    /// would decode (1(f) would also have nothing to read, but the
+    /// §7.6 pass dries the reader first).
+    #[test]
+    fn data_header_and_blocks_truncated_in_qi_pass() {
+        let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(0, 1); // FTYPE = intra
+        w.put(1, 6); // QIS[0]
+        w.put(1, 1); // MOREQIS = 1
+        w.put(2, 6); // QIS[1]
+        w.put(0, 1); // MOREQIS = 0
+        w.put(0, 3); // reserved trailer — 19 bits; finish() pads to 24
+        let packet = w.finish();
+        let err = decode_data_packet_header_and_blocks(
+            &packet,
+            true,
+            PixelFormat::Yuv420,
+            3,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::TruncatedHeader { .. }));
+    }
+
+    /// §7.11 step 1(f) reject path + shared-cursor `htiL` selection:
+    /// the packet's `htiL` nibble (read mid-byte, straight after the
+    /// intra header) selects Huffman table 3 for the first luma block
+    /// at ti=0, and an empty `HTS[3]` surfaces
+    /// [`Error::DctCoefficientEmptyHuffmanTable`] with the selected
+    /// index through the composed driver — pinning both that 1(f) is
+    /// wired and that its table index came off the shared reader at
+    /// the right bit offset.
+    #[test]
+    fn data_header_and_blocks_propagates_empty_huffman_table() {
+        let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let mut hts = make_uniform_hts(0);
+        hts[3] = HuffmanTable {
+            entries: vec![],
+            nodes: vec![],
+        };
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes = slice_outer(&planes_o);
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(0, 1); // FTYPE = intra
+        w.put(9, 6); // QIS[0]
+        w.put(0, 1); // MOREQIS = 0
+        w.put(0, 3); // reserved trailer
+        w.put(3, 4); // htiL at ti=0 → HG=0 ⇒ hti = 3 for luma blocks
+        w.put(0, 4); // htiC at ti=0
+        let packet = w.finish();
+        let err = decode_data_packet_header_and_blocks(
+            &packet,
+            true,
+            PixelFormat::Yuv420,
+            3,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: &planes,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::DctCoefficientEmptyHuffmanTable { hti: 3 }
+        ));
+    }
+
+    /// §7.11 step 1(g) reject path: a `plane_raster_order` with only
+    /// two plane slices propagates §7.8.2's
+    /// [`Error::DcInversionPlaneCount`] through the composed driver —
+    /// the bitstream work of steps 1(a)..1(f) completes, then the
+    /// no-bit 1(g) link rejects the malformed geometry.
+    #[test]
+    fn data_header_and_blocks_propagates_dc_plane_count() {
+        let nmbs = 4u32;
+        let (nbs, mb_map, cb_o, cr_o) = build_uniform_layout(nmbs, PixelFormat::Yuv420);
+        let map: Vec<u32> = (0..nbs).map(|bi| bi / 8).collect();
+        let cb = slice_outer(&cb_o);
+        let cr = slice_outer(&cr_o);
+        let hts = make_uniform_hts(0);
+        let (b2m, neigh, planes_o) = build_uniform_dc_geometry(nmbs, PixelFormat::Yuv420);
+        let planes_full = slice_outer(&planes_o);
+        let planes_two = &planes_full[..2];
+        let mut w = BitWriter::new();
+        w.put(0, 1); // data-packet flag
+        w.put(0, 1); // FTYPE = intra
+        w.put(9, 6); // QIS[0]
+        w.put(0, 1); // MOREQIS = 0
+        w.put(0, 3); // reserved trailer
+        w.put(0, 4); // htiL at ti=0
+        w.put(0, 4); // htiC at ti=0
+        w.put(0, 4); // htiL at ti=1
+        w.put(0, 4); // htiC at ti=1
+        let packet = w.finish();
+        let err = decode_data_packet_header_and_blocks(
+            &packet,
+            true,
+            PixelFormat::Yuv420,
+            3,
+            nbs,
+            nmbs,
+            &map,
+            &mb_map,
+            ChromaBlockLayout { cb: &cb, cr: &cr },
+            &hts,
+            DcPredictionGeometry {
+                block_to_macro_block: &b2m,
+                neighbors: &neigh,
+                plane_raster_order: planes_two,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::DcInversionPlaneCount { got: 2 }));
     }
 
     // -----------------------------------------------------------------

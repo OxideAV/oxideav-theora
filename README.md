@@ -2,6 +2,40 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-12 (round 284)
+
+Round 284 completes the **§7.11 Complete Frame Decode dispatch** — an
+intra frame now decodes end-to-end from a real Theora packet,
+sample-exact against the staged reference dumps. Three pieces land
+together. `decode_setup_header` chains the §6.4.5 setup-header body
+(§6.4.1 `LFLIMS` → §6.4.2 quantization parameters → §6.4.4 80-entry
+Huffman-table array) on one shared bit reader and returns the typed
+`SetupHeaderTables` bundle; `parse_setup_header` now delegates to it,
+retiring the body-not-implemented sentinel. `build_frame_geometry`
+resolves the full §2.3 / §2.4 frame layout from the identification
+header — continuous cross-plane coded-order block numbering, the
+super-block / macro-block / chroma maps, per-block `(pli, BX, BY,
+mbi)` tables, the §7.8.1 raster-neighbour table, and the per-plane
+raster orderings — validated against the spec's 240×48 worked
+examples (the printed Hilbert block grid 0–179 and macro-block grid
+0–44). `FrameDecoder::decode_frame` then runs §7.11 steps 1–8: the
+step 1 chain (or the step 2 zero-byte synthesis), §7.9.4
+reconstruction against the carried reference planes, the §7.10.3
+loop filter, and golden / previous reference promotion across
+frames. The round also fixes the §7.9.3.1 inverse-DCT sine constants
+(Table 7.65 pairs `Ci` with `S(8 − i)`: `S3 = 36410`, `S6 = 60547`,
+`S7 = 64277`; the old transcription aliased `Sj = Cj`, attenuating
+low-frequency AC energy — invisible on DC-only content, caught by
+the first fixture with real AC coefficients). End-to-end pins:
+`tiny-i-only-16x16` (qi=44) and `quant-table-custom` (qi=18, 3-qi
+header) decode sample-exact against their `expected.yuv`; a
+zero-byte packet replays the previous reference bit-identically;
+the decoded setup tables match every `LOOP_FILTER` / `QUANT` trace
+event the corpus records. +8 net tests (489 → 497, plus 1 doc
+test). Next §7.11 target: inter-frame end-to-end decode (motion
+compensation against a real P-packet) — the §7.5.2 / §7.9.1
+predictor machinery is already in place.
+
 ## Status — 2026-06-12 (round 281)
 
 Round 281 completes the §7.11 step 1 chain — **steps 1(e), 1(f), and

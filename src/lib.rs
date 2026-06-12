@@ -2,9 +2,45 @@
 //!
 //! Pure-Rust Theora video codec — clean-room implementation.
 //!
-//! ## Status — 2026-06-07 (round 250 of clean-room rebuild)
+//! ## Status — 2026-06-12 (round 284 of clean-room rebuild)
 //!
-//! Round 250 lands the **§7.11 Complete Frame Decode entry-shape
+//! Round 284 completes the **§7.11 Complete Frame Decode dispatch**:
+//! an intra frame now decodes end-to-end from a real Theora packet,
+//! sample-exact against the staged reference dumps. Three pieces
+//! land together:
+//!
+//! * [`decode_setup_header`] — the full §6.4.5 setup-header body
+//!   chain (§6.4.1 `LFLIMS` → §6.4.2 quantization parameters →
+//!   §6.4.4 Huffman tables on one shared bit reader) returning the
+//!   [`SetupHeaderTables`] bundle; [`parse_setup_header`] now
+//!   delegates to it instead of surfacing a body-not-implemented
+//!   sentinel.
+//! * [`build_frame_geometry`] / [`FrameGeometry`] — the resolved
+//!   §2.3 / §2.4 frame layout (continuous cross-plane coded-order
+//!   block numbering, super-block / macro-block maps, per-plane
+//!   raster grids, §7.8.1 neighbour table), validated against the
+//!   §2.3 / §2.4 worked examples (240×48: blocks 0–179 luma with
+//!   the printed Hilbert grid, macro blocks 0–44).
+//! * [`FrameDecoder`] / [`FrameDecoder::decode_frame`] — the §7.11
+//!   steps 1–8 driver: step 1 chain or step 2 empty-packet
+//!   synthesis, §7.9.4 reconstruction (step 5), §7.10.3 loop filter
+//!   (step 6), and golden / previous reference promotion (steps
+//!   7–8) across frames, emitting a [`DecodedFrame`].
+//!
+//! The round also fixes the §7.9.3.1 inverse-DCT sine constants:
+//! Table 7.65 pairs `Ci` with `S(8 − i)` (`S3 = 36410`,
+//! `S6 = 60547`, `S7 = 64277`); the previous transcription aliased
+//! `Sj = Cj`, which attenuated low-frequency AC energy (invisible on
+//! DC-only content, caught by the first fixture with real AC
+//! coefficients). End-to-end pins: `tiny-i-only-16x16` (solid-colour
+//! intra, qi=44) and `quant-table-custom` (textured intra, qi=18,
+//! 3-qi header) both decode sample-exact against their staged
+//! `expected.yuv`, and a zero-byte packet replays the previous
+//! reference bit-identically. Inter-frame end-to-end decode (motion
+//! compensation against a real P-packet) is the next §7.11 target;
+//! the §7.5.2 / §7.9.1 predictor machinery is already in place.
+//!
+//! Round 250 landed the **§7.11 Complete Frame Decode entry-shape
 //! primitives** as [`ReferencePlaneDimensions`] +
 //! [`reference_plane_dimensions_from_ident`] +
 //! [`FrameDecodePacket`] + [`classify_frame_decode_packet`]. The
@@ -194,11 +230,10 @@
 //!
 //! Bitstream-version-3.2.0+ streams override the Appendix-B defaults
 //! via the §6.4.1 / §6.4.2 procedures the setup-header body decode
-//! consumes — the end-to-end body chain remains blocked by the §6.4.1
-//! spec gap (see below) and [`parse_setup_header`] continues to
-//! surface [`Error::SetupHeaderBodyNotImplemented`]. §6.4.3 / §6.4.4
-//! are unblocked by that gap because they operate purely on the
-//! §6.4.2 outputs / their own bit payload.
+//! consumes — [`decode_setup_header`] chains §6.4.1 → §6.4.2 → §6.4.4
+//! on one shared bit reader per §6.4.5 and returns the complete
+//! [`SetupHeaderTables`] bundle (`LFLIMS`, the §6.4.2 quantization
+//! parameters, and the 80-entry `HTS` Huffman-table array).
 //!
 //! * [`decode_identification_header`] returns a typed
 //!   [`TheoraIdentHeader`] describing every field declared in
@@ -206,9 +241,12 @@
 //! * [`parse_comment_header`] returns a typed
 //!   [`TheoraCommentHeader`] with the decoded vendor string and the
 //!   list of `KEY=value` user comments.
-//! * [`parse_setup_header`] validates §6.4.5 step 1 (the common
-//!   header carrying the `0x82`+"theora" identifier) and returns
-//!   [`Error::SetupHeaderBodyNotImplemented`] for the body decode.
+//! * [`decode_setup_header`] decodes the complete §6.4.5 setup
+//!   header — step 1 common-header check (`0x82`+"theora"), then
+//!   the §6.4.1 / §6.4.2 / §6.4.4 body chain on one shared bit
+//!   reader — into a [`SetupHeaderTables`] bundle.
+//!   [`parse_setup_header`] is the legacy projection of the same
+//!   decode onto the [`TheoraSetupHeader`] field set.
 //! * [`TheoraSetupHeader::vp3_defaults`] constructs the Appendix B
 //!   VP3 fallback for streams that declare `version < 0x030200`
 //!   (alpha2 / VP3-compatibility decode, §B.1 first bullet).
@@ -301,14 +339,14 @@
 //! as `L` directly.
 //!
 //! The standalone [`decode_loop_filter_limit_table`] entry point
-//! exposes this; [`parse_setup_header`] still surfaces
-//! [`Error::SetupHeaderBodyNotImplemented`] because the body decode
-//! continues into §6.4.2 / §6.4.3 / §6.4.4 (which are already
-//! implemented as standalone entry points but not yet chained on a
-//! shared bit reader).
+//! exposes this; [`decode_setup_header`] chains it with the §6.4.2 /
+//! §6.4.4 body procedures on one shared bit reader per §6.4.5.
 
 #![warn(missing_debug_implementations)]
 #![deny(unsafe_code)]
+
+#[cfg(test)]
+mod fixture_data;
 
 use oxideav_core::RuntimeContext;
 
@@ -414,13 +452,6 @@ pub enum Error {
         /// Which vector failed UTF-8 decoding.
         field: CommentField,
     },
-    /// The setup-header body (§6.4.1 LFLIMS through §6.4.4 Huffman
-    /// tables) is not yet implemented. Returned by
-    /// [`parse_setup_header`] after the common-header check
-    /// succeeds. See the crate-level "Known spec gap" notice for
-    /// the underlying reason: §6.4.1's numbered procedure steps are
-    /// absent from the spec PDF.
-    SetupHeaderBodyNotImplemented,
     /// `NBMS` (number of base matrices, §6.4.2 step 5) exceeded the
     /// spec maximum of 384. The spec says "NBMS MUST be no greater
     /// than 384".
@@ -1191,6 +1222,19 @@ pub enum Error {
     /// (§6.2 step 23 derives `NBS` from `FMBW * FMBH` and both are
     /// `>= 1`, so `NBS >= 1` for any well-formed Theora stream).
     EmptyPacketFrameStateZeroNbs,
+    /// A count derived by the §2.3 / §2.4 frame-geometry walk
+    /// disagrees with the corresponding §6.2-derived total from the
+    /// identification header (`NBS` per Table 6.6, `NSBS` per Table
+    /// 6.5, or `NMBS = FMBW * FMBH`). Indicates an internal geometry
+    /// inconsistency rather than a malformed stream.
+    FrameGeometryCountMismatch {
+        /// Which §6.2 total disagreed (`"nbs"`, `"nsbs"`, `"nmbs"`).
+        which: &'static str,
+        /// The count produced by the geometry walk.
+        got: u64,
+        /// The §6.2-derived expectation.
+        expected: u64,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -1393,10 +1437,6 @@ impl core::fmt::Display for Error {
             Error::CommentNotUtf8 { field } => write!(
                 f,
                 "oxideav-theora: comment header {field:?} is not valid UTF-8"
-            ),
-            Error::SetupHeaderBodyNotImplemented => write!(
-                f,
-                "oxideav-theora: setup-header common header validated; body (§6.4.1–§6.4.4) deferred to later clean-room round"
             ),
             Error::TooManyBaseMatrices { nbms } => write!(
                 f,
@@ -1775,6 +1815,14 @@ impl core::fmt::Display for Error {
             Error::EmptyPacketFrameStateZeroNbs => write!(
                 f,
                 "oxideav-theora: §7.11 step 2 empty-packet synthesis requires NBS >= 1 (got 0)"
+            ),
+            Error::FrameGeometryCountMismatch {
+                which,
+                got,
+                expected,
+            } => write!(
+                f,
+                "oxideav-theora: §2.3/§2.4 geometry walk produced {which}={got}, identification header expects {expected}"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -2314,14 +2362,13 @@ pub const DCSCALE_VP3: [u16; 64] = [
 /// 5. The DCT-token Huffman tables (`HTS`, §6.4.4 — an 80-element
 ///    array of Huffman tables with up to 32 entries each).
 ///
-/// **Round 4 carries the Appendix B fallback tables only.**
-/// [`parse_setup_header`] still surfaces
-/// [`Error::SetupHeaderBodyNotImplemented`] (§6.4.1 procedure body
-/// gap), but the value layer is now in place: callers handling
-/// `vp3-compat-decode` style streams (`version < 0x030200`) can
-/// build a usable [`TheoraSetupHeader`] via
-/// [`TheoraSetupHeader::vp3_defaults`]. Base matrices, NQRS /
-/// QRSIZES / QRBMIS, and the Huffman tables are deferred to round 5.
+/// This legacy struct carries payloads 1 and 2 only; the complete
+/// §6.4.5 bundle (including the base matrices, quant-range tables,
+/// and Huffman tables) is [`SetupHeaderTables`], produced by
+/// [`decode_setup_header`]. `TheoraSetupHeader` remains the vehicle
+/// for the Appendix B fallback values: callers handling
+/// `vp3-compat-decode` style streams (`version < 0x030200`) build a
+/// usable header via [`TheoraSetupHeader::vp3_defaults`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TheoraSetupHeader {
     /// `LFLIMS` (§6.4.1) — 64-element array of 7-bit loop-filter
@@ -2329,7 +2376,7 @@ pub struct TheoraSetupHeader {
     /// 0..=127 (7-bit unsigned per the §6.4.1 output-parameters
     /// table). VP3-compatible streams populate this from
     /// [`LFLIMS_VP3`]; later streams override per §6.4.1's
-    /// procedure (currently blocked by spec gap).
+    /// procedure.
     pub loop_filter_limits: [u8; 64],
     /// `ACSCALE` (§6.4.2 steps 1–2) — 64-element array of 16-bit AC
     /// dequantization scale values, indexed by `qi`. VP3-compatible
@@ -2352,11 +2399,9 @@ impl TheoraSetupHeader {
     /// or ACSCALE/DCSCALE override.
     ///
     /// For `version >= 0x030200` streams, the spec requires the
-    /// setup-header §6.4.1 / §6.4.2 procedures to be applied; until
-    /// the §6.4.1 procedure-body spec gap is closed,
-    /// [`parse_setup_header`] returns
-    /// [`Error::SetupHeaderBodyNotImplemented`] rather than these
-    /// defaults.
+    /// setup-header §6.4.1 / §6.4.2 procedures to be applied;
+    /// [`parse_setup_header`] / [`decode_setup_header`] decode the
+    /// transmitted tables instead of these defaults.
     pub fn vp3_defaults() -> Self {
         Self {
             loop_filter_limits: LFLIMS_VP3,
@@ -2417,9 +2462,12 @@ pub struct QuantizationParameters {
 
 /// Decode a Theora setup header from `packet`.
 ///
-/// Rounds 3+4 implement only §6.4.5 step 1: the common-header check
-/// (the `0x82` header-type byte followed by the ASCII `"theora"`
-/// sync token mandated by §6.1).
+/// This is the legacy projection of the full §6.4.5 decode onto the
+/// [`TheoraSetupHeader`] field set (`LFLIMS` + `ACSCALE` +
+/// `DCSCALE`). It delegates to [`decode_setup_header`] and discards
+/// the base matrices, quant-range tables, and Huffman tables; callers
+/// driving the §7 frame-decode pipeline should use
+/// [`decode_setup_header`] directly so those payloads survive.
 ///
 /// `packet` must contain the whole header packet starting from the
 /// `0x82` header-type byte — i.e. the payload of the third Ogg
@@ -2432,24 +2480,78 @@ pub struct QuantizationParameters {
 ///   bit clear).
 /// * [`Error::BadMagic`] if the six bytes following the header-type
 ///   byte are not `"theora"`.
-/// * [`Error::TruncatedHeader`] if the packet is shorter than the
-///   7-byte common header.
-/// * [`Error::SetupHeaderBodyNotImplemented`] after the common
-///   header has been validated, while the spec gap on §6.4.1
-///   blocks further body decode. The error is "soft" in the sense
-///   that the caller has at least verified that the packet looks
-///   like a setup header — it just can't be decoded yet. Callers
-///   handling `version < 0x030200` (VP3-compatible) streams may
-///   substitute [`TheoraSetupHeader::vp3_defaults`] for the missing
-///   body; the Appendix B tables apply directly there.
-///
-/// A later round will replace the `SetupHeaderBodyNotImplemented`
-/// return with a fully-populated [`TheoraSetupHeader`] once §6.4.1's
-/// procedure body is recovered.
+/// * [`Error::TruncatedHeader`] if the packet ends before the §6.4.1
+///   / §6.4.2 / §6.4.4 body chain has consumed its final bit.
+/// * Any §6.4.2 / §6.4.4 reject from the body procedures (e.g.
+///   [`Error::TooManyBaseMatrices`],
+///   [`Error::BaseMatrixIndexOutOfRange`], or a Huffman-table shape
+///   reject) propagates unchanged.
 pub fn parse_setup_header(packet: &[u8]) -> Result<TheoraSetupHeader, Error> {
-    let mut r = Reader::new(packet);
+    let full = decode_setup_header(packet)?;
+    Ok(TheoraSetupHeader {
+        loop_filter_limits: full.loop_filter_limits,
+        ac_scale: full.quantization_parameters.ac_scale,
+        dc_scale: full.quantization_parameters.dc_scale,
+    })
+}
 
-    // --- §6.1 common header (called out by §6.4.5 step 1).
+/// The complete §6.4.5 setup-header bundle: every table the §7 frame
+/// decode consumes from the third header packet.
+///
+/// Produced by [`decode_setup_header`]. The three fields correspond
+/// to §6.4.5 steps 2, 3, and 4 respectively:
+///
+/// * `LFLIMS` (§6.4.1) feeds the §7.10.3 loop filter (`L =
+///   LFLIMS[QIS[0]]`).
+/// * The §6.4.2 quantization parameters (`ACSCALE` / `DCSCALE` /
+///   `NBMS` / `BMS` / `NQRS` / `QRSIZES` / `QRBMIS`) feed the §6.4.3
+///   quantization-matrix derivation used by §7.9.2 dequantization.
+/// * `HTS` (§6.4.4) — the 80-element Huffman-table array — feeds the
+///   §7.7.3 DCT-token decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupHeaderTables {
+    /// `LFLIMS` (§6.4.1) — 64-element loop-filter limit table
+    /// indexed by `qi`.
+    pub loop_filter_limits: [u8; 64],
+    /// The §6.4.2 quantization parameters (steps 1–7).
+    pub quantization_parameters: QuantizationParameters,
+    /// `HTS` (§6.4.4) — the 80-element DCT-token Huffman-table
+    /// array.
+    pub huffman_tables: Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>,
+}
+
+/// Decode the complete Theora setup header per §6.4.5 ("Setup Header
+/// Decode") of the Xiph Theora I Specification.
+///
+/// The four §6.4.5 steps run in order on a single bit cursor:
+///
+/// 1. Validate the §6.1 common header (`HEADERTYPE = 0x82` followed
+///    by the ASCII `"theora"` sync token).
+/// 2. Decode the loop-filter limit table per §6.4.1 into `LFLIMS`.
+/// 3. Decode the quantization parameters per §6.4.2 into `ACSCALE`,
+///    `DCSCALE`, `NBMS`, `BMS`, `NQRS`, `QRSIZES`, and `QRBMIS`.
+/// 4. Decode the DCT-token Huffman tables per §6.4.4 into `HTS`.
+///
+/// The shared-reader contract mirrors the §7.11 step 1 chain: the
+/// §6.4.2 payload begins at the bit position immediately after
+/// §6.4.1's last `LFLIMS` entry, and §6.4.4's tree bits immediately
+/// after §6.4.2's final `QRBMIS` read — no byte re-alignment between
+/// sections. The byte-aligned standalone entry points
+/// ([`decode_loop_filter_limit_table`],
+/// [`decode_quantization_parameters`],
+/// [`decode_dct_token_huffman_tables`]) cannot be composed for a real
+/// setup packet because each would restart its cursor at a byte
+/// boundary.
+///
+/// `packet` must contain the whole header packet starting from the
+/// `0x82` header-type byte, with Ogg framing already stripped.
+/// Trailing bits left over after §6.4.4's final table are ignored
+/// (the bit-packing pads the last byte).
+///
+/// Errors are as documented on [`parse_setup_header`].
+pub fn decode_setup_header(packet: &[u8]) -> Result<SetupHeaderTables, Error> {
+    // --- §6.4.5 step 1: §6.1 common header.
+    let mut r = Reader::new(packet);
     let header_type = r.read_u8("header_type")?;
     if header_type & 0x80 == 0 {
         return Err(Error::BadHeaderType { got: header_type });
@@ -2465,18 +2567,23 @@ pub fn parse_setup_header(packet: &[u8]) -> Result<TheoraSetupHeader, Error> {
         }
     }
 
-    // --- §6.4.5 steps 2–4 would follow here, consuming the body
-    // through a `BitReader` (§5.2). Step 2 (§6.4.1 LFLIMS) is
-    // currently blocked by a spec gap — see the crate-level "Known
-    // spec gap" notice and the comment on
-    // `Error::SetupHeaderBodyNotImplemented`. Round 4 ships the
-    // Appendix B fallback tables via `TheoraSetupHeader::vp3_defaults`
-    // for `version < 0x030200` callers, but
-    // `parse_setup_header` itself still requires the §6.4.1 body to
-    // be present in the spec; until then the soft sentinel lets
-    // callers route on the unparsed / fallback / parsed distinction
-    // once a later round closes the gap.
-    Err(Error::SetupHeaderBodyNotImplemented)
+    // --- §6.4.5 steps 2–4 share one bit reader over the body that
+    // follows the 7-byte common header.
+    let mut bits = BitReader::new(&packet[7..]);
+    // Step 2: §6.4.1 LFLIMS.
+    let loop_filter_limits = decode_lflims_inner(&mut bits)?;
+    // Step 3: §6.4.2 quantization parameters, resuming on the same
+    // reader immediately after the last LFLIMS entry.
+    let quantization_parameters = decode_quant_params_inner(&mut bits)?;
+    // Step 4: §6.4.4 Huffman tables, resuming immediately after the
+    // final QRBMIS read.
+    let huffman_tables = decode_huffman_tables_inner(&mut bits)?;
+
+    Ok(SetupHeaderTables {
+        loop_filter_limits,
+        quantization_parameters,
+        huffman_tables,
+    })
 }
 
 /// Decode the loop-filter limit table from the §6.4.1 setup-header
@@ -2539,7 +2646,7 @@ pub fn decode_loop_filter_limit_table(bits: &[u8]) -> Result<[u8; 64], Error> {
 }
 
 /// Inner §6.4.1 procedure operating on an already-positioned
-/// [`BitReader`]. Split out so a future `parse_setup_header` can chain
+/// [`BitReader`]. Split out so [`decode_setup_header`] chains
 /// §6.4.1 → §6.4.2 → §6.4.4 on the same underlying bit reader without
 /// re-aligning at byte boundaries.
 fn decode_lflims_inner(r: &mut BitReader<'_>) -> Result<[u8; 64], Error> {
@@ -2587,10 +2694,9 @@ fn ilog(a: i64) -> u32 {
 /// `bits` must start at the first bit of the §6.4.2 payload — i.e.
 /// immediately after the §6.4.1 LFLIMS table within the setup-header
 /// body (§6.4.5 step 3 runs after step 2). This entry point decodes
-/// the payload in isolation so it can be exercised independently of
-/// the §6.4.1 procedure-body spec gap; once that gap closes,
-/// `parse_setup_header` will chain §6.4.1 then call this on the same
-/// underlying bit reader.
+/// the payload in isolation for unit-test convenience;
+/// [`decode_setup_header`] chains §6.4.1 then the inner form of this
+/// procedure on the same underlying bit reader.
 ///
 /// Because the §6.4.2 payload is bit-packed and not byte-aligned in a
 /// real setup header, this helper is most useful in two situations:
@@ -2617,8 +2723,8 @@ pub fn decode_quantization_parameters(bits: &[u8]) -> Result<QuantizationParamet
 }
 
 /// Inner §6.4.2 procedure operating on an already-positioned
-/// [`BitReader`]. Split out so a future `parse_setup_header` can chain
-/// it onto the same reader after §6.4.1 without re-aligning.
+/// [`BitReader`]. Split out so [`decode_setup_header`] chains it
+/// onto the same reader after §6.4.1 without re-aligning.
 fn decode_quant_params_inner(r: &mut BitReader<'_>) -> Result<QuantizationParameters, Error> {
     // Step 1: read 4-bit NBITS, then add one.
     let mut nbits = r.read_bits(4, "ACSCALE NBITS")? + 1;
@@ -3078,9 +3184,8 @@ pub(crate) enum ReadTokenErr {
 /// immediately after the §6.4.2 quantization parameters within the
 /// setup-header body (§6.4.5 step 4 runs after step 3). Like
 /// [`decode_quantization_parameters`], this entry point decodes the
-/// payload in isolation so it can be exercised independently of the
-/// §6.4.1 procedure-body spec gap; once that gap closes,
-/// `parse_setup_header` will chain §6.4.1 → §6.4.2 → §6.4.4 on a
+/// payload in isolation for unit-test convenience;
+/// [`decode_setup_header`] chains §6.4.1 → §6.4.2 → §6.4.4 on a
 /// shared bit reader.
 ///
 /// Each of the 80 tables is described as a binary tree (§6.4.4): a
@@ -3107,8 +3212,8 @@ pub fn decode_dct_token_huffman_tables(
 }
 
 /// Inner §6.4.4 procedure operating on an already-positioned
-/// [`BitReader`]. Split out so a future `parse_setup_header` can chain
-/// it onto the same reader after §6.4.2 without re-aligning.
+/// [`BitReader`]. Split out so [`decode_setup_header`] chains it
+/// onto the same reader after §6.4.2 without re-aligning.
 fn decode_huffman_tables_inner(
     r: &mut BitReader<'_>,
 ) -> Result<Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>, Error> {
@@ -6675,9 +6780,10 @@ const IDCT_C3: i32 = 54491;
 const IDCT_C4: i32 = 46341;
 const IDCT_C6: i32 = 25080;
 const IDCT_C7: i32 = 12785;
-const IDCT_S3: i32 = IDCT_C3;
-const IDCT_S6: i32 = IDCT_C6;
-const IDCT_S7: i32 = IDCT_C7;
+// Sj pairs with C(8 − j) per Table 7.65: sin(jπ/16) = cos((8 − j)π/16).
+const IDCT_S3: i32 = 36410; // = C5
+const IDCT_S6: i32 = 60547; // = C2
+const IDCT_S7: i32 = 64277; // = C1
 
 /// Apply the §7.9.3.1 1D inverse DCT to an 8-element row of DCT
 /// coefficients, returning the 8-element row of inverse-DCT output
@@ -6885,11 +6991,12 @@ pub fn inverse_dct_2d(dqc: &[i16; 64]) -> [[i16; 8]; 8] {
 /// significant bit, etc." — i.e. each output integer is built MSb
 /// first, and within each source byte the MSb is consumed first.
 ///
-/// This is the bit reader that §6.4.1 / §6.4.2 / §6.4.4 will consume
-/// once their full decoding procedures are available. It is held
-/// crate-private until then; the public API only exposes the byte-
-/// aligned parsers ([`decode_identification_header`],
-/// [`parse_comment_header`], [`parse_setup_header`] step 1).
+/// This is the bit reader the §6.4.1 / §6.4.2 / §6.4.4 setup-header
+/// chain and the §7.x frame-decode chain consume. It is held
+/// crate-private; the public API exposes byte-aligned entry points
+/// ([`decode_identification_header`], [`parse_comment_header`],
+/// [`decode_setup_header`], [`FrameDecoder::decode_frame`]) that
+/// position it internally.
 ///
 /// The reader is non-panicking: every read returns `Err` rather than
 /// indexing past end-of-buffer. The byte position is advanced
@@ -7892,7 +7999,6 @@ pub struct CodedBlockPosition {
 /// is exactly the plane's [`PlaneBlockDims::block_count`].
 #[derive(Debug, Clone)]
 pub struct PlaneBlockCodedOrder {
-    dims: PlaneBlockDims,
     sb_w: u32,
     sb_h: u32,
     block_w: u32,
@@ -7910,11 +8016,34 @@ impl PlaneBlockCodedOrder {
     /// zero-block plane). The iterator yields no items in that case.
     pub fn new(dims: PlaneBlockDims) -> Self {
         Self {
-            dims,
             sb_w: dims.sb_w(),
             sb_h: dims.sb_h(),
             block_w: dims.block_w(),
             block_h: dims.block_h(),
+            next_sb: 0,
+            next_slot: 0,
+        }
+    }
+
+    /// Build a coded-order iterator from an explicit block extent
+    /// (`block_w` × `block_h`, in 8×8 blocks).
+    ///
+    /// [`PlaneBlockCodedOrder::new`] derives the block extent from a
+    /// macro-block extent as `2 * mb_w` / `2 * mb_h`, which is exact
+    /// for the luma plane but over-counts a subsampled chroma plane
+    /// when the luma macro-block count along an axis is odd: e.g.
+    /// 4:2:0 with `FMBW = 3` has a chroma plane `8 * FMBW = 24`
+    /// pixels (3 blocks) wide per Table 7.89, not `2 * ceil(3 / 2) =
+    /// 4` blocks. The chroma plane's block extent is its pixel
+    /// extent divided by 8 — pass that here. The super-block grid is
+    /// `ceil(block_w / 4)` × `ceil(block_h / 4)` per §2.3 (Table
+    /// 6.5's per-plane terms).
+    pub fn from_block_extent(block_w: u32, block_h: u32) -> Self {
+        Self {
+            sb_w: block_w.div_ceil(4),
+            sb_h: block_h.div_ceil(4),
+            block_w,
+            block_h,
             next_sb: 0,
             next_slot: 0,
         }
@@ -7926,11 +8055,9 @@ impl PlaneBlockCodedOrder {
         if self.next_sb >= self.sb_w * self.sb_h {
             return 0;
         }
-        // Pessimistic over-count is fine for size_hint; we tighten the
-        // exact value by re-counting from scratch using block_count.
-        // The caller already knows the total via PlaneBlockDims, so
-        // the tightening is mostly informational.
-        let total = self.dims.block_count();
+        // Exact count: total blocks inside the plane's block extent
+        // minus those already emitted.
+        let total = (self.block_w as u64) * (self.block_h as u64);
         let consumed = self.consumed_blocks_so_far();
         total.saturating_sub(consumed)
     }
@@ -8750,10 +8877,11 @@ impl<'a> FrameDecodePacket<'a> {
 /// (step 1). The classifier is a pure predicate; it does not read
 /// the packet body.
 ///
-/// This is the first piece of the §7.11 frame-decode driver to
-/// land; subsequent rounds will chain the §7.1 / §7.3 / §7.4 /
-/// §7.5.2 / §7.6 / §7.7.3 / §7.8.2 / §7.9.4 / §7.10.3 procedures
-/// behind it.
+/// This is the entry branch of the §7.11 frame-decode driver:
+/// [`FrameDecoder::decode_frame`] dispatches on the returned variant
+/// to either the [`decode_data_packet_header_and_blocks`] step 1
+/// chain or the [`synthesize_empty_packet_frame_state`] step 2
+/// synthesis before running steps 3–8.
 pub fn classify_frame_decode_packet(packet: &[u8]) -> FrameDecodePacket<'_> {
     if packet.is_empty() {
         FrameDecodePacket::Empty
@@ -8893,11 +9021,10 @@ impl From<&EmptyPacketFrameState> for TheoraFrameHeader {
 ///   surfaces a typed reject for the caller-supplied bound rather
 ///   than silently producing an empty `BCODED`.
 ///
-/// This is the third piece of the §7.11 frame-decode driver to
-/// land (after [`classify_frame_decode_packet`] and the
-/// [`ReferenceFrameStore`] promotion path); the step 1 chain
-/// (§7.1 → §7.3 → §7.4 → §7.5.2 → §7.6 → §7.7.3 → §7.8.2 on a
-/// shared bit reader) is still pending.
+/// [`FrameDecoder::decode_frame`] invokes this for the zero-byte
+/// branch and pairs it with the §7.4 / §7.5.2 / §7.6 / §7.7.3
+/// per-block defaults (`INTER_NOMV` modes, zero vectors, zero
+/// coefficients) that the §7.9.4 uncoded-block path never reads.
 pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFrameState, Error> {
     if nbs == 0 {
         return Err(Error::EmptyPacketFrameStateZeroNbs);
@@ -9166,8 +9293,9 @@ pub struct DcPredictionGeometry<'a> {
 /// propagates unchanged.
 ///
 /// This completes the §7.11 step 1 chain — steps 1(a) through 1(g).
-/// The step 5 / step 6 dispatch into [`reconstruct_frame`] /
-/// [`loop_filter_frame`] consumes this bundle in a later round.
+/// [`FrameDecoder::decode_frame`] consumes this bundle for its step
+/// 5 / step 6 dispatch into [`reconstruct_frame`] /
+/// [`loop_filter_frame`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_data_packet_header_and_blocks(
     packet: &[u8],
@@ -9552,6 +9680,551 @@ impl ReferenceFrameStore {
                 width: dims.width,
                 height: dims.height,
             })
+    }
+}
+
+/// Resolved §2.3 / §2.4 frame-layout geometry for one stream.
+///
+/// Every §7 frame-decode procedure consumes the frame layout through
+/// caller-supplied lookup tables (coded-order block maps, raster
+/// neighbour tables, per-plane grids). This struct derives all of
+/// them once from the identification header so the §7.11 driver can
+/// decode every frame of the stream against the same resolved
+/// geometry.
+///
+/// Index spaces (all per §2.3 / §2.4):
+///
+/// * **Blocks** are indexed in coded order, numbered continuously
+///   from the Y′ plane to the Cb plane to the Cr plane (§2.3:
+///   "They do not reset to zero at the start of each plane").
+///   Within each plane, super blocks are visited in raster order
+///   (lower-left origin) and the up-to-16 blocks inside each super
+///   block along the Figure 2.4 Hilbert curve, with blocks outside
+///   the plane's block extent omitted.
+/// * **Super blocks** are likewise numbered continuously across the
+///   three planes (Table 6.5 sums per-plane terms), raster order
+///   within each plane.
+/// * **Macro blocks** are indexed in §2.4 coded order over the luma
+///   plane's super blocks (Figure 2.6 Hilbert curve inside each).
+///
+/// Plane block extents come from the reference-plane pixel geometry
+/// (§7.11 steps 3–4 / Table 7.89) divided by 8 — for subsampled
+/// chroma planes this is *not* always `2 * ceil(FMB? / 2)` (see
+/// [`PlaneBlockCodedOrder::from_block_extent`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameGeometry {
+    /// `NBS` — total blocks across all three planes (Table 6.6).
+    pub nbs: u32,
+    /// `NSBS` — total super blocks across all three planes
+    /// (Table 6.5).
+    pub nsbs: u32,
+    /// `NMBS` — total macro blocks (`FMBW * FMBH`).
+    pub nmbs: u32,
+    /// The stream's pixel format (chroma subsampling).
+    pub pf: PixelFormat,
+    /// Per-block coded-order → global super-block index map
+    /// (length `nbs`), the §7.3 `block_to_super_block` contract.
+    pub block_to_super_block: Vec<u32>,
+    /// Per-macro-block `[A, B, C, D]` luma-block indices in raster
+    /// order (lower-left, lower-right, upper-left, upper-right) —
+    /// the §7.4 / §7.5.2 `luma_map` contract. Length `nmbs`.
+    pub macro_block_to_luma_blocks: Vec<[u32; 4]>,
+    /// Per-macro-block Cb-plane block indices (inner length 1 for
+    /// 4:2:0, 2 for 4:2:2 — bottom then top, 4 for 4:4:4 — the
+    /// `[A, B, C, D]` co-located order). Length `nmbs`. The §7.5.2
+    /// [`ChromaBlockLayout`] borrows these.
+    pub chroma_cb: Vec<Vec<u32>>,
+    /// Per-macro-block Cr-plane block indices; same shape as
+    /// `chroma_cb`.
+    pub chroma_cr: Vec<Vec<u32>>,
+    /// Per-block colour-plane index (`0` Y, `1` Cb, `2` Cr).
+    /// Length `nbs`.
+    pub pli_of_block: Vec<u8>,
+    /// Per-block lower-left pixel column within its plane (§7.9.4
+    /// step 2(b): `BX = 8 * bx_grid`). Length `nbs`.
+    pub bx_of_block: Vec<u32>,
+    /// Per-block lower-left pixel row within its plane (§7.9.4 step
+    /// 2(c)). Length `nbs`.
+    pub by_of_block: Vec<u32>,
+    /// Per-block macro-block index (every block, luma and chroma,
+    /// belongs to exactly one macro block per §2.4). Length `nbs`.
+    pub mbi_of_block: Vec<u32>,
+    /// Per-block §7.8.1 raster-neighbour table (left / lower-left /
+    /// lower / lower-right within the block's own plane, `None` at
+    /// plane edges). Length `nbs`.
+    pub neighbors: Vec<DcPredictorNeighbors>,
+    /// Per-plane raster-order listing of coded-order block indices —
+    /// the §7.8.2 `plane_raster_order` contract and, equivalently,
+    /// the §7.10.3 `grid_to_bi` raster→coded map (row-major from the
+    /// lower-left cell).
+    pub plane_raster_order: [Vec<u32>; 3],
+    /// Per-plane block extent `(block_w, block_h)` in 8×8 blocks.
+    /// Index 0 is Y; 1 and 2 are Cb / Cr (always equal).
+    pub block_extent: [(u32, u32); 3],
+    /// Y-plane pixel dimensions (`RPYW` × `RPYH`, §7.11 step 3).
+    pub dims_y: PlaneDimensions,
+    /// Cb / Cr plane pixel dimensions (`RPCW` × `RPCH`, §7.11
+    /// step 4 / Table 7.89).
+    pub dims_c: PlaneDimensions,
+}
+
+/// Derive the complete §2.3 / §2.4 frame-layout geometry from an
+/// identification header.
+///
+/// The walk visits each colour plane's blocks in coded order
+/// (assigning the continuous cross-plane block numbering), records
+/// each block's plane / pixel origin / super block, builds the
+/// per-plane raster grids, derives the §7.8.1 neighbour table from
+/// those grids, and walks the §2.4 macro-block coded order to
+/// associate every block (luma and chroma) with its macro block.
+///
+/// The derived totals are validated against the §6.2 header-derived
+/// `NBS` / `NSBS` / `NMBS` (Tables 6.5 / 6.6); a disagreement
+/// surfaces as [`Error::FrameGeometryCountMismatch`] rather than a
+/// silently inconsistent geometry.
+pub fn build_frame_geometry(ident: &TheoraIdentHeader) -> Result<FrameGeometry, Error> {
+    let fmbw = ident.fmbw as u32;
+    let fmbh = ident.fmbh as u32;
+    let expected_nbs = ident.nbs();
+    if expected_nbs > u32::MAX as u64 {
+        // Per-block indices are u32 throughout the §7 procedures.
+        return Err(Error::FrameGeometryCountMismatch {
+            which: "nbs (u32 index range)",
+            got: expected_nbs,
+            expected: u32::MAX as u64,
+        });
+    }
+
+    // Reference-plane pixel geometry (§7.11 steps 3–4 / Table 7.89)
+    // fixes each plane's block extent as pixels / 8.
+    let ref_dims = reference_plane_dimensions_from_ident(ident);
+    let dims_y = PlaneDimensions {
+        width: ref_dims.rpyw,
+        height: ref_dims.rpyh,
+    };
+    let dims_c = PlaneDimensions {
+        width: ref_dims.rpcw,
+        height: ref_dims.rpch,
+    };
+    let luma_extent = (ref_dims.rpyw / 8, ref_dims.rpyh / 8);
+    let chroma_extent = (ref_dims.rpcw / 8, ref_dims.rpch / 8);
+    let block_extent = [luma_extent, chroma_extent, chroma_extent];
+
+    let mut block_to_super_block: Vec<u32> = Vec::new();
+    let mut pli_of_block: Vec<u8> = Vec::new();
+    let mut bx_of_block: Vec<u32> = Vec::new();
+    let mut by_of_block: Vec<u32> = Vec::new();
+    // Per-plane raster grids: cell (bx, by) → coded-order bi.
+    let mut grids: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+
+    // §2.3 coded-order walk, plane by plane (Y′ then Cb then Cr),
+    // assigning the continuous block numbering and the continuous
+    // super-block numbering.
+    let mut next_bi: u32 = 0;
+    let mut sb_base: u32 = 0;
+    for (pli, &(bw, bh)) in block_extent.iter().enumerate() {
+        let grid = &mut grids[pli];
+        grid.resize((bw as usize) * (bh as usize), u32::MAX);
+        for pos in PlaneBlockCodedOrder::from_block_extent(bw, bh) {
+            let bi = next_bi;
+            next_bi += 1;
+            block_to_super_block.push(sb_base + pos.sb_index);
+            pli_of_block.push(pli as u8);
+            bx_of_block.push(pos.bx * 8);
+            by_of_block.push(pos.by * 8);
+            grid[(pos.by as usize) * (bw as usize) + pos.bx as usize] = bi;
+        }
+        sb_base += bw.div_ceil(4) * bh.div_ceil(4);
+    }
+
+    let nbs = next_bi;
+    if nbs as u64 != expected_nbs {
+        return Err(Error::FrameGeometryCountMismatch {
+            which: "nbs",
+            got: nbs as u64,
+            expected: expected_nbs,
+        });
+    }
+    if sb_base != ident.nsbs() {
+        return Err(Error::FrameGeometryCountMismatch {
+            which: "nsbs",
+            got: sb_base as u64,
+            expected: ident.nsbs() as u64,
+        });
+    }
+
+    // §7.8.1 raster-neighbour table from the per-plane grids. The
+    // neighbour slots are pure plane-edge geometry; per-frame coding
+    // status is applied by §7.8.1 itself (`compute_dc_predictor`
+    // consults `BCODED`).
+    let mut neighbors = vec![DcPredictorNeighbors::default(); nbs as usize];
+    for (pli, &(bw, bh)) in block_extent.iter().enumerate() {
+        let grid = &grids[pli];
+        let w = bw as usize;
+        for y in 0..bh as usize {
+            for x in 0..w {
+                let bi = grid[y * w + x] as usize;
+                let n = &mut neighbors[bi];
+                if x > 0 {
+                    n.left = Some(grid[y * w + x - 1]);
+                }
+                if y > 0 {
+                    if x > 0 {
+                        n.lower_left = Some(grid[(y - 1) * w + x - 1]);
+                    }
+                    n.lower = Some(grid[(y - 1) * w + x]);
+                    if x + 1 < w {
+                        n.lower_right = Some(grid[(y - 1) * w + x + 1]);
+                    }
+                }
+            }
+        }
+    }
+
+    // §2.4 macro-block coded-order walk over the luma plane,
+    // associating each macro block with its four luma blocks (raster
+    // [A, B, C, D]) and its co-located chroma blocks per Figure 2.5.
+    let lw = luma_extent.0 as usize;
+    let cw = chroma_extent.0 as usize;
+    let luma_grid = &grids[0];
+    let mut macro_block_to_luma_blocks: Vec<[u32; 4]> = Vec::new();
+    let mut chroma_cb: Vec<Vec<u32>> = Vec::new();
+    let mut chroma_cr: Vec<Vec<u32>> = Vec::new();
+    let mut mbi_of_block = vec![0u32; nbs as usize];
+    let mut next_mbi: u32 = 0;
+    for pos in PlaneMacroBlockCodedOrder::new(PlaneBlockDims {
+        mb_w: fmbw,
+        mb_h: fmbh,
+    }) {
+        let mbi = next_mbi;
+        next_mbi += 1;
+        let (mbx, mby) = (pos.mbx as usize, pos.mby as usize);
+        // Raster [A, B, C, D] = lower-left, lower-right, upper-left,
+        // upper-right luma blocks of the 2×2 quad.
+        let abcd = [
+            luma_grid[(2 * mby) * lw + 2 * mbx],
+            luma_grid[(2 * mby) * lw + 2 * mbx + 1],
+            luma_grid[(2 * mby + 1) * lw + 2 * mbx],
+            luma_grid[(2 * mby + 1) * lw + 2 * mbx + 1],
+        ];
+        for &bi in &abcd {
+            mbi_of_block[bi as usize] = mbi;
+        }
+        macro_block_to_luma_blocks.push(abcd);
+        // Co-located chroma blocks for each subsampling (Figure 2.5;
+        // slot order per the §7.5.2 chroma-averaging assignments —
+        // 4:2:2 lists the bottom block then the top, 4:4:4 the
+        // co-located [A, B, C, D]).
+        let (cb_slots, cr_slots): (Vec<u32>, Vec<u32>) = match ident.pf {
+            PixelFormat::Yuv420 => (
+                vec![grids[1][mby * cw + mbx]],
+                vec![grids[2][mby * cw + mbx]],
+            ),
+            PixelFormat::Yuv422 => (
+                vec![
+                    grids[1][(2 * mby) * cw + mbx],
+                    grids[1][(2 * mby + 1) * cw + mbx],
+                ],
+                vec![
+                    grids[2][(2 * mby) * cw + mbx],
+                    grids[2][(2 * mby + 1) * cw + mbx],
+                ],
+            ),
+            PixelFormat::Yuv444 => (
+                vec![
+                    grids[1][(2 * mby) * cw + 2 * mbx],
+                    grids[1][(2 * mby) * cw + 2 * mbx + 1],
+                    grids[1][(2 * mby + 1) * cw + 2 * mbx],
+                    grids[1][(2 * mby + 1) * cw + 2 * mbx + 1],
+                ],
+                vec![
+                    grids[2][(2 * mby) * cw + 2 * mbx],
+                    grids[2][(2 * mby) * cw + 2 * mbx + 1],
+                    grids[2][(2 * mby + 1) * cw + 2 * mbx],
+                    grids[2][(2 * mby + 1) * cw + 2 * mbx + 1],
+                ],
+            ),
+        };
+        for &bi in cb_slots.iter().chain(cr_slots.iter()) {
+            mbi_of_block[bi as usize] = mbi;
+        }
+        chroma_cb.push(cb_slots);
+        chroma_cr.push(cr_slots);
+    }
+
+    if next_mbi != ident.nmbs() {
+        return Err(Error::FrameGeometryCountMismatch {
+            which: "nmbs",
+            got: next_mbi as u64,
+            expected: ident.nmbs() as u64,
+        });
+    }
+
+    let [grid_y, grid_cb, grid_cr] = grids;
+    Ok(FrameGeometry {
+        nbs,
+        nsbs: sb_base,
+        nmbs: next_mbi,
+        pf: ident.pf,
+        block_to_super_block,
+        macro_block_to_luma_blocks,
+        chroma_cb,
+        chroma_cr,
+        pli_of_block,
+        bx_of_block,
+        by_of_block,
+        mbi_of_block,
+        neighbors,
+        plane_raster_order: [grid_y, grid_cb, grid_cr],
+        block_extent,
+        dims_y,
+        dims_c,
+    })
+}
+
+/// One decoded frame as emitted by [`FrameDecoder::decode_frame`] —
+/// the §7.11 outputs a caller consumes per frame.
+///
+/// The planes are the *uncropped* reconstruction at the reference
+/// dimensions (`RPYW` × `RPYH` / `RPCW` × `RPCH`); §7.11's closing
+/// narrative notes the frame "should be cropped to the picture
+/// region before display", which is a presentation step left to the
+/// caller (the picture region lives on [`TheoraIdentHeader`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedFrame {
+    /// The §7.1 frame type (intra/inter); the §7.11 step 2 branch
+    /// synthesises [`FrameType::Inter`] for a zero-byte packet.
+    pub ftype: FrameType,
+    /// The frame's `QIS` array (1..=3 entries; `[63]` on the step 2
+    /// branch).
+    pub qis: Vec<u8>,
+    /// The reconstructed, loop-filtered planes (lower-left origin
+    /// row-major, per the §2.1 coordinate convention).
+    pub frame: ReconstructedFrame,
+}
+
+/// Stateful §7.11 ("Complete Frame Decode") driver for one Theora
+/// stream.
+///
+/// Holds everything that survives across frames: the resolved
+/// [`FrameGeometry`], the [`SetupHeaderTables`], and the
+/// [`ReferenceFrameStore`] carrying the golden / previous reference
+/// planes that §7.11 steps 7–8 update after every frame. Feed it the
+/// stream's video-data packets in order via
+/// [`FrameDecoder::decode_frame`].
+#[derive(Debug)]
+pub struct FrameDecoder {
+    ident: TheoraIdentHeader,
+    setup: SetupHeaderTables,
+    geometry: FrameGeometry,
+    refs: ReferenceFrameStore,
+    /// Number of frames decoded so far; the first must be intra per
+    /// §7.1 step 2.
+    frames_decoded: u64,
+}
+
+impl FrameDecoder {
+    /// Build a decoder from the parsed identification header and the
+    /// decoded setup-header tables.
+    ///
+    /// Derives the [`FrameGeometry`] and allocates the zero-filled
+    /// [`ReferenceFrameStore`] at the §7.11 step 3–4 reference-plane
+    /// dimensions.
+    pub fn new(ident: TheoraIdentHeader, setup: SetupHeaderTables) -> Result<Self, Error> {
+        let geometry = build_frame_geometry(&ident)?;
+        let refs = ReferenceFrameStore::zeroed(geometry.dims_y, geometry.dims_c)?;
+        Ok(Self {
+            ident,
+            setup,
+            geometry,
+            refs,
+            frames_decoded: 0,
+        })
+    }
+
+    /// The identification header this decoder was built from.
+    pub fn ident(&self) -> &TheoraIdentHeader {
+        &self.ident
+    }
+
+    /// The resolved frame geometry.
+    pub fn geometry(&self) -> &FrameGeometry {
+        &self.geometry
+    }
+
+    /// Read-only view of the reference-frame store (golden /
+    /// previous planes as left by the most recent §7.11 step 7–8).
+    pub fn reference_store(&self) -> &ReferenceFrameStore {
+        &self.refs
+    }
+
+    /// Decode one video-data packet per §7.11 ("Complete Frame
+    /// Decode").
+    ///
+    /// * **Step 1** (non-empty packet): the §7.1 → §7.3 → §7.4 →
+    ///   §7.5.2 → §7.6 → §7.7.3 → §7.8.2 chain on one shared bit
+    ///   reader ([`decode_data_packet_header_and_blocks`]).
+    /// * **Step 2** (zero-byte packet): the synthesised inter frame
+    ///   with no coded blocks
+    ///   ([`synthesize_empty_packet_frame_state`]); the remaining
+    ///   per-block arrays (`MBMODES`, `MVECTS`, `QIIS`, `COEFFS`,
+    ///   `NCOEFFS`) take their §7.4 / §7.5.2 / §7.6 / §7.7.3
+    ///   defaults (`INTER_NOMV`, zero vectors, zeros), which the
+    ///   §7.9.4 uncoded-block path never reads.
+    /// * **Steps 3–4** are fixed in the [`FrameGeometry`] /
+    ///   [`ReferenceFrameStore`] dimensions.
+    /// * **Step 5**: §7.9.4 frame reconstruction against the current
+    ///   reference planes ([`reconstruct_frame`]).
+    /// * **Step 6**: §7.10.3 loop filter over the reconstructed
+    ///   planes in place ([`loop_filter_frame`]).
+    /// * **Steps 7–8**: golden (intra only) / previous reference
+    ///   promotion
+    ///   ([`ReferenceFrameStore::promote_from_reconstructed`]).
+    ///
+    /// The first packet of a stream must decode to an intra frame
+    /// (§7.1 step 2); [`Error::FirstFrameMustBeIntra`] surfaces
+    /// otherwise.
+    pub fn decode_frame(&mut self, packet: &[u8]) -> Result<DecodedFrame, Error> {
+        let g = &self.geometry;
+        let nbs = g.nbs as usize;
+        let nmbs = g.nmbs as usize;
+
+        // Steps 1 / 2: per-frame state off the packet body.
+        let (header, bcoded_u8, mbmodes, mvects, qiis, coeffs, ncoeffs) =
+            match classify_frame_decode_packet(packet) {
+                FrameDecodePacket::Empty => {
+                    let st = synthesize_empty_packet_frame_state(nbs)?;
+                    let header = TheoraFrameHeader::from(&st);
+                    (
+                        header,
+                        st.bcoded,
+                        vec![MacroBlockMode::InterNoMv; nmbs],
+                        vec![MotionVector::ZERO; nbs],
+                        vec![0u8; nbs],
+                        vec![[0i16; 64]; nbs],
+                        vec![0u8; nbs],
+                    )
+                }
+                FrameDecodePacket::Data(data) => {
+                    // §7.5.2's ChromaBlockLayout borrows `&[&[u32]]`;
+                    // re-slice the owned per-macro-block maps.
+                    let cb_slices: Vec<&[u32]> = g.chroma_cb.iter().map(|v| v.as_slice()).collect();
+                    let cr_slices: Vec<&[u32]> = g.chroma_cr.iter().map(|v| v.as_slice()).collect();
+                    let plane_orders: [&[u32]; 3] = [
+                        &g.plane_raster_order[0],
+                        &g.plane_raster_order[1],
+                        &g.plane_raster_order[2],
+                    ];
+                    let out = decode_data_packet_header_and_blocks(
+                        data,
+                        self.frames_decoded == 0,
+                        g.pf,
+                        g.nsbs,
+                        g.nbs,
+                        g.nmbs,
+                        &g.block_to_super_block,
+                        &g.macro_block_to_luma_blocks,
+                        ChromaBlockLayout {
+                            cb: &cb_slices,
+                            cr: &cr_slices,
+                        },
+                        &self.setup.huffman_tables[..],
+                        DcPredictionGeometry {
+                            block_to_macro_block: &g.mbi_of_block,
+                            neighbors: &g.neighbors,
+                            plane_raster_order: &plane_orders,
+                        },
+                    )?;
+                    (
+                        out.header,
+                        out.bcoded,
+                        out.mbmodes,
+                        out.mvects,
+                        out.qiis,
+                        out.coeffs,
+                        out.ncoeffs,
+                    )
+                }
+            };
+
+        let bcoded: Vec<bool> = bcoded_u8.iter().map(|&b| b != 0).collect();
+        let ncoeffs_u32: Vec<u32> = ncoeffs.iter().map(|&n| n as u32).collect();
+
+        // Step 5: §7.9.4 reconstruction against the current reference
+        // planes.
+        let mut frame = {
+            let refs_view = self.refs.as_reference_plane_set()?;
+            reconstruct_frame(
+                &bcoded,
+                &mbmodes,
+                &mvects,
+                &coeffs,
+                &ncoeffs_u32,
+                &qiis,
+                &g.pli_of_block,
+                &g.bx_of_block,
+                &g.by_of_block,
+                &g.mbi_of_block,
+                &header.qis,
+                &self.setup.quantization_parameters,
+                &refs_view,
+                g.dims_y,
+                g.dims_c,
+                g.dims_c,
+            )?
+        };
+
+        // Step 6: §7.10.3 loop filter in place.
+        let plane_inputs: [LoopFilterPlaneInput<'_>; 3] = [
+            LoopFilterPlaneInput {
+                block_w: g.block_extent[0].0,
+                block_h: g.block_extent[0].1,
+                grid_to_bi: &g.plane_raster_order[0],
+            },
+            LoopFilterPlaneInput {
+                block_w: g.block_extent[1].0,
+                block_h: g.block_extent[1].1,
+                grid_to_bi: &g.plane_raster_order[1],
+            },
+            LoopFilterPlaneInput {
+                block_w: g.block_extent[2].0,
+                block_h: g.block_extent[2].1,
+                grid_to_bi: &g.plane_raster_order[2],
+            },
+        ];
+        {
+            let mut planes = LoopFilterPlanes {
+                recy: &mut frame.samples_y,
+                rpyw: g.dims_y.width,
+                rpyh: g.dims_y.height,
+                reccb: &mut frame.samples_cb,
+                reccr: &mut frame.samples_cr,
+                rpcw: g.dims_c.width,
+                rpch: g.dims_c.height,
+            };
+            loop_filter_frame(
+                &self.setup.loop_filter_limits,
+                &header.qis,
+                &bcoded,
+                &g.pli_of_block,
+                &g.bx_of_block,
+                &g.by_of_block,
+                &plane_inputs[0],
+                &plane_inputs[1],
+                &plane_inputs[2],
+                &mut planes,
+            )?;
+        }
+
+        // Steps 7–8: reference-frame promotion.
+        self.refs.promote_from_reconstructed(&frame, header.ftype)?;
+        self.frames_decoded += 1;
+
+        Ok(DecodedFrame {
+            ftype: header.ftype,
+            qis: header.qis,
+            frame,
+        })
     }
 }
 
@@ -10356,34 +11029,18 @@ mod tests {
 
     // ------- §6.4.5 setup header entrypoint tests -------
 
-    /// Minimal setup-header common header: `0x82` + "theora". Round
-    /// 3 doesn't decode the body, so the test fixtures only need to
-    /// carry the 7-byte preamble.
+    /// Minimal setup-header common header: `0x82` + "theora". The
+    /// §6.4.5 step 1 guard tests below only need the 7-byte preamble.
     const SETUP_PREAMBLE: [u8; 7] = [0x82, b't', b'h', b'e', b'o', b'r', b'a'];
 
     #[test]
-    fn parse_setup_header_returns_body_not_implemented_on_valid_preamble() {
-        // Round 3: any packet whose first 7 bytes are 0x82 + "theora"
-        // should pass the §6.4.5 step 1 guard and surface the
-        // SetupHeaderBodyNotImplemented sentinel.
+    fn parse_setup_header_bare_preamble_truncates_in_body() {
+        // A packet that is only the 7-byte common header passes the
+        // §6.4.5 step 1 guard and then runs out of bits inside the
+        // §6.4.1 body (the 3-bit NBITS read is the first body field).
         match parse_setup_header(&SETUP_PREAMBLE) {
-            Err(Error::SetupHeaderBodyNotImplemented) => {}
-            other => panic!("expected SetupHeaderBodyNotImplemented, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_setup_header_accepts_trailing_body_bytes() {
-        // The setup-header body lives after the 7-byte common header;
-        // round 3's entrypoint must not care about its content. Drop
-        // some arbitrary trailing bytes onto the preamble and confirm
-        // we still get the body-not-implemented sentinel rather than
-        // any parsing-derived error.
-        let mut pkt = SETUP_PREAMBLE.to_vec();
-        pkt.extend_from_slice(&[0xff, 0x00, 0xaa, 0x55, 0x12, 0x34]);
-        match parse_setup_header(&pkt) {
-            Err(Error::SetupHeaderBodyNotImplemented) => {}
-            other => panic!("expected SetupHeaderBodyNotImplemented, got {other:?}"),
+            Err(Error::TruncatedHeader { .. }) => {}
+            other => panic!("expected TruncatedHeader inside §6.4.1, got {other:?}"),
         }
     }
 
@@ -10454,13 +11111,6 @@ mod tests {
         assert_eq!(h.ac_scale[63], 10);
         assert_eq!(h.dc_scale[0], 220);
         assert_eq!(h.dc_scale[63], 10);
-    }
-
-    #[test]
-    fn setup_header_body_not_implemented_error_renders() {
-        let s = format!("{}", Error::SetupHeaderBodyNotImplemented);
-        assert!(s.contains("setup-header"));
-        assert!(s.contains("§6.4.1") || s.contains("body"));
     }
 
     // ------- Appendix B.2 / B.3 VP3 table transcription tests -------
@@ -18329,29 +18979,43 @@ mod tests {
     /// the two inputs would yield transposed outputs.
     #[test]
     fn idct_2d_row_and_column_indices_are_not_swapped() {
+        // dqc[1] excites the (row-frequency 1, column-frequency 0)
+        // basis: after the §7.9.3.2 row pass only RES row 0 is
+        // non-zero, and the column pass sees a Y[0]-only (DC)
+        // column, whose 1D iDCT is exactly flat. The output must
+        // therefore vary along ci and be constant along ri.
         let mut dqc_row = [0i16; 64];
         dqc_row[1] = 4096;
         let res_row = inverse_dct_2d(&dqc_row);
+        for ri in 1..8 {
+            assert_eq!(res_row[ri], res_row[0], "row {ri} must repeat row 0");
+        }
+        assert!(
+            res_row[0].iter().any(|&v| v != res_row[0][0]),
+            "the ci axis must carry the cosine profile"
+        );
 
+        // dqc[8] is the transposed excitation: constant along ci,
+        // cosine profile along ri. (The two outputs are not asserted
+        // to be exact transposes of each other: the fixed-point
+        // truncations of the row pass and the final (X + 8) >> 4 of
+        // the column pass do not commute bit-exactly.)
         let mut dqc_col = [0i16; 64];
         dqc_col[8] = 4096;
         let res_col = inverse_dct_2d(&dqc_col);
-
-        // The two results should be transposes of each other: the
-        // 2D iDCT is separable so dqc[ri*8+ci] excitation maps to
-        // a row-frequency · column-frequency outer product. The
-        // (1,0) vs (0,1) frequency pair are transposes; if our
-        // implementation accidentally swapped the row/column
-        // passes, the two outputs would be identical instead.
-        let mut transpose = [[0i16; 8]; 8];
-        for ri in 0..8 {
-            for ci in 0..8 {
-                transpose[ri][ci] = res_col[ci][ri];
-            }
+        for row in &res_col {
+            assert!(
+                row.iter().all(|&v| v == row[0]),
+                "each row must be constant along ci"
+            );
         }
-        assert_eq!(res_row, transpose);
-        // And they must not coincide — proving the row/column
-        // axes are tracked, not collapsed.
+        let col0: Vec<i16> = res_col.iter().map(|row| row[0]).collect();
+        assert!(
+            col0.iter().any(|&v| v != col0[0]),
+            "the ri axis must carry the cosine profile"
+        );
+        // And the two excitations must not collapse onto the same
+        // output — proving the axes are tracked, not swapped.
         assert_ne!(res_row, res_col);
     }
 
@@ -18411,13 +19075,32 @@ mod tests {
     /// this pinned assertion makes the typo loud.
     #[test]
     fn idct_constants_match_spec_table_7_65() {
+        // Table 7.65 pairs Ci with S(8 - i) on each row (sin(jπ/16)
+        // = cos((8 - j)π/16)): (C1, S7) = 64277, (C2, S6) = 60547,
+        // (C3, S5) = 54491, (C4, S4) = 46341, (C5, S3) = 36410,
+        // (C6, S2) = 25080, (C7, S1) = 12785.
         assert_eq!(IDCT_C3, 54491);
         assert_eq!(IDCT_C4, 46341);
         assert_eq!(IDCT_C6, 25080);
         assert_eq!(IDCT_C7, 12785);
-        assert_eq!(IDCT_S3, 54491);
-        assert_eq!(IDCT_S6, 25080);
-        assert_eq!(IDCT_S7, 12785);
+        assert_eq!(IDCT_S3, 36410); // = C5 row
+        assert_eq!(IDCT_S6, 60547); // = C2 row
+        assert_eq!(IDCT_S7, 64277); // = C1 row
+                                    // Each (Ci, Sj) pair must satisfy the float identity within
+                                    // the 16-bit fixed-point rounding the table encodes.
+        for (c, angle_num) in [
+            (IDCT_C3, 3.0f64),
+            (IDCT_C4, 4.0),
+            (IDCT_C6, 6.0),
+            (IDCT_C7, 7.0),
+        ] {
+            let expected = (65536.0 * (angle_num * std::f64::consts::PI / 16.0).cos()).round();
+            assert_eq!(c as f64, expected, "C{angle_num}");
+        }
+        for (s, angle_num) in [(IDCT_S3, 3.0f64), (IDCT_S6, 6.0), (IDCT_S7, 7.0)] {
+            let expected = (65536.0 * (angle_num * std::f64::consts::PI / 16.0).sin()).round();
+            assert_eq!(s as f64, expected, "S{angle_num}");
+        }
     }
 
     // ---- §7.9.4 The Complete Reconstruction Algorithm (round 23) ----
@@ -23273,5 +23956,347 @@ mod tests {
         assert_eq!(store.previous_y.as_ptr(), ptr_previous_y);
         assert_eq!(store.golden_cb.as_ptr(), ptr_golden_cb);
         assert_eq!(store.previous_cr.as_ptr(), ptr_previous_cr);
+    }
+
+    // ------- §6.4.5 full setup-header decode (fixture packet) -------
+
+    /// Decode the staged fixture's transmitted setup header and pin
+    /// the tables against the values the corpus traces record:
+    /// `LOOP_FILTER` events give `LFLIMS[qi]` and `QUANT` events give
+    /// `ACSCALE[qi]` / `DCSCALE[qi]` for the qi values the two
+    /// fixture frames select.
+    #[test]
+    fn decode_setup_header_fixture_packet_tables() {
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET)
+            .expect("fixture setup header should decode");
+        // tiny-i-only-16x16 trace: LOOP_FILTER qi=44 filter_limit=2.
+        assert_eq!(setup.loop_filter_limits[44], 2);
+        // quant-table-custom trace: LOOP_FILTER qi=18 filter_limit=4.
+        assert_eq!(setup.loop_filter_limits[18], 4);
+        // QUANT events from both traces (ac_scale == dc_scale for
+        // every qi these streams exercise).
+        let qp = &setup.quantization_parameters;
+        for (qi, scale) in [
+            (44u8, 52u16),
+            (32, 85),
+            (50, 36),
+            (18, 160),
+            (8, 252),
+            (27, 107),
+        ] {
+            assert_eq!(qp.ac_scale[qi as usize], scale, "ACSCALE[{qi}]");
+            assert_eq!(qp.dc_scale[qi as usize], scale, "DCSCALE[{qi}]");
+        }
+        // §6.4.4: all 80 Huffman tables must be present and walkable
+        // (non-empty — the §7.7.3 token decode rejects empty tables).
+        assert_eq!(setup.huffman_tables.len(), NUM_HUFFMAN_TABLES);
+        assert!(setup.huffman_tables.iter().all(|t| !t.entries.is_empty()));
+    }
+
+    /// The legacy [`parse_setup_header`] projection must agree with
+    /// the full §6.4.5 decode on the fields it retains.
+    #[test]
+    fn parse_setup_header_matches_full_decode_projection() {
+        let full = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let legacy = parse_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        assert_eq!(legacy.loop_filter_limits, full.loop_filter_limits);
+        assert_eq!(legacy.ac_scale, full.quantization_parameters.ac_scale);
+        assert_eq!(legacy.dc_scale, full.quantization_parameters.dc_scale);
+    }
+
+    // ------- §2.3 / §2.4 frame-geometry builder -------
+
+    /// §2.3's worked example: a 240×48 frame (FMBW=15, FMBH=3,
+    /// 4:2:0). The luma plane has 30×6 blocks; the spec prints the
+    /// coded-order index of every block in the four left columns,
+    /// the two right columns, and gives the continuous-numbering
+    /// rule. Rows below are bottom-up (the spec figure's last row is
+    /// the bottom row).
+    #[test]
+    fn frame_geometry_matches_spec_240x48_block_example() {
+        let ident = ident_geometry(15, 3, PixelFormat::Yuv420);
+        let g = build_frame_geometry(&ident).unwrap();
+        assert_eq!(g.nbs, 270); // 180 luma + 45 + 45 chroma
+        assert_eq!(g.nmbs, 45);
+        assert_eq!(g.nsbs, ident.nsbs());
+        let luma = &g.plane_raster_order[0];
+        let w = 30usize;
+        // (bx, by) → coded index, transcribed from the §2.3 figure.
+        let expected = [
+            (0, 0, 0),
+            (1, 0, 1),
+            (2, 0, 14),
+            (3, 0, 15),
+            (28, 0, 112),
+            (29, 0, 113),
+            (0, 1, 3),
+            (1, 1, 2),
+            (2, 1, 13),
+            (3, 1, 12),
+            (28, 1, 115),
+            (29, 1, 114),
+            (0, 2, 4),
+            (1, 2, 7),
+            (2, 2, 8),
+            (3, 2, 11),
+            (28, 2, 116),
+            (29, 2, 119),
+            (0, 3, 5),
+            (1, 3, 6),
+            (2, 3, 9),
+            (3, 3, 10),
+            (28, 3, 117),
+            (29, 3, 118),
+            (0, 4, 120),
+            (1, 4, 121),
+            (28, 4, 176),
+            (29, 4, 177),
+            (0, 5, 123),
+            (1, 5, 122),
+            (28, 5, 179),
+            (29, 5, 178),
+        ];
+        for (bx, by, bi) in expected {
+            assert_eq!(luma[by * w + bx], bi, "luma block at ({bx}, {by})");
+        }
+        // Continuous numbering: the first Cb block is index 180, the
+        // first Cr block 225.
+        assert_eq!(g.plane_raster_order[1][0], 180);
+        assert_eq!(g.plane_raster_order[2][0], 225);
+        // Every per-block table covers all 270 blocks.
+        assert_eq!(g.pli_of_block.len(), 270);
+        assert_eq!(g.bx_of_block.len(), 270);
+        assert_eq!(g.mbi_of_block.len(), 270);
+        assert_eq!(g.neighbors.len(), 270);
+    }
+
+    /// §2.4's worked example on the same 240×48 frame: 15×3 macro
+    /// blocks with the printed coded-order indices.
+    #[test]
+    fn frame_geometry_matches_spec_240x48_macro_block_example() {
+        let ident = ident_geometry(15, 3, PixelFormat::Yuv420);
+        let g = build_frame_geometry(&ident).unwrap();
+        let luma = &g.plane_raster_order[0];
+        let w = 30usize;
+        // (mbx, mby) → coded macro-block index, from the §2.4 figure
+        // (bottom row first).
+        let expected = [
+            (0, 0, 0),
+            (1, 0, 3),
+            (2, 0, 4),
+            (3, 0, 7),
+            (13, 0, 27),
+            (14, 0, 28),
+            (0, 1, 1),
+            (1, 1, 2),
+            (2, 1, 5),
+            (3, 1, 6),
+            (13, 1, 26),
+            (14, 1, 29),
+            (0, 2, 30),
+            (1, 2, 31),
+            (2, 2, 32),
+            (12, 2, 42),
+            (13, 2, 43),
+            (14, 2, 44),
+        ];
+        for (mbx, mby, mbi) in expected {
+            // The macro block's A (lower-left) luma block sits at
+            // grid cell (2 * mbx, 2 * mby).
+            let a_bi = luma[(2 * mby) * w + 2 * mbx];
+            assert_eq!(
+                g.mbi_of_block[a_bi as usize], mbi,
+                "macro block at ({mbx}, {mby})"
+            );
+            assert_eq!(g.macro_block_to_luma_blocks[mbi as usize][0], a_bi);
+        }
+    }
+
+    /// The tiny 32×32 4:2:0 layout: 24 blocks (16 luma + 4 + 4), 3
+    /// super blocks (one per plane), 4 macro blocks. Cross-checks
+    /// the per-block tables the §7 procedures consume.
+    #[test]
+    fn frame_geometry_tiny_layout_tables() {
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let g = build_frame_geometry(&ident).unwrap();
+        assert_eq!(g.nbs, 24);
+        assert_eq!(g.nsbs, 3);
+        assert_eq!(g.nmbs, 4);
+        // Plane membership: luma 0..16, Cb 16..20, Cr 20..24 (the
+        // §2.3 continuous numbering), each mapping to super blocks
+        // 0 / 1 / 2.
+        for bi in 0..24usize {
+            let pli = if bi < 16 {
+                0
+            } else if bi < 20 {
+                1
+            } else {
+                2
+            };
+            assert_eq!(g.pli_of_block[bi], pli, "pli of block {bi}");
+            assert_eq!(g.block_to_super_block[bi], pli as u32, "sb of block {bi}");
+        }
+        // Luma Hilbert walk inside the single 4×4 super block:
+        // coded slots map to Figure 2.4 grid positions; pixel
+        // origins are 8× the grid cell.
+        assert_eq!((g.bx_of_block[0], g.by_of_block[0]), (0, 0));
+        assert_eq!((g.bx_of_block[1], g.by_of_block[1]), (8, 0));
+        assert_eq!((g.bx_of_block[2], g.by_of_block[2]), (8, 8));
+        assert_eq!((g.bx_of_block[3], g.by_of_block[3]), (0, 8));
+        assert_eq!((g.bx_of_block[15], g.by_of_block[15]), (24, 0));
+        // Macro blocks: §2.4 Hilbert order over the luma super block
+        // is lower-left, upper-left, upper-right, lower-right.
+        assert_eq!(g.macro_block_to_luma_blocks[0], [0, 1, 3, 2]);
+        // Each 4:2:0 macro block owns exactly one Cb + one Cr block.
+        for (mbi, (cb, cr)) in g.chroma_cb.iter().zip(g.chroma_cr.iter()).enumerate() {
+            assert_eq!(cb.len(), 1, "mb {mbi} cb");
+            assert_eq!(cr.len(), 1, "mb {mbi} cr");
+            assert_eq!(g.mbi_of_block[cb[0] as usize], mbi as u32);
+            assert_eq!(g.mbi_of_block[cr[0] as usize], mbi as u32);
+        }
+        // Raster-neighbour spot checks in the luma plane: block 0
+        // (lower-left corner) has no neighbours; block 2 (grid (1,1))
+        // has all four.
+        assert_eq!(g.neighbors[0], DcPredictorNeighbors::default());
+        let n2 = g.neighbors[2];
+        assert_eq!(n2.left, Some(3));
+        assert_eq!(n2.lower_left, Some(0));
+        assert_eq!(n2.lower, Some(1));
+        assert_eq!(n2.lower_right, Some(14));
+    }
+
+    // ------- §7.11 complete frame decode (fixture end-to-end) -------
+
+    /// Reorder a decoder plane (lower-left origin, bottom-up rows per
+    /// §2.1) into the top-down row order the corpus `expected.yuv`
+    /// dumps use.
+    fn plane_top_down(samples: &[u8], dims: PlaneDimensions) -> Vec<u8> {
+        let w = dims.width as usize;
+        let h = dims.height as usize;
+        assert_eq!(samples.len(), w * h);
+        let mut out = Vec::with_capacity(w * h);
+        for row in (0..h).rev() {
+            out.extend_from_slice(&samples[row * w..(row + 1) * w]);
+        }
+        out
+    }
+
+    /// Concatenated top-down Y + Cb + Cr bytes of a decoded frame, in
+    /// the corpus `expected.yuv` layout.
+    fn frame_top_down_yuv(frame: &ReconstructedFrame) -> Vec<u8> {
+        let mut out = plane_top_down(&frame.samples_y, frame.dims_y);
+        out.extend(plane_top_down(&frame.samples_cb, frame.dims_cb));
+        out.extend(plane_top_down(&frame.samples_cr, frame.dims_cr));
+        out
+    }
+
+    /// End-to-end §7.11 on the `tiny-i-only-16x16` fixture: decode
+    /// the single intra frame from the real packet bytes and compare
+    /// every sample against the staged reference dump.
+    #[test]
+    fn decode_frame_tiny_fixture_is_sample_exact() {
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let out = dec
+            .decode_frame(&fixture_data::TINY_DATA_PACKET_0)
+            .expect("tiny fixture frame should decode");
+        assert_eq!(out.ftype, FrameType::Intra);
+        // FRAME trace event: qis=44,32,50 nqps=3.
+        assert_eq!(out.qis, vec![44, 32, 50]);
+        assert_eq!(out.frame.dims_y.width, 32);
+        assert_eq!(out.frame.dims_y.height, 32);
+        assert_eq!(out.frame.dims_cb.width, 16);
+        let got = frame_top_down_yuv(&out.frame);
+        assert_eq!(got.len(), fixture_data::TINY_EXPECTED_YUV.len());
+        assert_eq!(
+            got,
+            &fixture_data::TINY_EXPECTED_YUV[..],
+            "decoded planes must match the reference dump sample-exactly"
+        );
+        // Step 7 + 8: an intra frame becomes both references.
+        let store = dec.reference_store();
+        assert_eq!(store.golden_y, out.frame.samples_y);
+        assert_eq!(store.previous_y, out.frame.samples_y);
+    }
+
+    /// End-to-end §7.11 on the `quant-table-custom` fixture (same
+    /// 32×32 geometry and the same transmitted setup tables, but a
+    /// mid-range 3-qi selection and non-flat picture content, so the
+    /// §7.6 / §7.7.3 / §7.10.3 paths do real work).
+    #[test]
+    fn decode_frame_quant_table_custom_fixture_is_sample_exact() {
+        let ident = decode_identification_header(&fixture_data::QTC_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let out = dec
+            .decode_frame(&fixture_data::QTC_DATA_PACKET_0)
+            .expect("quant-table-custom frame should decode");
+        assert_eq!(out.ftype, FrameType::Intra);
+        // FRAME trace event: qis=18,8,27 nqps=3.
+        assert_eq!(out.qis, vec![18, 8, 27]);
+        let got = frame_top_down_yuv(&out.frame);
+        assert_eq!(
+            got,
+            &fixture_data::QTC_EXPECTED_YUV[..],
+            "decoded planes must match the reference dump sample-exactly"
+        );
+    }
+
+    /// §7.11 step 2: a zero-byte packet decodes as an inter frame
+    /// with no coded blocks — bit-identical to the previous
+    /// reference, with `QIS = [63]`.
+    #[test]
+    fn decode_frame_empty_packet_replays_previous_frame() {
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let first = dec.decode_frame(&fixture_data::TINY_DATA_PACKET_0).unwrap();
+        let replay = dec.decode_frame(&[]).expect("empty packet should decode");
+        assert_eq!(replay.ftype, FrameType::Inter);
+        assert_eq!(replay.qis, vec![63]);
+        assert_eq!(replay.frame, first.frame);
+        // Step 7 skipped (inter): golden still holds the intra frame;
+        // step 8 ran: previous holds the replayed frame.
+        assert_eq!(dec.reference_store().golden_y, first.frame.samples_y);
+        assert_eq!(dec.reference_store().previous_y, replay.frame.samples_y);
+    }
+
+    /// §7.1 step 2: the first decoded frame must be intra. A data
+    /// packet whose FTYPE bit says inter is rejected on the first
+    /// frame but the same decoder accepts it after an intra landed.
+    #[test]
+    fn decode_frame_first_frame_must_be_intra() {
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        // A data packet with FTYPE=1 (inter): packet-type bit 0, then
+        // FTYPE 1. 0b0100_0000 plus arbitrary tail bits.
+        let inter_packet = [0x40u8, 0x00, 0x00, 0x00];
+        match dec.decode_frame(&inter_packet) {
+            Err(Error::FirstFrameMustBeIntra { .. }) => {}
+            other => panic!("expected FirstFrameMustBeIntra, got {other:?}"),
+        }
+    }
+
+    /// [`PlaneBlockCodedOrder::from_block_extent`] handles a chroma
+    /// plane whose block extent is not `2 * ceil(mb / 2)` — the
+    /// odd-FMBW 4:2:0 case where the naive macro-block-derived
+    /// extent over-counts.
+    #[test]
+    fn plane_block_coded_order_from_block_extent_odd_width() {
+        // 4:2:0 chroma plane of a FMBW=3, FMBH=3 stream: 3×3 blocks.
+        let walk: Vec<CodedBlockPosition> = PlaneBlockCodedOrder::from_block_extent(3, 3).collect();
+        assert_eq!(walk.len(), 9);
+        // All emitted positions stay inside the 3×3 extent.
+        assert!(walk.iter().all(|p| p.bx < 3 && p.by < 3));
+        // And the geometry builder accepts the odd-dimension stream
+        // end-to-end (NBS = 6 * 9 = 54 with the continuous
+        // numbering intact).
+        let ident = ident_geometry(3, 3, PixelFormat::Yuv420);
+        let g = build_frame_geometry(&ident).unwrap();
+        assert_eq!(g.nbs, 54);
+        assert_eq!(g.nsbs, ident.nsbs());
+        assert_eq!(g.block_extent[1], (3, 3));
     }
 }

@@ -6,6 +6,39 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.11 Complete Frame Decode dispatch — an intra frame now decodes
+  end-to-end from a real Theora packet (round 284). Three new public
+  surfaces:
+  - `decode_setup_header` + `SetupHeaderTables` — the full §6.4.5
+    setup-header body decode (§6.4.1 `LFLIMS` → §6.4.2 quantization
+    parameters → §6.4.4 80-entry Huffman-table array) on one shared
+    bit reader. `parse_setup_header` now delegates to it and returns
+    a populated `TheoraSetupHeader` instead of the
+    body-not-implemented sentinel.
+  - `build_frame_geometry` + `FrameGeometry` — the resolved §2.3 /
+    §2.4 frame layout: continuous cross-plane coded-order block
+    numbering, `block → super block` / `macro block → luma blocks` /
+    per-macro-block chroma maps, per-block `(pli, BX, BY, mbi)`
+    tables, the §7.8.1 raster-neighbour table, and the per-plane
+    raster orderings shared by §7.8.2 / §7.9.4 / §7.10.3. Pinned
+    against the §2.3 / §2.4 240×48 worked examples. A new
+    `PlaneBlockCodedOrder::from_block_extent` constructor handles
+    subsampled chroma planes whose block extent is not
+    `2 * ceil(mb / 2)` (odd-`FMBW`/`FMBH` 4:2:0 and 4:2:2 streams).
+  - `FrameDecoder` + `DecodedFrame` — the stateful §7.11 steps 1–8
+    driver: step 1 chain / step 2 empty-packet synthesis, §7.9.4
+    reconstruction against the carried reference planes (step 5),
+    §7.10.3 loop filter (step 6), and golden / previous reference
+    promotion (steps 7–8) across frames.
+- End-to-end fixture pins: `tiny-i-only-16x16` (solid-colour intra,
+  qi=44) and `quant-table-custom` (textured intra, qi=18, 3-qi
+  header) decode sample-exact against their staged `expected.yuv`
+  reference dumps (packet bytes embedded from the corpus with Ogg
+  framing stripped offline); a zero-byte packet replays the previous
+  reference bit-identically with `QIS = [63]`; the transmitted setup
+  tables match every `LOOP_FILTER` / `QUANT` trace event the corpus
+  records for those streams.
+
 - §7.11 steps 1(e) + 1(f) + 1(g) — the step 1 chain is complete
   (round 281). `decode_data_packet_header_and_blocks` now threads the
   §7.6 block-level `qi` decode (step 1(e)) and the §7.7.3 DCT
@@ -547,6 +580,22 @@ All notable changes to `oxideav-theora` are recorded here.
   for every coded block) via two new typed rejects. Seven new error variants
   cover input validation, tree corruption, and closing-paragraph violations.
   Fifteen new tests (total 286).
+
+### Fixed
+
+- §7.9.3.1 inverse-DCT sine constants: Table 7.65 pairs `Ci` with
+  `S(8 − i)` (`S3 = 36410 = C5`, `S6 = 60547 = C2`,
+  `S7 = 64277 = C1`); the previous transcription aliased `Sj = Cj`,
+  attenuating low-frequency AC energy. The slip is invisible on
+  DC-only content (the DC path only uses `C4`) and was caught by the
+  first fixture carrying real AC coefficients; it is now pinned by
+  the sample-exact decode tests plus a float-identity check on each
+  constant.
+
+### Removed
+
+- `Error::SetupHeaderBodyNotImplemented` — the §6.4.5 body decode it
+  guarded is now implemented; no path constructs it.
 
 ## [0.0.9](https://github.com/OxideAV/oxideav-theora/compare/v0.0.8...v0.0.9) - 2026-05-30
 

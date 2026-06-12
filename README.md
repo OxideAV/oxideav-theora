@@ -1770,7 +1770,7 @@ Only the Xiph Theora I Specification
 at `docs/video/theora/theora-6.4.1-lflims.md` (transcribed from the
 spec's own LaTeX source for the section the published PDF omits),
 and the fixture corpus under `docs/video/theora/fixtures/` are
-consulted. No libtheora, no FFmpeg `vp3.c`, no theora-rs.
+consulted.
 
 Black-box `ffmpeg` and `theoradec` binary invocations are allowed
 as opaque validators.

@@ -4,7 +4,29 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- §7.9.4 step 2(d)vi inter motion-compensation: `MVECTS` components
+  are in half-pixel units (luma) / quarter-pixel units (sub-sampled
+  chroma axes), not whole-pixel. `coded_block_pred_res` had hard-coded
+  `MVX2 = MVX`, forcing the whole-pixel predictor (§7.9.1.2) for every
+  inter block; explicit non-zero motion vectors with an odd component
+  produced visibly wrong predictors. It now halves each component via
+  `split_half_pixel_motion_vector` (`MVX = ⌊|MVECTS|/2⌋·sign`,
+  `MVX2 = ⌈|MVECTS|/2⌉·sign`) and dispatches to the §7.9.1.3 half-pixel
+  predictor when the offsets differ (round 288). New
+  `Error::ReconstructMotionVectorOutOfRange` guards the (unreachable
+  for spec-conformant input) i8 overflow of the halved offset pair.
+
 ### Added
+
+- Inter-frame end-to-end decode pins (round 288): the
+  `i-frame-then-p-frame-64x64` fixture (keyframe + `INTER_NOMV` /
+  uncoded MODE_COPY P frame) and the `q-low` fixture (P frame with an
+  explicit `INTER_PLUS_MV` non-zero motion vector) both reconstruct
+  their two frames sample-exactly against the staged `expected.yuv`,
+  exercising the §7.9.4 whole- and half-pixel motion-compensated
+  reconstruction path against the carried reference store.
 
 - §7.11 Complete Frame Decode dispatch — an intra frame now decodes
   end-to-end from a real Theora packet (round 284). Three new public

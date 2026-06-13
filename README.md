@@ -2,6 +2,34 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-13 (round 288)
+
+Round 288 lands **inter-frame end-to-end decode** — a P frame now
+reconstructs sample-exactly against its previous reference, completing
+the §7.9.4 motion-compensated reconstruction path. The work began as a
+straight end-to-end pin of the `i-frame-then-p-frame-64x64` fixture
+(keyframe + `INTER_NOMV`-coded first MB row + uncoded MODE_COPY
+tail) — which passed immediately — and then a second pin of the
+`q-low` fixture, whose P frame carries one `INTER_PLUS_MV` macro block
+with an explicit non-zero motion vector. That second fixture exposed a
+real decoder bug in §7.9.4 step 2(d)vi: `MVECTS` components are in
+**half-pixel** units in the luma plane (an integer in −31…31 spanning
+−15.5…15.5 pixels) and quarter-pixel units along each sub-sampled
+chroma axis, but `coded_block_pred_res` had hard-coded `MVX2 = MVX`,
+forcing the whole-pixel predictor for every vector. The fix routes the
+component through the existing `split_half_pixel_motion_vector`
+(`MVX = ⌊|MVECTS|/2⌋·sign`, `MVX2 = ⌈|MVECTS|/2⌉·sign`): even
+components collapse to one whole-pixel offset (§7.9.1.2), odd
+components leave a half-pixel fractional part and select the §7.9.1.3
+two-tap averaging predictor. With the fix the `q-low` inter frame
+drops from 74 mismatched samples to a byte-exact match. End-to-end
+pins now cover both zero-MV (`i-frame-then-p-frame-64x64`) and
+explicit-MV (`q-low`) inter reconstruction. +3 net tests (497 → 500);
+the two non-zero-MV `reconstruct_block` unit tests were rewritten to
+assert the correct half-pixel split (even MV → whole-pixel, odd MV →
+half-pixel). Next: longer inter runs with golden-frame and four-MV
+modes (`keyframe-interval-30`).
+
 ## Status — 2026-06-12 (round 284)
 
 Round 284 completes the **§7.11 Complete Frame Decode dispatch** — an

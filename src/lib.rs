@@ -978,6 +978,19 @@ pub enum Error {
     /// `rfi = 0 (None)` and the §7.9.1.1 intra predictor path, never
     /// the §7.9.1.2 / §7.9.1.3 inter path.
     ReconstructIntraInterBranchMismatch,
+    /// §7.9.4 step 2(d)vi.B–E halves each `MVECTS[bi]` component into
+    /// a whole-pixel offset pair. A component magnitude so large that
+    /// the rounded-away-from-zero half overflows the `i8` motion-vector
+    /// representation reaches this variant. A spec-conformant `MVECTS`
+    /// component is in `-31..=31` (luma) or narrower (sub-sampled
+    /// chroma axes), so this is unreachable for validated inputs and
+    /// only guards against a corrupt per-block vector.
+    ReconstructMotionVectorOutOfRange {
+        /// The offending `MVECTS[bi]x` component.
+        mvx: i32,
+        /// The offending `MVECTS[bi]y` component.
+        mvy: i32,
+    },
     /// A per-block input slice handed to the §7.9.4 frame-level driver
     /// has a length other than `nbs`. The driver iterates `bi in
     /// 0..NBS` and indexes every per-block array uniformly, so each
@@ -1684,6 +1697,10 @@ impl core::fmt::Display for Error {
             Error::ReconstructQiiIndexOutOfRange { qii, nqis } => write!(
                 f,
                 "oxideav-theora: §7.9.4 step 2(d)viii.A qii={qii} out of range for NQIS={nqis}"
+            ),
+            Error::ReconstructMotionVectorOutOfRange { mvx, mvy } => write!(
+                f,
+                "oxideav-theora: §7.9.4 step 2(d)vi motion vector ({mvx}, {mvy}) overflows the whole-pixel offset representation"
             ),
             Error::ReconstructIntraInterBranchMismatch => write!(
                 f,
@@ -7429,44 +7446,35 @@ fn coded_block_pred_res(
         ReferenceFrame::Previous | ReferenceFrame::Golden => {
             // Step 2(d)vi: rfi != 0 → inter predictor branch.
             let refp = refs.pick(rfi, pli)?;
-            // Step 2(d)vi.B / 2(d)vi.C: MVX/MVY = floor toward zero
-            // of each component. For integer-valued MotionVector
-            // this is the identity, but the spec's "//" operator
-            // means truncation toward negative infinity; combined
-            // with sign(MVECTS[bi]) the result equals truncation
-            // toward zero. Our MVECTS are already integer-valued
-            // i8, so the bottom-truncation step is a no-op.
+            // The §7.5.1 motion-vector components stored in `MVECTS`
+            // are in *half-pixel* units in the luma plane (an integer
+            // in -31..=31 spanning -15.5..=15.5 pixels), and in
+            // quarter-pixel units along each sub-sampled chroma axis.
+            // §7.9.4 step 2(d)vi.B–E convert each component to the
+            // pair of whole-pixel offsets the §7.9.1.2 / §7.9.1.3
+            // predictors consume:
+            //
+            //   MVX  = ⌊|MVECTS[bi]ₓ| / 2⌋ · sign(MVECTS[bi]ₓ)   (toward zero)
+            //   MVX2 = ⌈|MVECTS[bi]ₓ| / 2⌉ · sign(MVECTS[bi]ₓ)   (away from zero)
+            //
+            // (and likewise for the y component). `split_half_pixel_
+            // motion_vector` performs exactly this round-toward-zero /
+            // round-away-from-zero halving on the doubled integer
+            // value, i.e. on `MVECTS[bi]` itself. When a component is
+            // even the two offsets coincide and step 2(d)vi.F routes
+            // through the whole-pixel predictor; an odd component
+            // leaves a half-pixel fractional part and step 2(d)vi.G
+            // selects the half-pixel predictor.
             let mvx = inputs.mvect.x as i32;
             let mvy = inputs.mvect.y as i32;
-            // Step 2(d)vi.D / 2(d)vi.E: MVX2/MVY2 = ceil away from
-            // zero of each component. For an integer-valued MV
-            // both round-toward-zero and round-away-from-zero
-            // collapse to the same integer; the spec's
-            // step 2(d)vi.F "if MVX == MVX2 and MVY == MVY2" then
-            // routes us through §7.9.1.2 (whole pixel), step
-            // 2(d)vi.G otherwise. Theora MVs always come in as
-            // integer values, so the MVX == MVX2 branch is the
-            // common path here. The split helper is retained for
-            // any future chroma-MV halving driver to plug in.
-            let mvx2 = mvx;
-            let mvy2 = mvy;
-            if mvx == mvx2 && mvy == mvy2 {
+            let (mv1, mv2) = split_half_pixel_motion_vector(mvx, mvy)
+                .ok_or(Error::ReconstructMotionVectorOutOfRange { mvx, mvy })?;
+            if mv1 == mv2 {
                 // Step 2(d)vi.F: §7.9.1.2 whole-pixel predictor.
-                compute_whole_pixel_predictor(
-                    &refp,
-                    bx_origin,
-                    by_origin,
-                    MotionVector::new(mvx as i8, mvy as i8),
-                )
+                compute_whole_pixel_predictor(&refp, bx_origin, by_origin, mv1)
             } else {
                 // Step 2(d)vi.G: §7.9.1.3 half-pixel predictor.
-                compute_half_pixel_predictor(
-                    &refp,
-                    bx_origin,
-                    by_origin,
-                    MotionVector::new(mvx as i8, mvy as i8),
-                    MotionVector::new(mvx2 as i8, mvy2 as i8),
-                )
+                compute_half_pixel_predictor(&refp, bx_origin, by_origin, mv1, mv2)
             }
         }
     };
@@ -19472,12 +19480,48 @@ mod tests {
         assert_eq!(out.samples[0][0], 20);
     }
 
-    /// §7.9.4 step 2(d)vi.F: an integer-valued MV makes MVX2 == MVX
-    /// and MVY2 == MVY, routing through §7.9.1.2 whole-pixel. With
-    /// a non-zero MV the predictor reads from a shifted position
-    /// in the Previous-Y plane.
+    /// §7.9.4 step 2(d)vi.B–F: an *even* `MVECTS` component is a
+    /// whole-pixel offset (`MVECTS / 2`) and routes through §7.9.1.2.
+    /// The luma MV `(4, 2)` (half-pixel units, i.e. 2.0 × 1.0 pixels)
+    /// reads `REFP[1 + by][2 + bx]`.
     #[test]
-    fn reconstruct_inter_nonzero_mv_shifts_predictor_sample() {
+    fn reconstruct_inter_even_mv_whole_pixel_predictor() {
+        let params = make_recon_params();
+        let planes = [
+            ramp_plane(16, 16, 0),
+            ramp_plane(16, 16, 10),
+            ramp_plane(16, 16, 20),
+            ramp_plane(16, 16, 30),
+            ramp_plane(16, 16, 40),
+            ramp_plane(16, 16, 50),
+        ];
+        let refs = make_refs(&planes, 16, 16);
+        let inputs = ReconstructBlockInputs {
+            bcoded: true,
+            mb_mode: MacroBlockMode::InterMv,
+            mvect: MotionVector::new(4, 2),
+            coeffs_zz: [0i16; 64],
+            ncoeffs: 0,
+            qii: 0,
+        };
+        let qis = [10u8];
+        let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
+        // Previous-Y has bias = 0, REFP[ry][rx] = rx + ry. The doubled
+        // MV (4, 2) halves to the whole-pixel offset (2, 1), so the
+        // §7.9.1.2 predictor at BX=BY=0 reads REFP[1+by][2+bx] =
+        // (2+bx) + (1+by) = bx + by + 3. (0,0) → 3. (1,0) → 4.
+        assert_eq!(out.samples[0][0], 3);
+        assert_eq!(out.samples[0][1], 4);
+        assert_eq!(out.samples[1][0], 4);
+        assert_eq!(out.samples[7][7], 17);
+    }
+
+    /// §7.9.4 step 2(d)vi.B–E + G: an *odd* `MVECTS` component carries
+    /// a half-pixel fractional part, so the offsets `⌊MV/2⌋` and
+    /// `⌈MV/2⌉` differ and step 2(d)vi.G selects the §7.9.1.3
+    /// half-pixel predictor, which averages two whole-pixel reads.
+    #[test]
+    fn reconstruct_inter_odd_mv_half_pixel_predictor() {
         let params = make_recon_params();
         let planes = [
             ramp_plane(16, 16, 0),
@@ -19498,13 +19542,19 @@ mod tests {
         };
         let qis = [10u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
-        // Previous-Y has bias = 0. Whole-pixel predictor at BX=BY=0
-        // with MV=(2,3) samples REFP[3 + by][2 + bx], i.e.
-        // (2+bx) + (3+by) = bx + by + 5. (0,0) → 5. (1,0) → 6.
-        assert_eq!(out.samples[0][0], 5);
-        assert_eq!(out.samples[0][1], 6);
-        assert_eq!(out.samples[1][0], 6);
-        assert_eq!(out.samples[7][7], 19);
+        // Previous-Y has bias = 0, REFP[ry][rx] = rx + ry. The doubled
+        // MV (2, 3): x halves to whole-pixel 1 (even), y splits into
+        // ⌊3/2⌋ = 1 and ⌈3/2⌉ = 2 (half-pixel). So at BX=BY=0 the
+        // §7.9.1.3 predictor averages REFP[1+by][1+bx] and
+        // REFP[2+by][1+bx]:
+        //   s1 = (1+bx) + (1+by) = bx + by + 2
+        //   s2 = (1+bx) + (2+by) = bx + by + 3
+        //   PRED = (s1 + s2) >> 1 = (2bx + 2by + 5) >> 1
+        // (0,0) → 2. (0,1) → 3. (1,0) → 3. (7,7) → 16.
+        assert_eq!(out.samples[0][0], 2);
+        assert_eq!(out.samples[0][1], 3);
+        assert_eq!(out.samples[1][0], 3);
+        assert_eq!(out.samples[7][7], 16);
     }
 
     /// §7.9.4 step 2(d)viii — the full DCT path. With an all-zero
@@ -24277,6 +24327,95 @@ mod tests {
             Err(Error::FirstFrameMustBeIntra { .. }) => {}
             other => panic!("expected FirstFrameMustBeIntra, got {other:?}"),
         }
+    }
+
+    /// End-to-end §7.11 on the `i-frame-then-p-frame-64x64` fixture:
+    /// decode the keyframe and then the following inter frame from the
+    /// real packet bytes, exercising the §7.9.4 motion-compensated
+    /// reconstruction path (`INTER_NOMV` for the coded first MB row,
+    /// uncoded MODE_COPY for the rest), and verify both reconstructed
+    /// frames sample-exactly against the staged reference dump.
+    #[test]
+    fn decode_frame_i_then_p_inter_fixture_is_sample_exact() {
+        let ident = decode_identification_header(&fixture_data::IFP_IDENT_PACKET).unwrap();
+        assert_eq!(ident.coded_width(), 64);
+        assert_eq!(ident.coded_height(), 64);
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+
+        // Frame 0: the keyframe (FTYPE intra). FRAME trace: qis=44,32,50.
+        let f0 = dec
+            .decode_frame(&fixture_data::IFP_IFRAME_PACKET)
+            .expect("i-frame should decode");
+        assert_eq!(f0.ftype, FrameType::Intra);
+        assert_eq!(f0.qis, vec![44, 32, 50]);
+        let got0 = frame_top_down_yuv(&f0.frame);
+        assert_eq!(got0.len(), 6144);
+        assert_eq!(
+            got0,
+            &fixture_data::IFP_EXPECTED_YUV[..6144],
+            "keyframe planes must match the reference dump sample-exactly"
+        );
+        // Steps 7 + 8: the keyframe seeds both reference slots.
+        assert_eq!(dec.reference_store().golden_y, f0.frame.samples_y);
+        assert_eq!(dec.reference_store().previous_y, f0.frame.samples_y);
+
+        // Frame 1: the inter frame (FTYPE inter). FRAME trace:
+        // qis=44,34,55; the §7.9.4 inter MC path reconstructs the
+        // coded first MB row against the previous reference and copies
+        // the remaining (uncoded) macro blocks straight through.
+        let f1 = dec
+            .decode_frame(&fixture_data::IFP_PFRAME_PACKET)
+            .expect("p-frame should decode");
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert_eq!(f1.qis, vec![44, 34, 55]);
+        let got1 = frame_top_down_yuv(&f1.frame);
+        assert_eq!(got1.len(), 6144);
+        assert_eq!(
+            got1,
+            &fixture_data::IFP_EXPECTED_YUV[6144..],
+            "inter frame planes must match the reference dump sample-exactly"
+        );
+        // Step 7 skipped (inter): golden still holds the keyframe;
+        // step 8 ran: previous now holds the inter frame.
+        assert_eq!(dec.reference_store().golden_y, f0.frame.samples_y);
+        assert_eq!(dec.reference_store().previous_y, f1.frame.samples_y);
+    }
+
+    /// End-to-end §7.11 on the `q-low` fixture (qi=0, `nqps=1`). The
+    /// inter frame's trace carries an `INTER_PLUS_MV` macro block at
+    /// `mb_x=3`, `mb_y=2` with an explicit non-zero motion vector, so
+    /// this drives the §7.9.4 whole-/half-pixel motion-compensated
+    /// predictor beyond the zero-MV `INTER_NOMV` path, plus the full
+    /// loop filter (`filter_limit=15`).
+    #[test]
+    fn decode_frame_q_low_inter_mv_fixture_is_sample_exact() {
+        let ident = decode_identification_header(&fixture_data::QLOW_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+
+        let f0 = dec
+            .decode_frame(&fixture_data::QLOW_IFRAME_PACKET)
+            .expect("q-low keyframe should decode");
+        assert_eq!(f0.ftype, FrameType::Intra);
+        assert_eq!(f0.qis, vec![0]);
+        assert_eq!(
+            frame_top_down_yuv(&f0.frame),
+            &fixture_data::QLOW_EXPECTED_YUV[..6144],
+            "q-low keyframe planes must match the reference dump sample-exactly"
+        );
+
+        let f1 = dec
+            .decode_frame(&fixture_data::QLOW_PFRAME_PACKET)
+            .expect("q-low inter frame should decode");
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert_eq!(f1.qis, vec![0]);
+        assert_eq!(
+            frame_top_down_yuv(&f1.frame),
+            &fixture_data::QLOW_EXPECTED_YUV[6144..],
+            "q-low inter frame (with explicit MV) planes must match \
+             the reference dump sample-exactly"
+        );
     }
 
     /// [`PlaneBlockCodedOrder::from_block_extent`] handles a chroma

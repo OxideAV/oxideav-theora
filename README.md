@@ -2,6 +2,32 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-14 (round 302)
+
+Round 302 lands the **§2.2 / §4.4.4 picture-region crop** — the
+display step §7.11's closing narrative defers ("the frame must be
+cropped to the picture region before display"). `decode_frame` emits
+the entire macroblock-aligned reconstruction; the new
+[`crop_frame_to_picture_region`] (and the
+[`FrameDecoder::crop_for_display`] convenience wrapper) returns a
+[`CroppedFrame`] sized to the picture region. The luma plane is
+exactly `PICW` × `PICH` at offset `(PICX, PICY)`. The chroma planes
+follow §4.4.4: because "the sampling locations are defined relative to
+the frame, not the picture region", each chroma axis spans
+`[off / sub, ⌈(off + len) / sub⌉)` — floor on the low edge (so an odd
+offset pulls in the chroma sample straddling the boundary, "all the
+chroma samples corresponding to a luma sample in the cropped picture
+region must be included") and the §4.4.4 round-up (ceil) on the high
+edge. All buffers stay lower-left row-major per §2.1; `PICY` is itself
+a lower-left offset (§6.2 step 10) so the crop is a direct
+sub-rectangle copy with no vertical flip. Ten new tests cover the
+§4.4.4 axis rounding (even/odd offset × even/odd size), all three
+pixel formats, the full-frame identity crop, the
+`picture-region-non-mb-aligned` fixture header (visible 26×18 at
+PICY=14 → 13×9 chroma), both error guards (plane-length mismatch /
+region-out-of-plane), and an end-to-end crop of the decoded
+`tiny-i-only-16x16` fixture. +10 tests (501 → 511).
+
 ## Status — 2026-06-14 (round 295)
 
 Round 295 pins the **full `keyframe-interval-30` run** — a sustained
@@ -1797,21 +1823,17 @@ remain for subsequent rounds.
 
 ## Roadmap
 
-* Next: wire the §7.10.3 driver into the §7.9.4 frame reconstruction
-  pipeline so [`reconstruct_frame`] returns the post-loop-filter
-  buffer rather than the pre-loop-filter one. The blocker is the
-  per-plane raster-order to coded-order index map, which a follow-up
-  composition layer can build by iterating
-  `PlaneBlockCodedOrder::new(dims)` and bucketing the
-  `(bx, by)` → `bi` pairs into the raster grid.
-* The §2.3 / §2.4 coded-order resolver landed in round 238 as
-  `PlaneBlockCodedOrder` + `PlaneMacroBlockCodedOrder` over
-  `PlaneBlockDims`. Follow-ups that compose it into per-block
-  raster-order arrays (i.e. the `block_to_super_block`,
-  `block_to_macro_block`, and three per-plane raster orderings the
-  §7.3 / §7.5 / §7.8 drivers consume) can land alongside the
-  §7.10 driver in a later round, on top of the iterators that now
-  exist.
+* The §7.11 pipeline is wired end-to-end: [`build_frame_geometry`]
+  composes the §2.3 / §2.4 coded-order resolver into the per-block
+  raster-order arrays and per-plane `grid_to_bi` maps, and
+  [`FrameDecoder::decode_frame`] chains §7.1 → … → §7.8 (step 1) →
+  §7.9.4 reconstruction (step 5, [`reconstruct_frame`]) → §7.10.3
+  loop filter in place (step 6, [`loop_filter_frame`]) → step 7–8
+  reference promotion, then [`crop_frame_to_picture_region`]
+  (round 302) applies the §2.2 display crop.
+* Next: golden-reference and four-MV inter modes
+  (`INTER_GOLDEN_MV` / `INTER_MV_FOUR`), which the current fixture
+  corpus does not yet exercise end-to-end.
 * §7.9.3.3 (the 1D forward DCT) is explicitly non-normative per
   the spec ("the version of the transform used by Xiph.Org's
   Theora encoder, which is the same as that used by VP3") and is

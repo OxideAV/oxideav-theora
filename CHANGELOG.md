@@ -20,6 +20,19 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §2.2 / §4.4.4 picture-region crop (round 302):
+  `crop_frame_to_picture_region` and the `FrameDecoder::crop_for_display`
+  convenience wrapper return a `CroppedFrame` cropped to the display
+  picture region — the step §7.11 defers to the caller ("the frame
+  must be cropped to the picture region before display"). Luma crops to
+  `PICW` × `PICH` at `(PICX, PICY)`; chroma planes follow §4.4.4 with a
+  floor-low / ceil-high per-axis window so every chroma sample whose
+  luma footprint touches the picture region is retained (correct for
+  odd offsets and odd sizes). Buffers stay lower-left row-major; `PICY`
+  is a lower-left offset so no vertical flip is applied. New
+  `Error::CropPlaneLenMismatch` / `Error::CropRegionOutOfPlane` guard
+  inconsistent header-vs-frame geometry. +10 tests.
+
 - Sustained multi-frame end-to-end decode pin (round 295): the full
   8-packet `keyframe-interval-30` fixture (32×32, bitstream version
   3.2.1) decodes sample-exactly across its entire run. The stream

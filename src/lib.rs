@@ -1248,6 +1248,38 @@ pub enum Error {
         /// The §6.2-derived expectation.
         expected: u64,
     },
+    /// A reconstructed plane handed to [`crop_frame_to_picture_region`]
+    /// had a buffer length that disagreed with its declared
+    /// `width * height`, so the §2.2 crop window cannot be addressed
+    /// safely.
+    CropPlaneLenMismatch {
+        /// Colour-plane index (`0` Y, `1` Cb, `2` Cr).
+        pli: u8,
+        /// `samples.len()` as supplied.
+        got: usize,
+        /// `width * height` from the plane's declared dimensions.
+        expected: usize,
+    },
+    /// The §2.2 picture region (after the §4.4.4 chroma round-up)
+    /// escapes a reconstructed plane's declared dimensions. This can
+    /// only happen if the [`TheoraIdentHeader`] and the
+    /// [`ReconstructedFrame`] were built from inconsistent geometry.
+    CropRegionOutOfPlane {
+        /// Colour-plane index (`0` Y, `1` Cb, `2` Cr).
+        pli: u8,
+        /// Crop-window left edge (chroma-plane units for `pli != 0`).
+        x: u32,
+        /// Crop-window bottom edge (chroma-plane units for `pli != 0`).
+        y: u32,
+        /// Crop-window width.
+        w: u32,
+        /// Crop-window height.
+        h: u32,
+        /// Plane width.
+        plane_w: u32,
+        /// Plane height.
+        plane_h: u32,
+    },
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -1840,6 +1872,22 @@ impl core::fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-theora: §2.3/§2.4 geometry walk produced {which}={got}, identification header expects {expected}"
+            ),
+            Error::CropPlaneLenMismatch { pli, got, expected } => write!(
+                f,
+                "oxideav-theora: §2.2 crop plane {pli} buffer has {got} samples, declared dimensions imply {expected}"
+            ),
+            Error::CropRegionOutOfPlane {
+                pli,
+                x,
+                y,
+                w,
+                h,
+                plane_w,
+                plane_h,
+            } => write!(
+                f,
+                "oxideav-theora: §2.2 picture region [{x}+{w}, {y}+{h}) escapes plane {pli} of {plane_w}x{plane_h}"
             ),
             Error::NotImplemented => write!(
                 f,
@@ -10011,6 +10059,204 @@ pub struct DecodedFrame {
     pub frame: ReconstructedFrame,
 }
 
+// -----------------------------------------------------------------------------
+// §2.2 / §4.4.4 — Picture-region cropping (display step)
+// -----------------------------------------------------------------------------
+
+/// A frame cropped to its §2.2 picture region — the bytes a player
+/// actually displays.
+///
+/// §7.11 reconstructs the entire macroblock-aligned coded frame
+/// (`RPYW` × `RPYH` luma, `RPCW` × `RPCH` chroma). §2.2 then notes
+/// that "the portions of the frame which lie outside the picture
+/// region may contain arbitrary image data, so the frame must be
+/// cropped to the picture region before display." This struct is the
+/// result of that crop.
+///
+/// The luma plane is exactly `PICW` × `PICH`. The chroma planes are
+/// sized per §4.4.4: their crop window is the set of chroma samples
+/// whose luma footprint intersects the picture region, which (because
+/// "the sampling locations are defined relative to the frame, not the
+/// picture region") spans chroma columns `[PICX / sx, ceil((PICX +
+/// PICW) / sx))` and chroma rows `[PICY / sy, ceil((PICY + PICH) /
+/// sy))`, where `(sx, sy)` is the per-axis subsampling factor of the
+/// pixel format. §4.4.4's "they must be rounded up" rule is the
+/// `ceil` on the high edge; the `floor` on the low edge follows from
+/// "all the chroma samples corresponding to a luma sample in the
+/// cropped picture region must be included" — an odd offset pulls in
+/// the chroma sample straddling the picture boundary.
+///
+/// Like [`ReconstructedFrame`], every plane is stored lower-left
+/// row-major (`samples[y * width + x]`, `y` growing upward), the §2.1
+/// convention. `PICY` is itself a lower-left offset (§6.2 step 10),
+/// so the crop is a direct sub-rectangle copy with no vertical flip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CroppedFrame {
+    /// Cropped Y plane (`PICW` × `PICH`).
+    pub samples_y: Vec<u8>,
+    /// Cropped Cb plane.
+    pub samples_cb: Vec<u8>,
+    /// Cropped Cr plane.
+    pub samples_cr: Vec<u8>,
+    /// Y-plane crop dimensions (`PICW` × `PICH`).
+    pub dims_y: PlaneDimensions,
+    /// Cb / Cr crop dimensions (§4.4.4 round-up).
+    pub dims_c: PlaneDimensions,
+}
+
+/// Per-axis chroma subsampling factors `(sx, sy)` for a pixel format,
+/// per §4.4 — the number of luma columns / rows that map to one
+/// chroma column / row.
+fn chroma_subsampling_factors(pf: PixelFormat) -> (u32, u32) {
+    match pf {
+        // 4:2:0 — both axes subsampled.
+        PixelFormat::Yuv420 => (2, 2),
+        // 4:2:2 — horizontal subsampled, vertical full.
+        PixelFormat::Yuv422 => (2, 1),
+        // 4:4:4 — no subsampling.
+        PixelFormat::Yuv444 => (1, 1),
+    }
+}
+
+/// Crop one chroma axis to the picture region per §4.4.4.
+///
+/// `off` / `len` are the luma-plane offset and length of the picture
+/// region along this axis (`PICX` / `PICW` or `PICY` / `PICH`); `sub`
+/// is the axis subsampling factor. Returns `(start, count)` in
+/// chroma-sample units: `start = off / sub` (floor) and `count =
+/// ceil((off + len) / sub) - start`.
+fn chroma_crop_axis(off: u32, len: u32, sub: u32) -> (u32, u32) {
+    let start = off / sub;
+    let end = (off + len).div_ceil(sub);
+    (start, end - start)
+}
+
+/// A crop sub-rectangle in lower-left plane coordinates: lower-left
+/// corner `(x, y)` and extent `w` × `h`, all in samples of the plane
+/// being cropped.
+#[derive(Debug, Clone, Copy)]
+struct CropWindow {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// Copy a [`CropWindow`] out of a lower-left row-major plane buffer
+/// into a fresh tightly-packed `w * h` buffer.
+///
+/// Validates the source buffer length and that the window lies within
+/// the source plane before copying.
+fn crop_plane(
+    src: &[u8],
+    pli: u8,
+    src_dims: PlaneDimensions,
+    win: CropWindow,
+) -> Result<Vec<u8>, Error> {
+    let src_w = src_dims.width;
+    let src_h = src_dims.height;
+    let expected = (src_w as usize) * (src_h as usize);
+    if src.len() != expected {
+        return Err(Error::CropPlaneLenMismatch {
+            pli,
+            got: src.len(),
+            expected,
+        });
+    }
+    if win.x.checked_add(win.w).map_or(true, |e| e > src_w)
+        || win.y.checked_add(win.h).map_or(true, |e| e > src_h)
+    {
+        return Err(Error::CropRegionOutOfPlane {
+            pli,
+            x: win.x,
+            y: win.y,
+            w: win.w,
+            h: win.h,
+            plane_w: src_w,
+            plane_h: src_h,
+        });
+    }
+    let src_stride = src_w as usize;
+    let w = win.w as usize;
+    let mut out = vec![0u8; w * win.h as usize];
+    for row in 0..win.h as usize {
+        let src_base = (win.y as usize + row) * src_stride + win.x as usize;
+        let dst_base = row * w;
+        out[dst_base..dst_base + w].copy_from_slice(&src[src_base..src_base + w]);
+    }
+    Ok(out)
+}
+
+/// Crop a reconstructed frame to its §2.2 picture region.
+///
+/// This is the display step §7.11's closing narrative defers: the
+/// reconstruction operates on the entire coded frame, then "the frame
+/// must be cropped to the picture region before display" (§2.2).
+///
+/// The picture-region geometry (`PICW` / `PICH` / `PICX` / `PICY`) and
+/// the chroma format (`PF`) come from the [`TheoraIdentHeader`]; the
+/// pixels come from `frame` (a [`ReconstructedFrame`] as returned by
+/// [`reconstruct_frame`] or carried inside a [`DecodedFrame`]).
+///
+/// * The luma crop window is `[PICX, PICX + PICW) × [PICY, PICY +
+///   PICH)` (§6.2 steps 7–10 guarantee it lies inside `RPYW` × `RPYH`).
+/// * Each chroma crop window is the §4.4.4 round-up of that region,
+///   computed by [`chroma_crop_axis`]. For 4:4:4 it equals the luma
+///   window; for 4:2:0 / 4:2:2 it is the smallest chroma rectangle
+///   covering every chroma sample whose luma footprint touches the
+///   picture region.
+///
+/// Returns [`Error::CropPlaneLenMismatch`] if a plane buffer disagrees
+/// with its declared dimensions, or [`Error::CropRegionOutOfPlane`] if
+/// the (header-derived) crop window escapes the (frame-derived) plane —
+/// either of which signals the header and the reconstructed frame were
+/// built from inconsistent geometry.
+pub fn crop_frame_to_picture_region(
+    frame: &ReconstructedFrame,
+    ident: &TheoraIdentHeader,
+) -> Result<CroppedFrame, Error> {
+    let (sx, sy) = chroma_subsampling_factors(ident.pf);
+
+    // Luma window: the picture region verbatim.
+    let lx = ident.picx as u32;
+    let ly = ident.picy as u32;
+    let lw = ident.picw;
+    let lh = ident.pich;
+    let luma_win = CropWindow {
+        x: lx,
+        y: ly,
+        w: lw,
+        h: lh,
+    };
+    let samples_y = crop_plane(&frame.samples_y, 0, frame.dims_y, luma_win)?;
+
+    // Chroma windows: §4.4.4 round-up, applied per axis.
+    let (cx, cw) = chroma_crop_axis(lx, lw, sx);
+    let (cy, ch) = chroma_crop_axis(ly, lh, sy);
+    let chroma_win = CropWindow {
+        x: cx,
+        y: cy,
+        w: cw,
+        h: ch,
+    };
+    let samples_cb = crop_plane(&frame.samples_cb, 1, frame.dims_cb, chroma_win)?;
+    let samples_cr = crop_plane(&frame.samples_cr, 2, frame.dims_cr, chroma_win)?;
+
+    Ok(CroppedFrame {
+        samples_y,
+        samples_cb,
+        samples_cr,
+        dims_y: PlaneDimensions {
+            width: lw,
+            height: lh,
+        },
+        dims_c: PlaneDimensions {
+            width: cw,
+            height: ch,
+        },
+    })
+}
+
 /// Stateful §7.11 ("Complete Frame Decode") driver for one Theora
 /// stream.
 ///
@@ -10064,6 +10310,18 @@ impl FrameDecoder {
     /// previous planes as left by the most recent §7.11 step 7–8).
     pub fn reference_store(&self) -> &ReferenceFrameStore {
         &self.refs
+    }
+
+    /// Crop a decoded frame to its §2.2 picture region for display.
+    ///
+    /// [`FrameDecoder::decode_frame`] emits the uncropped,
+    /// macroblock-aligned reconstruction (§7.11 operates on the whole
+    /// coded frame). This convenience wrapper applies the §2.2 / §4.4.4
+    /// display crop using the decoder's own identification header, so a
+    /// caller can go straight from a [`DecodedFrame`] to displayable
+    /// `PICW` × `PICH` luma. See [`crop_frame_to_picture_region`].
+    pub fn crop_for_display(&self, decoded: &DecodedFrame) -> Result<CroppedFrame, Error> {
+        crop_frame_to_picture_region(&decoded.frame, &self.ident)
     }
 
     /// Decode one video-data packet per §7.11 ("Complete Frame
@@ -24540,5 +24798,308 @@ mod tests {
         assert_eq!(g.nbs, 54);
         assert_eq!(g.nsbs, ident.nsbs());
         assert_eq!(g.block_extent[1], (3, 3));
+    }
+
+    // -------------------------------------------------------------------------
+    // §2.2 / §4.4.4 — picture-region cropping
+    // -------------------------------------------------------------------------
+
+    /// Build a plane buffer (lower-left row-major) where each cell
+    /// encodes its own `(x, y)` as `((x * 7 + y * 13) & 0xff)`, so a
+    /// crop can be checked cell-by-cell against the source coordinate.
+    fn coord_plane(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                v[(y * w + x) as usize] = ((x * 7 + y * 13) & 0xff) as u8;
+            }
+        }
+        v
+    }
+
+    fn coord_at(x: u32, y: u32) -> u8 {
+        ((x * 7 + y * 13) & 0xff) as u8
+    }
+
+    /// Build a `ReconstructedFrame` with coordinate-encoded planes for
+    /// the given coded geometry + pixel format.
+    fn coord_frame(ident: &TheoraIdentHeader) -> ReconstructedFrame {
+        let rp = reference_plane_dimensions_from_ident(ident);
+        ReconstructedFrame {
+            samples_y: coord_plane(rp.rpyw, rp.rpyh),
+            samples_cb: coord_plane(rp.rpcw, rp.rpch),
+            samples_cr: coord_plane(rp.rpcw, rp.rpch),
+            dims_y: PlaneDimensions {
+                width: rp.rpyw,
+                height: rp.rpyh,
+            },
+            dims_cb: PlaneDimensions {
+                width: rp.rpcw,
+                height: rp.rpch,
+            },
+            dims_cr: PlaneDimensions {
+                width: rp.rpcw,
+                height: rp.rpch,
+            },
+        }
+    }
+
+    /// §4.4.4 axis helper: floor on the low edge, ceil on the high
+    /// edge. Spot-check the documented boundary behaviours.
+    #[test]
+    fn chroma_crop_axis_rounding() {
+        // No subsampling: identity.
+        assert_eq!(chroma_crop_axis(3, 5, 1), (3, 5));
+        // 2:1, even offset + even length → exact halving.
+        assert_eq!(chroma_crop_axis(4, 8, 2), (2, 4));
+        // 2:1, even offset + odd length → high edge rounds up.
+        assert_eq!(chroma_crop_axis(4, 7, 2), (2, 4));
+        // 2:1, odd offset → low edge floors, pulling in the straddling
+        // chroma sample; high edge rounds up.
+        assert_eq!(chroma_crop_axis(3, 8, 2), (1, 5));
+        // 2:1, odd offset + even length: first and last chroma columns
+        // each map to a single luma column.
+        assert_eq!(chroma_crop_axis(3, 6, 2), (1, 4));
+    }
+
+    /// 4:4:4: chroma crop window equals the luma window (sx = sy = 1).
+    #[test]
+    fn crop_yuv444_chroma_matches_luma() {
+        let mut ident = ident_geometry(2, 2, PixelFormat::Yuv444);
+        ident.picw = 20;
+        ident.pich = 18;
+        ident.picx = 5;
+        ident.picy = 7;
+        let frame = coord_frame(&ident);
+        let c = crop_frame_to_picture_region(&frame, &ident).unwrap();
+        assert_eq!(
+            c.dims_y,
+            PlaneDimensions {
+                width: 20,
+                height: 18
+            }
+        );
+        assert_eq!(
+            c.dims_c,
+            PlaneDimensions {
+                width: 20,
+                height: 18
+            }
+        );
+        // Every cropped luma cell equals the source at the offset.
+        for y in 0..18u32 {
+            for x in 0..20u32 {
+                assert_eq!(c.samples_y[(y * 20 + x) as usize], coord_at(x + 5, y + 7));
+                // Chroma is full-res in 4:4:4 → same mapping.
+                assert_eq!(c.samples_cb[(y * 20 + x) as usize], coord_at(x + 5, y + 7));
+                assert_eq!(c.samples_cr[(y * 20 + x) as usize], coord_at(x + 5, y + 7));
+            }
+        }
+    }
+
+    /// 4:2:0, even offset + even size: chroma window is the exact half.
+    #[test]
+    fn crop_yuv420_even_offset_even_size() {
+        let mut ident = ident_geometry(2, 2, PixelFormat::Yuv420);
+        ident.picw = 24;
+        ident.pich = 16;
+        ident.picx = 4;
+        ident.picy = 8;
+        let frame = coord_frame(&ident);
+        let c = crop_frame_to_picture_region(&frame, &ident).unwrap();
+        assert_eq!(
+            c.dims_y,
+            PlaneDimensions {
+                width: 24,
+                height: 16
+            }
+        );
+        // sx = sy = 2 → 12 × 8 chroma, starting at chroma (2, 4).
+        assert_eq!(
+            c.dims_c,
+            PlaneDimensions {
+                width: 12,
+                height: 8
+            }
+        );
+        for cy in 0..8u32 {
+            for cx in 0..12u32 {
+                assert_eq!(
+                    c.samples_cb[(cy * 12 + cx) as usize],
+                    coord_at(cx + 2, cy + 4)
+                );
+            }
+        }
+    }
+
+    /// 4:2:0, odd offset / odd size: §4.4.4 floor-low / ceil-high.
+    #[test]
+    fn crop_yuv420_odd_offset_odd_size() {
+        let mut ident = ident_geometry(2, 2, PixelFormat::Yuv420);
+        ident.picw = 7; // odd width
+        ident.pich = 9; // odd height
+        ident.picx = 3; // odd X offset
+        ident.picy = 5; // odd Y offset
+        let frame = coord_frame(&ident);
+        let c = crop_frame_to_picture_region(&frame, &ident).unwrap();
+        assert_eq!(
+            c.dims_y,
+            PlaneDimensions {
+                width: 7,
+                height: 9
+            }
+        );
+        // X: floor(3/2)=1 .. ceil(10/2)=5 → width 4, start chroma 1.
+        // Y: floor(5/2)=2 .. ceil(14/2)=7 → height 5, start chroma 2.
+        assert_eq!(
+            c.dims_c,
+            PlaneDimensions {
+                width: 4,
+                height: 5
+            }
+        );
+        for cy in 0..5u32 {
+            for cx in 0..4u32 {
+                assert_eq!(
+                    c.samples_cr[(cy * 4 + cx) as usize],
+                    coord_at(cx + 1, cy + 2)
+                );
+            }
+        }
+    }
+
+    /// 4:2:2: horizontal subsampled (sx = 2), vertical full (sy = 1).
+    #[test]
+    fn crop_yuv422_axes_independent() {
+        let mut ident = ident_geometry(2, 2, PixelFormat::Yuv422);
+        ident.picw = 9; // odd
+        ident.pich = 13;
+        ident.picx = 5; // odd X offset
+        ident.picy = 4; // even Y offset
+        let frame = coord_frame(&ident);
+        let c = crop_frame_to_picture_region(&frame, &ident).unwrap();
+        // X: floor(5/2)=2 .. ceil(14/2)=7 → width 5, start chroma 2.
+        // Y: full res → height 13, start chroma 4.
+        assert_eq!(
+            c.dims_c,
+            PlaneDimensions {
+                width: 5,
+                height: 13
+            }
+        );
+        for cy in 0..13u32 {
+            for cx in 0..5u32 {
+                assert_eq!(
+                    c.samples_cb[(cy * 5 + cx) as usize],
+                    coord_at(cx + 2, cy + 4)
+                );
+            }
+        }
+    }
+
+    /// The full-frame picture region (PIC* = coded extent, offset 0)
+    /// crops to the entire reconstruction unchanged.
+    #[test]
+    fn crop_full_frame_is_identity() {
+        let ident = ident_geometry(2, 2, PixelFormat::Yuv420);
+        let frame = coord_frame(&ident);
+        let c = crop_frame_to_picture_region(&frame, &ident).unwrap();
+        assert_eq!(c.samples_y, frame.samples_y);
+        assert_eq!(c.samples_cb, frame.samples_cb);
+        assert_eq!(c.samples_cr, frame.samples_cr);
+        assert_eq!(c.dims_y, frame.dims_y);
+        assert_eq!(c.dims_c, frame.dims_cb);
+    }
+
+    /// Crop matches the `picture-region-non-mb-aligned` fixture header
+    /// (coded 32×32, visible 26×18 at PICY=14, 4:2:0).
+    #[test]
+    fn crop_picture_region_fixture_header() {
+        let ident = decode_identification_header(&PIC_REGION_HEADER).unwrap();
+        assert_eq!(
+            (ident.picw, ident.pich, ident.picx, ident.picy),
+            (26, 18, 0, 14)
+        );
+        let frame = coord_frame(&ident);
+        let c = crop_frame_to_picture_region(&frame, &ident).unwrap();
+        assert_eq!(
+            c.dims_y,
+            PlaneDimensions {
+                width: 26,
+                height: 18
+            }
+        );
+        // 4:2:0: X floor(0/2)=0 .. ceil(26/2)=13 → 13 wide.
+        // Y floor(14/2)=7 .. ceil(32/2)=16 → 9 tall.
+        assert_eq!(
+            c.dims_c,
+            PlaneDimensions {
+                width: 13,
+                height: 9
+            }
+        );
+        // Bottom-left cropped luma cell is the picture origin (0, 14).
+        assert_eq!(c.samples_y[0], coord_at(0, 14));
+    }
+
+    /// A plane buffer that disagrees with its declared dimensions is
+    /// rejected before any out-of-bounds read.
+    #[test]
+    fn crop_rejects_plane_len_mismatch() {
+        let ident = ident_geometry(2, 2, PixelFormat::Yuv420);
+        let mut frame = coord_frame(&ident);
+        frame.samples_y.pop(); // now one short of width*height
+        let err = crop_frame_to_picture_region(&frame, &ident).unwrap_err();
+        assert!(matches!(err, Error::CropPlaneLenMismatch { pli: 0, .. }));
+    }
+
+    /// A picture region that escapes the reconstructed plane (header /
+    /// frame geometry inconsistent) is rejected.
+    #[test]
+    fn crop_rejects_region_out_of_plane() {
+        let mut ident = ident_geometry(2, 2, PixelFormat::Yuv420);
+        // Frame built at the smaller geometry...
+        let frame = coord_frame(&ident);
+        // ...but the header claims a picture region past it. (Bypasses
+        // the §6.2 header-parse bound, which a hand-built header can.)
+        ident.picw = 40;
+        ident.pich = 40;
+        let err = crop_frame_to_picture_region(&frame, &ident).unwrap_err();
+        assert!(matches!(err, Error::CropRegionOutOfPlane { pli: 0, .. }));
+    }
+
+    /// End-to-end: decode the real `tiny-i-only-16x16` intra fixture,
+    /// then crop for display via the decoder convenience wrapper. The
+    /// fixture is coded 32×32 with `PICW = PICH = 32` at offset 0, so
+    /// the crop is an identity over the reconstructed planes.
+    #[test]
+    fn crop_for_display_end_to_end() {
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let dec = FrameDecoder::new(ident, setup).unwrap();
+        let mut dec = dec;
+        let decoded = dec
+            .decode_frame(&fixture_data::TINY_DATA_PACKET_0)
+            .expect("tiny fixture frame should decode");
+        let c = dec.crop_for_display(&decoded).unwrap();
+        assert_eq!(
+            c.dims_y,
+            PlaneDimensions {
+                width: 32,
+                height: 32
+            }
+        );
+        // 4:2:0 chroma of a 32×32 picture region at offset 0 → 16×16.
+        assert_eq!(
+            c.dims_c,
+            PlaneDimensions {
+                width: 16,
+                height: 16
+            }
+        );
+        // Identity crop: cropped planes equal the reconstruction.
+        assert_eq!(c.samples_y, decoded.frame.samples_y);
+        assert_eq!(c.samples_cb, decoded.frame.samples_cb);
+        assert_eq!(c.samples_cr, decoded.frame.samples_cr);
     }
 }

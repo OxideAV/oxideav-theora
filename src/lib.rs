@@ -24418,6 +24418,109 @@ mod tests {
         );
     }
 
+    /// End-to-end §7.11 on the full `keyframe-interval-30` fixture — a
+    /// sustained 8-packet run that decodes sample-exactly against the
+    /// 6-frame reference dump. The stream's structure exercises three
+    /// pieces beyond the prior 2-frame `i-then-p` pin:
+    ///
+    /// * a keyframe (pkt3) that seeds both reference slots (§7.11
+    ///   steps 7 + 8),
+    /// * two consecutive **zero-byte** packets (pkt4, pkt5) that take
+    ///   the §7.11 step 2 "Otherwise" branch — each synthesises an
+    ///   `INTER` / `NQIS=1` / `QIS[0]=63` / all-uncoded frame that
+    ///   reproduces the carried previous reference bit-identically, so
+    ///   both replay the keyframe — and then promote it back through
+    ///   step 8, and
+    /// * five real inter frames (pkt6..pkt10) decoded in sequence, each
+    ///   reconstructed against the previous frame and chained forward
+    ///   through the reference store.
+    ///
+    /// The corpus `expected.yuv` records the **six displayed frames**
+    /// (the two duplicate-only zero-byte packets are collapsed by the
+    /// dump tool, which is why 8 packets map onto 6 reference frames);
+    /// the empty packets are validated by asserting they reproduce
+    /// frame 0. All eight decodes are sample-exact.
+    #[test]
+    fn decode_frame_keyframe_interval_30_full_run_is_sample_exact() {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        assert_eq!(ident.coded_width(), 32);
+        assert_eq!(ident.coded_height(), 32);
+        // The 32×32 stream shares the byte-identical setup header packet
+        // with the tiny-i / quant-table-custom fixtures.
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+
+        // Each displayed reference frame is 1536 bytes (32×32 Y + two
+        // 16×16 chroma planes); the dump holds six of them.
+        const FRAME_LEN: usize = 1536;
+        let expected = &fixture_data::KI30_EXPECTED_YUV;
+        assert_eq!(expected.len(), 6 * FRAME_LEN);
+        let ref_frame = |i: usize| &expected[i * FRAME_LEN..(i + 1) * FRAME_LEN];
+
+        // pkt3 — keyframe → displayed frame 0; seeds both references.
+        let f = dec
+            .decode_frame(&fixture_data::KI30_DATA_PACKET_0)
+            .expect("keyframe should decode");
+        assert_eq!(f.ftype, FrameType::Intra);
+        assert_eq!(f.qis, vec![31, 20, 41]);
+        assert_eq!(
+            frame_top_down_yuv(&f.frame),
+            ref_frame(0),
+            "keyframe must match reference frame 0 sample-exactly"
+        );
+        assert_eq!(dec.reference_store().golden_y, f.frame.samples_y);
+        assert_eq!(dec.reference_store().previous_y, f.frame.samples_y);
+
+        // pkt4, pkt5 — zero-byte packets: §7.11 step 2 synthesises an
+        // all-uncoded inter frame that reproduces the previous
+        // reference, so both replay the keyframe (reference frame 0).
+        for empty in [
+            &fixture_data::KI30_DATA_PACKET_1[..],
+            &fixture_data::KI30_DATA_PACKET_2[..],
+        ] {
+            assert!(empty.is_empty(), "duplicate-frame packet must be zero-byte");
+            let dup = dec
+                .decode_frame(empty)
+                .expect("zero-byte packet should synthesise a duplicate frame");
+            assert_eq!(dup.ftype, FrameType::Inter);
+            assert_eq!(dup.qis, vec![63]);
+            assert_eq!(
+                frame_top_down_yuv(&dup.frame),
+                ref_frame(0),
+                "zero-byte packet must reproduce the previous reference (frame 0)"
+            );
+        }
+
+        // pkt6..pkt10 — five real inter frames → displayed frames 1..=5,
+        // each reconstructed against the chained previous reference.
+        let inter_packets: [&[u8]; 5] = [
+            &fixture_data::KI30_DATA_PACKET_3,
+            &fixture_data::KI30_DATA_PACKET_4,
+            &fixture_data::KI30_DATA_PACKET_5,
+            &fixture_data::KI30_DATA_PACKET_6,
+            &fixture_data::KI30_DATA_PACKET_7,
+        ];
+        for (k, pkt) in inter_packets.iter().enumerate() {
+            let fi = dec
+                .decode_frame(pkt)
+                .unwrap_or_else(|e| panic!("inter frame {k} should decode: {e:?}"));
+            assert_eq!(fi.ftype, FrameType::Inter);
+            assert_eq!(fi.qis, vec![31, 20, 40]);
+            assert_eq!(
+                frame_top_down_yuv(&fi.frame),
+                ref_frame(k + 1),
+                "inter frame {} must match reference frame {} sample-exactly",
+                k,
+                k + 1
+            );
+            // All inter frames leave golden untouched (no keyframe) and
+            // promote the reconstruction into the previous slot.
+            assert_eq!(dec.reference_store().previous_y, fi.frame.samples_y);
+        }
+        // Golden still holds the keyframe across the whole inter run.
+        assert_eq!(dec.reference_store().golden_y, f.frame.samples_y);
+    }
+
     /// [`PlaneBlockCodedOrder::from_block_extent`] handles a chroma
     /// plane whose block extent is not `2 * ceil(mb / 2)` — the
     /// odd-FMBW 4:2:0 case where the naive macro-block-derived

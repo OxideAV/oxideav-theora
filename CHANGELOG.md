@@ -20,6 +20,23 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- Sustained multi-frame end-to-end decode pin (round 295): the full
+  8-packet `keyframe-interval-30` fixture (32×32, bitstream version
+  3.2.1) decodes sample-exactly across its entire run. The stream
+  exercises a keyframe seeding both references, two consecutive
+  **zero-byte** packets that take the §7.11 step 2 "Otherwise" branch
+  (each synthesises an `INTER` / `NQIS=1` / `QIS[0]=63` /
+  all-uncoded frame that reproduces the carried previous reference,
+  so both replay the keyframe), and five real inter frames decoded in
+  sequence with the reference store chained forward. The corpus
+  `expected.yuv` records the six displayed frames (the two
+  duplicate-only zero-byte packets are collapsed by the dump tool, so
+  the 8 packets map onto 6 reference frames); the empty packets are
+  validated by asserting they reproduce frame 0. The data-packet and
+  identification-header bytes were Ogg-de-framed offline (the crate
+  never parses Ogg); the setup-header packet is byte-identical to the
+  existing `tiny-i` / `quant-table-custom` fixture and is reused.
+
 - Inter-frame end-to-end decode pins (round 288): the
   `i-frame-then-p-frame-64x64` fixture (keyframe + `INTER_NOMV` /
   uncoded MODE_COPY P frame) and the `q-low` fixture (P frame with an

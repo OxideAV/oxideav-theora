@@ -2,6 +2,32 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-14 (round 295)
+
+Round 295 pins the **full `keyframe-interval-30` run** — a sustained
+8-packet, 32×32 (bitstream version 3.2.1) stream that decodes
+sample-exactly across its entire length, extending coverage from the
+2-frame `i-then-p` pin to a long multi-frame sequence. Three new
+behaviours land under test together. The keyframe (pkt 3) seeds both
+reference slots. Two consecutive **zero-byte** packets (pkt 4, pkt 5)
+take the §7.11 step 2 "Otherwise" branch — each synthesises an
+`INTER` / `NQIS=1` / `QIS[0]=63` / all-uncoded frame that reproduces
+the carried previous reference, so both replay the keyframe — then
+promote it back through step 8. Five real inter frames (pkt 6 … pkt
+10) then decode in sequence, each reconstructed against the chained
+previous reference, with golden held at the keyframe throughout. The
+corpus `expected.yuv` records the **six displayed frames** (the two
+duplicate-only zero-byte packets are collapsed by the dump tool, so
+the 8 packets map onto 6 reference frames); the test validates the
+empty packets by asserting they reproduce frame 0. The
+identification-header and eight data-packet bytes were Ogg-de-framed
+offline (the crate itself never parses Ogg); the setup-header packet
+is byte-identical to the `tiny-i` / `quant-table-custom` fixture and
+is reused rather than re-embedded. +1 net test (500 → 501). Next:
+golden-reference and four-MV inter modes (`INTER_GOLDEN_MV` /
+`INTER_MV_FOUR`), which the corpus's current fixtures do not yet
+exercise end-to-end.
+
 ## Status — 2026-06-13 (round 288)
 
 Round 288 lands **inter-frame end-to-end decode** — a P frame now

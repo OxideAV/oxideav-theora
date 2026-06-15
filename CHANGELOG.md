@@ -4,6 +4,37 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-theora/compare/v0.0.9...v0.0.10) - 2026-06-15
+
+### Other
+
+- pin q-high weak-quant fixture end-to-end (round 309)
+- §2.2/§4.4.4 picture-region display crop
+- §7.11 full keyframe-interval-30 run — 8-packet sustained decode, sample-exact
+- inter-frame end-to-end decode + §7.9.4 half-pixel MC fix
+- state clean-room sources positively in README
+- §7.11 complete frame decode — intra end-to-end, sample-exact against staged fixtures
+- §7.11 steps 1(e)+(f)+(g) — complete the step-1 chain with §7.6 qi, §7.7.3 coefficients, and §7.8.2 DC inversion
+- §7.11 step 1(d) — thread §7.5.2 motion vectors onto the shared step-1 reader
+- §7.11 step 1(c) — thread §7.4 macro-block coding modes onto the shared step-1 reader
+- scrub pre-existing decorative libtheora/FFmpeg attribution from doc comments
+- §7.11 step 1(a)+1(b) header+coded-block-flags chain (round 267)
+- §7.11 step 2 (empty-packet) state synthesiser (round 260)
+- §7.11 step 7 + step 8 reference-frame promotion (round 256)
+- reference-plane geometry + packet classifier (round 250)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- §7.10.3 Complete Loop Filter raster-order driver (round 244)
+- §7.10.1 / §7.10.2 loop-filter edge primitives + lflim() (round 241)
+- §2.3 / §2.4 coded-order resolver (round 238)
+- §7.9.4 frame-level driver (round 233)
+- §7.9.4 The Complete Reconstruction Algorithm — per-block body (round 23)
+- §7.9.3 Inverse DCT — 1D + 2D (round 22)
+- §7.9.1 Predictors: intra / whole-pixel / half-pixel (round 21)
+- §7.9.2 Dequantization (round 20)
+- §7.8.2 Inverting the DC Prediction Process (round 19)
+- §7.8.1 Computing the DC Predictor (round 18)
+- §7.7.3 DCT Coefficient Decode driver (round 17)
+
 ### Fixed
 
 - §7.9.4 step 2(d)vi inter motion-compensation: `MVECTS` components

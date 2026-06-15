@@ -37,6 +37,17 @@ against reference output.
 reference promotion) and is the high-level entry point. Empty (zero-byte)
 packets are handled as duplicate-frame markers.
 
+* **Framework `Decoder` integration** — `TheoraDecoder` implements
+  `oxideav_core::Decoder`, and `register` installs it into a
+  `RuntimeContext` (reachable through the shared `CodecRegistry`). Packets
+  are dispatched by their §6.1 type bit: header packets (`0x80` / `0x81`
+  / `0x82`) advance header collection, video-data packets are decoded,
+  §2.2-cropped to the picture region, and flipped to top-down raster as
+  an `oxideav_core::VideoFrame`. Headers may arrive inline as leading
+  stream packets, via `TheoraDecoder::with_headers`, or as a
+  length-prefixed `CodecParameters::extradata` chain parsed by the
+  `make_decoder` factory.
+
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation
 tables, weakest- and strongest-quantiser streams, non-MB-aligned picture
@@ -51,10 +62,11 @@ sustained multi-frame keyframe-interval run.
   deferred to a future encoder-side effort.
 * **Golden-reference and four-MV inter modes** (`INTER_GOLDEN_MV` /
   `INTER_MV_FOUR`) — implemented in the reconstruction code paths but
-  not yet exercised end-to-end by the fixture corpus.
-* **Framework `Decoder`/`Encoder` trait integration** — the
-  `oxideav_core::register!` entry point is currently a no-op; use the
-  direct functions above.
+  not yet exercised end-to-end by the fixture corpus (no corpus fixture
+  emits a golden or four-MV macroblock mode).
+* **Framework `Encoder` trait integration** — there is no encoder, so
+  no `oxideav_core::Encoder` impl. The decoder side is wired (see
+  above).
 
 ## Usage
 
@@ -69,6 +81,27 @@ let mut dec = FrameDecoder::new(ident, setup)?;
 let frame = dec.decode_frame(data_packet)?;
 let display = dec.crop_for_display(&frame)?;
 # Ok::<(), oxideav_theora::Error>(())
+```
+
+Alternatively, drive the decoder through the `oxideav_core::Decoder`
+trait. `TheoraDecoder` accepts the three §6 header packets (inline, via
+`with_headers`, or as a length-prefixed `extradata` chain) and then
+emits a top-down `VideoFrame` per video-data packet:
+
+```rust
+use oxideav_core::{CodecId, Decoder, Packet, TimeBase};
+use oxideav_theora::{TheoraDecoder, THEORA_CODEC_ID};
+
+# fn run(ident: &[u8], setup: &[u8], data: &[u8]) -> oxideav_core::Result<()> {
+let mut dec = TheoraDecoder::with_headers(
+    CodecId::new(THEORA_CODEC_ID),
+    &[ident, setup],
+)
+.map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+dec.send_packet(&Packet::new(0, TimeBase::from_rate(1), data.to_vec()))?;
+let _frame = dec.receive_frame()?; // Frame::Video, top-down planes
+# Ok(())
+# }
 ```
 
 ## Clean-room sources

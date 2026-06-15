@@ -6,6 +6,20 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- wire the `oxideav_core::Decoder` trait (round 317): `TheoraDecoder`
+  implements the framework decoder interface and `register` installs it
+  into a `RuntimeContext` (the `register!` entry point was previously a
+  no-op). Packets are dispatched by their §6.1 type bit — header packets
+  (`0x80`/`0x81`/`0x82`) advance header collection, video-data packets
+  decode through `FrameDecoder`, get §2.2-cropped to the picture region,
+  and are flipped from the §2.1 lower-left order to top-down raster as an
+  `oxideav_core::VideoFrame`. Headers can arrive as leading stream
+  packets, via `TheoraDecoder::with_headers`, or as a length-prefixed
+  `CodecParameters::extradata` chain consumed by the `make_decoder`
+  factory. Adds `THEORA_CODEC_ID`, `TheoraDecoder`, `make_decoder`,
+  `register_codecs`, and a `FrameDecoder::setup_tables` accessor, plus
+  six integration tests (the `tiny-i-only-16x16` fixture decodes
+  sample-exactly through the trait path).
 - pin the `bitstream-version-3.2.1` fixture end-to-end (round 313):
   the single-frame 32×32 stream whose identification header reports
   version `0x030201` (`VMAJ=3`, `VMIN=2`, `VREV=1`, i.e. the

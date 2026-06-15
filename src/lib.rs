@@ -10301,6 +10301,11 @@ impl FrameDecoder {
         &self.ident
     }
 
+    /// The decoded setup-header tables this decoder was built from.
+    pub fn setup_tables(&self) -> &SetupHeaderTables {
+        &self.setup
+    }
+
     /// The resolved frame geometry.
     pub fn geometry(&self) -> &FrameGeometry {
         &self.geometry
@@ -10494,11 +10499,304 @@ impl FrameDecoder {
     }
 }
 
-/// No-op codec registration. Decoder/encoder wiring will land in a
-/// later clean-room round; the identification-header parser is a
-/// standalone helper that does not need to be wired into a
-/// [`RuntimeContext`] to be useful.
-pub fn register(_ctx: &mut RuntimeContext) {}
+// -----------------------------------------------------------------------------
+// oxideav_core::Decoder integration
+// -----------------------------------------------------------------------------
+
+/// Canonical codec id this decoder registers under.
+pub const THEORA_CODEC_ID: &str = "theora";
+
+/// Reorder one plane from the §2.1 lower-left, bottom-up row order the
+/// reconstruction stores into the top-down raster order
+/// [`oxideav_core::VideoFrame`] consumers expect.
+///
+/// The §2.1 coordinate origin is the lower-left corner with `y` growing
+/// upward, so emitting top-down raster is a row reversal: row `y` of the
+/// output is row `h - 1 - y` of the stored plane. The plane is tightly
+/// packed (`width` bytes per row).
+fn plane_to_top_down(samples: &[u8], dims: PlaneDimensions) -> Vec<u8> {
+    let w = dims.width as usize;
+    let h = dims.height as usize;
+    let mut out = Vec::with_capacity(w * h);
+    for row in (0..h).rev() {
+        let start = row * w;
+        out.extend_from_slice(&samples[start..start + w]);
+    }
+    out
+}
+
+/// Convert a §2.2-cropped display frame into a top-down
+/// [`oxideav_core::VideoFrame`].
+///
+/// The three planes are flipped to top-down raster (`plane_to_top_down`)
+/// and packed with a stride equal to their pixel width — the cropped
+/// planes are already tightly packed at `PICW` / chroma-cropped widths.
+fn cropped_to_video_frame(cropped: &CroppedFrame, pts: Option<i64>) -> oxideav_core::VideoFrame {
+    use oxideav_core::frame::VideoPlane;
+    oxideav_core::VideoFrame {
+        pts,
+        planes: vec![
+            VideoPlane {
+                stride: cropped.dims_y.width as usize,
+                data: plane_to_top_down(&cropped.samples_y, cropped.dims_y),
+            },
+            VideoPlane {
+                stride: cropped.dims_c.width as usize,
+                data: plane_to_top_down(&cropped.samples_cb, cropped.dims_c),
+            },
+            VideoPlane {
+                stride: cropped.dims_c.width as usize,
+                data: plane_to_top_down(&cropped.samples_cr, cropped.dims_c),
+            },
+        ],
+    }
+}
+
+/// Header-decode progress before frame data can be decoded.
+///
+/// A Theora bitstream begins with the three header packets — the §6.2
+/// identification header (`0x80`), the §6.3 comment header (`0x81`), and
+/// the §6.4 setup header (`0x82`) — followed by the §7 video-data
+/// packets. §6.1 distinguishes the two classes by the most-significant
+/// bit of the first byte: header packets set it, data packets clear it.
+enum HeaderState {
+    /// Still gathering header packets. Holds whatever has been parsed so
+    /// far. The setup tables are boxed — they dwarf the ident header, so
+    /// boxing keeps the enum's variants balanced in size.
+    Collecting {
+        ident: Option<TheoraIdentHeader>,
+        setup: Option<Box<SetupHeaderTables>>,
+    },
+    /// All three headers seen; the frame decoder is live.
+    Ready(Box<FrameDecoder>),
+}
+
+/// An [`oxideav_core::Decoder`] driving [`FrameDecoder`].
+///
+/// The decoder is fed packets via
+/// [`send_packet`](oxideav_core::Decoder::send_packet) in bitstream
+/// order. Header packets (§6.1 most-significant-bit set) advance the
+/// internal [`HeaderState`]; once the identification (`0x80`) and setup
+/// (`0x82`) headers have been parsed the [`FrameDecoder`] is
+/// constructed and subsequent video-data packets (most-significant-bit
+/// clear) are queued for decoding. Each
+/// [`receive_frame`](oxideav_core::Decoder::receive_frame) decodes one
+/// queued data packet, applies the §2.2 display crop, flips the planes
+/// to top-down raster, and returns the frame.
+///
+/// When the three header packets arrive in a container's setup
+/// bytes rather than as leading stream packets, hand them to
+/// [`send_packet`] ahead of the data packets — the dispatch is purely
+/// per-packet on the §6.1 type bit, so either carriage works.
+pub struct TheoraDecoder {
+    codec_id: oxideav_core::CodecId,
+    state: HeaderState,
+    pending: std::collections::VecDeque<oxideav_core::Packet>,
+    eof: bool,
+}
+
+impl std::fmt::Debug for TheoraDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = match &self.state {
+            HeaderState::Collecting { ident, setup } => {
+                format!(
+                    "collecting(ident={}, setup={})",
+                    ident.is_some(),
+                    setup.is_some()
+                )
+            }
+            HeaderState::Ready(_) => "ready".to_string(),
+        };
+        f.debug_struct("TheoraDecoder")
+            .field("codec_id", &self.codec_id)
+            .field("state", &stage)
+            .field("pending", &self.pending.len())
+            .field("eof", &self.eof)
+            .finish()
+    }
+}
+
+impl TheoraDecoder {
+    /// Build a fresh decoder bound to `codec_id`, awaiting the three
+    /// §6 header packets.
+    pub fn new(codec_id: oxideav_core::CodecId) -> Self {
+        Self {
+            codec_id,
+            state: HeaderState::Collecting {
+                ident: None,
+                setup: None,
+            },
+            pending: std::collections::VecDeque::new(),
+            eof: false,
+        }
+    }
+
+    /// Build a decoder whose three header packets are supplied up front
+    /// (the common container path: ident/comment/setup live in the
+    /// stream's setup bytes). Each slice is one §6 header packet
+    /// starting at its `0x8N` type byte.
+    pub fn with_headers(codec_id: oxideav_core::CodecId, headers: &[&[u8]]) -> Result<Self, Error> {
+        let mut dec = Self::new(codec_id);
+        for h in headers {
+            dec.consume_header_packet(h)?;
+        }
+        Ok(dec)
+    }
+
+    /// Feed one §6.1 header packet (most-significant-bit set). The §6.3
+    /// comment header is parsed for validity and otherwise discarded
+    /// (its vendor string / user comments are not needed to decode).
+    fn consume_header_packet(&mut self, data: &[u8]) -> Result<(), Error> {
+        let HeaderState::Collecting { ident, setup } = &mut self.state else {
+            // Headers after the decoder is live are ignored — a
+            // re-sent setup chain on a seek-rewound stream.
+            return Ok(());
+        };
+        let header_type = *data.first().ok_or(Error::TruncatedHeader {
+            field: "header_type",
+        })?;
+        match header_type {
+            0x80 => {
+                *ident = Some(decode_identification_header(data)?);
+            }
+            0x81 => {
+                // Comment header: validate framing, discard the payload.
+                parse_comment_header(data)?;
+            }
+            0x82 => {
+                *setup = Some(Box::new(decode_setup_header(data)?));
+            }
+            other => return Err(Error::BadHeaderType { got: other }),
+        }
+        // Promote to Ready once ident + setup are both in hand. The
+        // comment header is optional for decoding.
+        if let (Some(i), Some(s)) = (ident.clone(), setup.clone()) {
+            let fd = FrameDecoder::new(i, *s)?;
+            self.state = HeaderState::Ready(Box::new(fd));
+        }
+        Ok(())
+    }
+}
+
+impl oxideav_core::Decoder for TheoraDecoder {
+    fn codec_id(&self) -> &oxideav_core::CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &oxideav_core::Packet) -> oxideav_core::Result<()> {
+        // §6.1: most-significant bit of the first byte distinguishes a
+        // header packet (set) from a video-data packet (clear). A
+        // zero-length packet is a §7.11 step-2 duplicate-frame marker
+        // (a data packet).
+        let is_header = packet.data.first().map(|b| b & 0x80 != 0).unwrap_or(false);
+        if is_header {
+            self.consume_header_packet(&packet.data)
+                .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+        } else {
+            self.pending.push_back(packet.clone());
+        }
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> oxideav_core::Result<oxideav_core::Frame> {
+        let Some(pkt) = self.pending.pop_front() else {
+            return if self.eof {
+                Err(oxideav_core::Error::Eof)
+            } else {
+                Err(oxideav_core::Error::NeedMore)
+            };
+        };
+        let HeaderState::Ready(fd) = &mut self.state else {
+            return Err(oxideav_core::Error::invalid(
+                "oxideav-theora: video-data packet received before the §6.2 \
+                 identification and §6.4 setup headers",
+            ));
+        };
+        let decoded = fd
+            .decode_frame(&pkt.data)
+            .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+        let cropped = crop_frame_to_picture_region(&decoded.frame, fd.ident())
+            .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+        let vf = cropped_to_video_frame(&cropped, pkt.pts);
+        Ok(oxideav_core::Frame::Video(vf))
+    }
+
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> oxideav_core::Result<()> {
+        // Drop queued packets and pending output, but keep the parsed
+        // headers / frame geometry: a container seek rewinds the data
+        // stream, not the setup headers. Rebuild the FrameDecoder from
+        // the headers so reference frames start clean.
+        self.pending.clear();
+        self.eof = false;
+        if let HeaderState::Ready(fd) = &self.state {
+            let fresh = FrameDecoder::new(fd.ident().clone(), fd.setup_tables().clone())
+                .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+            self.state = HeaderState::Ready(Box::new(fresh));
+        }
+        Ok(())
+    }
+}
+
+/// `make_decoder` factory plugged into the registry. Parses the three
+/// §6 header packets from [`CodecParameters::extradata`] when present;
+/// otherwise returns a decoder awaiting the headers as leading stream
+/// packets.
+///
+/// The extradata layout consumed here is the concatenation of the three
+/// header packets each prefixed by a 16-bit big-endian length — the
+/// minimal self-describing packing. When `extradata` is empty the
+/// decoder collects the headers from [`Decoder::send_packet`]
+/// (dispatched per the §6.1 type bit), so callers whose container hands
+/// the headers inline still work.
+pub fn make_decoder(
+    params: &oxideav_core::CodecParameters,
+) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
+    let mut dec = TheoraDecoder::new(params.codec_id.clone());
+    let ed = &params.extradata;
+    if !ed.is_empty() {
+        let mut off = 0usize;
+        while off + 2 <= ed.len() {
+            let len = ((ed[off] as usize) << 8) | (ed[off + 1] as usize);
+            off += 2;
+            if off + len > ed.len() {
+                return Err(oxideav_core::Error::invalid(
+                    "oxideav-theora: extradata header length runs past the buffer",
+                ));
+            }
+            dec.consume_header_packet(&ed[off..off + len])
+                .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+            off += len;
+        }
+    }
+    Ok(Box::new(dec))
+}
+
+/// Register the Theora codec into `reg` under [`THEORA_CODEC_ID`], with
+/// the Matroska CodecID `V_THEORA` the codec is carried under in MKV /
+/// WebM. (Theora has no canonical AVI FourCC; the container-specific tag
+/// resolution lives in the container crates against this registration.)
+pub fn register_codecs(reg: &mut oxideav_core::CodecRegistry) {
+    use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
+    let caps = CodecCapabilities::video(THEORA_CODEC_ID).with_lossy(true);
+    reg.register(
+        CodecInfo::new(CodecId::new(THEORA_CODEC_ID))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .tag(CodecTag::matroska("V_THEORA")),
+    );
+}
+
+/// Unified entry point — installs the Theora codec into a
+/// [`RuntimeContext`]. Called by `oxideav-meta` via the
+/// [`oxideav_core::register!`] hook below.
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
 
 oxideav_core::register!("theora", register);
 
@@ -25202,5 +25500,146 @@ mod tests {
         assert_eq!(c.samples_y, decoded.frame.samples_y);
         assert_eq!(c.samples_cb, decoded.frame.samples_cb);
         assert_eq!(c.samples_cr, decoded.frame.samples_cr);
+    }
+
+    // ───────── oxideav_core::Decoder integration tests ─────────
+
+    use oxideav_core::{CodecId, Decoder as _, Error as CoreError, Frame, Packet};
+
+    /// Build a minimal valid §6.3 comment header packet: the `0x81`
+    /// type byte, the `"theora"` magic, a zero-length vendor string, and
+    /// zero user comments. Exercises the `0x81` dispatch arm.
+    fn minimal_comment_packet() -> Vec<u8> {
+        let mut v = vec![0x81u8, 0x74, 0x68, 0x65, 0x6f, 0x72, 0x61];
+        v.extend_from_slice(&0u32.to_le_bytes()); // vendor_len = 0
+        v.extend_from_slice(&0u32.to_le_bytes()); // ncomments = 0
+        v
+    }
+
+    fn data_packet(bytes: &[u8]) -> Packet {
+        Packet::new(0, oxideav_core::TimeBase::from_rate(1), bytes.to_vec())
+    }
+
+    /// Feeding the three header packets (incl. the comment header) then
+    /// one intra data packet through the [`Decoder`] trait yields a
+    /// [`Frame::Video`] whose top-down planes match the corpus
+    /// `expected.yuv` byte-for-byte. The picture region equals the coded
+    /// frame for `tiny-i-only-16x16`, so the cropped output is the whole
+    /// 32×32 frame.
+    #[test]
+    fn decoder_trait_tiny_fixture_is_sample_exact() {
+        let mut dec = TheoraDecoder::new(CodecId::new(THEORA_CODEC_ID));
+        // §6.1 header packets in order: ident (0x80), comment (0x81),
+        // setup (0x82).
+        dec.send_packet(&data_packet(&TINY_HEADER)).unwrap();
+        dec.send_packet(&data_packet(&minimal_comment_packet()))
+            .unwrap();
+        dec.send_packet(&data_packet(&fixture_data::FIXTURE_SETUP_PACKET))
+            .unwrap();
+        // Data packet (high bit clear).
+        dec.send_packet(&data_packet(&fixture_data::TINY_DATA_PACKET_0))
+            .unwrap();
+
+        let frame = dec.receive_frame().expect("one frame should decode");
+        let Frame::Video(vf) = frame else {
+            panic!("expected a video frame");
+        };
+        assert_eq!(vf.planes.len(), 3);
+        // Top-down concatenated Y + Cb + Cr.
+        let mut got = vf.planes[0].data.clone();
+        got.extend_from_slice(&vf.planes[1].data);
+        got.extend_from_slice(&vf.planes[2].data);
+        assert_eq!(got.len(), fixture_data::TINY_EXPECTED_YUV.len());
+        assert_eq!(got, &fixture_data::TINY_EXPECTED_YUV[..]);
+        // Plane strides equal the picture-region widths (32 luma / 16
+        // chroma for the 32×32 4:2:0 frame).
+        assert_eq!(vf.planes[0].stride, 32);
+        assert_eq!(vf.planes[1].stride, 16);
+        assert_eq!(vf.planes[2].stride, 16);
+    }
+
+    /// `with_headers` parses the ident + setup chain up front (the
+    /// container-setup carriage path); the comment header is optional.
+    #[test]
+    fn decoder_with_headers_then_data_packet() {
+        let mut dec = TheoraDecoder::with_headers(
+            CodecId::new(THEORA_CODEC_ID),
+            &[&TINY_HEADER, &fixture_data::FIXTURE_SETUP_PACKET],
+        )
+        .expect("ident + setup parse");
+        dec.send_packet(&data_packet(&fixture_data::TINY_DATA_PACKET_0))
+            .unwrap();
+        let Frame::Video(vf) = dec.receive_frame().expect("frame") else {
+            panic!("expected video frame");
+        };
+        let mut got = vf.planes[0].data.clone();
+        got.extend_from_slice(&vf.planes[1].data);
+        got.extend_from_slice(&vf.planes[2].data);
+        assert_eq!(got, &fixture_data::TINY_EXPECTED_YUV[..]);
+    }
+
+    /// `receive_frame` returns `NeedMore` when no data packet is queued
+    /// and `Eof` after `flush`.
+    #[test]
+    fn decoder_need_more_then_eof() {
+        let mut dec = TheoraDecoder::with_headers(
+            CodecId::new(THEORA_CODEC_ID),
+            &[&TINY_HEADER, &fixture_data::FIXTURE_SETUP_PACKET],
+        )
+        .unwrap();
+        assert!(matches!(dec.receive_frame(), Err(CoreError::NeedMore)));
+        dec.flush().unwrap();
+        assert!(matches!(dec.receive_frame(), Err(CoreError::Eof)));
+    }
+
+    /// A data packet that arrives before the headers errors rather than
+    /// panicking.
+    #[test]
+    fn decoder_data_before_headers_errors() {
+        let mut dec = TheoraDecoder::new(CodecId::new(THEORA_CODEC_ID));
+        dec.send_packet(&data_packet(&fixture_data::TINY_DATA_PACKET_0))
+            .unwrap();
+        assert!(dec.receive_frame().is_err());
+    }
+
+    /// The factory parses a length-prefixed extradata header chain and
+    /// the resulting decoder is immediately ready for data packets.
+    #[test]
+    fn make_decoder_parses_extradata_header_chain() {
+        // Pack ident + comment + setup as 16-bit-BE-length-prefixed
+        // records.
+        let comment = minimal_comment_packet();
+        let mut ed = Vec::new();
+        for pkt in [
+            &TINY_HEADER[..],
+            &comment[..],
+            &fixture_data::FIXTURE_SETUP_PACKET[..],
+        ] {
+            let len = pkt.len() as u16;
+            ed.extend_from_slice(&len.to_be_bytes());
+            ed.extend_from_slice(pkt);
+        }
+        let mut params = oxideav_core::CodecParameters::video(CodecId::new(THEORA_CODEC_ID));
+        params.extradata = ed;
+        let mut dec = make_decoder(&params).expect("factory builds from extradata");
+        dec.send_packet(&data_packet(&fixture_data::TINY_DATA_PACKET_0))
+            .unwrap();
+        let Frame::Video(vf) = dec.receive_frame().expect("frame") else {
+            panic!("expected video frame");
+        };
+        let mut got = vf.planes[0].data.clone();
+        got.extend_from_slice(&vf.planes[1].data);
+        got.extend_from_slice(&vf.planes[2].data);
+        assert_eq!(got, &fixture_data::TINY_EXPECTED_YUV[..]);
+    }
+
+    /// Registration installs a Theora decoder reachable through the
+    /// shared [`oxideav_core::CodecRegistry`].
+    #[test]
+    fn register_installs_theora_decoder() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        assert!(ctx.codecs.has_decoder(&CodecId::new(THEORA_CODEC_ID)));
+        assert!(!ctx.codecs.has_encoder(&CodecId::new(THEORA_CODEC_ID)));
     }
 }

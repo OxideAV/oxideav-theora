@@ -20,6 +20,28 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- `q-high` weak-quant end-to-end decode pin (round 309): the 64×64,
+  2-frame `q-high` fixture (bitstream version 3.2.1, `-q:v 10` →
+  qi=63, `ac_scale=10`) decodes sample-exactly across both frames.
+  At the weakest quantiser far more DCT AC coefficients survive
+  dequantisation than in the strong-quant pins, so this is the
+  hardest exercise of the §7.7.3 / §7.9.2 / §7.9.3 coefficient path
+  to date (the §7.9.3.2 two-pass inverse DCT runs on most blocks
+  rather than the DC-only shortcut). The fixture also pins two frame
+  configurations no prior end-to-end test reached: `nqps=2` (a
+  two-`qi` frame header, so the §7.6 block-level `qi` decode runs
+  exactly one `NQIS − 1` long-run pass), and `filter_limit=0` at
+  qi=63 (this stream's transmitted §6.4.1 `LFLIMS[63]` is zero, so
+  the §7.10.3 loop filter collapses to identity via the
+  `lflim(R, 0) = 0` response, leaving the reconstruction untouched —
+  the decode is sample-exact regardless). The keyframe codes all 16
+  macro blocks INTRA; the inter frame codes the first macro-block row
+  `INTER_NOMV` and copies the remaining three rows from the previous
+  reference. The identification and two data packets were
+  Ogg-de-framed offline (the crate never parses Ogg); the
+  setup-header packet is byte-identical to the existing fixtures and
+  is reused. +1 test (511 → 512).
+
 - §2.2 / §4.4.4 picture-region crop (round 302):
   `crop_frame_to_picture_region` and the `FrameDecoder::crop_for_display`
   convenience wrapper return a `CroppedFrame` cropped to the display

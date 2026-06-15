@@ -24779,6 +24779,74 @@ mod tests {
         assert_eq!(dec.reference_store().golden_y, f.frame.samples_y);
     }
 
+    /// End-to-end §7.11 on the `q-high` fixture (64×64, `-q:v 10` →
+    /// qi=63, `ac_scale=10`). This is the weak-quant extreme: the
+    /// quantiser is the smallest available, so many DCT AC
+    /// coefficients survive dequantisation and the §7.7.3 / §7.9.2 /
+    /// §7.9.3 path does substantially more work than the strong-quant
+    /// fixtures. Two further properties this fixture pins that no
+    /// prior end-to-end pin exercises:
+    ///
+    /// * `nqps=2` — a two-`qi` frame header (the existing pins use
+    ///   `nqps=3` or `nqps=1`), so the §7.6 block-level `qi` decode
+    ///   runs exactly one `NQIS − 1` long-run pass.
+    /// * `filter_limit=0` at qi=63 (the §6.4.1 `LFLIMS[63]` entry for
+    ///   this stream's transmitted table is zero), so the §7.10.3
+    ///   loop filter collapses to identity for every coded edge — the
+    ///   `lflim(R, 0) = 0` response leaves the reconstruction
+    ///   untouched. The decode is sample-exact regardless, confirming
+    ///   the zero-limit path matches the reference.
+    ///
+    /// The keyframe codes all 16 macro blocks INTRA (trace `mode=1`);
+    /// the inter frame codes the first macro-block row `INTER_NOMV`
+    /// (trace `mode=0`, `coded=1`) and copies the remaining three rows
+    /// straight through from the previous reference (`coded=0`).
+    #[test]
+    fn decode_frame_q_high_weak_quant_fixture_is_sample_exact() {
+        let ident = decode_identification_header(&fixture_data::QHIGH_IDENT_PACKET).unwrap();
+        assert_eq!(ident.coded_width(), 64);
+        assert_eq!(ident.coded_height(), 64);
+        // The 64×64 stream shares the byte-identical setup header packet
+        // with the tiny-i / quant-table-custom / i-then-p fixtures.
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+
+        // Frame 0 — the keyframe. FRAME trace: qi=63, qis=63,52 nqps=2.
+        let f0 = dec
+            .decode_frame(&fixture_data::QHIGH_IFRAME_PACKET)
+            .expect("q-high keyframe should decode");
+        assert_eq!(f0.ftype, FrameType::Intra);
+        assert_eq!(f0.qis, vec![63, 52]);
+        let got0 = frame_top_down_yuv(&f0.frame);
+        assert_eq!(got0.len(), 6144);
+        assert_eq!(
+            got0,
+            &fixture_data::QHIGH_EXPECTED_YUV[..6144],
+            "q-high keyframe planes must match the reference dump sample-exactly"
+        );
+        // Steps 7 + 8: the keyframe seeds both reference slots.
+        assert_eq!(dec.reference_store().golden_y, f0.frame.samples_y);
+        assert_eq!(dec.reference_store().previous_y, f0.frame.samples_y);
+
+        // Frame 1 — the inter frame. FRAME trace: P, qis=63,52 nqps=2.
+        let f1 = dec
+            .decode_frame(&fixture_data::QHIGH_PFRAME_PACKET)
+            .expect("q-high inter frame should decode");
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert_eq!(f1.qis, vec![63, 52]);
+        let got1 = frame_top_down_yuv(&f1.frame);
+        assert_eq!(got1.len(), 6144);
+        assert_eq!(
+            got1,
+            &fixture_data::QHIGH_EXPECTED_YUV[6144..],
+            "q-high inter frame planes must match the reference dump sample-exactly"
+        );
+        // Step 7 skipped (inter): golden still holds the keyframe;
+        // step 8 ran: previous now holds the inter frame.
+        assert_eq!(dec.reference_store().golden_y, f0.frame.samples_y);
+        assert_eq!(dec.reference_store().previous_y, f1.frame.samples_y);
+    }
+
     /// [`PlaneBlockCodedOrder::from_block_extent`] handles a chroma
     /// plane whose block extent is not `2 * ceil(mb / 2)` — the
     /// odd-FMBW 4:2:0 case where the naive macro-block-derived

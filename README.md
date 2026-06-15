@@ -2,6 +2,34 @@
 
 Pure-Rust Theora video codec — clean-room implementation in progress.
 
+## Status — 2026-06-15 (round 309)
+
+Round 309 pins the **`q-high` weak-quant fixture** end-to-end — a
+64×64, 2-frame (bitstream version 3.2.1) stream encoded at the
+weakest quantiser (`-q:v 10` → qi=63, `ac_scale=10`), decoding
+sample-exactly across both frames. This is the highest-stress
+exercise of the §7.7.3 / §7.9.2 / §7.9.3 coefficient path so far:
+at qi=63 the quantiser is the smallest available, so far more DCT AC
+coefficients survive dequantisation than in the strong-quant pins,
+and the inverse-DCT runs the full §7.9.3.2 two-pass path rather than
+the DC-only shortcut on most blocks. The fixture also pins two frame
+configurations no prior end-to-end test reached: `nqps=2` (a two-`qi`
+frame header, so the §7.6 block-level `qi` decode runs exactly one
+`NQIS − 1` long-run pass — the existing pins used `nqps=3` or
+`nqps=1`), and `filter_limit=0` at qi=63 (this stream's transmitted
+§6.4.1 `LFLIMS[63]` is zero, so the §7.10.3 loop filter collapses to
+identity via the `lflim(R, 0) = 0` response — the decode is
+sample-exact regardless, confirming the zero-limit path leaves the
+reconstruction untouched). The keyframe codes all 16 macro blocks
+INTRA; the inter frame codes the first macro-block row `INTER_NOMV`
+and copies the remaining three rows from the previous reference. The
+identification and two data packets were Ogg-de-framed offline (the
+crate never parses Ogg); the setup-header packet is byte-identical to
+the `tiny-i` / `quant-table-custom` / `i-then-p` fixtures and is
+reused. +1 net test (511 → 512). Next: golden-reference and four-MV
+inter modes (`INTER_GOLDEN_MV` / `INTER_MV_FOUR`), which the current
+fixture corpus does not yet exercise end-to-end.
+
 ## Status — 2026-06-14 (round 302)
 
 Round 302 lands the **§2.2 / §4.4.4 picture-region crop** — the

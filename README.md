@@ -40,7 +40,8 @@ packets are handled as duplicate-frame markers.
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation
 tables, weakest- and strongest-quantiser streams, non-MB-aligned picture
-regions, and a sustained multi-frame keyframe-interval run.
+regions, a single-frame bitstream-version-3.2.1 (alpha3+) stream, and a
+sustained multi-frame keyframe-interval run.
 
 ## Not yet supported
 

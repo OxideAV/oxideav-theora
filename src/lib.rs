@@ -24528,6 +24528,39 @@ mod tests {
         assert_eq!(store.previous_y, out.frame.samples_y);
     }
 
+    /// End-to-end §7.11 on the `bitstream-version-3.2.1` fixture: a
+    /// single intra 32×32 frame whose identification header carries
+    /// `VMAJ=3`, `VMIN=2`, `VREV=1` (version `0x030201`, the alpha3+
+    /// feature set). Confirms the version-3.2.1 path decodes
+    /// sample-exactly against the staged reference dump. The setup
+    /// header is byte-identical to the shared `FIXTURE_SETUP_PACKET`.
+    #[test]
+    fn decode_frame_bitstream_version_321_fixture_is_sample_exact() {
+        let ident = decode_identification_header(&fixture_data::BV321_IDENT_PACKET).unwrap();
+        assert_eq!(ident.version(), 0x03_02_01);
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let out = dec
+            .decode_frame(&fixture_data::BV321_DATA_PACKET)
+            .expect("bitstream-version-3.2.1 fixture frame should decode");
+        assert_eq!(out.ftype, FrameType::Intra);
+        assert_eq!(out.frame.dims_y.width, 32);
+        assert_eq!(out.frame.dims_y.height, 32);
+        assert_eq!(out.frame.dims_cb.width, 16);
+        assert_eq!(out.frame.dims_cb.height, 16);
+        let got = frame_top_down_yuv(&out.frame);
+        assert_eq!(got.len(), fixture_data::BV321_EXPECTED_YUV.len());
+        assert_eq!(
+            got,
+            &fixture_data::BV321_EXPECTED_YUV[..],
+            "decoded planes must match the reference dump sample-exactly"
+        );
+        // Step 7 + 8: an intra frame becomes both references.
+        let store = dec.reference_store();
+        assert_eq!(store.golden_y, out.frame.samples_y);
+        assert_eq!(store.previous_y, out.frame.samples_y);
+    }
+
     /// End-to-end §7.11 on the `quant-table-custom` fixture (same
     /// 32×32 geometry and the same transmitted setup tables, but a
     /// mid-range 3-qi selection and non-flat picture content, so the

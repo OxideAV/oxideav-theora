@@ -4,6 +4,19 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- pin the `bitstream-version-3.2.1` fixture end-to-end (round 313):
+  the single-frame 32×32 stream whose identification header reports
+  version `0x030201` (`VMAJ=3`, `VMIN=2`, `VREV=1`, i.e. the
+  `>= 0x030200` alpha3+ feature set per §6.2) decodes sample-exactly.
+  Adds `BV321_IDENT_PACKET` / `BV321_DATA_PACKET` / `BV321_EXPECTED_YUV`
+  to the embedded fixture data (Ogg framing stripped offline; the setup
+  header is byte-identical to the shared `FIXTURE_SETUP_PACKET`) and an
+  end-to-end §7.11 assertion against the staged reference dump. This is
+  the first pin to assert the exact version-field value the decoder
+  branches on for the alpha3+ feature set.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-theora/compare/v0.0.9...v0.0.10) - 2026-06-15
 
 ### Other

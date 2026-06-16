@@ -30,7 +30,10 @@ against reference output.
 * **Display crop** — `crop_frame_to_picture_region` (and the
   `FrameDecoder::crop_for_display` wrapper) crops the macroblock-aligned
   reconstruction down to the picture region, with the spec's chroma-axis
-  rounding for all three pixel formats.
+  rounding for all three pixel formats. A non-MB-aligned fixture
+  (visible 26×18 inside coded 32×32) is validated end-to-end against a
+  reference dump captured *after* the §2.2 crop, exercising the §4.4.4
+  chroma round-up (13×9, not 13×8) on real reference pixels.
 
 `FrameDecoder::decode_frame` chains the per-packet path
 (header → block decode → reconstruction → in-place loop filter →
@@ -50,9 +53,10 @@ packets are handled as duplicate-frame markers.
 
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation
-tables, weakest- and strongest-quantiser streams, non-MB-aligned picture
-regions, a single-frame bitstream-version-3.2.1 (alpha3+) stream, and a
-sustained multi-frame keyframe-interval run.
+tables, weakest- and strongest-quantiser streams, a non-MB-aligned
+picture region cropped to its visible 26×18 window (compared against a
+post-crop reference dump), a single-frame bitstream-version-3.2.1
+(alpha3+) stream, and a sustained multi-frame keyframe-interval run.
 
 ## Not yet supported
 

@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- pin the `picture-region-non-mb-aligned` fixture end-to-end (round 321):
+  decode the single intra frame (coded 32×32) and crop to its 26×18
+  visible region, comparing against the corpus `expected.yuv`. This is
+  the only corpus dump captured *after* the §2.2 crop (702 bytes:
+  26×18 Y + 13×9 Cb + 13×9 Cr), so it is the first fixture to validate
+  the §4.4.4 chroma round-up (`ceil(26/2)=13` × `ceil(18/2)=9`, not
+  13×8) and the non-identity `crop_for_display` path against reference
+  pixels rather than at the macroblock-aligned coded dimensions. Adds
+  the `PICREG_IDENT_PACKET` / `PICREG_DATA_PACKET` / `PICREG_EXPECTED_YUV`
+  fixture constants and one end-to-end test (setup header reused verbatim
+  from the shared `FIXTURE_SETUP_PACKET`).
 - wire the `oxideav_core::Decoder` trait (round 317): `TheoraDecoder`
   implements the framework decoder interface and `register` installs it
   into a `RuntimeContext` (the `register!` entry point was previously a

@@ -25502,6 +25502,77 @@ mod tests {
         assert_eq!(c.samples_cr, decoded.frame.samples_cr);
     }
 
+    /// Concatenated top-down Y + Cb + Cr bytes of a *cropped* frame, in
+    /// the corpus post-crop `expected.yuv` layout. Mirrors
+    /// [`frame_top_down_yuv`] but over a [`CroppedFrame`]'s visible-region
+    /// planes (luma `dims_y`, both chroma planes `dims_c`).
+    fn cropped_top_down_yuv(c: &CroppedFrame) -> Vec<u8> {
+        let mut out = plane_top_down(&c.samples_y, c.dims_y);
+        out.extend(plane_top_down(&c.samples_cb, c.dims_c));
+        out.extend(plane_top_down(&c.samples_cr, c.dims_c));
+        out
+    }
+
+    /// End-to-end §2.2 / §4.4.4 display crop on the
+    /// `picture-region-non-mb-aligned` fixture: decode the single intra
+    /// frame (coded 32×32), crop to the 26×18 visible region, and compare
+    /// against the corpus `expected.yuv` — the staged reference dump for
+    /// this fixture is captured *after* the crop (702 bytes: 26×18 Y +
+    /// 13×9 Cb + 13×9 Cr).
+    ///
+    /// This is the only corpus dump taken at visible/cropped dimensions,
+    /// so it is the one fixture that validates the §4.4.4 chroma round-up
+    /// (`ceil(26/2)=13` × `ceil(18/2)=9`, not 13×8) end-to-end against
+    /// reference pixels rather than at the macroblock-aligned coded size.
+    #[test]
+    fn crop_picture_region_non_mb_aligned_fixture_is_sample_exact() {
+        let ident = decode_identification_header(&fixture_data::PICREG_IDENT_PACKET).unwrap();
+        // §6.2: visible 26×18 inside coded 32×32.
+        assert_eq!(ident.picw, 26);
+        assert_eq!(ident.pich, 18);
+        // §6.2 step 10: PICX / PICY are the picture-region origin in the
+        // §2.1 lower-left axis. The staged corpus trace records this as a
+        // top-flipped `off_y=14`; in the lower-left axis the region sits
+        // at the top of the coded frame, so PICY = 14 (rows [14, 32)).
+        assert_eq!(ident.picx, 0);
+        assert_eq!(ident.picy, 14);
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let decoded = dec
+            .decode_frame(&fixture_data::PICREG_DATA_PACKET)
+            .expect("picture-region fixture frame should decode");
+        assert_eq!(decoded.ftype, FrameType::Intra);
+        // Reconstruction is at coded (macroblock-aligned) dimensions.
+        assert_eq!(decoded.frame.dims_y.width, 32);
+        assert_eq!(decoded.frame.dims_y.height, 32);
+
+        let cropped = dec.crop_for_display(&decoded).unwrap();
+        // §2.2 luma crop = picture region verbatim.
+        assert_eq!(
+            cropped.dims_y,
+            PlaneDimensions {
+                width: 26,
+                height: 18,
+            }
+        );
+        // §4.4.4 chroma round-up: 4:2:0, so ceil(26/2)=13 × ceil(18/2)=9.
+        assert_eq!(
+            cropped.dims_c,
+            PlaneDimensions {
+                width: 13,
+                height: 9,
+            }
+        );
+
+        let got = cropped_top_down_yuv(&cropped);
+        assert_eq!(got.len(), fixture_data::PICREG_EXPECTED_YUV.len());
+        assert_eq!(
+            got,
+            &fixture_data::PICREG_EXPECTED_YUV[..],
+            "cropped visible-region planes must match the post-crop reference dump sample-exactly"
+        );
+    }
+
     // ───────── oxideav_core::Decoder integration tests ─────────
 
     use oxideav_core::{CodecId, Decoder as _, Error as CoreError, Frame, Packet};

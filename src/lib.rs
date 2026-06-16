@@ -24971,6 +24971,85 @@ mod tests {
         assert_eq!(dec.reference_store().previous_y, f1.frame.samples_y);
     }
 
+    /// End-to-end §7.11 on the `monochrome-via-zero-chroma` fixture — a
+    /// 64×64 two-frame I+P stream encoded from a grayscale source, so
+    /// both chroma planes are uniformly the neutral `0x80` in every
+    /// frame. This pins two things the prior inter fixtures do not:
+    ///
+    /// * the **flat-chroma invariant** survives the inter
+    ///   reconstruction path bit-exactly (both the coded-residual and
+    ///   the pure-copy branches must leave a 128-valued chroma plane
+    ///   untouched), and
+    /// * a 64×64 P frame whose **top macro-block row is coded
+    ///   INTER_NO_MV** (trace `mode=0`, `coded=1` — residual added to
+    ///   the colocated previous-reference prediction) while the lower
+    ///   three rows are **uncoded copies** (`coded=0`).
+    ///
+    /// Both frames are validated sample-exactly against the reference
+    /// dump (SHA-256 in `MONO_EXPECTED_YUV`'s doc comment), and the
+    /// chroma planes are additionally asserted to be a flat `0x80`.
+    #[test]
+    fn decode_frame_monochrome_zero_chroma_fixture_is_sample_exact() {
+        let ident = decode_identification_header(&fixture_data::MONO_IDENT_PACKET).unwrap();
+        assert_eq!(ident.coded_width(), 64);
+        assert_eq!(ident.coded_height(), 64);
+        // 64×64 stream shares the byte-identical built-in setup header.
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+
+        // Frame 0: the keyframe (FRAME trace idx=0, frame_type=I,
+        // qis=44,32,50). All sixteen MBs decode INTRA and seed both
+        // reference slots.
+        let f0 = dec
+            .decode_frame(&fixture_data::MONO_IFRAME_PACKET)
+            .expect("monochrome keyframe should decode");
+        assert_eq!(f0.ftype, FrameType::Intra);
+        assert_eq!(f0.qis, vec![44, 32, 50]);
+        let got0 = frame_top_down_yuv(&f0.frame);
+        assert_eq!(got0.len(), 6144);
+        assert_eq!(
+            got0,
+            &fixture_data::MONO_EXPECTED_YUV[..6144],
+            "monochrome keyframe planes must match the reference dump \
+             sample-exactly"
+        );
+        // Both reference slots seeded by the keyframe (§7.11 steps 7+8).
+        assert_eq!(dec.reference_store().golden_y, f0.frame.samples_y);
+        assert_eq!(dec.reference_store().previous_y, f0.frame.samples_y);
+        // The grayscale-source chroma planes are a flat 0x80: bytes
+        // [4096..6144] cover the 32×32 Cb followed by the 32×32 Cr.
+        assert!(
+            got0[4096..6144].iter().all(|&c| c == 0x80),
+            "keyframe chroma planes must be uniformly 0x80"
+        );
+
+        // Frame 1: the inter frame (FRAME trace idx=1, frame_type=P,
+        // qis=44,34,55). Top MB row coded INTER_NO_MV, lower rows are
+        // uncoded copies.
+        let f1 = dec
+            .decode_frame(&fixture_data::MONO_PFRAME_PACKET)
+            .expect("monochrome inter frame should decode");
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert_eq!(f1.qis, vec![44, 34, 55]);
+        let got1 = frame_top_down_yuv(&f1.frame);
+        assert_eq!(got1.len(), 6144);
+        assert_eq!(
+            got1,
+            &fixture_data::MONO_EXPECTED_YUV[6144..],
+            "monochrome inter frame planes must match the reference \
+             dump sample-exactly"
+        );
+        // The flat-chroma invariant must survive the inter MC path.
+        assert!(
+            got1[4096..6144].iter().all(|&c| c == 0x80),
+            "inter-frame chroma planes must remain uniformly 0x80"
+        );
+        // Inter promotion: golden still holds the keyframe, previous
+        // now holds the inter frame (§7.11 step 7 skipped, step 8 ran).
+        assert_eq!(dec.reference_store().golden_y, f0.frame.samples_y);
+        assert_eq!(dec.reference_store().previous_y, f1.frame.samples_y);
+    }
+
     /// End-to-end §7.11 on the `q-low` fixture (qi=0, `nqps=1`). The
     /// inter frame's trace carries an `INTER_PLUS_MV` macro block at
     /// `mb_x=3`, `mb_y=2` with an explicit non-zero motion vector, so

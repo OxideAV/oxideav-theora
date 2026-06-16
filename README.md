@@ -56,7 +56,10 @@ intra-then-inter sequences, explicit motion vectors, custom quantisation
 tables, weakest- and strongest-quantiser streams, a non-MB-aligned
 picture region cropped to its visible 26×18 window (compared against a
 post-crop reference dump), a single-frame bitstream-version-3.2.1
-(alpha3+) stream, and a sustained multi-frame keyframe-interval run.
+(alpha3+) stream, a sustained multi-frame keyframe-interval run, and a
+grayscale-source `monochrome-via-zero-chroma` I+P stream whose chroma
+planes stay a flat `0x80` through both the coded-residual and pure-copy
+inter branches (asserted in addition to the sample-exact pixel match).
 
 ## Not yet supported
 

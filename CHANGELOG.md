@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- pin the `monochrome-via-zero-chroma` fixture end-to-end (round 325):
+  decode the 64×64 two-frame I+P grayscale-source stream and compare both
+  frames against the corpus `expected.yuv` sample-exactly. This is the
+  first fixture to assert the **flat-chroma invariant** — both chroma
+  planes stay uniformly `0x80` across the inter reconstruction (covering
+  both the top-row coded INTER_NO_MV residual branch and the lower-row
+  pure-copy branch). Adds the `MONO_IDENT_PACKET` / `MONO_IFRAME_PACKET`
+  / `MONO_PFRAME_PACKET` / `MONO_EXPECTED_YUV` fixture constants and one
+  end-to-end test (setup header reused verbatim from the shared
+  `FIXTURE_SETUP_PACKET`; SHA-256 of the YUV recorded in the constant's
+  doc comment).
 - pin the `picture-region-non-mb-aligned` fixture end-to-end (round 321):
   decode the single intra frame (coded 32×32) and crop to its 26×18
   visible region, comparing against the corpus `expected.yuv`. This is

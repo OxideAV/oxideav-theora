@@ -20582,6 +20582,243 @@ mod tests {
         }
     }
 
+    /// §7.9.4 frame driver — a fully-coded frame whose single
+    /// macroblock is `INTER_GOLDEN_NOMV` (Table 7.46 `rfi = 2`) must
+    /// sample the **golden** reference, not the previous one. This
+    /// exercises the golden-reference branch through the complete
+    /// `reconstruct_frame` driver (the block-level golden test
+    /// `reconstruct_inter_golden_samples_golden_reference` covers only
+    /// a single `reconstruct_block` call). Previous and golden planes
+    /// carry distinct biases so a wrong reference pick is detectable on
+    /// every plane.
+    #[test]
+    fn reconstruct_frame_golden_mode_samples_golden_reference() {
+        let params = make_recon_params();
+        // PREV* biases differ from GOLD* biases on every plane.
+        let prev_y_bias = 0u32;
+        let prev_cb_bias = 100u32;
+        let prev_cr_bias = 110u32;
+        let gold_y_bias = 50u32;
+        let gold_cb_bias = 120u32;
+        let gold_cr_bias = 130u32;
+        let prev_y = ramp_plane(16, 16, prev_y_bias);
+        let prev_cb = ramp_plane(8, 8, prev_cb_bias);
+        let prev_cr = ramp_plane(8, 8, prev_cr_bias);
+        let gold_y = ramp_plane(16, 16, gold_y_bias);
+        let gold_cb = ramp_plane(8, 8, gold_cb_bias);
+        let gold_cr = ramp_plane(8, 8, gold_cr_bias);
+        let refs = ReferencePlaneSet {
+            previous_y: ReferencePlane::new(16, 16, &prev_y).unwrap(),
+            previous_cb: ReferencePlane::new(8, 8, &prev_cb).unwrap(),
+            previous_cr: ReferencePlane::new(8, 8, &prev_cr).unwrap(),
+            golden_y: ReferencePlane::new(16, 16, &gold_y).unwrap(),
+            golden_cb: ReferencePlane::new(8, 8, &gold_cb).unwrap(),
+            golden_cr: ReferencePlane::new(8, 8, &gold_cr).unwrap(),
+        };
+        let (bcoded, mut mb_modes, mvects, coeffs, ncoeffs, qiis, pli, bx, by, mbi) =
+            four_block_geometry();
+        // The single macroblock is golden-no-MV. Zero MV + zero
+        // residual means each block is a verbatim copy of the golden
+        // plane at its own (BX, BY).
+        mb_modes[0] = MacroBlockMode::InterGoldenNoMv;
+        let qis = [10u8];
+        let out = reconstruct_frame(
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            PlaneDimensions {
+                width: 16,
+                height: 16,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap();
+        // Every luma sample equals the GOLDEN-Y ramp (bias 50), not the
+        // PREVIOUS-Y ramp (bias 0).
+        for ry in 0..16u32 {
+            for rx in 0..16u32 {
+                let idx = (ry * 16 + rx) as usize;
+                let expected = ((rx + ry + gold_y_bias) % 256) as u8;
+                assert_eq!(
+                    out.samples_y[idx], expected,
+                    "luma ({rx},{ry}) must sample GOLDEN-Y"
+                );
+            }
+        }
+        // Chroma planes equally sample the golden Cb / Cr ramps.
+        for ry in 0..8u32 {
+            for rx in 0..8u32 {
+                let idx = (ry * 8 + rx) as usize;
+                assert_eq!(
+                    out.samples_cb[idx],
+                    ((rx + ry + gold_cb_bias) % 256) as u8,
+                    "Cb ({rx},{ry}) must sample GOLDEN-Cb"
+                );
+                assert_eq!(
+                    out.samples_cr[idx],
+                    ((rx + ry + gold_cr_bias) % 256) as u8,
+                    "Cr ({rx},{ry}) must sample GOLDEN-Cr"
+                );
+            }
+        }
+    }
+
+    /// §7.9.4 frame driver — an `INTER_MV_FOUR` macroblock carries an
+    /// independent motion vector for each of its four luma blocks
+    /// (resolved upstream into the per-block `MVECTS` array) and a
+    /// single averaged MV for the chroma blocks. The driver must apply
+    /// each block's own MV against the **previous** reference (Table
+    /// 7.46 `rfi = 1`). With even (whole-pixel) MV components and zero
+    /// residual, block `(BX, BY)` with MV `(mx, my)` is a verbatim copy
+    /// of the previous plane at `(BX + mx/2, BY + my/2)`.
+    #[test]
+    fn reconstruct_frame_four_mv_applies_per_block_luma_mvs() {
+        let params = make_recon_params();
+        // Distinct previous-plane biases; golden planes carry other
+        // biases so a wrong-reference pick (golden instead of previous)
+        // would be caught.
+        let prev_y = ramp_plane(16, 16, 0);
+        let prev_cb = ramp_plane(8, 8, 100);
+        let prev_cr = ramp_plane(8, 8, 110);
+        let gold_y = ramp_plane(16, 16, 50);
+        let gold_cb = ramp_plane(8, 8, 120);
+        let gold_cr = ramp_plane(8, 8, 130);
+        let refs = ReferencePlaneSet {
+            previous_y: ReferencePlane::new(16, 16, &prev_y).unwrap(),
+            previous_cb: ReferencePlane::new(8, 8, &prev_cb).unwrap(),
+            previous_cr: ReferencePlane::new(8, 8, &prev_cr).unwrap(),
+            golden_y: ReferencePlane::new(16, 16, &gold_y).unwrap(),
+            golden_cb: ReferencePlane::new(8, 8, &gold_cb).unwrap(),
+            golden_cr: ReferencePlane::new(8, 8, &gold_cr).unwrap(),
+        };
+        let (bcoded, mut mb_modes, mut mvects, coeffs, ncoeffs, qiis, pli, bx, by, mbi) =
+            four_block_geometry();
+        mb_modes[0] = MacroBlockMode::InterMvFour;
+        // Per-block luma MVs (doubled / half-pixel units). All even so
+        // each halves to a clean whole-pixel offset, keeping these
+        // predictions a pure copy. Block order matches four_block_geometry:
+        //   block 0 = (BX=0,  BY=0)
+        //   block 1 = (BX=8,  BY=0)
+        //   block 2 = (BX=0,  BY=8)
+        //   block 3 = (BX=8,  BY=8)
+        // Offsets are chosen so every clamped read stays inside the
+        // 16×16 plane (no edge clamping), making each block a clean,
+        // un-clamped copy whose expected value is the ramp at the
+        // shifted coordinate. Blocks on the right/bottom edge (BX=8 /
+        // BY=8) take a zero offset on the edge-facing axis so the
+        // 8-pixel footprint cannot run past pixel 15.
+        //
+        // Chroma blocks 4 (Cb) / 5 (Cr) consume MVECTS[4]/[5] verbatim:
+        // the frame driver does not recompute the §7.5.2 four-MV chroma
+        // average — that resolution happened upstream in
+        // decode_macroblock_motion_vectors. We therefore set the chroma
+        // entries explicitly and assert the driver applies exactly
+        // those values.
+        let mv0 = MotionVector::new(0, 2);
+        let mv1 = MotionVector::new(0, 0);
+        let mv2 = MotionVector::new(2, 0);
+        let mv3 = MotionVector::new(0, 0);
+        let chroma_mv = MotionVector::new(2, 2);
+        mvects[0] = mv0;
+        mvects[1] = mv1;
+        mvects[2] = mv2;
+        mvects[3] = mv3;
+        mvects[4] = chroma_mv;
+        mvects[5] = chroma_mv;
+        let qis = [10u8];
+        let out = reconstruct_frame(
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            PlaneDimensions {
+                width: 16,
+                height: 16,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+            PlaneDimensions {
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap();
+        // Each luma block is the previous-Y ramp shifted by its own
+        // whole-pixel MV offset (mx/2, my/2). prev_y[v][u] = u + v.
+        let luma_blocks = [(0u32, 0u32, mv0), (8, 0, mv1), (0, 8, mv2), (8, 8, mv3)];
+        for (bx0, by0, mv) in luma_blocks {
+            let ox = (mv.x / 2) as i32;
+            let oy = (mv.y / 2) as i32;
+            for ly in 0..8u32 {
+                for lx in 0..8u32 {
+                    let idx = ((by0 + ly) * 16 + (bx0 + lx)) as usize;
+                    // prev_y read coordinate (all in-bounds → no clamp);
+                    // prev_y[v][u] = u + v (bias 0), and u+v ≤ 30 < 256.
+                    let u = (bx0 as i32) + ox + lx as i32;
+                    let v = (by0 as i32) + oy + ly as i32;
+                    let expected = (u + v) as u8;
+                    assert_eq!(
+                        out.samples_y[idx], expected,
+                        "luma block ({bx0},{by0}) MV ({},{}) at ({lx},{ly})",
+                        mv.x, mv.y
+                    );
+                }
+            }
+        }
+        // Chroma blocks use the averaged MV (2,2) → whole-pixel offset
+        // (1,1) against previous Cb (bias 100) / Cr (bias 110). The 8×8
+        // chroma block fills its whole 8×8 plane, so the +1 offset
+        // pushes the right column / bottom row one past the edge; the
+        // §7.9.1.2 step 1(b)/1(d) coordinate clamp folds those reads
+        // back to index 7. A clamped sample proves the MV was applied
+        // (the interior pattern is shifted) without going out of bounds.
+        for cy in 0..8u32 {
+            for cx in 0..8u32 {
+                let idx = (cy * 8 + cx) as usize;
+                let u = (cx + 1).min(7); // BX=0 + ox=1, clamped to [0,7]
+                let v = (cy + 1).min(7); // BY=0 + oy=1, clamped to [0,7]
+                assert_eq!(
+                    out.samples_cb[idx],
+                    ((u + v + 100) % 256) as u8,
+                    "Cb ({cx},{cy}) must sample previous Cb at clamped averaged MV"
+                );
+                assert_eq!(
+                    out.samples_cr[idx],
+                    ((u + v + 110) % 256) as u8,
+                    "Cr ({cx},{cy}) must sample previous Cr at clamped averaged MV"
+                );
+            }
+        }
+    }
+
     /// §7.9.4 frame driver — `pli_of_block[bi] > 2` is rejected with
     /// the [`Error::ReconstructFramePliOutOfRange`] variant.
     #[test]

@@ -6,6 +6,22 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- exercise the golden-reference and four-MV inter modes through the
+  full §7.9.4 `reconstruct_frame` driver (round 334). Two new
+  frame-driver integration tests close the gap between the existing
+  block-level (`reconstruct_block`) and motion-vector-level
+  (`decode_macroblock_motion_vectors`) coverage of these modes and a
+  full-frame reconstruction run: (1) an `INTER_GOLDEN_NOMV` frame whose
+  every block samples the **golden** reference plane (Table 7.46
+  `rfi = 2`) rather than the previous one, verified per-pixel across all
+  three planes with distinct previous/golden ramp biases; (2) an
+  `INTER_MV_FOUR` macroblock whose four luma blocks each carry an
+  independent whole-pixel motion vector while the chroma blocks consume
+  the averaged MV, verified against the previous reference (Table 7.46
+  `rfi = 1`) including the §7.9.1.2 edge-coordinate clamp on the chroma
+  block. No reference-captured corpus fixture covers these modes, since
+  libtheora's `testsrc`-class encodes never emit a golden or four-MV
+  macroblock; these tests pin the reconstruction behaviour directly.
 - pin the `keyframe-interval-1` fixture end-to-end (round 331): decode
   the 32×32 four-packet stream in which *every* frame is a fresh INTRA
   keyframe (`-g 1`) and compare all four reconstructions against the

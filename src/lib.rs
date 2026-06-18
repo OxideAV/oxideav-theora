@@ -25189,6 +25189,75 @@ mod tests {
         assert_eq!(dec.reference_store().golden_y, f.frame.samples_y);
     }
 
+    /// End-to-end §7.11 on the `keyframe-interval-1` fixture (32×32,
+    /// `-g 1`): a four-packet sequence in which *every* frame is a
+    /// fresh INTRA keyframe (trace `frame_type=I` for all four, all
+    /// macro blocks `mode=1`). Nothing else in the corpus pins a run
+    /// of back-to-back keyframes — the existing multi-frame pins
+    /// (`keyframe-interval-30`) are I + P sequences. This exercises:
+    ///
+    /// * Repeated §7.11 step-1 intra decode across four independent
+    ///   packets through a single `FrameDecoder`, confirming the
+    ///   per-frame state (DC predictors, qi context, reference store)
+    ///   is reset cleanly between keyframes rather than carrying inter
+    ///   prediction state forward.
+    /// * Reference-frame promotion on *every* frame: a keyframe seeds
+    ///   both the golden and the previous reference, so after each of
+    ///   the four decodes both reference planes must equal the frame
+    ///   just produced (unlike an inter run, where golden stays pinned
+    ///   to the lone keyframe).
+    /// * `qi=31` (frame-level), a mid-range quantiser distinct from the
+    ///   qi=0 / qi=18 / qi=63 pins, with `nqps=3` (`qis=31,20,41`).
+    ///
+    /// All four decodes are sample-exact against the staged reference
+    /// dump (four 1536-byte frames concatenated in stream order).
+    #[test]
+    fn decode_frame_keyframe_interval_1_all_keyframes_is_sample_exact() {
+        // Identification header is byte-identical to the I+P 32×32
+        // fixture; the setup header is the shared FIXTURE_SETUP_PACKET.
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        assert_eq!(ident.coded_width(), 32);
+        assert_eq!(ident.coded_height(), 32);
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+
+        const FRAME_LEN: usize = 1536;
+        let expected = &fixture_data::KI1_EXPECTED_YUV;
+        assert_eq!(expected.len(), 4 * FRAME_LEN);
+        let ref_frame = |i: usize| &expected[i * FRAME_LEN..(i + 1) * FRAME_LEN];
+
+        let packets: [&[u8]; 4] = [
+            &fixture_data::KI1_DATA_PACKET_0,
+            &fixture_data::KI1_DATA_PACKET_1,
+            &fixture_data::KI1_DATA_PACKET_2,
+            &fixture_data::KI1_DATA_PACKET_3,
+        ];
+
+        for (i, pkt) in packets.iter().enumerate() {
+            let f = dec
+                .decode_frame(pkt)
+                .unwrap_or_else(|e| panic!("keyframe {i} should decode: {e:?}"));
+            assert_eq!(f.ftype, FrameType::Intra, "frame {i} must be a keyframe");
+            assert_eq!(f.qis, vec![31, 20, 41], "frame {i} qis");
+            assert_eq!(
+                frame_top_down_yuv(&f.frame),
+                ref_frame(i),
+                "keyframe {i} must match reference frame {i} sample-exactly"
+            );
+            // Each keyframe re-seeds BOTH references with itself.
+            assert_eq!(
+                dec.reference_store().golden_y,
+                f.frame.samples_y,
+                "keyframe {i} must re-seed the golden reference"
+            );
+            assert_eq!(
+                dec.reference_store().previous_y,
+                f.frame.samples_y,
+                "keyframe {i} must re-seed the previous reference"
+            );
+        }
+    }
+
     /// End-to-end §7.11 on the `q-high` fixture (64×64, `-q:v 10` →
     /// qi=63, `ac_scale=10`). This is the weak-quant extreme: the
     /// quantiser is the smallest available, so many DCT AC

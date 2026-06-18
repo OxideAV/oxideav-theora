@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- pin the `keyframe-interval-1` fixture end-to-end (round 331): decode
+  the 32×32 four-packet stream in which *every* frame is a fresh INTRA
+  keyframe (`-g 1`) and compare all four reconstructions against the
+  corpus `expected.yuv` sample-exactly. This is the first multi-frame
+  pin that is a run of back-to-back keyframes (the existing multi-frame
+  pins are I + P sequences), and it asserts the keyframe reference-store
+  invariant on every frame: a keyframe re-seeds **both** the golden and
+  the previous reference with itself. Adds the `KI1_DATA_PACKET_0..3`
+  and `KI1_EXPECTED_YUV` fixture constants (identification header reused
+  from `KI30_IDENT_PACKET`, setup header from the shared
+  `FIXTURE_SETUP_PACKET`) and one end-to-end test.
 - pin the `monochrome-via-zero-chroma` fixture end-to-end (round 325):
   decode the 64×64 two-frame I+P grayscale-source stream and compare both
   frames against the corpus `expected.yuv` sample-exactly. This is the

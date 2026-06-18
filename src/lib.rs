@@ -6355,6 +6355,143 @@ pub fn invert_dc_prediction(
     Ok(())
 }
 
+/// Apply the §7.8 DC prediction in the *forward* (encoder) direction —
+/// the exact inverse of [`invert_dc_prediction`].
+///
+/// On entry `COEFFS[bi][0]` holds the **reconstructed** DC value of
+/// each coded block (the quantized DC the decoder will recover after
+/// it re-adds the predictor). This procedure replaces it in place with
+/// the **residual** the §7.7 token stream actually carries: the
+/// difference between the reconstructed DC and the predictor the
+/// decoder will recompute from its already-decoded neighbours.
+///
+/// Because [`compute_dc_predictor`] forms each predictor from the
+/// *reconstructed* DC values of earlier raster neighbours — and the
+/// decoder, running [`invert_dc_prediction`], rebuilds exactly those
+/// same reconstructed values as it goes — the encoder must predict
+/// against the reconstructed DCs, not the residuals it is writing. A
+/// scratch copy of the reconstructed DC column is therefore taken
+/// before any residual is written, and every predictor is computed
+/// against that frozen copy. The `LASTDC` register file is advanced
+/// with the reconstructed DC exactly as the inverse does (§7.8.2 step
+/// 1(d)i.G), so the predictor sequence the encoder produces matches
+/// the decoder's bit-for-bit.
+///
+/// The residual is truncated to a 16-bit two's-complement
+/// representation (the inverse of §7.8.2 step 1(d)i.C's truncated
+/// add): `residual = (reconstructed_dc − dcpred) as i16`. When the
+/// decoder adds the predictor back and re-truncates, it recovers the
+/// reconstructed DC for any value in `i16` range.
+///
+/// Inputs mirror [`invert_dc_prediction`] exactly (same `bcoded`,
+/// `mbmodes`, `block_to_macro_block`, `neighbors`,
+/// `plane_raster_order`, in-place `coeffs`). The same error variants
+/// are returned for malformed geometry.
+pub fn forward_dc_prediction(
+    bcoded: &[u8],
+    mbmodes: &[MacroBlockMode],
+    block_to_macro_block: &[u32],
+    neighbors: &[DcPredictorNeighbors],
+    plane_raster_order: &[&[u32]],
+    coeffs: &mut [[i16; 64]],
+) -> Result<(), Error> {
+    if plane_raster_order.len() != 3 {
+        return Err(Error::DcInversionPlaneCount {
+            got: plane_raster_order.len(),
+        });
+    }
+    let nbs = bcoded.len();
+    let nbs_u32 = nbs as u32;
+    if block_to_macro_block.len() != nbs {
+        return Err(Error::DcInversionLenMismatch {
+            which: DcInversionLenField::BlockToMacroBlock,
+            got: block_to_macro_block.len(),
+            nbs,
+        });
+    }
+    if neighbors.len() != nbs {
+        return Err(Error::DcInversionLenMismatch {
+            which: DcInversionLenField::Neighbors,
+            got: neighbors.len(),
+            nbs,
+        });
+    }
+    if coeffs.len() != nbs {
+        return Err(Error::DcInversionLenMismatch {
+            which: DcInversionLenField::Coeffs,
+            got: coeffs.len(),
+            nbs,
+        });
+    }
+
+    // Freeze the reconstructed DC column. `compute_dc_predictor` reads
+    // `coeffs[bj][0]` for the neighbour blocks, which on the decoder
+    // side are the already-reconstructed DCs. We must predict against
+    // those, not the residuals we overwrite below, so build a private
+    // reconstructed-DC view the predictor consults while `coeffs` is
+    // mutated in place.
+    let recon = coeffs.to_vec();
+
+    let mut visited = vec![0u8; nbs];
+
+    for (pli_usize, plane_blocks) in plane_raster_order.iter().enumerate() {
+        let pli = pli_usize as u8;
+        let mut lastdc = DcLastDc::zero();
+
+        for &bi in plane_blocks.iter() {
+            if bi >= nbs_u32 {
+                return Err(Error::DcInversionBlockIndexOutOfRange {
+                    pli,
+                    bi,
+                    nbs: nbs_u32,
+                });
+            }
+            if visited[bi as usize] != 0 {
+                return Err(Error::DcInversionDuplicateBlockIndex { bi, pli });
+            }
+            visited[bi as usize] = 1;
+
+            if bcoded[bi as usize] == 0 {
+                continue;
+            }
+
+            // Predict against the frozen reconstructed DC column, the
+            // same values the decoder will hold when it reaches `bi`.
+            let dcpred = compute_dc_predictor(
+                bi,
+                bcoded,
+                mbmodes,
+                block_to_macro_block,
+                neighbors,
+                &lastdc,
+                &recon,
+            )?;
+
+            let recon_dc = recon[bi as usize][0] as i32;
+
+            // Residual = reconstructed DC − predictor, truncated to
+            // i16 (the inverse of the decoder's truncated add).
+            let residual = recon_dc.wrapping_sub(dcpred) as i16;
+            coeffs[bi as usize][0] = residual;
+
+            // Advance LASTDC with the reconstructed DC, exactly as
+            // §7.8.2 step 1(d)i.G does (the decoder seeds the same
+            // value). `recon` already holds it; no write needed.
+            let mbi = block_to_macro_block[bi as usize];
+            if (mbi as usize) >= mbmodes.len() {
+                return Err(Error::DcPredictorMacroBlockIndexOutOfRange {
+                    mbi,
+                    nmbs: mbmodes.len() as u32,
+                });
+            }
+            let rfi = reference_frame_for_mb_mode(mbmodes[mbi as usize]);
+            lastdc.set(rfi, recon_dc as i16 as i32);
+        }
+    }
+
+    Ok(())
+}
+
 /// Mapping from natural-order DCT coefficient index `ci` (row-major,
 /// `row = ci/8`, `col = ci%8`) to its zig-zag position `zzi`, per
 /// Figure 2.8 ("Zig-zag order") of the Theora I Specification.
@@ -18719,6 +18856,103 @@ mod tests {
         let plane = [&[][..], &[][..], &[][..]];
         invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
         assert!(coeffs.is_empty());
+    }
+
+    // ----- forward DC prediction (encoder) round-trip tests (r338) -----
+
+    /// `forward_dc_prediction` must be the exact inverse of
+    /// `invert_dc_prediction`: starting from a set of reconstructed
+    /// DCs, forward-predict to residuals, then invert back and recover
+    /// the original reconstructed DCs bit-for-bit.
+    #[test]
+    fn forward_dc_prediction_round_trips_through_invert() {
+        // Two-block raster chain: block 1's left neighbour is block 0.
+        let bcoded = vec![1u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32, 0u32];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 2];
+        neighbors[1].left = Some(0);
+        let plane = [&[0u32, 1u32][..], &[][..], &[][..]];
+
+        // Reconstructed DCs we want the decoder to recover.
+        let recon_dcs = [40i16, 47i16];
+        let mut coeffs = coeffs_with_dc(&recon_dcs);
+        forward_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        // Block 0: predictor 0 → residual 40. Block 1: predictor 40
+        // (left neighbour reconstructed DC) → residual 7.
+        assert_eq!(coeffs[0][0], 40);
+        assert_eq!(coeffs[1][0], 7);
+
+        // Inverting the residuals recovers the reconstructed DCs.
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 40);
+        assert_eq!(coeffs[1][0], 47);
+    }
+
+    /// A larger raster grid round-trips: a 4-block luma plane with the
+    /// standard left/lower-left/lower/lower-right neighbour wiring.
+    #[test]
+    fn forward_dc_prediction_round_trips_multi_block_grid() {
+        // 2×2 block grid, single macro block, all Intra. Neighbour
+        // wiring approximates a raster order 0,1,2,3 where 1's left is
+        // 0, 2's left is none but lower is 0, 3's left is 2 and
+        // lower-left is none.
+        let nbs = 4;
+        let bcoded = vec![1u8; nbs];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; nbs];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); nbs];
+        neighbors[1].left = Some(0);
+        neighbors[2].lower = Some(0);
+        neighbors[3].left = Some(2);
+        neighbors[3].lower = Some(1);
+        let plane = [&[0u32, 1, 2, 3][..], &[][..], &[][..]];
+
+        let recon_dcs = [120i16, -45, 77, 200];
+        let original = coeffs_with_dc(&recon_dcs);
+        let mut coeffs = original.clone();
+        forward_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        // Residuals differ from the reconstructed DCs (prediction did
+        // something) for at least one predicted block.
+        assert_ne!(coeffs, original);
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs, original, "forward then inverse must be identity");
+    }
+
+    /// Uncoded blocks carry no DC and must be left untouched by the
+    /// forward pass (mirroring the inverse's skip).
+    #[test]
+    fn forward_dc_prediction_skips_uncoded_blocks() {
+        let bcoded = vec![1u8, 0u8, 1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32; 3];
+        let mut neighbors = vec![DcPredictorNeighbors::default(); 3];
+        neighbors[2].left = Some(0);
+        let plane = [&[0u32, 1, 2][..], &[][..], &[][..]];
+        let mut coeffs = coeffs_with_dc(&[50, 999, 60]);
+        forward_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        // The uncoded block's DC is untouched.
+        assert_eq!(coeffs[1][0], 999);
+        // Round-trip on the coded blocks.
+        invert_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs).unwrap();
+        assert_eq!(coeffs[0][0], 50);
+        assert_eq!(coeffs[2][0], 60);
+    }
+
+    /// Geometry rejects mirror `invert_dc_prediction`.
+    #[test]
+    fn forward_dc_prediction_rejects_wrong_plane_count() {
+        let bcoded = vec![1u8];
+        let mbmodes = vec![MacroBlockMode::Intra];
+        let b2m = vec![0u32];
+        let neighbors = vec![DcPredictorNeighbors::default()];
+        let mut coeffs = coeffs_with_dc(&[0]);
+        let plane = [&[0u32][..], &[][..]];
+        assert_eq!(
+            forward_dc_prediction(&bcoded, &mbmodes, &b2m, &neighbors, &plane, &mut coeffs)
+                .unwrap_err(),
+            Error::DcInversionPlaneCount { got: 2 }
+        );
     }
 
     /// `Display` rendering carries the §7.8.2 section tag for every

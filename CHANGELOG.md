@@ -6,6 +6,21 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- forward DC prediction — the inverse of §7.8.2 (round 338, third
+  encoder commit). New public `forward_dc_prediction(bcoded, mbmodes,
+  block_to_macro_block, neighbors, plane_raster_order, coeffs)` replaces
+  each coded block's reconstructed DC (held in `COEFFS[bi][0]` on entry)
+  with the residual the §7.7 token stream carries: `residual =
+  (reconstructed_dc − DCPRED) as i16`. The predictor is formed by the
+  same §7.8.1 `compute_dc_predictor` the decoder uses, against a frozen
+  copy of the reconstructed DC column (so the encoder predicts from the
+  same values `invert_dc_prediction` rebuilds), advancing the per-plane
+  `LASTDC` register file identically. Forward then inverse is the exact
+  identity on the reconstructed DCs for any `i16` value. 4 new tests
+  (two-block and 2×2-grid round-trips back through
+  `invert_dc_prediction`, uncoded-block skip, and the plane-count
+  reject).
+
 - forward (encoder-side) quantization — the inverse of §7.9.2
   dequantization (round 338, second encoder commit). New public
   `quantize_block(dqc, qmat_dc, qmat_ac) -> [i16; 64]` divides each

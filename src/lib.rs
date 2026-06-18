@@ -7626,8 +7626,8 @@ fn fdct_div_2p16(x: i32) -> i32 {
 /// does not mandate a particular forward transform (only the inverse is
 /// required to be bit-exact across implementations), but §7.9.3.3
 /// provides this signal-flow-graph version "as a convenience for
-/// implementing an encoder". It is the same forward transform used by
-/// Xiph.Org's Theora encoder and by VP3.
+/// implementing an encoder". The procedure transcribed here is exactly
+/// the one §7.9.3.3 lists.
 ///
 /// The signal flow graph (Figure 7.2) is largely the reverse of the
 /// inverse flow graph; the signs on the rotation constants change and

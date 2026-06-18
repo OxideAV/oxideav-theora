@@ -1,9 +1,10 @@
 # oxideav-theora
 
-Pure-Rust Theora video decoder — clean-room implementation, in
-progress. The crate decodes Theora packets directly (it does not parse
-the Ogg container); callers de-frame the bitstream packets and hand them
-in. There is no encoder yet.
+Pure-Rust Theora video codec — clean-room implementation, in progress.
+The crate works on Theora packets directly (it does not parse the Ogg
+container); callers de-frame the bitstream packets and hand them in. The
+decoder is sample-exact for its supported feature set; an intra-frame
+encoder now round-trips through the crate's own decoder faithfully.
 
 ## What works
 
@@ -40,6 +41,20 @@ against reference output.
 reference promotion) and is the high-level entry point. Empty (zero-byte)
 packets are handled as duplicate-frame markers.
 
+* **Intra encoder** — `FrameEncoder` turns a macro-block-aligned
+  `SourceFrame` into a §7 video-data packet. The forward pipeline
+  inverts the decoder's: the §7.9.3.3 forward DCT (`forward_dct_1d` /
+  `forward_dct_2d`), forward quantization (`quantize_block`, the inverse
+  of §7.9.2), forward §7.8 DC prediction (`forward_dc_prediction`), and
+  the §7.7 token entropy writer (single-coefficient tokens 9–22,
+  zero-run token 8, self-terminating EOB) over a new MSb-first
+  `BitWriter`. An intra, all-coded, single-`qi` frame emits no §7.3 /
+  §7.4 / §7.5 / §7.6 bits, matching the decoder's intra short-circuits.
+  An encoded INTRA frame decodes back through this crate's own
+  `FrameDecoder` faithfully to within the quantizer step (a 32×32
+  gradient round-trips with max luma error 5 / mean 0.27 at the weakest
+  quantiser, chroma exact; a flat frame is lossless).
+
 * **Framework `Decoder` integration** — `TheoraDecoder` implements
   `oxideav_core::Decoder`, and `register` installs it into a
   `RuntimeContext` (reachable through the shared `CodecRegistry`). Packets
@@ -67,8 +82,14 @@ inter branches (asserted in addition to the sample-exact pixel match).
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **Encoder** — none. The forward DCT (non-normative in the spec) is
-  deferred to a future encoder-side effort.
+* **Inter-frame encoding** — the encoder is intra (keyframe) only. Inter
+  prediction, motion estimation, mode decision, and rate control are
+  future work. Header-packet *serialization* (writing the §6
+  identification / comment / setup headers) is also not yet
+  implemented: the encoder reuses the same in-memory header objects the
+  decoder consumes, so a full encode that emits a complete stream
+  (headers + data) — and the `oxideav_core::Encoder` trait integration
+  that depends on it — remain to be wired.
 * **Golden-reference and four-MV inter modes** (`INTER_GOLDEN_MV` /
   `INTER_MV_FOUR`) — implemented in the reconstruction code paths and
   now exercised through the full `reconstruct_frame` driver
@@ -77,8 +98,10 @@ inter branches (asserted in addition to the sample-exact pixel match).
   corpus fixture: the reference encoder's `testsrc`-class encodes never emit a
   golden or four-MV macroblock, so no `expected.yuv` fixture covers
   these modes top-to-bottom from a real bitstream.
-* **Framework `Encoder` trait integration** — there is no encoder, so
-  no `oxideav_core::Encoder` impl. The decoder side is wired (see
+* **Framework `Encoder` trait integration** — the intra encoder is
+  reachable through the direct `FrameEncoder` API, but there is no
+  `oxideav_core::Encoder` impl yet (it needs the header-packet
+  serialization noted above). The decoder side is fully wired (see
   above).
 
 ## Usage
@@ -113,6 +136,24 @@ let mut dec = TheoraDecoder::with_headers(
 .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
 dec.send_packet(&Packet::new(0, TimeBase::from_rate(1), data.to_vec()))?;
 let _frame = dec.receive_frame()?; // Frame::Video, top-down planes
+# Ok(())
+# }
+```
+
+To encode an intra frame, build a `FrameEncoder` from the same header
+objects and a quantization index, then hand it a `SourceFrame` (three
+planes, lower-left row-major, at the coded macro-block-aligned
+dimensions). The produced packet decodes back through `FrameDecoder`:
+
+```rust
+use oxideav_theora::{FrameEncoder, FrameDecoder, SourceFrame};
+# fn run(ident: oxideav_theora::TheoraIdentHeader,
+#        setup: oxideav_theora::SetupHeaderTables,
+#        frame: SourceFrame) -> Result<(), oxideav_theora::Error> {
+let enc = FrameEncoder::new(ident.clone(), setup.clone(), /* qi */ 32)?;
+let packet = enc.encode_intra_frame(&frame)?;
+let mut dec = FrameDecoder::new(ident, setup)?;
+let _decoded = dec.decode_frame(&packet)?; // faithful to within the quantizer
 # Ok(())
 # }
 ```

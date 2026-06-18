@@ -74,7 +74,7 @@ inter branches (asserted in addition to the sample-exact pixel match).
   now exercised through the full `reconstruct_frame` driver
   (golden-reference plane selection and per-block four-MV luma motion
   with the averaged chroma MV), but not yet by a *reference-captured*
-  corpus fixture: libtheora's `testsrc`-class encodes never emit a
+  corpus fixture: the reference encoder's `testsrc`-class encodes never emit a
   golden or four-MV macroblock, so no `expected.yuv` fixture covers
   these modes top-to-bottom from a real bitstream.
 * **Framework `Encoder` trait integration** — there is no encoder, so

@@ -6,6 +6,24 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- §7.9.3.3 forward DCT — the non-normative encoder-side transform
+  (round 338, first encoder commit). New public `forward_dct_1d(x:
+  &[i16; 8]) -> [i16; 8]` transcribes the 31-step §7.9.3.3 signal-flow
+  procedure (the reverse of §7.9.3.1 with the rotation-constant signs
+  flipped and the C4 scale factors moved to the opposite butterfly
+  side) using the same Table 7.65 constants as the inverse, and
+  `forward_dct_2d(input: &[[i16; 8]; 8]) -> [i16; 64]` applies it
+  row-then-column to produce natural-order coefficients in the exact
+  scale the §7.9.2 dequantizer expects. The §7.9.3.3 `//2^16`
+  floor-division-toward-zero is implemented by the `fdct_div_2p16`
+  helper (the spec's 0xFFFF-negative-offset form). A flat block of
+  value `v` forward-transforms to a DC-only `DQC[0] ≈ 32 * v` that the
+  §7.9.3.2 inverse maps back to `v` exactly; textured blocks round-trip
+  through forward → inverse with ≤ 2 levels of fixed-point error and no
+  quantization. 4 new tests. This is the first piece of the deferred
+  encoder; quantization, forward DC prediction, the token entropy
+  writer, and the frame-level encode driver follow.
+
 - exercise the golden-reference and four-MV inter modes through the
   full §7.9.4 `reconstruct_frame` driver (round 334). Two new
   frame-driver integration tests close the gap between the existing

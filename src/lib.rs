@@ -7047,6 +7047,176 @@ pub fn inverse_dct_2d(dqc: &[i16; 64]) -> [[i16; 8]; 8] {
     res
 }
 
+// =====================================================================
+// §7.9.3.3 The 1D Forward DCT (Non-Normative)
+// =====================================================================
+
+/// Spec §7.9.3.3 floor-division by 2^16.
+///
+/// The §7.9.3.3 prose specifies "a proper division by 2^16 ... instead
+/// of a shift", noting it "can be implemented quickly by adding an
+/// offset of 0xFFFF if the number is negative, and then shifting as
+/// before". For a non-negative `x` this is `x >> 16`; for a negative
+/// `x` it is `(x + 0xFFFF) >> 16` — i.e. division that rounds *toward
+/// zero* rather than the arithmetic right shift's round toward
+/// negative infinity. Rust's `i32` `/` already truncates toward zero,
+/// which is exactly the "proper division" the spec calls for, so this
+/// helper is `dividend / 65536` with the explicit-offset form written
+/// out to match the spec text.
+#[inline]
+fn fdct_div_2p16(x: i32) -> i32 {
+    // Equivalent to `x / 65536` (truncation toward zero). Written via
+    // the spec's negative-offset trick so the transcription is
+    // self-evidently §7.9.3.3.
+    if x < 0 {
+        (x.wrapping_add(0xFFFF)) >> 16
+    } else {
+        x >> 16
+    }
+}
+
+/// Apply the §7.9.3.3 1D forward DCT to an 8-element row of input
+/// values, returning the 8-element row of forward-DCT coefficients.
+///
+/// This is the non-normative companion to [`inverse_dct_1d`]: the spec
+/// does not mandate a particular forward transform (only the inverse is
+/// required to be bit-exact across implementations), but §7.9.3.3
+/// provides this signal-flow-graph version "as a convenience for
+/// implementing an encoder". It is the same forward transform used by
+/// Xiph.Org's Theora encoder and by VP3.
+///
+/// The signal flow graph (Figure 7.2) is largely the reverse of the
+/// inverse flow graph; the signs on the rotation constants change and
+/// the `C4` scale factors move to the opposite butterfly side. The 31
+/// numbered steps below mirror §7.9.3.3 verbatim. The shared
+/// constants `C3`/`S3`, `C4`, `C6`/`S6`, `C7`/`S7` are the same 16-bit
+/// approximations used by the inverse transform (Table 7.65).
+///
+/// Per §7.9.3.3, 16-bit registers and a 16×16→32 multiply suffice to
+/// avoid overflow as long as the input is in `−6270..=6270`; this
+/// implementation keeps the intermediates in `i32` for clarity. The
+/// `//2^16` floor-division-toward-zero steps use [`fdct_div_2p16`].
+pub fn forward_dct_1d(x: &[i16; 8]) -> [i16; 8] {
+    let x0 = x[0] as i32;
+    let x1 = x[1] as i32;
+    let x2 = x[2] as i32;
+    let x3 = x[3] as i32;
+    let x4 = x[4] as i32;
+    let x5 = x[5] as i32;
+    let x6 = x[6] as i32;
+    let x7 = x[7] as i32;
+
+    let mut t = [0i32; 8];
+
+    // Steps 1–8.
+    t[0] = x0.wrapping_add(x7);
+    t[1] = x1.wrapping_add(x6);
+    t[2] = x2.wrapping_add(x5);
+    t[3] = x3.wrapping_add(x4);
+    t[4] = x3.wrapping_sub(x4);
+    t[5] = x2.wrapping_sub(x5);
+    t[6] = x1.wrapping_sub(x6);
+    t[7] = x0.wrapping_sub(x7);
+
+    // Steps 9–14: butterflies on the even group.
+    let mut r = t[0].wrapping_add(t[3]);
+    t[3] = t[0].wrapping_sub(t[3]);
+    t[0] = r;
+    r = t[1].wrapping_add(t[2]);
+    t[2] = t[1].wrapping_sub(t[2]);
+    t[1] = r;
+
+    // Steps 15–17: C4 rotation on the odd group.
+    r = t[6].wrapping_sub(t[5]);
+    t[6] = fdct_div_2p16(IDCT_C4.wrapping_mul(t[6].wrapping_add(t[5])));
+    t[5] = fdct_div_2p16(IDCT_C4.wrapping_mul(r));
+
+    // Steps 18–23: butterflies on the odd group.
+    r = t[4].wrapping_add(t[5]);
+    t[5] = t[4].wrapping_sub(t[5]);
+    t[4] = r;
+    r = t[7].wrapping_add(t[6]);
+    t[6] = t[7].wrapping_sub(t[6]);
+    t[7] = r;
+
+    // Steps 24–31: output rotations.
+    let mut y = [0i16; 8];
+    // Step 24: Y[0] = (C4 * (T[0] + T[1])) // 2^16.
+    y[0] = fdct_div_2p16(IDCT_C4.wrapping_mul(t[0].wrapping_add(t[1]))) as i16;
+    // Step 25: Y[4] = (C4 * (T[0] − T[1])) // 2^16.
+    y[4] = fdct_div_2p16(IDCT_C4.wrapping_mul(t[0].wrapping_sub(t[1]))) as i16;
+    // Step 26: Y[2] = (S6 * T[3]) // 2^16 + (C6 * T[2]) // 2^16.
+    y[2] = fdct_div_2p16(IDCT_S6.wrapping_mul(t[3]))
+        .wrapping_add(fdct_div_2p16(IDCT_C6.wrapping_mul(t[2]))) as i16;
+    // Step 27: Y[6] = (C6 * T[3]) // 2^16 − (S6 * T[2]) // 2^16.
+    y[6] = fdct_div_2p16(IDCT_C6.wrapping_mul(t[3]))
+        .wrapping_sub(fdct_div_2p16(IDCT_S6.wrapping_mul(t[2]))) as i16;
+    // Step 28: Y[1] = (S7 * T[7]) // 2^16 + (C7 * T[4]) // 2^16.
+    y[1] = fdct_div_2p16(IDCT_S7.wrapping_mul(t[7]))
+        .wrapping_add(fdct_div_2p16(IDCT_C7.wrapping_mul(t[4]))) as i16;
+    // Step 29: Y[5] = (S3 * T[6]) // 2^16 + (C3 * T[5]) // 2^16.
+    y[5] = fdct_div_2p16(IDCT_S3.wrapping_mul(t[6]))
+        .wrapping_add(fdct_div_2p16(IDCT_C3.wrapping_mul(t[5]))) as i16;
+    // Step 30: Y[3] = (C3 * T[6]) // 2^16 − (S3 * T[5]) // 2^16.
+    y[3] = fdct_div_2p16(IDCT_C3.wrapping_mul(t[6]))
+        .wrapping_sub(fdct_div_2p16(IDCT_S3.wrapping_mul(t[5]))) as i16;
+    // Step 31: Y[7] = (C7 * T[7]) // 2^16 − (S7 * T[4]) // 2^16.
+    y[7] = fdct_div_2p16(IDCT_C7.wrapping_mul(t[7]))
+        .wrapping_sub(fdct_div_2p16(IDCT_S7.wrapping_mul(t[4]))) as i16;
+
+    y
+}
+
+/// Apply the 2D forward DCT to an 8×8 block of input samples, returning
+/// the 64-element natural-order array of forward-DCT coefficients
+/// (`DQC[ri * 8 + ci]`) ready to be quantized by [`quantize_block`].
+///
+/// This is the non-normative encoder companion to [`inverse_dct_2d`].
+/// Mirroring the §7.9.3.2 two-pass structure, it applies the §7.9.3.3
+/// 1D forward DCT first to each row of the input, then to each column
+/// of the row-transformed result.
+///
+/// # Scaling
+///
+/// [`inverse_dct_2d`] applies two 1D inverse passes (each scaling its
+/// orthonormal result by a factor of two, i.e. a combined factor of
+/// four) and then divides by 16 via the `(X + 8) >> 4` step, so a flat
+/// block with DC coefficient `D` reconstructs to `D / 32` per sample.
+/// The §7.9.3.3 forward transform carries the matching inverse gain:
+/// applying the two 1D forward passes directly (no extra pre- or
+/// post-scaling) produces coefficients in exactly the scale the
+/// §7.9.2 dequantizer expects, so the full forward → quantize →
+/// dequantize → inverse round-trip is near-lossless at unit quantizer
+/// step. A flat block of value `v` yields `DQC[0] ≈ 32 * v`, which the
+/// inverse maps back to `v`.
+///
+/// Inputs are `i16` spatial samples (typically a residual in the range
+/// `−255..=255` for intra blocks, where the §7.9.1.1 predictor is the
+/// constant 128). Outputs are `i16` natural-order coefficients.
+pub fn forward_dct_2d(input: &[[i16; 8]; 8]) -> [i16; 64] {
+    // Pass 1: row-by-row 1D forward DCT.
+    let mut res = [[0i16; 8]; 8];
+    for (ri, res_row) in res.iter_mut().enumerate() {
+        let x = forward_dct_1d(&input[ri]);
+        res_row.copy_from_slice(&x);
+    }
+
+    // Pass 2: column-by-column 1D forward DCT.
+    let mut out = [0i16; 64];
+    for ci in 0..8 {
+        let mut col = [0i16; 8];
+        for (ri, slot) in col.iter_mut().enumerate() {
+            *slot = res[ri][ci];
+        }
+        let y = forward_dct_1d(&col);
+        for (ri, &v) in y.iter().enumerate() {
+            out[ri * 8 + ci] = v;
+        }
+    }
+
+    out
+}
+
 /// MSb-first bit reader implementing §5.2 of the Theora I
 /// Specification.
 ///
@@ -19630,6 +19800,103 @@ mod tests {
             for v in row.iter() {
                 assert_eq!(*v, 0);
             }
+        }
+    }
+
+    // ----- §7.9.3.3 forward DCT (non-normative encoder helper) -----
+
+    /// A flat input block (all samples equal `v`) must forward-transform
+    /// to a DC-only block, then inverse-transform back to the same flat
+    /// block exactly. This pins the §7.9.3.3 / §7.9.3.2 scale match: the
+    /// forward DC coefficient is `≈ 32 * v`, and the inverse maps
+    /// `DQC[0] = 32 * v` back to `v` per cell.
+    #[test]
+    fn fdct_2d_flat_block_round_trips_through_idct() {
+        for &v in &[-200i16, -127, -50, -1, 0, 1, 50, 127, 200, 255] {
+            let input = [[v; 8]; 8];
+            let coeffs = forward_dct_2d(&input);
+            // All AC coefficients are zero for a flat block.
+            for (ci, &c) in coeffs.iter().enumerate().skip(1) {
+                assert_eq!(c, 0, "AC coeff {ci} of a flat block must be zero (v={v})");
+            }
+            // DC is approximately 32 * v.
+            let expected_dc = 32 * v as i32;
+            assert!(
+                (coeffs[0] as i32 - expected_dc).abs() <= 32,
+                "flat-block DC {} should be ≈ 32*{} = {}",
+                coeffs[0],
+                v,
+                expected_dc
+            );
+            // Inverse reconstructs the flat block exactly.
+            let res = inverse_dct_2d(&coeffs);
+            for row in &res {
+                for &r in row {
+                    assert_eq!(r, v, "flat block v={v} must round-trip exactly");
+                }
+            }
+        }
+    }
+
+    /// A textured (non-flat) input block must round-trip through
+    /// forward → inverse DCT with at most a small fixed-point rounding
+    /// error. With no quantization the only loss is the integer
+    /// truncation in the two transform pairs, bounded to a couple of
+    /// levels per sample.
+    #[test]
+    fn fdct_2d_textured_block_round_trips_within_small_error() {
+        let mut input = [[0i16; 8]; 8];
+        for (ri, row) in input.iter_mut().enumerate() {
+            for (ci, slot) in row.iter_mut().enumerate() {
+                // A deterministic non-separable pattern in −64..=63.
+                *slot = (((ri * 13 + ci * 7) as i16) % 128) - 64;
+            }
+        }
+        let coeffs = forward_dct_2d(&input);
+        // At least one AC coefficient is non-zero for a textured block.
+        assert!(
+            coeffs.iter().skip(1).any(|&c| c != 0),
+            "a textured block must excite AC coefficients"
+        );
+        let res = inverse_dct_2d(&coeffs);
+        let mut max_err = 0i16;
+        for (ri, row) in input.iter().enumerate() {
+            for (ci, &v) in row.iter().enumerate() {
+                let e = (res[ri][ci] - v).abs();
+                if e > max_err {
+                    max_err = e;
+                }
+            }
+        }
+        assert!(max_err <= 2, "round-trip error {max_err} exceeds tolerance");
+    }
+
+    /// `forward_dct_2d` is pure: the same input yields the same output.
+    #[test]
+    fn fdct_2d_is_deterministic() {
+        let mut input = [[0i16; 8]; 8];
+        for (ri, row) in input.iter_mut().enumerate() {
+            for (ci, slot) in row.iter_mut().enumerate() {
+                *slot = (ri as i16) * 8 + ci as i16 - 32;
+            }
+        }
+        assert_eq!(forward_dct_2d(&input), forward_dct_2d(&input));
+    }
+
+    /// `fdct_div_2p16` is truncation toward zero (the §7.9.3.3 "proper
+    /// division by 2^16" via the 0xFFFF negative offset).
+    #[test]
+    fn fdct_div_2p16_truncates_toward_zero() {
+        assert_eq!(fdct_div_2p16(0), 0);
+        assert_eq!(fdct_div_2p16(65536), 1);
+        assert_eq!(fdct_div_2p16(65535), 0);
+        assert_eq!(fdct_div_2p16(-65536), -1);
+        assert_eq!(fdct_div_2p16(-65535), 0);
+        assert_eq!(fdct_div_2p16(131071), 1);
+        assert_eq!(fdct_div_2p16(-131071), -1);
+        // Cross-check against plain integer division for a range.
+        for x in [-200003i32, -70000, -1, 1, 70000, 200003] {
+            assert_eq!(fdct_div_2p16(x), x / 65536);
         }
     }
 

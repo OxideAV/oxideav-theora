@@ -6,6 +6,34 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **intra-frame encoder — encode → decode self-roundtrip (round 338
+  milestone)**. New public `FrameEncoder` / `SourceFrame` turn a
+  macro-block-aligned source frame into a §7 video-data packet that
+  this crate's own `FrameDecoder` reconstructs faithfully (to within
+  the quantizer step). The forward pipeline inverts the decoder's: per
+  block, extract the 8×8 spatial samples, subtract the §7.9.1.1 intra
+  predictor (constant 128), apply the §7.9.3.3 forward DCT, and
+  `quantize_block` to zig-zag coefficients; run `forward_dc_prediction`
+  so each DC slot carries the §7.7 residual; then write the §7.1 intra
+  frame header (`0` data bit, `FTYPE=0`, 6-bit `QIS[0]`, `MOREQIS=0`,
+  3 reserved zero bits) and the §7.7.3 token stream onto one shared
+  `BitWriter`. An intra, all-coded, single-`qi` frame needs no §7.3 /
+  §7.4 / §7.5 / §7.6 bits, matching the decoder's no-bit-read
+  short-circuits. Supporting additions: the MSb-first `BitWriter` (the
+  encoder-side inverse of the §5.2 `BitReader`); the §7.7 forward token
+  writer (`encode_dct_coefficients_inner` + `plan_block_tokens`,
+  emitting single-coefficient tokens 9..=22, zero-run token 8, and a
+  self-terminating EOB so EOB runs never span blocks), which
+  round-trips quantized coefficients bit-for-bit through
+  `decode_dct_coefficients` across both luma and chroma table
+  selectors. New error variants `EncodeCoefficientOutOfRange`,
+  `EncodeHuffmanTokenMissing`, `EncodePlaneLenMismatch`,
+  `EncodeBlockOutOfPlane`. End-to-end: a 32×32 synthetic gradient
+  round-trips with max Y error 5 / mean 0.27 at qi=63 (chroma exact)
+  and a flat-128 frame round-trips losslessly; +13 tests (forward
+  token round-trip, planner shapes, bit-writer round-trip, three
+  encode→decode self-roundtrips, and the geometry/qi rejects).
+
 - forward DC prediction — the inverse of §7.8.2 (round 338, third
   encoder commit). New public `forward_dc_prediction(bcoded, mbmodes,
   block_to_macro_block, neighbors, plane_raster_order, coeffs)` replaces

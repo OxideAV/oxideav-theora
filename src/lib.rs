@@ -839,6 +839,44 @@ pub enum Error {
         /// The block's residual `TIS` value (0..63).
         tis: u8,
     },
+    /// The forward (encoder) §7.7 token planner met a coefficient whose
+    /// magnitude exceeds the single-coefficient token range
+    /// (`|v| > 580`). The encoder clamps coefficients before
+    /// quantization, so this is an internal-invariant guard.
+    EncodeCoefficientOutOfRange {
+        /// The coded block index whose coefficients overran the range.
+        bi: u32,
+    },
+    /// The forward (encoder) §7.7 token writer could not find a leaf for
+    /// a planned token in the selected §6.4.4 Huffman table. The full
+    /// default tables carry every token, so this fires only for a
+    /// pathological setup header missing a token leaf.
+    EncodeHuffmanTokenMissing {
+        /// The Huffman-table index that lacked the token.
+        hti: u8,
+        /// The token value with no leaf in that table.
+        token: u8,
+    },
+    /// [`FrameEncoder::encode_intra_frame`] was handed a source plane
+    /// whose length disagrees with the coded (macro-block-aligned)
+    /// geometry.
+    EncodePlaneLenMismatch {
+        /// The plane index (`0` Y, `1` Cb, `2` Cr).
+        plane: u8,
+        /// The supplied plane length.
+        got: usize,
+        /// The expected `width * height` length.
+        want: usize,
+    },
+    /// A block's 8×8 footprint escaped its source plane during
+    /// [`FrameEncoder::encode_intra_frame`] — an internal geometry
+    /// inconsistency (the coded dimensions are always a multiple of 8).
+    EncodeBlockOutOfPlane {
+        /// The block's lower-left pixel column.
+        bx: u32,
+        /// The block's lower-left pixel row.
+        by: u32,
+    },
     /// The `bi` argument to [`compute_dc_predictor`] was `>= nbs`, so the
     /// per-block arrays cannot be indexed safely. §7.8.1 works per
     /// coded-order block index; the caller must keep `bi < NBS`.
@@ -1673,6 +1711,22 @@ impl core::fmt::Display for Error {
             Error::DctCoefficientBlockNotClosed { bi, tis } => write!(
                 f,
                 "oxideav-theora: §7.7.3 coded block bi={bi} unclosed: TIS={tis} != 64"
+            ),
+            Error::EncodeCoefficientOutOfRange { bi } => write!(
+                f,
+                "oxideav-theora: §7.7 encode block bi={bi} has a coefficient magnitude > 580"
+            ),
+            Error::EncodeHuffmanTokenMissing { hti, token } => write!(
+                f,
+                "oxideav-theora: §7.7 encode HTS[{hti}] has no leaf for token {token}"
+            ),
+            Error::EncodePlaneLenMismatch { plane, got, want } => write!(
+                f,
+                "oxideav-theora: encode source plane {plane} length {got} != coded {want}"
+            ),
+            Error::EncodeBlockOutOfPlane { bx, by } => write!(
+                f,
+                "oxideav-theora: encode block at ({bx},{by}) escapes its source plane"
             ),
             Error::DcPredictorBlockIndexOutOfRange { bi, nbs } => write!(
                 f,
@@ -5765,6 +5819,275 @@ pub(crate) fn decode_dct_coefficients_inner(
     Ok((coeffs, ncoeffs))
 }
 
+// =====================================================================
+// §7.7 forward (encoder) DCT-coefficient token encode
+// =====================================================================
+
+/// One planned DCT token for a single block, with the extra-bits
+/// payload the §7.7.1 / §7.7.2 procedures consume after the Huffman
+/// code. The `token` value is decoded back identically by the §7.7.3
+/// driver; the `advance` field is how many zig-zag positions the token
+/// consumes (so the encoder can replay the same `TIS` bookkeeping the
+/// decoder does).
+#[derive(Debug, Clone, Copy)]
+struct PlannedToken {
+    /// The §7.7 token value (0..=31).
+    token: u8,
+    /// Extra-bits payload, written MSb-first after the Huffman code.
+    /// `(value, nbits)` pairs in emission order. At most three (e.g.
+    /// run+sign+mag).
+    extra: [(u32, u32); 3],
+    /// Number of `extra` entries that are meaningful.
+    n_extra: u8,
+    /// How many zig-zag positions this token consumes (`TIS` advance).
+    advance: u8,
+}
+
+impl PlannedToken {
+    fn simple(token: u8, advance: u8) -> Self {
+        Self {
+            token,
+            extra: [(0, 0); 3],
+            n_extra: 0,
+            advance,
+        }
+    }
+
+    fn with_extra(token: u8, advance: u8, extra: &[(u32, u32)]) -> Self {
+        let mut e = [(0u32, 0u32); 3];
+        for (i, &pair) in extra.iter().enumerate() {
+            e[i] = pair;
+        }
+        Self {
+            token,
+            extra: e,
+            n_extra: extra.len() as u8,
+            advance,
+        }
+    }
+}
+
+/// Encode a single non-zero coefficient `v` (`v != 0`) as a §7.7.2
+/// single-coefficient token (Table 7.38 tokens 9..=22). Returns the
+/// planned token, advancing `TIS` by 1. The full magnitude range the
+/// single-coefficient tokens cover is `|v| <= 580`; out-of-range
+/// magnitudes return `None` (the caller clamps before quantization so
+/// this never fires for spec-conformant content).
+fn plan_single_coefficient(v: i16) -> Option<PlannedToken> {
+    debug_assert!(v != 0);
+    let sign: u32 = if v < 0 { 1 } else { 0 };
+    let mag = v.unsigned_abs() as u32;
+    let pt = match mag {
+        1 => PlannedToken::simple(if v > 0 { 9 } else { 10 }, 1),
+        2 => PlannedToken::simple(if v > 0 { 11 } else { 12 }, 1),
+        // 13..=16: SIGN + fixed magnitude 3..=6.
+        3 => PlannedToken::with_extra(13, 1, &[(sign, 1)]),
+        4 => PlannedToken::with_extra(14, 1, &[(sign, 1)]),
+        5 => PlannedToken::with_extra(15, 1, &[(sign, 1)]),
+        6 => PlannedToken::with_extra(16, 1, &[(sign, 1)]),
+        // 17: SIGN + 1-bit MAG, offset 7 (range 7..=8).
+        7..=8 => PlannedToken::with_extra(17, 1, &[(sign, 1), (mag - 7, 1)]),
+        // 18: 2-bit MAG, offset 9 (9..=12).
+        9..=12 => PlannedToken::with_extra(18, 1, &[(sign, 1), (mag - 9, 2)]),
+        // 19: 3-bit MAG, offset 13 (13..=20).
+        13..=20 => PlannedToken::with_extra(19, 1, &[(sign, 1), (mag - 13, 3)]),
+        // 20: 4-bit MAG, offset 21 (21..=36).
+        21..=36 => PlannedToken::with_extra(20, 1, &[(sign, 1), (mag - 21, 4)]),
+        // 21: 5-bit MAG, offset 37 (37..=68).
+        37..=68 => PlannedToken::with_extra(21, 1, &[(sign, 1), (mag - 37, 5)]),
+        // 22: 9-bit MAG, offset 69 (69..=580).
+        69..=580 => PlannedToken::with_extra(22, 1, &[(sign, 1), (mag - 69, 9)]),
+        _ => return None,
+    };
+    Some(pt)
+}
+
+/// Build the ordered token plan for one coded block from its zig-zag
+/// quantized coefficients.
+///
+/// The plan reproduces exactly the §7.7.3 decoder's per-block
+/// behaviour: a sequence of tokens that, replayed through §7.7.1 /
+/// §7.7.2, reconstructs `coeffs_zz` and ends the block. Each block is
+/// self-terminated with a single-block EOB token (token 0), so EOB runs
+/// never span blocks and the frame-level interleave stays a simple
+/// per-block cursor.
+///
+/// Strategy: walk zig-zag positions 0..=`last_nz`. Pure zero gaps are
+/// skipped with token 8 (6-bit `RLEN`, run 1..=64); each non-zero
+/// coefficient is a single-coefficient token (9..=22). After the last
+/// non-zero coefficient an EOB token closes the block (zero-filling the
+/// tail). An all-zero block is closed by a single EOB token at ti = 0.
+///
+/// Returns `None` if any coefficient magnitude exceeds the
+/// single-coefficient token range (`|v| > 580`); callers clamp before
+/// quantization so this does not fire for spec-conformant content.
+fn plan_block_tokens(coeffs_zz: &[i16; 64]) -> Option<Vec<PlannedToken>> {
+    // Find the highest non-zero zig-zag index.
+    let last_nz = (0..64).rev().find(|&i| coeffs_zz[i] != 0);
+    let mut plan: Vec<PlannedToken> = Vec::new();
+
+    let Some(last_nz) = last_nz else {
+        // All-zero block: a single EOB token (token 0) zero-fills
+        // [0..64] and pins TIS to 64.
+        plan.push(PlannedToken::simple(0, 64));
+        return Some(plan);
+    };
+
+    let mut ti = 0usize;
+    while ti <= last_nz {
+        if coeffs_zz[ti] != 0 {
+            plan.push(plan_single_coefficient(coeffs_zz[ti])?);
+            ti += 1;
+        } else {
+            // Count the zero run up to the next non-zero (bounded by
+            // last_nz, which is non-zero).
+            let mut run = 0usize;
+            while coeffs_zz[ti] == 0 {
+                run += 1;
+                ti += 1;
+            }
+            // token 8: 6-bit RLEN = run - 1, range 1..=64.
+            let rlen = (run - 1) as u32;
+            plan.push(PlannedToken::with_extra(8, run as u8, &[(rlen, 6)]));
+        }
+    }
+
+    // Close the block: EOB token 0 zero-fills [ti..64], TIS := 64.
+    let remaining = (64 - ti) as u8;
+    plan.push(PlannedToken::simple(0, remaining));
+    Some(plan)
+}
+
+/// Locate the `(code, len)` for a given `token` in a §6.4.4 Huffman
+/// table. Returns `None` if the table has no leaf for that token.
+fn huffman_code_for_token(table: &HuffmanTable, token: u8) -> Option<(u32, u8)> {
+    table
+        .entries
+        .iter()
+        .find(|e| e.token == token)
+        .map(|e| (e.code, e.len))
+}
+
+/// Encode a frame's quantized DCT coefficients into the §7.7.3
+/// bitstream — the encoder-side inverse of [`decode_dct_coefficients`].
+///
+/// Writes the §7.7.3 token stream onto the shared [`BitWriter`]: the
+/// 4-bit `htiL` / `htiC` selectors at `ti ∈ {0, 1}` (both fixed to the
+/// `0` table within each Huffman group, so the `16 * HG` base tables
+/// are used), followed by the interleaved per-`(ti, bi)` Huffman-coded
+/// tokens in exactly the order the §7.7.3 decoder reads them: the outer
+/// loop over `ti`, the inner loop over coded blocks `bi` whose `TIS[bi]`
+/// equals `ti`. Each block carries a self-terminating EOB token
+/// (token 0), so EOB runs never span blocks.
+///
+/// Inputs:
+///   * `w` — the shared bit writer (already positioned after §7.6).
+///   * `nbs` / `nmbs` — frame block / macro-block counts (`NLBS =
+///     4 * NMBS` chooses the luma vs chroma table per block).
+///   * `bcoded` — the per-block coded flag (length `nbs`).
+///   * `coeffs` — per-block zig-zag quantized coefficients (length
+///     `nbs`).
+///   * `hts` — the 80-element §6.4.4 Huffman table array.
+///
+/// Returns [`Error::EncodeCoefficientOutOfRange`] if a coefficient
+/// magnitude exceeds the single-coefficient token range, or
+/// [`Error::EncodeHuffmanTokenMissing`] if a selected table lacks a
+/// leaf for a planned token (never happens for the full default
+/// tables).
+fn encode_dct_coefficients_inner(
+    w: &mut BitWriter,
+    nbs: u32,
+    nmbs: u32,
+    bcoded: &[u8],
+    coeffs: &[[i16; 64]],
+    hts: &[HuffmanTable],
+) -> Result<(), Error> {
+    let nbs_us = nbs as usize;
+    let nlbs = nmbs.saturating_mul(4);
+
+    // Build each coded block's token plan and a per-block cursor.
+    // Uncoded blocks carry an empty plan (never visited).
+    let mut plans: Vec<Vec<PlannedToken>> = Vec::with_capacity(nbs_us);
+    for bi in 0..nbs_us {
+        if bcoded[bi] != 0 {
+            let plan = plan_block_tokens(&coeffs[bi])
+                .ok_or(Error::EncodeCoefficientOutOfRange { bi: bi as u32 })?;
+            plans.push(plan);
+        } else {
+            plans.push(Vec::new());
+        }
+    }
+
+    // Per-block emission state: index into the plan and current TIS.
+    let mut plan_idx = vec![0usize; nbs_us];
+    let mut tis = vec![0u8; nbs_us];
+
+    // Fixed table selectors: the `0` table within each group.
+    let hti_l: u8 = 0;
+    let hti_c: u8 = 0;
+
+    for ti in 0u8..=63 {
+        // §7.7.3 step 4(a): emit the table selectors at ti ∈ {0, 1}.
+        if ti == 0 || ti == 1 {
+            w.write_bits(hti_l as u32, 4);
+            w.write_bits(hti_c as u32, 4);
+        }
+
+        // §7.7.3 step 4(b): for each coded block whose TIS matches ti.
+        for bi in 0..nbs_us {
+            if bcoded[bi] == 0 {
+                continue;
+            }
+            if tis[bi] != ti {
+                continue;
+            }
+            // The next planned token for this block.
+            let idx = plan_idx[bi];
+            debug_assert!(
+                idx < plans[bi].len(),
+                "every coded block's plan terminates with an EOB before TIS reaches 64"
+            );
+            let pt = plans[bi][idx];
+            plan_idx[bi] = idx + 1;
+
+            // Select the §6.4.4 Huffman table (Table 7.42 group × luma
+            // / chroma selector), matching the decoder's addressing.
+            let hg = huffman_table_group(ti);
+            let hti = if (bi as u32) < nlbs {
+                16u8 * hg + hti_l
+            } else {
+                16u8 * hg + hti_c
+            };
+            let table = hts
+                .get(hti as usize)
+                .ok_or(Error::EncodeHuffmanTokenMissing {
+                    hti,
+                    token: pt.token,
+                })?;
+            let (code, len) = huffman_code_for_token(table, pt.token).ok_or(
+                Error::EncodeHuffmanTokenMissing {
+                    hti,
+                    token: pt.token,
+                },
+            )?;
+
+            // Write the Huffman code, then the extra-bits payload.
+            w.write_bits(code, len as u32);
+            for k in 0..pt.n_extra as usize {
+                let (val, nbits) = pt.extra[k];
+                w.write_bits(val, nbits);
+            }
+
+            // Advance TIS exactly as the §7.7.1 / §7.7.2 side effects
+            // would; the EOB / final token pins it to 64.
+            let new_tis = (tis[bi] as u16 + pt.advance as u16).min(64);
+            tis[bi] = new_tis as u8;
+        }
+    }
+
+    Ok(())
+}
+
 // ----------------------------------------------------------------------
 // §7.8.1 Computing the DC Predictor
 // ----------------------------------------------------------------------
@@ -7499,6 +7822,65 @@ impl<'a> BitReader<'a> {
             }
         }
         Ok(value)
+    }
+}
+
+/// MSb-first bit writer — the encoder-side inverse of [`BitReader`].
+///
+/// Bits are packed into bytes most-significant-bit first, matching §5.2
+/// of the Theora I Specification: the first bit written lands in the
+/// MSb of the first output byte. A partially-filled final byte is
+/// zero-padded in its low bits when [`BitWriter::into_bytes`] is
+/// called, so the produced buffer round-trips through [`BitReader`]
+/// exactly for every full integer written.
+struct BitWriter {
+    bytes: Vec<u8>,
+    /// The byte currently being filled (MSb-first). Flushed into
+    /// `bytes` once 8 bits have accumulated.
+    cur: u8,
+    /// Number of bits already written into `cur` (0..=7).
+    nbits: u8,
+}
+
+impl BitWriter {
+    /// Create an empty writer positioned at the MSb of the first byte.
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            cur: 0,
+            nbits: 0,
+        }
+    }
+
+    /// Write the low `n` bits of `value` (0 ≤ n ≤ 32), MSb first. Bits
+    /// above bit `n - 1` are ignored.
+    fn write_bits(&mut self, value: u32, n: u32) {
+        debug_assert!(n <= 32, "write_bits called with n > 32");
+        for i in (0..n).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            self.cur = (self.cur << 1) | bit;
+            self.nbits += 1;
+            if self.nbits == 8 {
+                self.bytes.push(self.cur);
+                self.cur = 0;
+                self.nbits = 0;
+            }
+        }
+    }
+
+    /// Finish writing and return the packed bytes. Any partially-filled
+    /// final byte is left-justified (the written bits occupy the high
+    /// bits) and zero-padded in its low bits.
+    fn into_bytes(mut self) -> Vec<u8> {
+        if self.nbits > 0 {
+            // Left-justify the partial byte so the first-written bit is
+            // the MSb, matching the reader's MSb-first consumption.
+            self.cur <<= 8 - self.nbits;
+            self.bytes.push(self.cur);
+            self.cur = 0;
+            self.nbits = 0;
+        }
+        self.bytes
     }
 }
 
@@ -10887,6 +11269,232 @@ impl FrameDecoder {
             qis: header.qis,
             frame,
         })
+    }
+}
+
+// =====================================================================
+// Intra frame encoder
+// =====================================================================
+
+/// A source frame handed to [`FrameEncoder::encode_intra_frame`].
+///
+/// The three planes are stored in the same lower-left, bottom-up
+/// row-major order the decoder's [`ReconstructedFrame`] uses (the §2.1
+/// coordinate origin), tightly packed at the macro-block-aligned coded
+/// dimensions `(RPYW × RPYH)` for luma and `(RPCW × RPCH)` for chroma.
+/// `samples[y * width + x]` is the sample at column `x`, row `y` from
+/// the lower-left corner.
+#[derive(Debug, Clone)]
+pub struct SourceFrame {
+    /// Luma plane (`RPYW × RPYH`, lower-left row-major).
+    pub samples_y: Vec<u8>,
+    /// Cb plane (`RPCW × RPCH`).
+    pub samples_cb: Vec<u8>,
+    /// Cr plane (`RPCW × RPCH`).
+    pub samples_cr: Vec<u8>,
+}
+
+/// A stateful Theora **intra-frame** encoder, the encoder-side
+/// counterpart to [`FrameDecoder`].
+///
+/// Built from the same [`TheoraIdentHeader`] and [`SetupHeaderTables`]
+/// a decoder consumes, [`FrameEncoder::encode_intra_frame`] turns a
+/// macro-block-aligned [`SourceFrame`] into a §7 video-data packet that
+/// the matching [`FrameDecoder`] reconstructs faithfully (to within the
+/// quantizer step). The pipeline is the inverse of the decoder's:
+///
+/// 1. For every block, extract its 8×8 spatial samples, subtract the
+///    §7.9.1.1 intra predictor (constant 128), apply the §7.9.3.3
+///    forward DCT ([`forward_dct_2d`]), and quantize
+///    ([`quantize_block`]) to zig-zag coefficients.
+/// 2. Run the §7.8 DC prediction forward ([`forward_dc_prediction`]) so
+///    each block's DC slot carries the residual the §7.7 token stream
+///    transmits.
+/// 3. Write the §7.1 intra frame header and the §7.7.3 token stream
+///    ([`encode_dct_coefficients_inner`]) onto one shared
+///    [`BitWriter`]. An intra frame needs no §7.3 / §7.4 / §7.5 / §7.6
+///    bits (every block is coded, every mode is `INTRA`, no motion
+///    vectors, and `NQIS = 1`), exactly matching the decoder's
+///    no-bit-read intra short-circuits.
+///
+/// Only intra (keyframe) encoding is implemented; inter prediction,
+/// motion estimation, and rate control are future work.
+#[derive(Debug)]
+pub struct FrameEncoder {
+    ident: TheoraIdentHeader,
+    setup: SetupHeaderTables,
+    geometry: FrameGeometry,
+    /// Frame-level quantization index used for both the frame header
+    /// `QIS[0]` and the per-block dequantization. `0..=63`.
+    qi: u8,
+}
+
+impl FrameEncoder {
+    /// Build an intra encoder from the identification header, decoded
+    /// setup tables, and a frame-level quantization index `qi`
+    /// (`0..=63`; lower = stronger quantization). The geometry is
+    /// derived once via [`build_frame_geometry`].
+    pub fn new(ident: TheoraIdentHeader, setup: SetupHeaderTables, qi: u8) -> Result<Self, Error> {
+        if qi > 63 {
+            return Err(Error::QuantIndexOutOfRange { qi: qi as usize });
+        }
+        let geometry = build_frame_geometry(&ident)?;
+        Ok(Self {
+            ident,
+            setup,
+            geometry,
+            qi,
+        })
+    }
+
+    /// The identification header this encoder was built from.
+    pub fn ident(&self) -> &TheoraIdentHeader {
+        &self.ident
+    }
+
+    /// The resolved frame geometry.
+    pub fn geometry(&self) -> &FrameGeometry {
+        &self.geometry
+    }
+
+    /// Extract one block's 8×8 spatial samples from a lower-left
+    /// row-major plane at the block's `(BX, BY)` origin.
+    fn extract_block(
+        plane: &[u8],
+        plane_w: u32,
+        plane_h: u32,
+        bx: u32,
+        by: u32,
+    ) -> Result<[[i16; 8]; 8], Error> {
+        if bx + 8 > plane_w || by + 8 > plane_h {
+            return Err(Error::EncodeBlockOutOfPlane { bx, by });
+        }
+        let w = plane_w as usize;
+        let mut block = [[0i16; 8]; 8];
+        for (r, row) in block.iter_mut().enumerate() {
+            let py = (by as usize) + r;
+            for (c, slot) in row.iter_mut().enumerate() {
+                let px = (bx as usize) + c;
+                *slot = plane[py * w + px] as i16;
+            }
+        }
+        Ok(block)
+    }
+
+    /// Encode one intra (keyframe) frame, returning the §7 video-data
+    /// packet bytes.
+    ///
+    /// The supplied [`SourceFrame`] planes must be sized to the coded
+    /// (macro-block-aligned) dimensions in the encoder's geometry
+    /// (`dims_y` for luma, `dims_c` for chroma), lower-left row-major.
+    pub fn encode_intra_frame(&self, frame: &SourceFrame) -> Result<Vec<u8>, Error> {
+        let g = &self.geometry;
+        let nbs = g.nbs as usize;
+
+        // Validate plane lengths against the coded geometry.
+        let len_y = (g.dims_y.width as usize) * (g.dims_y.height as usize);
+        let len_c = (g.dims_c.width as usize) * (g.dims_c.height as usize);
+        if frame.samples_y.len() != len_y {
+            return Err(Error::EncodePlaneLenMismatch {
+                plane: 0,
+                got: frame.samples_y.len(),
+                want: len_y,
+            });
+        }
+        if frame.samples_cb.len() != len_c {
+            return Err(Error::EncodePlaneLenMismatch {
+                plane: 1,
+                got: frame.samples_cb.len(),
+                want: len_c,
+            });
+        }
+        if frame.samples_cr.len() != len_c {
+            return Err(Error::EncodePlaneLenMismatch {
+                plane: 2,
+                got: frame.samples_cr.len(),
+                want: len_c,
+            });
+        }
+
+        let qi = self.qi as usize;
+
+        // Pre-build the per-plane intra (qti = 0) quantization matrix
+        // once. For an intra frame `qi0 == qi` (NQIS = 1), so the DC and
+        // AC matrices coincide and a single per-plane matrix serves both
+        // the DC and the AC quantizer in `quantize_block`.
+        let qmats: [QuantizationMatrix; 3] = [
+            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 0, qi)?,
+            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 1, qi)?,
+            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 2, qi)?,
+        ];
+
+        // Step 1: per-block forward DCT + quantize. The DC slot of each
+        // block holds the absolute (reconstructed) quantized DC at this
+        // point; forward DC prediction below converts it to a residual.
+        let mut coeffs = vec![[0i16; 64]; nbs];
+        for (bi, out) in coeffs.iter_mut().enumerate() {
+            let pli = g.pli_of_block[bi] as usize;
+            let (plane, pw, ph) = match pli {
+                0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+                1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+                _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+            };
+            let block = Self::extract_block(plane, pw, ph, g.bx_of_block[bi], g.by_of_block[bi])?;
+            // Subtract the §7.9.1.1 intra predictor (constant 128).
+            let mut residual = [[0i16; 8]; 8];
+            for (r, row) in residual.iter_mut().enumerate() {
+                for (c, slot) in row.iter_mut().enumerate() {
+                    *slot = block[r][c] - 128;
+                }
+            }
+            let dqc = forward_dct_2d(&residual);
+            *out = quantize_block(&dqc, &qmats[pli], &qmats[pli]);
+        }
+
+        // Step 2: forward DC prediction. Every block is INTRA so
+        // mbmodes is uniform; bcoded is all-coded.
+        let bcoded = vec![1u8; nbs];
+        let mbmodes = vec![MacroBlockMode::Intra; g.nmbs as usize];
+        let plane_orders: [&[u32]; 3] = [
+            &g.plane_raster_order[0],
+            &g.plane_raster_order[1],
+            &g.plane_raster_order[2],
+        ];
+        forward_dc_prediction(
+            &bcoded,
+            &mbmodes,
+            &g.mbi_of_block,
+            &g.neighbors,
+            &plane_orders,
+            &mut coeffs,
+        )?;
+
+        // Step 3: write the §7.1 frame header + §7.7.3 token stream.
+        let mut w = BitWriter::new();
+        // §7.1 step 1: packet-type bit 0 (data packet).
+        w.write_bits(0, 1);
+        // §7.1 step 2: FTYPE = 0 (intra).
+        w.write_bits(0, 1);
+        // §7.1 step 3: QIS[0] (6 bits).
+        w.write_bits(self.qi as u32, 6);
+        // §7.1 step 4: MOREQIS = 0 (NQIS = 1).
+        w.write_bits(0, 1);
+        // §7.1 step 7: 3 reserved bits, must be 0, on intra frames.
+        w.write_bits(0, 3);
+
+        // §7.3 / §7.4 / §7.5 / §7.6 read no bits on an intra,
+        // all-coded, single-qi frame — matching the decoder's
+        // short-circuits — so the token stream follows immediately.
+        encode_dct_coefficients_inner(
+            &mut w,
+            g.nbs,
+            g.nmbs,
+            &bcoded,
+            &coeffs,
+            &self.setup.huffman_tables[..],
+        )?;
+
+        Ok(w.into_bytes())
     }
 }
 
@@ -17867,6 +18475,108 @@ mod tests {
         let (coeffs, ncoeffs) = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts).unwrap();
         assert_eq!(coeffs[0], [1i16; 64]);
         assert_eq!(ncoeffs[0], 64);
+    }
+
+    // ----- §7.7 forward token encode round-trip (round 338) -----
+
+    /// Encode a frame's quantized DCT coefficients with the §7.7 forward
+    /// token writer, then decode them back through `decode_dct_
+    /// coefficients` and confirm the coefficients survive the round
+    /// trip exactly. Uses the full default Huffman tables (the fixture
+    /// setup header), which carry every token.
+    #[test]
+    fn encode_dct_coefficients_round_trips_through_decoder() {
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let hts = &setup.huffman_tables[..];
+
+        // Eight coded blocks with nmbs=1 (nlbs=4): blocks 0..3 are luma
+        // and use htiL, blocks 4..7 are chroma and use htiC, so the
+        // round trip exercises both table selectors. Each block carries
+        // a distinct coefficient profile.
+        let nbs = 8u32;
+        let nmbs = 1u32;
+        let bcoded = vec![1u8; 8];
+        let mut coeffs = vec![[0i16; 64]; 8];
+        // Block 0: all zero.
+        // Block 1: DC only.
+        coeffs[1][0] = -37;
+        // Block 2: DC + a few AC including a zero gap and large mag.
+        coeffs[2][0] = 5;
+        coeffs[2][1] = 1;
+        coeffs[2][2] = -2;
+        coeffs[2][7] = 100; // forces a zero run then a 9-bit-mag token
+        coeffs[2][20] = -300;
+        // Block 3 (luma): a single mid-range AC.
+        coeffs[3][4] = 45;
+        // Block 4 (chroma): DC + AC.
+        coeffs[4][0] = 12;
+        coeffs[4][5] = -6;
+        // Block 5 (chroma): all zero.
+        // Block 6 (chroma): tail AC only.
+        coeffs[6][63] = 3;
+        // Block 7 (chroma): full-range coefficients.
+        coeffs[7][0] = 580;
+        coeffs[7][1] = -580;
+
+        let mut w = super::BitWriter::new();
+        encode_dct_coefficients_inner(&mut w, nbs, nmbs, &bcoded, &coeffs, hts).unwrap();
+        let bytes = w.into_bytes();
+
+        let (decoded, _ncoeffs) = decode_dct_coefficients(&bytes, nbs, nmbs, &bcoded, hts).unwrap();
+        for bi in 0..8 {
+            assert_eq!(decoded[bi], coeffs[bi], "block {bi} coefficients differ");
+        }
+    }
+
+    /// The token planner closes an all-zero block with a single EOB and
+    /// a fully-populated block with single-coefficient tokens.
+    #[test]
+    fn plan_block_tokens_shapes() {
+        // All-zero → one EOB token (token 0) consuming all 64 slots.
+        let plan = plan_block_tokens(&[0i16; 64]).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].token, 0);
+        assert_eq!(plan[0].advance, 64);
+
+        // DC-only +1 → single-coefficient token 9 then a closing EOB.
+        let mut c = [0i16; 64];
+        c[0] = 1;
+        let plan = plan_block_tokens(&c).unwrap();
+        assert_eq!(plan[0].token, 9);
+        assert_eq!(plan.last().unwrap().token, 0);
+        // Total advance covers all 64 positions.
+        let total: u16 = plan.iter().map(|p| p.advance as u16).sum();
+        assert_eq!(total, 64);
+    }
+
+    /// A coefficient beyond the single-coefficient token range is
+    /// rejected at plan time (and surfaces as
+    /// `EncodeCoefficientOutOfRange` from the frame writer).
+    #[test]
+    fn encode_dct_coefficients_rejects_out_of_range_coeff() {
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let hts = &setup.huffman_tables[..];
+        let bcoded = vec![1u8];
+        let mut coeffs = vec![[0i16; 64]];
+        coeffs[0][0] = 1000; // > 580
+        let mut w = super::BitWriter::new();
+        let err = encode_dct_coefficients_inner(&mut w, 1, 1, &bcoded, &coeffs, hts).unwrap_err();
+        assert_eq!(err, Error::EncodeCoefficientOutOfRange { bi: 0 });
+    }
+
+    /// `BitWriter` round-trips every full integer through `BitReader`.
+    #[test]
+    fn bit_writer_round_trips_through_bit_reader() {
+        let mut w = super::BitWriter::new();
+        let fields: &[(u32, u32)] = &[(1, 1), (0, 1), (0b101, 3), (0xABCD, 16), (7, 6), (0, 4)];
+        for &(v, n) in fields {
+            w.write_bits(v, n);
+        }
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        for &(v, n) in fields {
+            assert_eq!(r.read_bits(n, "test").unwrap(), v);
+        }
     }
 
     /// A coded block whose TOKEN stream runs out of tokens before
@@ -26181,6 +26891,156 @@ mod tests {
                 "keyframe {i} must re-seed the previous reference"
             );
         }
+    }
+
+    // ----- intra encoder self-roundtrip (round 338 milestone) -----
+
+    /// MILESTONE: encode a synthetic intra frame with [`FrameEncoder`],
+    /// decode the produced packet back through this crate's own
+    /// [`FrameDecoder`], and confirm the reconstruction is faithful to
+    /// the source (to within the quantizer step).
+    ///
+    /// The encoder and decoder share the same identification header and
+    /// setup tables, so no setup-header serialisation is needed; this
+    /// pins the full forward pipeline (forward DCT → quantize → forward
+    /// DC prediction → §7.1 header + §7.7.3 token writer) against the
+    /// decoder's inverse pipeline end-to-end.
+    fn encode_decode_roundtrip_at_qi(qi: u8, tolerance: i16) {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        assert_eq!(ident.coded_width(), 32);
+        assert_eq!(ident.coded_height(), 32);
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), qi).unwrap();
+        let g = enc.geometry();
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+
+        // Synthetic source: a smooth two-axis luma gradient and two
+        // flat-ish chroma planes with a gentle ramp. Lower-left
+        // row-major, coded (MB-aligned) dimensions.
+        let w_y = g.dims_y.width;
+        let mut samples_y = vec![0u8; len_y];
+        for y in 0..g.dims_y.height {
+            for x in 0..w_y {
+                let v = 16 + (x * 5 + y * 3) % 220;
+                samples_y[(y * w_y + x) as usize] = v as u8;
+            }
+        }
+        let w_c = g.dims_c.width;
+        let mut samples_cb = vec![0u8; len_c];
+        let mut samples_cr = vec![0u8; len_c];
+        for y in 0..g.dims_c.height {
+            for x in 0..w_c {
+                samples_cb[(y * w_c + x) as usize] = (110 + (x * 2) % 40) as u8;
+                samples_cr[(y * w_c + x) as usize] = (140 + (y * 2) % 40) as u8;
+            }
+        }
+        let source = SourceFrame {
+            samples_y: samples_y.clone(),
+            samples_cb: samples_cb.clone(),
+            samples_cr: samples_cr.clone(),
+        };
+
+        let packet = enc.encode_intra_frame(&source).unwrap();
+        assert!(!packet.is_empty(), "encoded packet must be non-empty");
+        // The first bit must be 0 (data packet) and FTYPE 0 (intra).
+        assert_eq!(packet[0] & 0b1100_0000, 0, "intra data packet header bits");
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let decoded = dec
+            .decode_frame(&packet)
+            .expect("encoder output must decode");
+        assert_eq!(decoded.ftype, FrameType::Intra);
+
+        // Compare reconstruction to the source plane-by-plane within
+        // the quantizer tolerance.
+        let check = |label: &str, got: &[u8], want: &[u8]| {
+            assert_eq!(got.len(), want.len(), "{label} length");
+            let mut max_err = 0i16;
+            let mut sum_err = 0i64;
+            for (&g, &w) in got.iter().zip(want.iter()) {
+                let e = (g as i16 - w as i16).abs();
+                if e > max_err {
+                    max_err = e;
+                }
+                sum_err += e as i64;
+            }
+            let mean = sum_err as f64 / got.len() as f64;
+            assert!(
+                max_err <= tolerance,
+                "{label}: max error {max_err} exceeds tolerance {tolerance} (mean {mean:.2})"
+            );
+        };
+        check("Y", &decoded.frame.samples_y, &samples_y);
+        check("Cb", &decoded.frame.samples_cb, &samples_cb);
+        check("Cr", &decoded.frame.samples_cr, &samples_cr);
+    }
+
+    #[test]
+    fn encode_intra_frame_self_roundtrips_strong_quant() {
+        // qi = 10 (strong quantization): larger reconstruction error
+        // tolerated.
+        encode_decode_roundtrip_at_qi(10, 40);
+    }
+
+    #[test]
+    fn encode_intra_frame_self_roundtrips_weak_quant() {
+        // qi = 63 (weakest quantization on this stream): near-lossless,
+        // so the tolerance is tight.
+        encode_decode_roundtrip_at_qi(63, 8);
+    }
+
+    #[test]
+    fn encode_intra_frame_self_roundtrips_flat_block_lossless() {
+        // A perfectly flat frame round-trips exactly: the only non-zero
+        // coefficient is the DC, which quantizes and dequantizes without
+        // any AC truncation error.
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 63).unwrap();
+        let g = enc.geometry();
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        let source = SourceFrame {
+            samples_y: vec![128u8; len_y],
+            samples_cb: vec![128u8; len_c],
+            samples_cr: vec![128u8; len_c],
+        };
+        let packet = enc.encode_intra_frame(&source).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let decoded = dec.decode_frame(&packet).unwrap();
+        // A flat 128 frame has zero residual after the intra predictor,
+        // so every reconstructed sample is exactly 128.
+        assert!(decoded.frame.samples_y.iter().all(|&v| v == 128));
+        assert!(decoded.frame.samples_cb.iter().all(|&v| v == 128));
+        assert!(decoded.frame.samples_cr.iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn encode_intra_frame_rejects_wrong_plane_length() {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let enc = FrameEncoder::new(ident, setup, 30).unwrap();
+        let source = SourceFrame {
+            samples_y: vec![0u8; 4],
+            samples_cb: vec![0u8; 4],
+            samples_cr: vec![0u8; 4],
+        };
+        match enc.encode_intra_frame(&source) {
+            Err(Error::EncodePlaneLenMismatch { plane: 0, .. }) => {}
+            other => panic!("expected EncodePlaneLenMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_encoder_rejects_out_of_range_qi() {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        assert_eq!(
+            FrameEncoder::new(ident, setup, 64).unwrap_err(),
+            Error::QuantIndexOutOfRange { qi: 64 }
+        );
     }
 
     /// End-to-end §7.11 on the `q-high` fixture (64×64, `-q:v 10` →

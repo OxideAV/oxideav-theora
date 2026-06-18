@@ -6,6 +6,22 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- forward (encoder-side) quantization — the inverse of §7.9.2
+  dequantization (round 338, second encoder commit). New public
+  `quantize_block(dqc, qmat_dc, qmat_ac) -> [i16; 64]` divides each
+  natural-order forward-DCT coefficient `DQC[ci]` by its quantizer and
+  rounds to nearest (ties away from zero), writing the result into the
+  zig-zag slot `ZIGZAG_NATURAL_TO_ZIGZAG[ci]` — exactly inverting
+  `dequantize_block`'s `DQC[ci] = COEFFS[zzi] * QMAT[ci]` read
+  addressing, with an `i16` clamp on the quotient. Round-to-nearest
+  minimises the dequantization error so the forward → quantize →
+  dequantize → inverse-DCT path is faithful to within the quantizer
+  step. Companion `quantize_block_from_params(dqc, params, qti, pli,
+  qi0, qi)` builds the two §6.4.3 matrices inline, mirroring
+  `dequantize_block_from_params`. 7 new tests (round-trip inverse on
+  exact multiples, ties-away rounding, zig-zag AC routing, all-zero,
+  params-driven round-trip, and error propagation).
+
 - §7.9.3.3 forward DCT — the non-normative encoder-side transform
   (round 338, first encoder commit). New public `forward_dct_1d(x:
   &[i16; 8]) -> [i16; 8]` transcribes the 31-step §7.9.3.3 signal-flow

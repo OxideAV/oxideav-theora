@@ -6490,6 +6490,90 @@ pub fn dequantize_block_from_params(
     Ok(dequantize_block(coeffs_zz, &qmat_dc, &qmat_ac))
 }
 
+/// Forward (encoder-side) quantization: the inverse of
+/// [`dequantize_block`].
+///
+/// Given a block of natural-order forward-DCT coefficients
+/// `dqc[ci]` (the output of [`forward_dct_2d`]) and the per-block
+/// `QMAT_DC` / `QMAT_AC` matrices, this produces the zig-zag-order
+/// quantized coefficient array `COEFFS` that the §7.7 token entropy
+/// stream carries — the same array the decoder reconstructs and feeds
+/// back into [`dequantize_block`].
+///
+/// [`dequantize_block`] computes, for each natural-order index `ci`,
+/// `DQC[ci] = COEFFS[zzi] * QMAT[ci]` where `zzi =
+/// ZIGZAG_NATURAL_TO_ZIGZAG[ci]` (DC uses `QMAT_DC`, AC uses
+/// `QMAT_AC`). To invert it this divides each `dqc[ci]` by the
+/// corresponding quantizer and rounds to the nearest integer
+/// (ties away from zero), writing the result into the zig-zag slot
+/// `zzi`. The DC term goes to `COEFFS[0]` (zig-zag index 0).
+///
+/// Rounding to nearest minimizes the dequantization error
+/// `|DQC[ci] − COEFFS[zzi] * QMAT[ci]|`, so the forward → quantize →
+/// dequantize → inverse-DCT round-trip is faithful to within the
+/// quantizer step. The quotient is clamped to the `i16` range
+/// (`COEFFS` is a 16-bit signed array); for spec-conformant DCT
+/// magnitudes and the `1..=4096` quantizer range the clamp is never
+/// reached.
+///
+/// Inputs are the same two [`QuantizationMatrix`] arguments
+/// [`dequantize_block`] consumes; callers building a whole frame
+/// pre-compute the at-most-six per-plane matrices once and reuse them
+/// across blocks (the §7.9.2 efficiency note applies symmetrically to
+/// the encoder).
+pub fn quantize_block(
+    dqc: &[i16; 64],
+    qmat_dc: &QuantizationMatrix,
+    qmat_ac: &QuantizationMatrix,
+) -> [i16; 64] {
+    /// Divide `num` by the positive quantizer `den`, rounding to the
+    /// nearest integer with ties rounded away from zero, then clamp to
+    /// the `i16` range.
+    fn quant_round(num: i32, den: i32) -> i16 {
+        debug_assert!(den > 0, "quantizer values are in 1..=4096");
+        let half = den / 2;
+        let q = if num >= 0 {
+            (num + half) / den
+        } else {
+            (num - half) / den
+        };
+        q.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    }
+
+    let mut coeffs = [0i16; 64];
+
+    // DC term: natural-order ci = 0 → zig-zag slot 0.
+    coeffs[0] = quant_round(dqc[0] as i32, qmat_dc.values[0] as i32);
+
+    // AC terms: natural-order ci = 1..=63 → zig-zag slot zzi.
+    for ci in 1usize..=63 {
+        let zzi = ZIGZAG_NATURAL_TO_ZIGZAG[ci] as usize;
+        coeffs[zzi] = quant_round(dqc[ci] as i32, qmat_ac.values[ci] as i32);
+    }
+
+    coeffs
+}
+
+/// Convenience wrapper around [`quantize_block`] that builds the
+/// `QMAT_DC` / `QMAT_AC` matrices from a [`QuantizationParameters`] and
+/// the per-block `(qti, pli, qi0, qi)` selector, mirroring
+/// [`dequantize_block_from_params`] on the encoder side.
+///
+/// Returns any error propagated by [`compute_quantization_matrix`]
+/// (`qti > 1`, `pli > 2`, or `qi > 63`).
+pub fn quantize_block_from_params(
+    dqc: &[i16; 64],
+    params: &QuantizationParameters,
+    qti: usize,
+    pli: usize,
+    qi0: usize,
+    qi: usize,
+) -> Result<[i16; 64], Error> {
+    let qmat_dc = compute_quantization_matrix(params, qti, pli, qi0)?;
+    let qmat_ac = compute_quantization_matrix(params, qti, pli, qi)?;
+    Ok(quantize_block(dqc, &qmat_dc, &qmat_ac))
+}
+
 /// A reference-frame plane consumed by the §7.9.1.2 / §7.9.1.3
 /// inter predictors.
 ///
@@ -19018,6 +19102,109 @@ mod tests {
         let dqc = dequantize_block_from_params(&coeffs, &params, 0, 0, 10, 20).expect("in range");
         assert_eq!(dqc[0], 120);
         assert_eq!(dqc[5], 80);
+    }
+
+    // ------------------------------------------------------------------
+    // Forward quantization (encoder helper) tests (round 338).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn quantize_block_is_inverse_of_dequantize_on_multiples() {
+        // When every dqc[ci] is an exact multiple of its quantizer,
+        // forward quantization recovers the original COEFFS exactly and
+        // re-dequantizing reproduces dqc.
+        let qdc = flat_qmat(40);
+        let qac = ramp_qmat(7);
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 5;
+        for ci in 1usize..=63 {
+            coeffs[ZIGZAG_NATURAL_TO_ZIGZAG[ci] as usize] = (ci as i16 % 9) - 4;
+        }
+        let dqc = dequantize_block(&coeffs, &qdc, &qac);
+        let requant = quantize_block(&dqc, &qdc, &qac);
+        assert_eq!(requant, coeffs, "quantize must invert dequantize");
+        // And the round-trip back through dequantize is identical.
+        assert_eq!(dequantize_block(&requant, &qdc, &qac), dqc);
+    }
+
+    #[test]
+    fn quantize_block_rounds_to_nearest_ties_away_from_zero() {
+        // dqc[0] = 25, quantizer 10: 25/10 = 2.5 -> rounds to 3.
+        // dqc[0] = -25 -> -3. dqc = 24 -> 2 (2.4). dqc = 26 -> 3 (2.6).
+        let qdc = flat_qmat(10);
+        let qac = flat_qmat(10);
+        let mut dqc = [0i16; 64];
+        dqc[0] = 25;
+        assert_eq!(quantize_block(&dqc, &qdc, &qac)[0], 3);
+        dqc[0] = -25;
+        assert_eq!(quantize_block(&dqc, &qdc, &qac)[0], -3);
+        dqc[0] = 24;
+        assert_eq!(quantize_block(&dqc, &qdc, &qac)[0], 2);
+        dqc[0] = 26;
+        assert_eq!(quantize_block(&dqc, &qdc, &qac)[0], 3);
+        dqc[0] = -24;
+        assert_eq!(quantize_block(&dqc, &qdc, &qac)[0], -2);
+    }
+
+    #[test]
+    fn quantize_block_routes_ac_through_zigzag() {
+        // The AC slot for natural index ci must be written at zig-zag
+        // position zzi — the mirror of dequantize's read addressing.
+        let qdc = flat_qmat(4);
+        let qac = flat_qmat(4);
+        let mut dqc = [0i16; 64];
+        // Natural-order ci = 3 carries 12 -> quantized 3 at zig-zag slot.
+        dqc[3] = 12;
+        let coeffs = quantize_block(&dqc, &qdc, &qac);
+        let zzi = ZIGZAG_NATURAL_TO_ZIGZAG[3] as usize;
+        assert_eq!(coeffs[zzi], 3);
+        // No other slot is touched.
+        for (i, &c) in coeffs.iter().enumerate() {
+            if i != zzi {
+                assert_eq!(c, 0, "slot {i} should be zero");
+            }
+        }
+    }
+
+    #[test]
+    fn quantize_block_all_zero_input_yields_all_zero() {
+        let qdc = flat_qmat(40);
+        let qac = ramp_qmat(13);
+        assert_eq!(quantize_block(&[0i16; 64], &qdc, &qac), [0i16; 64]);
+    }
+
+    #[test]
+    fn quantize_block_from_params_round_trips_through_dequantize_from_params() {
+        // Full §6.4.3 input list on both sides: a flat block of DCT
+        // coefficients quantizes and re-dequantizes consistently.
+        let params = single_range_params(vec![[10u8; 64]; 2], 0, 1, 100, 100);
+        let mut dqc = [0i16; 64];
+        dqc[0] = 240; // 240/40 = 6 exactly (qmat = 40).
+        dqc[1] = 80; // 80/40 = 2.
+        let coeffs = quantize_block_from_params(&dqc, &params, 0, 0, 30, 30).expect("in range");
+        assert_eq!(coeffs[0], 6);
+        assert_eq!(coeffs[ZIGZAG_NATURAL_TO_ZIGZAG[1] as usize], 2);
+        let back = dequantize_block_from_params(&coeffs, &params, 0, 0, 30, 30).expect("in range");
+        assert_eq!(back[0], 240);
+        assert_eq!(back[1], 80);
+    }
+
+    #[test]
+    fn quantize_block_from_params_propagates_errors() {
+        let params = single_range_params(vec![[10u8; 64]; 2], 0, 1, 100, 100);
+        let dqc = [0i16; 64];
+        assert_eq!(
+            quantize_block_from_params(&dqc, &params, 2, 0, 0, 0).unwrap_err(),
+            Error::QuantTypeIndexOutOfRange { qti: 2 }
+        );
+        assert_eq!(
+            quantize_block_from_params(&dqc, &params, 0, 3, 0, 0).unwrap_err(),
+            Error::QuantPlaneIndexOutOfRange { pli: 3 }
+        );
+        assert_eq!(
+            quantize_block_from_params(&dqc, &params, 0, 0, 64, 0).unwrap_err(),
+            Error::QuantIndexOutOfRange { qi: 64 }
+        );
     }
 
     // ------------------------------------------------------------------

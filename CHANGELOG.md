@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **encoder chroma-format + multi-frame coverage (round 342, third
+  encoder commit)**. The `oxideav_core::Encoder` path is now exercised
+  across all three chroma-sampling formats (4:2:0 / 4:2:2 / 4:4:4): a
+  flat frame reconstructs losslessly under each, with the per-format
+  chroma plane geometry driven by `FrameGeometry` and the advertised
+  `output_params.pixel_format` mapped per format — coverage the
+  4:2:0-only fixture corpus cannot reach end-to-end. A multi-frame
+  sequence test confirms the encoder is reusable across frames, emits
+  exactly one keyframe data packet per `send_frame` after the three
+  headers, and advances the auto-assigned PTS monotonically. +2 tests.
+
 - **`oxideav_core::Encoder` trait integration (round 342, second
   encoder commit)**. New public `TheoraEncoder` implements
   `oxideav_core::Encoder`, and `register` now installs an encoder

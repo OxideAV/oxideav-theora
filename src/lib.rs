@@ -27208,6 +27208,107 @@ mod tests {
         );
     }
 
+    /// Rebuild `TINY_HEADER` with a different pixel-format (`PF`) value
+    /// so the encoder's chroma-sampling variants can be exercised
+    /// without a per-format fixture. Only the 2-bit `PF` field of the
+    /// packed final octet changes; everything else (coded 32×32, the
+    /// §6.2 geometry) is shared.
+    fn tiny_ident_with_pf(pf: PixelFormat) -> TheoraIdentHeader {
+        let mut ident = decode_identification_header(&TINY_HEADER).unwrap();
+        ident.pf = pf;
+        ident
+    }
+
+    /// The encoder reconstructs a flat frame losslessly across all three
+    /// chroma-sampling formats (4:2:0 / 4:2:2 / 4:4:4), with the
+    /// per-format chroma plane geometry driven by `FrameGeometry`. This
+    /// exercises the encoder's chroma handling for the 4:2:2 and 4:4:4
+    /// paths the fixture corpus (4:2:0 only) cannot reach end-to-end.
+    #[test]
+    fn encoder_trait_flat_frame_all_chroma_formats() {
+        use oxideav_core::{Decoder, Encoder};
+        for pf in [
+            PixelFormat::Yuv420,
+            PixelFormat::Yuv422,
+            PixelFormat::Yuv444,
+        ] {
+            let ident = tiny_ident_with_pf(pf);
+            let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+            let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+            let mut enc = TheoraEncoder::new(codec_id.clone(), ident.clone(), setup, 24).unwrap();
+            // PF maps to the advertised core pixel format.
+            let want_core = match pf {
+                PixelFormat::Yuv420 => oxideav_core::PixelFormat::Yuv420P,
+                PixelFormat::Yuv422 => oxideav_core::PixelFormat::Yuv422P,
+                PixelFormat::Yuv444 => oxideav_core::PixelFormat::Yuv444P,
+            };
+            assert_eq!(enc.output_params().pixel_format, Some(want_core));
+
+            let vf = flat_video_frame(&ident, 128, 128, 128, 0);
+            enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+
+            let mut dec = TheoraDecoder::new(codec_id);
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => dec.send_packet(&p).unwrap(),
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("{pf:?}: encoder error {e}"),
+                }
+            }
+            let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+                panic!("{pf:?}: expected video frame");
+            };
+            assert_eq!(out.planes.len(), 3, "{pf:?}: three planes");
+            for (pi, plane) in out.planes.iter().enumerate() {
+                assert!(
+                    plane.data.iter().all(|&b| b == 128),
+                    "{pf:?}: plane {pi} not flat 128"
+                );
+            }
+        }
+    }
+
+    /// Encoding multiple frames in sequence yields one data packet each
+    /// (after the three headers), with monotonically increasing PTS, and
+    /// every data packet flagged as a keyframe (intra-only). Confirms the
+    /// encoder is reusable across a frame sequence and that the per-frame
+    /// PTS bookkeeping advances correctly.
+    #[test]
+    fn encoder_trait_multi_frame_sequence() {
+        use oxideav_core::Encoder;
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let mut enc = TheoraEncoder::new(codec_id, ident.clone(), setup, 32).unwrap();
+
+        // Send three frames with no explicit pts (encoder assigns 0,1,2).
+        for v in [100u8, 120, 140] {
+            let mut vf = flat_video_frame(&ident, v, 128, 128, 0);
+            vf.pts = None;
+            enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+        }
+
+        let mut headers = 0;
+        let mut data_pts: Vec<i64> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if p.flags.header {
+                        headers += 1;
+                    } else {
+                        assert!(p.flags.keyframe);
+                        data_pts.push(p.pts.unwrap());
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error {e}"),
+            }
+        }
+        assert_eq!(headers, 3, "three §6 header packets");
+        assert_eq!(data_pts, vec![0, 1, 2], "monotonic auto-assigned PTS");
+    }
+
     // ------- §2.3 / §2.4 frame-geometry builder -------
 
     /// §2.3's worked example: a 240×48 frame (FMBW=15, FMBH=3,

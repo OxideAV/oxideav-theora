@@ -66,6 +66,28 @@ packets are handled as duplicate-frame markers.
   length-prefixed `CodecParameters::extradata` chain parsed by the
   `make_decoder` factory.
 
+* **§6 header-packet serialization** — `encode_identification_header`
+  (§6.2), `encode_comment_header` (§6.3), and `encode_setup_header`
+  (§6.4) are the exact inverses of the three header decoders. The
+  identification serializer is *byte-exact* (re-encoding a decoded ident
+  packet reproduces the original payload); the setup serializer writes
+  the §6.4.5 body (LFLIMS with minimal `NBITS`, the §6.4.2 quantization
+  parameters as fresh `NEWQR=1` ranges, and all 80 §6.4.4 Huffman tables
+  via a pre-order tree walk) onto one shared `BitWriter` and round-trips
+  the full setup tables back to an equal `SetupHeaderTables`.
+
+* **Framework `Encoder` integration** — `TheoraEncoder` implements
+  `oxideav_core::Encoder`, and `register` now installs it (alongside the
+  decoder) via the `make_encoder` factory. The encoder serializes the
+  three §6 headers up front and emits them as the first three packets
+  (flagged `header`), then turns each top-down `VideoFrame` at the coded
+  dimensions into one §7 intra data packet (flagged keyframe).
+  `output_params` carries the coded dimensions, the mapped pixel format,
+  and a length-prefixed extradata header chain, so a complete
+  encode → decode loop round-trips through both `oxideav_core` traits and
+  through the shared `CodecRegistry` (`first_encoder` → `first_decoder`):
+  a flat frame is lossless, a gradient stays within the quantizer bound.
+
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation
 tables, weakest- and strongest-quantiser streams, a non-MB-aligned
@@ -82,14 +104,14 @@ inter branches (asserted in addition to the sample-exact pixel match).
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **Inter-frame encoding** — the encoder is intra (keyframe) only. Inter
-  prediction, motion estimation, mode decision, and rate control are
-  future work. Header-packet *serialization* (writing the §6
-  identification / comment / setup headers) is also not yet
-  implemented: the encoder reuses the same in-memory header objects the
-  decoder consumes, so a full encode that emits a complete stream
-  (headers + data) — and the `oxideav_core::Encoder` trait integration
-  that depends on it — remain to be wired.
+* **Inter-frame encoding** — the encoder is intra (keyframe) only.
+  Header serialization and the `oxideav_core::Encoder` trait integration
+  are now wired (a full stream of headers + intra data packets is
+  emitted), but inter prediction, motion estimation, mode decision, and
+  rate control remain future work, so every emitted frame is a keyframe.
+  The setup header (§6.4 quantization parameters + Huffman tables) is
+  supplied by the caller via `TheoraEncoder::new` / `extradata` rather
+  than synthesized from scratch.
 * **Golden-reference and four-MV inter modes** (`INTER_GOLDEN_MV` /
   `INTER_MV_FOUR`) — implemented in the reconstruction code paths and
   now exercised through the full `reconstruct_frame` driver
@@ -98,11 +120,6 @@ inter branches (asserted in addition to the sample-exact pixel match).
   corpus fixture: the reference encoder's `testsrc`-class encodes never emit a
   golden or four-MV macroblock, so no `expected.yuv` fixture covers
   these modes top-to-bottom from a real bitstream.
-* **Framework `Encoder` trait integration** — the intra encoder is
-  reachable through the direct `FrameEncoder` API, but there is no
-  `oxideav_core::Encoder` impl yet (it needs the header-packet
-  serialization noted above). The decoder side is fully wired (see
-  above).
 
 ## Usage
 
@@ -154,6 +171,32 @@ let enc = FrameEncoder::new(ident.clone(), setup.clone(), /* qi */ 32)?;
 let packet = enc.encode_intra_frame(&frame)?;
 let mut dec = FrameDecoder::new(ident, setup)?;
 let _decoded = dec.decode_frame(&packet)?; // faithful to within the quantizer
+# Ok(())
+# }
+```
+
+To emit a complete decodable stream, drive `TheoraEncoder` through the
+`oxideav_core::Encoder` trait. It serializes the three §6 headers up
+front (returned as the first `receive_packet` outputs, flagged
+`header`), then encodes each top-down `VideoFrame` — supplied at the
+coded macro-block-aligned dimensions — into one intra data packet:
+
+```rust
+use oxideav_core::{CodecId, Encoder, Frame};
+use oxideav_theora::{TheoraEncoder, THEORA_CODEC_ID};
+# fn run(ident: oxideav_theora::TheoraIdentHeader,
+#        setup: oxideav_theora::SetupHeaderTables,
+#        frame: Frame) -> oxideav_core::Result<()> {
+let mut enc = TheoraEncoder::new(
+    CodecId::new(THEORA_CODEC_ID), ident, setup, /* qi */ 32,
+)
+.map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+enc.send_frame(&frame)?;
+while let Ok(pkt) = enc.receive_packet() {
+    // pkt.flags.header marks the three §6 header packets; the rest are
+    // §7 intra video-data packets (each a keyframe).
+    let _ = pkt;
+}
 # Ok(())
 # }
 ```

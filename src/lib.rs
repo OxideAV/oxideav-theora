@@ -12118,6 +12118,295 @@ pub fn make_decoder(
     Ok(Box::new(dec))
 }
 
+// -----------------------------------------------------------------------------
+// oxideav_core::Encoder integration
+// -----------------------------------------------------------------------------
+
+/// Map a Theora [`PixelFormat`] to the `oxideav_core` pixel format the
+/// encoder advertises in [`Encoder::output_params`].
+fn core_pixel_format(pf: PixelFormat) -> oxideav_core::PixelFormat {
+    match pf {
+        PixelFormat::Yuv420 => oxideav_core::PixelFormat::Yuv420P,
+        PixelFormat::Yuv422 => oxideav_core::PixelFormat::Yuv422P,
+        PixelFormat::Yuv444 => oxideav_core::PixelFormat::Yuv444P,
+    }
+}
+
+/// Pack the three §6 header packets into the length-prefixed
+/// [`CodecParameters::extradata`] chain `make_decoder` consumes: each
+/// header is preceded by a 16-bit big-endian length.
+fn pack_extradata(headers: &[&[u8]]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    for h in headers {
+        let len = u16::try_from(h.len()).map_err(|_| Error::EncodeHeaderFieldOutOfRange {
+            field: "extradata_header_len",
+            value: h.len() as u64,
+        })?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(h);
+    }
+    Ok(out)
+}
+
+/// Convert one top-down [`oxideav_core::VideoPlane`] into the §2.1
+/// lower-left, bottom-up row-major plane the encoder pipeline consumes.
+///
+/// The trait input frame is top-down raster (row 0 at the top); §2.1
+/// stores row 0 at the bottom, so the conversion reverses the row order
+/// and strips any stride padding down to a tight `width`-byte pack.
+fn top_down_plane_to_lower_left(
+    plane: &oxideav_core::frame::VideoPlane,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Error> {
+    let w = width as usize;
+    let h = height as usize;
+    if plane.stride < w || plane.data.len() < plane.stride * h {
+        return Err(Error::EncodePlaneLenMismatch {
+            plane: 0,
+            got: plane.data.len(),
+            want: plane.stride.max(w) * h,
+        });
+    }
+    let mut out = Vec::with_capacity(w * h);
+    // Bottom-up: output row 0 (bottom) is top-down row h-1.
+    for row in (0..h).rev() {
+        let start = row * plane.stride;
+        out.extend_from_slice(&plane.data[start..start + w]);
+    }
+    Ok(out)
+}
+
+/// A frame-to-packet [`oxideav_core::Encoder`] driving [`FrameEncoder`].
+///
+/// The encoder is constructed from the same [`TheoraIdentHeader`] and
+/// [`SetupHeaderTables`] a decoder consumes (so the produced stream is
+/// self-describing and decodes through this crate's own
+/// [`TheoraDecoder`]). On construction it serializes the three §6
+/// header packets — §6.2 identification, §6.3 comment, §6.4 setup — via
+/// [`encode_identification_header`] / [`encode_comment_header`] /
+/// [`encode_setup_header`] and queues them as the first three output
+/// packets (each flagged [`PacketFlags::header`]). Every
+/// [`send_frame`](oxideav_core::Encoder::send_frame) then turns a
+/// top-down [`oxideav_core::VideoFrame`] (at the coded,
+/// macro-block-aligned dimensions) into one §7 intra video-data packet
+/// via [`FrameEncoder::encode_intra_frame`].
+///
+/// Only intra (keyframe) encoding is implemented; every emitted data
+/// packet is a keyframe. Inter prediction / motion estimation / rate
+/// control remain future work.
+pub struct TheoraEncoder {
+    codec_id: oxideav_core::CodecId,
+    output_params: Box<oxideav_core::CodecParameters>,
+    frame_encoder: FrameEncoder,
+    /// Output packets awaiting `receive_packet` (headers first, then
+    /// the per-frame data packets in send order).
+    pending: std::collections::VecDeque<oxideav_core::Packet>,
+    /// Per-frame presentation index assigned to data packets that have
+    /// no `pts` of their own.
+    next_index: i64,
+}
+
+impl std::fmt::Debug for TheoraEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TheoraEncoder")
+            .field("codec_id", &self.codec_id)
+            .field("pending", &self.pending.len())
+            .field("next_index", &self.next_index)
+            .finish()
+    }
+}
+
+impl TheoraEncoder {
+    /// Build an encoder from the identification + setup headers and a
+    /// frame-level quantization index `qi` (`0..=63`). The three §6
+    /// header packets are serialized immediately and queued ahead of
+    /// any frame data; [`output_params`](oxideav_core::Encoder::output_params)
+    /// carries the same headers as a length-prefixed extradata chain.
+    pub fn new(
+        codec_id: oxideav_core::CodecId,
+        ident: TheoraIdentHeader,
+        setup: SetupHeaderTables,
+        qi: u8,
+    ) -> Result<Self, Error> {
+        let frame_encoder = FrameEncoder::new(ident.clone(), setup.clone(), qi)?;
+
+        // Serialize the three §6 header packets up front.
+        let ident_pkt = encode_identification_header(&ident)?;
+        let comment_pkt = encode_comment_header("oxideav-theora", &[])?;
+        let setup_pkt = encode_setup_header(&setup)?;
+
+        let extradata = pack_extradata(&[&ident_pkt, &comment_pkt, &setup_pkt])?;
+
+        // Advertise the coded (macro-block-aligned) dimensions: that is
+        // what `send_frame` consumes and what the data packets carry.
+        let mut params = oxideav_core::CodecParameters::video(codec_id.clone());
+        params.width = Some(ident.coded_width());
+        params.height = Some(ident.coded_height());
+        params.pixel_format = Some(core_pixel_format(ident.pf));
+        params.extradata = extradata;
+
+        let mut pending = std::collections::VecDeque::new();
+        for pkt_bytes in [ident_pkt, comment_pkt, setup_pkt] {
+            let mut pkt =
+                oxideav_core::Packet::new(0, oxideav_core::TimeBase::from_rate(1), pkt_bytes);
+            pkt.flags.header = true;
+            pending.push_back(pkt);
+        }
+
+        Ok(Self {
+            codec_id,
+            output_params: Box::new(params),
+            frame_encoder,
+            pending,
+            next_index: 0,
+        })
+    }
+
+    /// Encode one already-converted [`SourceFrame`] into a queued §7
+    /// intra data packet. Shared by [`send_frame`] and direct callers.
+    fn push_source_frame(&mut self, frame: &SourceFrame, pts: Option<i64>) -> Result<(), Error> {
+        let bytes = self.frame_encoder.encode_intra_frame(frame)?;
+        let pts = pts.unwrap_or(self.next_index);
+        self.next_index = pts + 1;
+        let mut pkt = oxideav_core::Packet::new(0, oxideav_core::TimeBase::from_rate(1), bytes);
+        pkt.pts = Some(pts);
+        pkt.dts = Some(pts);
+        pkt.flags.keyframe = true; // intra-only: every frame is a keyframe
+        self.pending.push_back(pkt);
+        Ok(())
+    }
+
+    /// Convert a top-down [`oxideav_core::VideoFrame`] at the coded
+    /// dimensions into a lower-left [`SourceFrame`].
+    fn video_frame_to_source(&self, vf: &oxideav_core::VideoFrame) -> Result<SourceFrame, Error> {
+        let g = self.frame_encoder.geometry();
+        if vf.planes.len() != 3 {
+            return Err(Error::EncodePlaneLenMismatch {
+                plane: 0,
+                got: vf.planes.len(),
+                want: 3,
+            });
+        }
+        let samples_y =
+            top_down_plane_to_lower_left(&vf.planes[0], g.dims_y.width, g.dims_y.height)?;
+        let samples_cb =
+            top_down_plane_to_lower_left(&vf.planes[1], g.dims_c.width, g.dims_c.height)?;
+        let samples_cr =
+            top_down_plane_to_lower_left(&vf.planes[2], g.dims_c.width, g.dims_c.height)?;
+        Ok(SourceFrame {
+            samples_y,
+            samples_cb,
+            samples_cr,
+        })
+    }
+}
+
+impl oxideav_core::Encoder for TheoraEncoder {
+    fn codec_id(&self) -> &oxideav_core::CodecId {
+        &self.codec_id
+    }
+
+    fn output_params(&self) -> &oxideav_core::CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &oxideav_core::Frame) -> oxideav_core::Result<()> {
+        let oxideav_core::Frame::Video(vf) = frame else {
+            return Err(oxideav_core::Error::invalid(
+                "oxideav-theora: encoder accepts only video frames",
+            ));
+        };
+        let source = self
+            .video_frame_to_source(vf)
+            .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+        self.push_source_frame(&source, vf.pts)
+            .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> oxideav_core::Result<oxideav_core::Packet> {
+        self.pending
+            .pop_front()
+            .ok_or(oxideav_core::Error::NeedMore)
+    }
+
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        // Intra-only: every frame is emitted on send_frame, so there is
+        // no buffered state to drain.
+        Ok(())
+    }
+}
+
+/// `make_encoder` factory plugged into the registry. Builds a
+/// [`TheoraEncoder`] from the identification + setup headers carried in
+/// [`CodecParameters::extradata`] (the same length-prefixed header chain
+/// `make_decoder` consumes), at the frame-level quantization index from
+/// the `qi` codec option (default 32).
+///
+/// The setup header (§6.4 quantization parameters + Huffman tables)
+/// cannot be synthesized from the spec alone without reconstructing
+/// encoder-private tables, so the caller supplies a complete setup
+/// header via `extradata` — typically taken verbatim from a stream this
+/// crate (or any conformant Theora source) already produced.
+pub fn make_encoder(
+    params: &oxideav_core::CodecParameters,
+) -> oxideav_core::Result<Box<dyn oxideav_core::Encoder>> {
+    let mut ident: Option<TheoraIdentHeader> = None;
+    let mut setup: Option<SetupHeaderTables> = None;
+    let ed = &params.extradata;
+    let mut off = 0usize;
+    while off + 2 <= ed.len() {
+        let len = ((ed[off] as usize) << 8) | (ed[off + 1] as usize);
+        off += 2;
+        if off + len > ed.len() {
+            return Err(oxideav_core::Error::invalid(
+                "oxideav-theora: encoder extradata header length runs past the buffer",
+            ));
+        }
+        let pkt = &ed[off..off + len];
+        match pkt.first() {
+            Some(0x80) => {
+                ident = Some(
+                    decode_identification_header(pkt)
+                        .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?,
+                )
+            }
+            Some(0x82) => {
+                setup = Some(
+                    decode_setup_header(pkt)
+                        .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?,
+                )
+            }
+            // Comment header (0x81) and anything else are skipped — the
+            // encoder writes its own comment header.
+            _ => {}
+        }
+        off += len;
+    }
+    let ident = ident.ok_or_else(|| {
+        oxideav_core::Error::invalid(
+            "oxideav-theora: encoder needs the §6.2 identification header in extradata",
+        )
+    })?;
+    let setup = setup.ok_or_else(|| {
+        oxideav_core::Error::invalid(
+            "oxideav-theora: encoder needs the §6.4 setup header in extradata",
+        )
+    })?;
+
+    // Frame-level quantization index from the `qi` option (default 32).
+    let qi = params
+        .options
+        .get("qi")
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(32);
+
+    let enc = TheoraEncoder::new(params.codec_id.clone(), ident, setup, qi)
+        .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+    Ok(Box::new(enc))
+}
+
 /// Register the Theora codec into `reg` under [`THEORA_CODEC_ID`], with
 /// the Matroska CodecID `V_THEORA` the codec is carried under in MKV /
 /// WebM. (Theora has no canonical AVI FourCC; the container-specific tag
@@ -12129,6 +12418,7 @@ pub fn register_codecs(reg: &mut oxideav_core::CodecRegistry) {
         CodecInfo::new(CodecId::new(THEORA_CODEC_ID))
             .capabilities(caps)
             .decoder(make_decoder)
+            .encoder(make_encoder)
             .tag(CodecTag::matroska("V_THEORA")),
     );
 }
@@ -26730,6 +27020,194 @@ mod tests {
         assert_eq!(back, tables);
     }
 
+    // ------- oxideav_core::Encoder trait integration -------
+
+    /// Build a flat-128 top-down `VideoFrame` at the coded dimensions of
+    /// `ident`, with a per-plane stride padding to exercise the
+    /// stride-strip path.
+    fn flat_video_frame(
+        ident: &TheoraIdentHeader,
+        y: u8,
+        cb: u8,
+        cr: u8,
+        extra_stride: usize,
+    ) -> oxideav_core::VideoFrame {
+        use oxideav_core::frame::VideoPlane;
+        let g = build_frame_geometry(ident).unwrap();
+        let mk = |w: u32, h: u32, val: u8| -> VideoPlane {
+            let stride = w as usize + extra_stride;
+            VideoPlane {
+                stride,
+                data: vec![val; stride * h as usize],
+            }
+        };
+        oxideav_core::VideoFrame {
+            pts: Some(0),
+            planes: vec![
+                mk(g.dims_y.width, g.dims_y.height, y),
+                mk(g.dims_c.width, g.dims_c.height, cb),
+                mk(g.dims_c.width, g.dims_c.height, cr),
+            ],
+        }
+    }
+
+    /// The full `oxideav_core::Encoder` path: encode three header
+    /// packets then a flat data packet, feed everything back through
+    /// `TheoraDecoder`, and confirm the decoded frame matches the source
+    /// (a flat frame is lossless through the intra encoder).
+    #[test]
+    fn encoder_trait_flat_frame_round_trips_through_decoder() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        let mut enc = TheoraEncoder::new(codec_id.clone(), ident.clone(), setup, 32).unwrap();
+        // A flat-128 frame is reproduced losslessly by the intra encoder.
+        let vf = flat_video_frame(&ident, 128, 128, 128, 4);
+        enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+
+        // Drain encoder output: 3 header packets (flagged header) then
+        // one keyframe data packet.
+        let mut header_pkts: Vec<oxideav_core::Packet> = Vec::new();
+        let mut data_pkt = None;
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if p.flags.header {
+                        header_pkts.push(p);
+                    } else {
+                        assert!(p.flags.keyframe, "intra data packet must be a keyframe");
+                        data_pkt = Some(p);
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("unexpected encoder error: {e}"),
+            }
+        }
+        assert_eq!(header_pkts.len(), 3, "three §6 header packets");
+        let data_pkt = data_pkt.expect("one data packet");
+
+        // Feed headers + data into a fresh trait decoder.
+        let mut dec = TheoraDecoder::new(codec_id);
+        for h in &header_pkts {
+            dec.send_packet(h).unwrap();
+        }
+        dec.send_packet(&data_pkt).unwrap();
+        let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!("expected a video frame");
+        };
+        // Decoder crops to the picture region (32×32 == coded here) and
+        // emits top-down planes. Flat 128 in → flat 128 out.
+        assert!(out.planes[0].data.iter().all(|&b| b == 128), "luma flat");
+        assert!(out.planes[1].data.iter().all(|&b| b == 128), "cb flat");
+        assert!(out.planes[2].data.iter().all(|&b| b == 128), "cr flat");
+    }
+
+    /// `output_params` advertises the coded dimensions, the mapped pixel
+    /// format, and an extradata chain whose embedded headers parse back
+    /// (so a muxer hands the decoder a self-describing setup).
+    #[test]
+    fn encoder_output_params_carry_decodable_extradata() {
+        use oxideav_core::Encoder;
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let enc = TheoraEncoder::new(codec_id.clone(), ident.clone(), setup, 16).unwrap();
+        let params = enc.output_params();
+        assert_eq!(params.width, Some(32));
+        assert_eq!(params.height, Some(32));
+        assert_eq!(
+            params.pixel_format,
+            Some(oxideav_core::PixelFormat::Yuv420P)
+        );
+
+        // The factory rebuilds a working encoder from the extradata alone.
+        let rebuilt = make_encoder(params).expect("make_encoder from extradata");
+        assert_eq!(rebuilt.output_params().width, Some(32));
+    }
+
+    /// `make_encoder` without the §6.2 / §6.4 headers in extradata is a
+    /// typed error, not a panic.
+    #[test]
+    fn make_encoder_rejects_missing_headers() {
+        let params =
+            oxideav_core::CodecParameters::video(oxideav_core::CodecId::new(THEORA_CODEC_ID));
+        assert!(make_encoder(&params).is_err());
+    }
+
+    /// A textured (gradient) frame survives the full trait round-trip to
+    /// within the quantizer step — the same fidelity bound the direct
+    /// `FrameEncoder` self-roundtrip asserts, now exercised through the
+    /// `oxideav_core::Encoder` / `Decoder` traits end-to-end.
+    #[test]
+    fn encoder_trait_gradient_frame_round_trips_within_quantizer() {
+        use oxideav_core::{frame::VideoPlane, Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let g = build_frame_geometry(&ident).unwrap();
+
+        // Top-down gradient luma; flat chroma.
+        let yw = g.dims_y.width as usize;
+        let yh = g.dims_y.height as usize;
+        let mut ydata = vec![0u8; yw * yh];
+        for (r, row) in ydata.chunks_mut(yw).enumerate() {
+            for (c, px) in row.iter_mut().enumerate() {
+                *px = ((r + c) * 4).min(255) as u8;
+            }
+        }
+        let cw = g.dims_c.width as usize;
+        let ch = g.dims_c.height as usize;
+        let vf = oxideav_core::VideoFrame {
+            pts: Some(0),
+            planes: vec![
+                VideoPlane {
+                    stride: yw,
+                    data: ydata.clone(),
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: vec![128u8; cw * ch],
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: vec![128u8; cw * ch],
+                },
+            ],
+        };
+
+        // Encode at the weakest quantizer for the tightest fidelity.
+        let mut enc = TheoraEncoder::new(codec_id.clone(), ident.clone(), setup, 63).unwrap();
+        enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+
+        let mut dec = TheoraDecoder::new(codec_id);
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => dec.send_packet(&p).unwrap(),
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error: {e}"),
+            }
+        }
+        let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        // Compare decoded luma against the source gradient (both top-down,
+        // 32×32 picture == coded). Bound the per-sample error.
+        let mut max_err = 0i32;
+        for (a, b) in out.planes[0].data.iter().zip(ydata.iter()) {
+            max_err = max_err.max((*a as i32 - *b as i32).abs());
+        }
+        assert!(
+            max_err <= 12,
+            "max luma error {max_err} exceeds quantizer bound"
+        );
+        assert!(
+            out.planes[1].data.iter().all(|&b| b == 128),
+            "cb stays flat"
+        );
+    }
+
     // ------- §2.3 / §2.4 frame-geometry builder -------
 
     /// §2.3's worked example: a 240×48 frame (FMBW=15, FMBH=3,
@@ -28122,13 +28600,59 @@ mod tests {
         assert_eq!(got, &fixture_data::TINY_EXPECTED_YUV[..]);
     }
 
-    /// Registration installs a Theora decoder reachable through the
-    /// shared [`oxideav_core::CodecRegistry`].
+    /// Registration installs both a Theora decoder and a Theora encoder
+    /// reachable through the shared [`oxideav_core::CodecRegistry`].
     #[test]
-    fn register_installs_theora_decoder() {
+    fn register_installs_theora_decoder_and_encoder() {
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
         assert!(ctx.codecs.has_decoder(&CodecId::new(THEORA_CODEC_ID)));
-        assert!(!ctx.codecs.has_encoder(&CodecId::new(THEORA_CODEC_ID)));
+        assert!(ctx.codecs.has_encoder(&CodecId::new(THEORA_CODEC_ID)));
+    }
+
+    /// End-to-end through the registry: build an encoder from
+    /// `CodecParameters` (headers in extradata), encode a flat frame,
+    /// build a decoder from the encoder's `output_params`, and confirm a
+    /// lossless flat round-trip — proving the `make_encoder` /
+    /// `make_decoder` factories are correctly wired into the registry.
+    #[test]
+    fn registry_encode_decode_round_trip() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let extradata = pack_extradata(&[
+            &encode_identification_header(&ident).unwrap(),
+            &encode_comment_header("v", &[]).unwrap(),
+            &encode_setup_header(&setup).unwrap(),
+        ])
+        .unwrap();
+
+        let mut enc_params = oxideav_core::CodecParameters::video(CodecId::new(THEORA_CODEC_ID));
+        enc_params.extradata = extradata;
+        let mut enc = ctx.codecs.first_encoder(&enc_params).unwrap();
+
+        // A flat-128 frame equals the §7.9.1.1 intra predictor, so it
+        // reconstructs losslessly regardless of the (default) quantizer.
+        let vf = flat_video_frame(&ident, 128, 128, 128, 0);
+        enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+
+        let dec_params = enc.output_params().clone();
+        let mut dec = ctx.codecs.first_decoder(&dec_params).unwrap();
+
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => dec.send_packet(&p).unwrap(),
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error: {e}"),
+            }
+        }
+        let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        assert!(out.planes[0].data.iter().all(|&b| b == 128));
+        assert!(out.planes[1].data.iter().all(|&b| b == 128));
+        assert!(out.planes[2].data.iter().all(|&b| b == 128));
     }
 }

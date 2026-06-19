@@ -6,6 +6,29 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **`oxideav_core::Encoder` trait integration (round 342, second
+  encoder commit)**. New public `TheoraEncoder` implements
+  `oxideav_core::Encoder`, and `register` now installs an encoder
+  factory (`make_encoder`) alongside the decoder. On construction the
+  encoder serializes the three §6 header packets (via the new
+  `encode_*_header` functions) and queues them as the first three
+  `receive_packet` outputs (each flagged `PacketFlags::header`); every
+  `send_frame` converts a top-down `oxideav_core::VideoFrame` at the
+  coded macro-block-aligned dimensions into one §7 intra video-data
+  packet (flagged keyframe) via `FrameEncoder::encode_intra_frame`,
+  reversing the §2.1 row order and stripping stride padding.
+  `output_params` advertises the coded dimensions, the mapped pixel
+  format, and a length-prefixed extradata chain carrying the three
+  headers (the same format `make_decoder` consumes), so a muxer hands a
+  self-describing setup downstream. `make_encoder` rebuilds an encoder
+  from that extradata (ident + setup headers required) at the `qi`
+  codec-option quantizer (default 32). A complete encode → decode loop
+  now round-trips through both `oxideav_core` traits: a flat frame is
+  lossless, a 32×32 gradient stays within the quantizer bound, and the
+  full path also round-trips through the shared `CodecRegistry`
+  (`first_encoder` → `first_decoder`). +6 tests; the registration test
+  was updated to assert both a decoder and an encoder are installed.
+
 - **§6 header-packet serialization (round 342, first encoder commit)**.
   New public `encode_identification_header` (§6.2), `encode_comment_header`
   (§6.3), and `encode_setup_header` (§6.4) — the exact inverses of

@@ -877,6 +877,17 @@ pub enum Error {
         /// The block's lower-left pixel row.
         by: u32,
     },
+    /// A header-serialization field could not be represented on the wire
+    /// — e.g. a `picw`/`pich` exceeding the 24-bit field, or a comment
+    /// vector longer than the 32-bit length prefix. The encoder builds
+    /// headers from validated [`TheoraIdentHeader`] / [`SetupHeaderTables`]
+    /// values, so this is an internal-invariant guard.
+    EncodeHeaderFieldOutOfRange {
+        /// The spec mnemonic of the offending field.
+        field: &'static str,
+        /// The value that overran its on-wire width.
+        value: u64,
+    },
     /// The `bi` argument to [`compute_dc_predictor`] was `>= nbs`, so the
     /// per-block arrays cannot be indexed safely. §7.8.1 works per
     /// coded-order block index; the caller must keep `bi < NBS`.
@@ -1728,6 +1739,10 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: encode block at ({bx},{by}) escapes its source plane"
             ),
+            Error::EncodeHeaderFieldOutOfRange { field, value } => write!(
+                f,
+                "oxideav-theora: header field {field} value {value} overruns its on-wire width"
+            ),
             Error::DcPredictorBlockIndexOutOfRange { bi, nbs } => write!(
                 f,
                 "oxideav-theora: §7.8.1 bi={bi} >= nbs={nbs}"
@@ -2014,6 +2029,18 @@ impl ColorSpace {
             1 => ColorSpace::Rec470M,
             2 => ColorSpace::Rec470Bg,
             other => ColorSpace::Reserved(other),
+        }
+    }
+
+    /// The §6.2 step-15 `CS` octet for this color space — the exact
+    /// inverse of [`ColorSpace::from_byte`], so a decoded then
+    /// re-encoded identification header carries the same `CS` value.
+    fn to_byte(self) -> u8 {
+        match self {
+            ColorSpace::Undefined => 0,
+            ColorSpace::Rec470M => 1,
+            ColorSpace::Rec470Bg => 2,
+            ColorSpace::Reserved(b) => b,
         }
     }
 }
@@ -11496,6 +11523,322 @@ impl FrameEncoder {
 
         Ok(w.into_bytes())
     }
+}
+
+// =====================================================================
+// §6 header-packet serialization (encoder side)
+// =====================================================================
+//
+// The three serializers below are the exact inverses of
+// `decode_identification_header` (§6.2), the comment-header
+// constructor used by `parse_comment_header` (§6.3), and
+// `decode_setup_header` (§6.4): a header decoded by those functions
+// and re-encoded here reproduces the same logical fields, and the
+// re-encoded bytes decode back to an equal struct. They let the
+// `oxideav_core::Encoder` integration emit a complete, self-describing
+// Theora stream (the three §6 headers followed by §7 video-data
+// packets) without re-using the in-memory header objects the decoder
+// happened to consume.
+
+/// Push a big-endian unsigned integer of `n` bytes (`n` in `1..=4`)
+/// onto `out`, most-significant byte first. The §6.2 identification
+/// header is byte-aligned, so its multi-octet fields (`FMBW` u16,
+/// `PICW`/`PICH`/`PARN`/`PARD`/`NOMBR` u24, `FRN`/`FRD` u32) are
+/// written with this helper, mirroring the `Reader::read_u*_be`
+/// consumption order.
+fn push_be(out: &mut Vec<u8>, value: u32, n: usize) {
+    for i in (0..n).rev() {
+        out.push(((value >> (8 * i)) & 0xff) as u8);
+    }
+}
+
+/// Serialize a [`TheoraIdentHeader`] into the §6.2 identification
+/// header packet (the 42-byte payload `decode_identification_header`
+/// consumes, starting at the `0x80` type byte).
+///
+/// The field order and widths follow Figure 6.2 exactly: the §6.1
+/// common header (`0x80` + `"theora"`), `VMAJ`/`VMIN`/`VREV`,
+/// `FMBW`/`FMBH` (u16), `PICW`/`PICH` (u24), `PICX`/`PICY` (u8),
+/// `FRN`/`FRD` (u32), `PARN`/`PARD` (u24), `CS` (u8), `NOMBR` (u24),
+/// then the packed `QUAL:6 | KFGSHIFT:5 | PF:2 | Res:3` final octet
+/// pair. Round-trips through [`decode_identification_header`] to an
+/// equal struct for every header that function accepts.
+pub fn encode_identification_header(ident: &TheoraIdentHeader) -> Result<Vec<u8>, Error> {
+    // The encoder always emits the alpha3+ feature set the decoder
+    // requires (§6.2 steps 2–4 fix VMAJ=3, VMIN=2, VREV>=1). Range
+    // guards mirror the on-wire field widths so an out-of-spec value
+    // surfaces as a typed error rather than a silent truncation.
+    let chk = |field: &'static str, v: u32, bits: u32| -> Result<(), Error> {
+        if bits < 32 && v >= (1u32 << bits) {
+            return Err(Error::EncodeHeaderFieldOutOfRange {
+                field,
+                value: v as u64,
+            });
+        }
+        Ok(())
+    };
+    chk("PICW", ident.picw, 24)?;
+    chk("PICH", ident.pich, 24)?;
+    chk("PARN", ident.parn, 24)?;
+    chk("PARD", ident.pard, 24)?;
+    chk("NOMBR", ident.nombr, 24)?;
+    if ident.qual > 0x3f {
+        return Err(Error::EncodeHeaderFieldOutOfRange {
+            field: "QUAL",
+            value: ident.qual as u64,
+        });
+    }
+    if ident.kfgshift > 0x1f {
+        return Err(Error::EncodeHeaderFieldOutOfRange {
+            field: "KFGSHIFT",
+            value: ident.kfgshift as u64,
+        });
+    }
+
+    let mut out = Vec::with_capacity(42);
+    out.push(0x80);
+    out.extend_from_slice(b"theora");
+    out.push(ident.vmaj);
+    out.push(ident.vmin);
+    out.push(ident.vrev);
+    push_be(&mut out, ident.fmbw as u32, 2);
+    push_be(&mut out, ident.fmbh as u32, 2);
+    push_be(&mut out, ident.picw, 3);
+    push_be(&mut out, ident.pich, 3);
+    out.push(ident.picx);
+    out.push(ident.picy);
+    push_be(&mut out, ident.frn, 4);
+    push_be(&mut out, ident.frd, 4);
+    push_be(&mut out, ident.parn, 3);
+    push_be(&mut out, ident.pard, 3);
+    out.push(ident.cs.to_byte());
+    push_be(&mut out, ident.nombr, 3);
+
+    // Packed final 16-bit field: QUAL(6) | KFGSHIFT(5) | PF(2) | Res(3).
+    let pf_raw = ident.pf as u32; // 0 (4:2:0), 2 (4:2:2), 3 (4:4:4)
+    let packed = ((ident.qual as u32) << 10) | ((ident.kfgshift as u32) << 5) | (pf_raw << 3); // reserved 3 bits = 0
+    push_be(&mut out, packed, 2);
+
+    Ok(out)
+}
+
+/// Serialize a vendor string and `(key, value)` user comments into the
+/// §6.3 comment header packet (the payload `parse_comment_header`
+/// consumes, starting at the `0x81` type byte).
+///
+/// The Vorbis-compatible layout from §6.3.1 is reproduced verbatim:
+/// the §6.1 common header (`0x81` + `"theora"`), a 32-bit
+/// little-endian vendor length and the vendor bytes, a 32-bit
+/// little-endian comment count, and then each comment as a 32-bit
+/// little-endian length plus its `KEY=value` UTF-8 vector. Round-trips
+/// through [`parse_comment_header`].
+pub fn encode_comment_header(
+    vendor: &str,
+    comments: &[(String, String)],
+) -> Result<Vec<u8>, Error> {
+    let push_le = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
+    let to_len = |field: &'static str, n: usize| -> Result<u32, Error> {
+        u32::try_from(n).map_err(|_| Error::EncodeHeaderFieldOutOfRange {
+            field,
+            value: n as u64,
+        })
+    };
+
+    let mut out = Vec::new();
+    out.push(0x81);
+    out.extend_from_slice(b"theora");
+    push_le(&mut out, to_len("vendor_len", vendor.len())?);
+    out.extend_from_slice(vendor.as_bytes());
+    push_le(&mut out, to_len("ncomments", comments.len())?);
+    for (k, v) in comments {
+        // §6.3.3: each user comment is the `KEY=value` byte vector.
+        let mut vector = Vec::with_capacity(k.len() + 1 + v.len());
+        vector.extend_from_slice(k.as_bytes());
+        vector.push(b'=');
+        vector.extend_from_slice(v.as_bytes());
+        push_le(&mut out, to_len("comment_len", vector.len())?);
+        out.extend_from_slice(&vector);
+    }
+    Ok(out)
+}
+
+/// Emit one §6.4.4 Huffman table onto `w` as the binary-tree bit
+/// description the decoder walks (`decode_one_huffman_table`'s
+/// inverse).
+///
+/// The decoder reconstructs the flat node array from a pre-order walk:
+/// at each node a 1-bit `ISLEAF` flag, then either a 5-bit `TOKEN`
+/// (leaf) or the `0` subtree followed by the `1` subtree (branch). We
+/// reproduce that pre-order traversal over the already-built `nodes`
+/// array, so the bits we write are exactly the bits the decoder read.
+fn encode_one_huffman_table(w: &mut BitWriter, table: &HuffmanTable) {
+    // Iterative pre-order DFS mirroring the decoder's stack order
+    // (`0` child visited before `1`): push `1` then `0` so `0` pops
+    // first.
+    let mut stack: Vec<u32> = vec![0];
+    while let Some(idx) = stack.pop() {
+        match table.nodes[idx as usize] {
+            HuffmanNode::Leaf { token } => {
+                w.write_bits(1, 1); // ISLEAF = 1
+                w.write_bits(token as u32, 5);
+            }
+            HuffmanNode::Branch { zero, one } => {
+                w.write_bits(0, 1); // ISLEAF = 0
+                stack.push(one);
+                stack.push(zero);
+            }
+        }
+    }
+}
+
+/// Serialize a [`SetupHeaderTables`] into the §6.4 setup header packet
+/// (the payload `decode_setup_header` consumes, starting at the `0x82`
+/// type byte).
+///
+/// The §6.1 common header (`0x82` + `"theora"`) is byte-aligned; the
+/// §6.4.5 body (steps 2–4) is a single bit-packed run written onto one
+/// [`BitWriter`], mirroring the shared-reader contract on the decode
+/// side (§6.4.1 LFLIMS, then §6.4.2 quantization parameters, then
+/// §6.4.4 Huffman tables, with no byte re-alignment between sections).
+/// Round-trips through [`decode_setup_header`] to an equal
+/// [`SetupHeaderTables`].
+pub fn encode_setup_header(setup: &SetupHeaderTables) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    out.push(0x82);
+    out.extend_from_slice(b"theora");
+
+    let mut w = BitWriter::new();
+
+    // --- §6.4.1: LFLIMS. Choose the minimal NBITS (0..=7) that holds
+    // every entry, then write the 3-bit NBITS and 64 NBITS-bit values.
+    let lf_max = setup.loop_filter_limits.iter().copied().max().unwrap_or(0);
+    let lf_nbits = if lf_max == 0 {
+        0
+    } else {
+        8 - lf_max.leading_zeros()
+    };
+    w.write_bits(lf_nbits, 3);
+    if lf_nbits > 0 {
+        for &v in setup.loop_filter_limits.iter() {
+            w.write_bits(v as u32, lf_nbits);
+        }
+    }
+
+    // --- §6.4.2: quantization parameters.
+    encode_quant_params_inner(&mut w, &setup.quantization_parameters)?;
+
+    // --- §6.4.4: the 80 DCT-token Huffman tables.
+    for table in setup.huffman_tables.iter() {
+        encode_one_huffman_table(&mut w, table);
+    }
+
+    out.extend_from_slice(&w.into_bytes());
+    Ok(out)
+}
+
+/// Minimal NBITS (`1..=16`) needed to hold every entry of a 64-element
+/// scale table, the inverse of the §6.4.2 step 1/3 "read 4-bit NBITS,
+/// add one" decode (the stored 4-bit value is `nbits - 1`).
+fn scale_nbits(scales: &[u16; 64]) -> u32 {
+    let m = scales.iter().copied().max().unwrap_or(0);
+    if m == 0 {
+        1
+    } else {
+        16 - m.leading_zeros()
+    }
+}
+
+/// Write the §6.4.2 quantization-parameter payload onto `w`, the
+/// inverse of [`decode_quant_params_inner`].
+///
+/// The encoder always emits each `(qti, pli)` quant-range set with a
+/// fresh definition (`NEWQR = 1`) rather than the copy short-cut, so
+/// the serialized ranges are self-contained and unambiguous. That is a
+/// valid §6.4.2 step-7 encoding for any parameter set the decoder
+/// produced: the copy path (`NEWQR = 0`) is an optional size
+/// optimization, not a semantic requirement.
+fn encode_quant_params_inner(w: &mut BitWriter, qp: &QuantizationParameters) -> Result<(), Error> {
+    // Steps 1–2: ACSCALE.
+    let ac_nbits = scale_nbits(&qp.ac_scale);
+    w.write_bits(ac_nbits - 1, 4);
+    for &v in qp.ac_scale.iter() {
+        w.write_bits(v as u32, ac_nbits);
+    }
+    // Steps 3–4: DCSCALE.
+    let dc_nbits = scale_nbits(&qp.dc_scale);
+    w.write_bits(dc_nbits - 1, 4);
+    for &v in qp.dc_scale.iter() {
+        w.write_bits(v as u32, dc_nbits);
+    }
+
+    // Step 5: NBMS (stored as nbms - 1 in 9 bits).
+    let nbms = qp.num_base_matrices;
+    if nbms == 0 || nbms > 384 {
+        return Err(Error::EncodeHeaderFieldOutOfRange {
+            field: "NBMS",
+            value: nbms as u64,
+        });
+    }
+    w.write_bits((nbms as u32) - 1, 9);
+
+    // Step 6: BMS — NBMS base matrices, 64 8-bit entries each.
+    if qp.base_matrices.len() < nbms as usize {
+        return Err(Error::EncodeHeaderFieldOutOfRange {
+            field: "BMS",
+            value: qp.base_matrices.len() as u64,
+        });
+    }
+    for bmi in 0..nbms as usize {
+        for &v in qp.base_matrices[bmi].iter() {
+            w.write_bits(v as u32, 8);
+        }
+    }
+
+    // Step 7: per-(qti, pli) quant ranges. `bmi_bits = ilog(NBMS - 1)`
+    // is the width of each QRBMIS, matching the decoder.
+    let bmi_bits = ilog(nbms as i64 - 1);
+    for qti in 0usize..2 {
+        for pli in 0usize..3 {
+            // (a)i/ii: NEWQR is implicit-1 at (0,0); elsewhere we always
+            // emit a fresh definition.
+            if qti > 0 || pli > 0 {
+                w.write_bits(1, 1); // NEWQR = 1
+            }
+            // (a)iv: write the range chain. C: first QRBMIS.
+            let nqrs = qp.num_quant_ranges[qti][pli] as usize;
+            w.write_bits(
+                qp.quant_range_base_matrix_indices[qti][pli][0] as u32,
+                bmi_bits,
+            );
+            let mut qi = 0i64;
+            for qri in 0..nqrs {
+                // D: QRSIZES[qri] written as (size - 1) in ilog(62 - qi) bits.
+                let size = qp.quant_range_sizes[qti][pli][qri] as u32;
+                if size == 0 {
+                    return Err(Error::EncodeHeaderFieldOutOfRange {
+                        field: "QRSIZES",
+                        value: 0,
+                    });
+                }
+                w.write_bits(size - 1, ilog(62 - qi));
+                qi += size as i64;
+                // G: the trailing QRBMIS for range boundary qri + 1.
+                w.write_bits(
+                    qp.quant_range_base_matrix_indices[qti][pli][qri + 1] as u32,
+                    bmi_bits,
+                );
+            }
+            // The decoder loops until qi == 63; a well-formed range set
+            // sums to exactly 63.
+            if qi != 63 {
+                return Err(Error::EncodeHeaderFieldOutOfRange {
+                    field: "QRSIZES_sum",
+                    value: qi as u64,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -26243,6 +26586,148 @@ mod tests {
         assert_eq!(legacy.loop_filter_limits, full.loop_filter_limits);
         assert_eq!(legacy.ac_scale, full.quantization_parameters.ac_scale);
         assert_eq!(legacy.dc_scale, full.quantization_parameters.dc_scale);
+    }
+
+    // ------- §6 header-packet serialization (encoder side) -------
+
+    /// `encode_identification_header` is a byte-exact inverse of
+    /// `decode_identification_header` on the fixture ident packet —
+    /// the re-encoded bytes equal the original 42-byte payload.
+    #[test]
+    fn encode_identification_header_byte_exact_round_trip() {
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let bytes = encode_identification_header(&ident).unwrap();
+        assert_eq!(&bytes[..], &TINY_HEADER[..]);
+    }
+
+    /// The same byte-exact round-trip holds for the non-MB-aligned
+    /// picture-region ident header (non-zero PICY, smaller PICW/PICH).
+    #[test]
+    fn encode_identification_header_pic_region_byte_exact() {
+        let ident = decode_identification_header(&PIC_REGION_HEADER).unwrap();
+        let bytes = encode_identification_header(&ident).unwrap();
+        assert_eq!(&bytes[..], &PIC_REGION_HEADER[..]);
+    }
+
+    /// All three pixel formats and a Reserved color space survive the
+    /// struct → bytes → struct round-trip with every field intact.
+    #[test]
+    fn encode_identification_header_struct_round_trip_all_formats() {
+        for pf in [
+            PixelFormat::Yuv420,
+            PixelFormat::Yuv422,
+            PixelFormat::Yuv444,
+        ] {
+            let ident = TheoraIdentHeader {
+                vmaj: 3,
+                vmin: 2,
+                vrev: 1,
+                fmbw: 5,
+                fmbh: 3,
+                picw: 70,
+                pich: 40,
+                picx: 2,
+                picy: 4,
+                frn: 30000,
+                frd: 1001,
+                parn: 16,
+                pard: 9,
+                cs: ColorSpace::Reserved(7),
+                nombr: 250_000,
+                qual: 44,
+                kfgshift: 6,
+                pf,
+            };
+            let bytes = encode_identification_header(&ident).unwrap();
+            let back = decode_identification_header(&bytes).unwrap();
+            assert_eq!(back, ident, "round-trip for pf={pf:?}");
+        }
+    }
+
+    /// Out-of-range header fields surface as a typed error rather than
+    /// silently truncating.
+    #[test]
+    fn encode_identification_header_rejects_oversized_qual() {
+        let mut ident = decode_identification_header(&TINY_HEADER).unwrap();
+        ident.qual = 64; // > 6-bit field
+        assert!(matches!(
+            encode_identification_header(&ident),
+            Err(Error::EncodeHeaderFieldOutOfRange { field: "QUAL", .. })
+        ));
+    }
+
+    /// `encode_comment_header` round-trips a vendor string and a list
+    /// of `(key, value)` comments through `parse_comment_header`.
+    #[test]
+    fn encode_comment_header_round_trip() {
+        let vendor = "oxideav-theora";
+        let comments = vec![
+            ("ENCODER".to_string(), "oxideav".to_string()),
+            ("TITLE".to_string(), "round-trip".to_string()),
+            // UTF-8 value with a multi-byte character.
+            ("ARTIST".to_string(), "café".to_string()),
+        ];
+        let bytes = encode_comment_header(vendor, &comments).unwrap();
+        let parsed = parse_comment_header(&bytes).unwrap();
+        assert_eq!(parsed.vendor, vendor);
+        assert_eq!(parsed.comments, comments);
+    }
+
+    /// An empty comment list (vendor only) is the minimal valid comment
+    /// header and round-trips.
+    #[test]
+    fn encode_comment_header_empty_comments_round_trip() {
+        let bytes = encode_comment_header("v", &[]).unwrap();
+        let parsed = parse_comment_header(&bytes).unwrap();
+        assert_eq!(parsed.vendor, "v");
+        assert!(parsed.comments.is_empty());
+    }
+
+    /// `encode_setup_header` round-trips the full fixture setup tables:
+    /// the bytes it produces decode back to an *equal*
+    /// `SetupHeaderTables` (LFLIMS + every quant parameter + all 80
+    /// Huffman tables). NEWQR is always emitted fresh, so the decoded
+    /// quant ranges match the originals even though the byte layout may
+    /// differ from the fixture's copy-optimized encoding.
+    #[test]
+    fn encode_setup_header_round_trips_fixture_tables() {
+        let original = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let bytes = encode_setup_header(&original).unwrap();
+        let back = decode_setup_header(&bytes).unwrap();
+        assert_eq!(back, original);
+    }
+
+    /// The Huffman-tree serializer reproduces the exact pre-order bits
+    /// the decoder reads: each of the 80 re-encoded tables decodes to
+    /// the same entry list and tree.
+    #[test]
+    fn encode_setup_header_preserves_every_huffman_table() {
+        let original = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let bytes = encode_setup_header(&original).unwrap();
+        let back = decode_setup_header(&bytes).unwrap();
+        for hti in 0..NUM_HUFFMAN_TABLES {
+            assert_eq!(
+                back.huffman_tables[hti], original.huffman_tables[hti],
+                "HTS[{hti}] mismatch after re-encode"
+            );
+        }
+    }
+
+    /// A setup header built from the VP3 default scale tables (a
+    /// distinct quant-parameter shape from the fixture) also round-trips
+    /// — exercises the minimal-NBITS scale-width selection.
+    #[test]
+    fn encode_setup_header_round_trips_synthesized_tables() {
+        // Reuse the fixture quant ranges / base matrices / Huffman
+        // tables but swap in the VP3 default scale tables and a custom
+        // LFLIMS to vary the bit widths.
+        let mut tables = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        tables.loop_filter_limits = LFLIMS_VP3;
+        tables.quantization_parameters.ac_scale = ACSCALE_VP3;
+        tables.quantization_parameters.dc_scale = DCSCALE_VP3;
+        let bytes = encode_setup_header(&tables).unwrap();
+        let back = decode_setup_header(&bytes).unwrap();
+        assert_eq!(back, tables);
     }
 
     // ------- §2.3 / §2.4 frame-geometry builder -------

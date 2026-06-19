@@ -6,6 +6,27 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **§6 header-packet serialization (round 342, first encoder commit)**.
+  New public `encode_identification_header` (§6.2), `encode_comment_header`
+  (§6.3), and `encode_setup_header` (§6.4) — the exact inverses of
+  `decode_identification_header`, `parse_comment_header`, and
+  `decode_setup_header`. The identification serializer is *byte-exact*:
+  re-encoding either fixture ident packet reproduces the original 42-byte
+  payload, and a struct → bytes → struct round-trip preserves every
+  field across all three pixel formats and a reserved color space. The
+  setup serializer writes the §6.4.5 body (LFLIMS with minimal NBITS, the
+  §6.4.2 quantization parameters with fresh `NEWQR=1` ranges, and all 80
+  §6.4.4 Huffman tables emitted from a pre-order tree walk that
+  reproduces the exact ISLEAF/TOKEN bits the decoder reads) onto one
+  shared `BitWriter`, mirroring the decode-side shared-reader contract;
+  it round-trips the full fixture setup tables and a VP3-default-scale
+  variant back to an equal `SetupHeaderTables` (LFLIMS + every quant
+  parameter + every Huffman table). New `ColorSpace::to_byte` inverse and
+  `Error::EncodeHeaderFieldOutOfRange` for fields that overrun their
+  on-wire width. This is the keystone unblocker for a full
+  `oxideav_core::Encoder` integration that emits a complete decodable
+  stream. +9 tests.
+
 - **intra-frame encoder — encode → decode self-roundtrip (round 338
   milestone)**. New public `FrameEncoder` / `SourceFrame` turn a
   macro-block-aligned source frame into a §7 video-data packet that

@@ -104,12 +104,19 @@ packets are handled as duplicate-frame markers.
   decoder) via the `make_encoder` factory. The encoder serializes the
   three §6 headers up front and emits them as the first three packets
   (flagged `header`), then turns each top-down `VideoFrame` at the coded
-  dimensions into one §7 intra data packet (flagged keyframe).
-  `output_params` carries the coded dimensions, the mapped pixel format,
-  and a length-prefixed extradata header chain, so a complete
-  encode → decode loop round-trips through both `oxideav_core` traits and
-  through the shared `CodecRegistry` (`first_encoder` → `first_decoder`):
-  a flat frame is lossless, a gradient stays within the quantizer bound.
+  dimensions into one §7 data packet. The keyframe interval (`-g`,
+  `TheoraEncoder::with_keyframe_interval`, default 1) decides intra vs
+  inter: interval-boundary frames are intra keyframes, the frames
+  between are inter (P) frames predicted from the reconstructed previous
+  reference. The encoder mirrors its own output through an internal
+  `FrameDecoder` so the reference it predicts from is byte-identical to
+  the downstream decoder's. `output_params` carries the coded
+  dimensions, the mapped pixel format, and a length-prefixed extradata
+  header chain, so a complete encode → decode loop round-trips through
+  both `oxideav_core` traits and through the shared `CodecRegistry`
+  (`first_encoder` → `first_decoder`): a flat frame is lossless, a
+  gradient stays within the quantizer bound, and an I,P,P interval-3
+  sequence reconstructs every frame within the quantizer bound.
 
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation
@@ -127,21 +134,14 @@ inter branches (asserted in addition to the sample-exact pixel match).
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **Inter encode via the `oxideav_core::Encoder` trait** — the
-  packet-level inter encoder (`FrameEncoder::encode_inter_frame` /
-  `encode_inter_frame_motion`) round-trips through this crate's own
-  decoder, but `TheoraEncoder` (the `oxideav_core::Encoder` adapter)
-  still emits every frame as a keyframe; wiring a keyframe-interval +
-  reference-tracking policy into the trait adapter (so `send_frame`
-  alternates I/P frames) is the next step. The setup header (§6.4
-  quantization parameters + Huffman tables) is supplied by the caller
-  via `TheoraEncoder::new` / `extradata` rather than synthesized from
-  scratch.
 * **`INTER_MV_LAST` / `INTER_MV_LAST2` / golden / four-MV encode
   modes** — the inter encoder codes `INTER_NOMV` and `INTER_MV` only;
   the predicted-MV, golden-reference, and four-MV modes are decoded but
   not yet *chosen* by the encoder's mode decision, and rate control /
-  RD-optimal mode selection remain future work.
+  RD-optimal mode selection remain future work. The setup header (§6.4
+  quantization parameters + Huffman tables) is supplied by the caller
+  via `TheoraEncoder::new` / `extradata` rather than synthesized from
+  scratch.
 * **Golden-reference and four-MV inter modes** (`INTER_GOLDEN_MV` /
   `INTER_MV_FOUR`) — implemented in the reconstruction code paths and
   now exercised through the full `reconstruct_frame` driver

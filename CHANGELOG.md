@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **`oxideav_core::Encoder` P-frame wiring (round 347, second commit)**.
+  `TheoraEncoder::with_keyframe_interval` adds a `-g`-style keyframe
+  interval: the first frame and every interval-boundary frame is an
+  intra keyframe, the frames between are inter (P) frames. The encoder
+  mirrors its own output through an internal `FrameDecoder` so each P
+  frame predicts from the byte-identical reconstructed reference a
+  downstream decoder holds. `TheoraEncoder::new` keeps the historical
+  all-keyframe behaviour (interval 1). A full `Encoder` → `Decoder`
+  round-trip with interval 3 confirms the I,P,P keyframe-flag pattern
+  and reconstructs every frame within the quantizer bound. +1 test.
+
 - **inter (P-frame) encoder (round 347)**. `FrameEncoder` now encodes
   §7 *inter* video-data packets that round-trip through this crate's
   own decoder. New production §7.2 run-length bit-string encoders

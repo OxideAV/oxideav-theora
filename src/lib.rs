@@ -12850,12 +12850,18 @@ fn top_down_plane_to_lower_left(
 /// packets (each flagged [`PacketFlags::header`]). Every
 /// [`send_frame`](oxideav_core::Encoder::send_frame) then turns a
 /// top-down [`oxideav_core::VideoFrame`] (at the coded,
-/// macro-block-aligned dimensions) into one §7 intra video-data packet
-/// via [`FrameEncoder::encode_intra_frame`].
+/// macro-block-aligned dimensions) into one §7 video-data packet.
 ///
-/// Only intra (keyframe) encoding is implemented; every emitted data
-/// packet is a keyframe. Inter prediction / motion estimation / rate
-/// control remain future work.
+/// The keyframe interval (`-g`, default 1) decides intra vs inter: the
+/// first frame and every frame at an interval boundary is an intra
+/// keyframe ([`FrameEncoder::encode_intra_frame`]); the frames between
+/// are inter (P) frames ([`FrameEncoder::encode_inter_frame_motion`])
+/// predicted from the reconstructed previous reference. The encoder
+/// mirrors its own output through an internal [`FrameDecoder`] so the
+/// reference it predicts from is byte-identical to the one a downstream
+/// decoder reconstructs. RD-optimal mode decision and rate control
+/// remain future work — the inter path uses a whole-pixel SAD motion
+/// search and a fixed frame-level quantizer.
 pub struct TheoraEncoder {
     codec_id: oxideav_core::CodecId,
     output_params: Box<oxideav_core::CodecParameters>,
@@ -12866,6 +12872,22 @@ pub struct TheoraEncoder {
     /// Per-frame presentation index assigned to data packets that have
     /// no `pts` of their own.
     next_index: i64,
+    /// Maximum number of frames between forced keyframes (`-g`). The
+    /// first `send_frame` always emits a keyframe; subsequent frames
+    /// are inter (P) frames until `keyframe_interval` frames have
+    /// elapsed, at which point the next frame is a fresh keyframe.
+    /// A value of `1` reproduces the all-keyframe behaviour.
+    keyframe_interval: u32,
+    /// Frames emitted since the last keyframe (`0` means the next frame
+    /// must be a keyframe).
+    frames_since_keyframe: u32,
+    /// Internal decoder mirroring the emitted bitstream so the encoder
+    /// predicts inter frames from the exact reconstructed references the
+    /// downstream decoder will hold. Built lazily on the first frame.
+    mirror: Option<Box<FrameDecoder>>,
+    /// Cached ident + setup for (re)building the mirror decoder.
+    ident: TheoraIdentHeader,
+    setup: SetupHeaderTables,
 }
 
 impl std::fmt::Debug for TheoraEncoder {
@@ -12889,6 +12911,24 @@ impl TheoraEncoder {
         ident: TheoraIdentHeader,
         setup: SetupHeaderTables,
         qi: u8,
+    ) -> Result<Self, Error> {
+        Self::with_keyframe_interval(codec_id, ident, setup, qi, 1)
+    }
+
+    /// Build an encoder with an explicit keyframe interval (`-g`).
+    ///
+    /// `keyframe_interval` is the maximum number of frames between
+    /// forced keyframes. `1` emits every frame as a keyframe (the
+    /// historical [`TheoraEncoder::new`] behaviour); a larger value
+    /// emits one keyframe followed by up to `keyframe_interval - 1`
+    /// inter (P) frames, each predicted from the reconstructed previous
+    /// frame, before the cycle restarts with another keyframe.
+    pub fn with_keyframe_interval(
+        codec_id: oxideav_core::CodecId,
+        ident: TheoraIdentHeader,
+        setup: SetupHeaderTables,
+        qi: u8,
+        keyframe_interval: u32,
     ) -> Result<Self, Error> {
         let frame_encoder = FrameEncoder::new(ident.clone(), setup.clone(), qi)?;
 
@@ -12921,19 +12961,61 @@ impl TheoraEncoder {
             frame_encoder,
             pending,
             next_index: 0,
+            keyframe_interval: keyframe_interval.max(1),
+            frames_since_keyframe: 0,
+            mirror: None,
+            ident,
+            setup,
         })
     }
 
     /// Encode one already-converted [`SourceFrame`] into a queued §7
-    /// intra data packet. Shared by [`send_frame`] and direct callers.
+    /// data packet, choosing intra (keyframe) or inter (P-frame) per the
+    /// keyframe-interval policy. The encoder mirrors its own output
+    /// through an internal [`FrameDecoder`] so inter frames predict from
+    /// the exact reconstructed references the downstream decoder holds.
     fn push_source_frame(&mut self, frame: &SourceFrame, pts: Option<i64>) -> Result<(), Error> {
-        let bytes = self.frame_encoder.encode_intra_frame(frame)?;
+        // Decide intra vs inter: the very first frame, and every frame
+        // at a keyframe boundary, is intra.
+        let want_keyframe =
+            self.mirror.is_none() || self.frames_since_keyframe >= self.keyframe_interval;
+
+        let bytes = if want_keyframe {
+            self.frame_encoder.encode_intra_frame(frame)?
+        } else {
+            // Predict from the mirror decoder's reconstructed reference.
+            let mirror = self
+                .mirror
+                .as_ref()
+                .expect("mirror is Some on the inter branch");
+            let refs = mirror.reference_store().as_reference_plane_set()?;
+            self.frame_encoder.encode_inter_frame_motion(frame, &refs)?
+        };
+
+        // Mirror the emitted packet so the reference store stays in
+        // lock-step with what a downstream decoder would reconstruct.
+        let mirror = match self.mirror.as_mut() {
+            Some(m) => m,
+            None => {
+                let dec = FrameDecoder::new(self.ident.clone(), self.setup.clone())?;
+                self.mirror = Some(Box::new(dec));
+                self.mirror.as_mut().unwrap()
+            }
+        };
+        mirror.decode_frame(&bytes)?;
+
+        if want_keyframe {
+            self.frames_since_keyframe = 1;
+        } else {
+            self.frames_since_keyframe += 1;
+        }
+
         let pts = pts.unwrap_or(self.next_index);
         self.next_index = pts + 1;
         let mut pkt = oxideav_core::Packet::new(0, oxideav_core::TimeBase::from_rate(1), bytes);
         pkt.pts = Some(pts);
         pkt.dts = Some(pts);
-        pkt.flags.keyframe = true; // intra-only: every frame is a keyframe
+        pkt.flags.keyframe = want_keyframe;
         self.pending.push_back(pkt);
         Ok(())
     }
@@ -27968,6 +28050,83 @@ mod tests {
         }
         assert_eq!(headers, 3, "three §6 header packets");
         assert_eq!(data_pts, vec![0, 1, 2], "monotonic auto-assigned PTS");
+    }
+
+    /// MILESTONE: the `oxideav_core::Encoder` adapter with a keyframe
+    /// interval of 3 emits an I,P,P pattern (keyframe flag set only on
+    /// the first frame of each group), and the whole stream — headers
+    /// plus the I + two P data packets — round-trips through
+    /// `TheoraDecoder` to within the quantizer bound. The flat frames
+    /// reconstruct losslessly (the P frames are pure copies), and a
+    /// brightened third frame's change survives the inter path.
+    #[test]
+    fn encoder_trait_emits_pframes_and_round_trips() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let mut enc =
+            TheoraEncoder::with_keyframe_interval(codec_id.clone(), ident.clone(), setup, 32, 3)
+                .unwrap();
+
+        // Three flat frames; the third brightens luma so its P frame
+        // codes a residual instead of a pure copy.
+        let vals = [100u8, 100, 130];
+        for &v in &vals {
+            let mut vf = flat_video_frame(&ident, v, 128, 128, 0);
+            vf.pts = None;
+            enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+        }
+
+        // Collect output: headers, then data packets with keyframe flags.
+        let mut header_pkts: Vec<oxideav_core::Packet> = Vec::new();
+        let mut data_pkts: Vec<oxideav_core::Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if p.flags.header {
+                        header_pkts.push(p);
+                    } else {
+                        data_pkts.push(p);
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error {e}"),
+            }
+        }
+        assert_eq!(header_pkts.len(), 3);
+        assert_eq!(data_pkts.len(), 3);
+        // I, P, P pattern.
+        assert!(data_pkts[0].flags.keyframe, "frame 0 must be a keyframe");
+        assert!(!data_pkts[1].flags.keyframe, "frame 1 must be a P frame");
+        assert!(!data_pkts[2].flags.keyframe, "frame 2 must be a P frame");
+
+        // Feed everything back through the decoder.
+        let mut dec = TheoraDecoder::new(codec_id);
+        for p in &header_pkts {
+            dec.send_packet(p).unwrap();
+        }
+        for (i, p) in data_pkts.iter().enumerate() {
+            dec.send_packet(p).unwrap();
+            let frame = dec.receive_frame().unwrap();
+            let oxideav_core::Frame::Video(vf) = frame else {
+                panic!("expected video frame");
+            };
+            // The decoder crops to the picture region; the whole luma
+            // plane is a flat `vals[i]` source, so every cropped sample
+            // should land within the quantizer bound of it.
+            let want = vals[i] as i16;
+            let max_err = vf.planes[0]
+                .data
+                .iter()
+                .map(|&p| (p as i16 - want).abs())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_err <= 8,
+                "frame {i} luma max error {max_err} exceeds tolerance"
+            );
+        }
     }
 
     // ------- §2.3 / §2.4 frame-geometry builder -------

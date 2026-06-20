@@ -134,7 +134,30 @@ grayscale-source `monochrome-via-zero-chroma` I+P stream whose chroma
 planes stay a flat `0x80` through both the coded-residual and pure-copy
 inter branches (asserted in addition to the sample-exact pixel match).
 
+The `dimensions-1080p-very-short` fixture (coded 1920×1088, visible
+1920×1080, two frames I then P) is decoded end-to-end and validated
+against every invariant the staged instrumented trace records
+bit-exactly: the HD §6.2 geometry (`NMBS = 8160`, `NSBS = 3060`,
+`NBS = 48960`), both §7.1 frame headers, the §6.4.1 loop-filter limit,
+the §2.2 visible-crop dimensions, and the complete §7.4 frame-1
+macro-block mode histogram across all 8160 macro blocks (the full
+inter-mode set — `INTER_NO_MV`, `INTER_MV`, `INTER_MV_LAST`,
+`INTER_MV_LAST2`). This is the first end-to-end exercise of the
+large-frame geometry and the full inter-mode mix; the byte-exact pixel
+SHA-256 is an open item (see below).
+
 ## Not yet supported
+
+* **HD (1920×1088) byte-exact pixel reconstruction** — the
+  `dimensions-1080p-very-short` fixture decodes end-to-end without error
+  and matches every trace-recorded invariant (geometry, frame headers,
+  loop-filter limit, the full frame-1 macro-block mode histogram, and the
+  visible-crop size), but the SHA-256 of the cropped output does not yet
+  equal the value the fixture's `notes.md` records. The discrepancy is in
+  pixel reconstruction (header / geometry / mode / MV / coded-flag decode
+  are all confirmed bit-exact against the trace); pinning it needs a
+  per-block or per-coefficient reference signal finer than the
+  whole-stream SHA the corpus currently provides.
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.

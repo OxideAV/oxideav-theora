@@ -6,6 +6,28 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **inter (P-frame) encoder (round 347)**. `FrameEncoder` now encodes
+  §7 *inter* video-data packets that round-trip through this crate's
+  own decoder. New production §7.2 run-length bit-string encoders
+  (`encode_long_run_bit_string` / `encode_short_run_bit_string`) are the
+  exact inverses of the §7.2.1 / §7.2.2 decoders; `encode_coded_block_flags`
+  derives the §7.3 `SBPCODED` / `SBFCODED` / per-block streams from a
+  `bcoded` array; `encode_macroblock_modes` emits the §7.4 mode stream
+  (`MSCHEME = 7` direct modes); and `encode_macroblock_motion_vectors`
+  emits the §7.5 MV stream (`MVMODE = 1` fixed-length components).
+  `FrameEncoder::encode_inter_frame` is the zero-MV (`INTER_NOMV`)
+  baseline — each block is predicted from the **reconstructed** previous
+  reference, so an unchanged frame reconstructs bit-exactly as an
+  all-uncoded pure copy and a changed frame stays within the quantizer
+  bound. `encode_inter_frame_motion` adds a per-macro-block whole-pixel
+  SAD motion search, codes the winning vector with `INTER_MV`, and
+  forces that macro block's blocks coded (an uncoded inter block always
+  copies the zero-MV colocated reference, so a non-zero MV requires
+  coded blocks); a horizontally translated frame round-trips and the
+  search measurably reduces luma SAD versus the zero-MV baseline. +5
+  tests (two run-length round-trips, identical-frame pure copy,
+  changed-frame round-trip, motion round-trip + SAD reduction).
+
 - **encoder chroma-format + multi-frame coverage (round 342, third
   encoder commit)**. The `oxideav_core::Encoder` path is now exercised
   across all three chroma-sampling formats (4:2:0 / 4:2:2 / 4:4:4): a

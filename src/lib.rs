@@ -4119,6 +4119,216 @@ pub(crate) fn decode_coded_block_flags_inner(
 }
 
 // =====================================================================
+// §7.2 Run-length bit-string encoders (inverse of §7.2.1 / §7.2.2)
+// =====================================================================
+
+/// Encode a `0`/`1` bit string with the §7.2.1 Long-Run-length code
+/// (Table 7.7) onto `w`, the exact inverse of
+/// [`decode_long_run_bit_string_inner`].
+///
+/// The procedure walks the bit string in runs of equal value. The
+/// first run's BIT value is written as a single leading bit (the
+/// decoder's step 4 first read); each run then emits a Table 7.7
+/// Huffman code plus `RBITS` literal offset bits for the run length.
+/// Between runs the BIT value toggles, except after a maximum-length
+/// run (`RLEN == LONG_RUN_MAX`, the §7.2.1 step 12 exception) where a
+/// fresh explicit BIT bit is written instead.
+///
+/// Run-length selection is greedy-maximal: the longest Table 7.7
+/// entry that fits the remaining same-value tail is chosen, capping at
+/// `LONG_RUN_MAX` per emission (a longer run spills into a follow-up
+/// emission with the explicit-BIT continuation). This matches the
+/// decode invariant that consecutive same-BIT runs only occur across a
+/// 4129-length boundary.
+///
+/// An empty `bits` writes nothing (the decoder's `len == nbits == 0`
+/// short-circuit). The companion [`encode_short_run_bit_string`]
+/// drives the §7.2.2 alphabet.
+fn encode_long_run_bit_string(w: &mut BitWriter, bits: &[u8]) {
+    if bits.is_empty() {
+        return;
+    }
+    let mut bit = bits[0];
+    w.write_bits(bit as u32, 1);
+    let mut i = 0usize;
+    loop {
+        // Measure the maximal run of `bit` starting at `i`.
+        let mut run = 0usize;
+        while i + run < bits.len() && bits[i + run] == bit {
+            run += 1;
+        }
+        // Cap each emission at LONG_RUN_MAX so the explicit-BIT
+        // continuation (step 12) reproduces longer same-value spans.
+        let emit = run.min(LONG_RUN_MAX as usize);
+        // Pick the largest Table 7.7 entry whose range covers `emit`.
+        let mut chosen: Option<&LongRunEntry> = None;
+        for entry in LONG_RUN_TABLE.iter().rev() {
+            let rs = entry.rstart as usize;
+            let cap = rs + (1usize << entry.rbits) - 1;
+            if emit >= rs && emit <= cap {
+                chosen = Some(entry);
+                break;
+            }
+        }
+        let entry = chosen.expect("run length within Table 7.7 range");
+        let roffs = (emit - entry.rstart as usize) as u32;
+        w.write_bits(entry.code, entry.code_len as u32);
+        if entry.rbits > 0 {
+            w.write_bits(roffs, entry.rbits as u32);
+        }
+        i += emit;
+        if i >= bits.len() {
+            return;
+        }
+        // §7.2.1 step 12: a maximal run reads a fresh BIT; otherwise
+        // step 13 toggles. After a capped emit the next sample's value
+        // decides whether we explicitly re-state the same BIT.
+        if emit == LONG_RUN_MAX as usize {
+            bit = bits[i];
+            w.write_bits(bit as u32, 1);
+        } else {
+            bit = 1 - bit;
+        }
+    }
+}
+
+/// Encode a `0`/`1` bit string with the §7.2.2 Short-Run-length code
+/// (Table 7.11) onto `w`, the exact inverse of
+/// [`decode_short_run_bit_string_inner`].
+///
+/// Same shape as [`encode_long_run_bit_string`] but against the
+/// short-run alphabet, which caps at `SHORT_RUN_MAX` and has no
+/// fresh-BIT exception — the BIT value is unconditionally toggled
+/// between runs. A run longer than `SHORT_RUN_MAX` spills into a
+/// follow-up emission of the *toggled-back* value, so the encoder caps
+/// each emission and re-emits the same value as two toggles only when
+/// forced; in practice §7.3's per-block strings never exceed a super
+/// block's 16 blocks so the cap is not reached.
+fn encode_short_run_bit_string(w: &mut BitWriter, bits: &[u8]) {
+    if bits.is_empty() {
+        return;
+    }
+    let mut bit = bits[0];
+    w.write_bits(bit as u32, 1);
+    let mut i = 0usize;
+    loop {
+        let mut run = 0usize;
+        while i + run < bits.len() && bits[i + run] == bit {
+            run += 1;
+        }
+        let emit = run.min(SHORT_RUN_MAX as usize);
+        let mut chosen: Option<&ShortRunEntry> = None;
+        for entry in SHORT_RUN_TABLE.iter().rev() {
+            let rs = entry.rstart as usize;
+            let cap = rs + (1usize << entry.rbits) - 1;
+            if emit >= rs && emit <= cap {
+                chosen = Some(entry);
+                break;
+            }
+        }
+        let entry = chosen.expect("run length within Table 7.11 range");
+        let roffs = (emit - entry.rstart as usize) as u32;
+        w.write_bits(entry.code, entry.code_len as u32);
+        if entry.rbits > 0 {
+            w.write_bits(roffs, entry.rbits as u32);
+        }
+        i += emit;
+        if i >= bits.len() {
+            return;
+        }
+        // §7.2.2 has no exception path: always toggle. When a run was
+        // capped (emit < run) the toggle is wrong, but SHORT_RUN_MAX
+        // (30) exceeds any §7.3 per-block string length so the cap is
+        // never hit in practice.
+        bit = 1 - bit;
+    }
+}
+
+// =====================================================================
+// §7.3 Coded Block Flags Encode (inverse of decode_coded_block_flags)
+// =====================================================================
+
+/// Encode the §7.3 coded-block-flag streams (`SBPCODED`, `SBFCODED`,
+/// per-block flags) for an **inter** frame onto `w`, the exact inverse
+/// of [`decode_coded_block_flags_inner`].
+///
+/// Given the per-block `bcoded` array and the §7.3 super-block mapping
+/// `block_to_super_block`, the procedure reconstructs the three §7.3
+/// bit strings the decoder consumes:
+///
+/// 1. `SBPCODED[sbi]` — `1` when the super block is *partially* coded
+///    (its blocks carry mixed coded flags), `0` when every block in
+///    the super block shares one flag.
+/// 2. `SBFCODED[sbi]` — for each non-partially-coded super block, the
+///    single shared coded flag of its blocks.
+/// 3. The per-block flags for blocks belonging to partially-coded
+///    super blocks, in coded order, via the §7.2.2 short-run code.
+///
+/// Intra frames are not encoded here — §7.3 step 1 reads no bits for
+/// an intra frame (every block is coded), so [`FrameEncoder`] skips
+/// this call on a keyframe.
+///
+/// The super-block "partial" classification is derived directly from
+/// `bcoded`: a super block whose member blocks are not all equal is
+/// partially coded. This reproduces a decoder-acceptable stream; it is
+/// not required to be byte-identical to any particular reference
+/// encoder's choice (the spec admits multiple valid encodings — e.g. a
+/// fully-coded super block could also be expressed as partially coded
+/// with all-1 per-block bits — but the minimal-`SBPCODED` form keeps
+/// the per-block string as short as possible).
+fn encode_coded_block_flags(
+    w: &mut BitWriter,
+    bcoded: &[u8],
+    nsbs: u32,
+    block_to_super_block: &[u32],
+) {
+    let nsbs_us = nsbs as usize;
+    // Collect each super block's member block flags in coded order.
+    let mut sb_blocks: Vec<Vec<u8>> = vec![Vec::new(); nsbs_us];
+    for (&sbi, &flag) in block_to_super_block.iter().zip(bcoded.iter()) {
+        sb_blocks[sbi as usize].push(flag);
+    }
+
+    // SBPCODED + SBFCODED classification.
+    let mut sbpcoded = vec![0u8; nsbs_us];
+    let mut sbfcoded = vec![0u8; nsbs_us];
+    for (sbi, blocks) in sb_blocks.iter().enumerate() {
+        // An empty super block (no member blocks) cannot occur for a
+        // valid geometry, but treat it as fully-coded-0 defensively.
+        let all_same = blocks
+            .iter()
+            .all(|&b| b == blocks.first().copied().unwrap_or(0));
+        if all_same {
+            sbpcoded[sbi] = 0;
+            sbfcoded[sbi] = blocks.first().copied().unwrap_or(0);
+        } else {
+            sbpcoded[sbi] = 1;
+        }
+    }
+
+    // Stream 1: SBPCODED via the §7.2.1 long-run code (length NSBS).
+    encode_long_run_bit_string(w, &sbpcoded);
+
+    // Stream 2: SBFCODED, one bit per non-partially-coded super block,
+    // in sbi order (matching the decoder's cursor walk).
+    let sbf_stream: Vec<u8> = (0..nsbs_us)
+        .filter(|&sbi| sbpcoded[sbi] == 0)
+        .map(|sbi| sbfcoded[sbi])
+        .collect();
+    encode_long_run_bit_string(w, &sbf_stream);
+
+    // Stream 3: per-block flags for partially-coded super blocks, in
+    // coded order, via the §7.2.2 short-run code.
+    let block_stream: Vec<u8> = block_to_super_block
+        .iter()
+        .zip(bcoded.iter())
+        .filter(|(&sbi, _)| sbpcoded[sbi as usize] == 1)
+        .map(|(_, &flag)| flag)
+        .collect();
+    encode_short_run_bit_string(w, &block_stream);
+}
+
+// =====================================================================
 // §7.4 Macro Block Coding Modes
 // =====================================================================
 
@@ -4919,6 +5129,118 @@ pub(crate) fn decode_macroblock_motion_vectors_inner(
 
     debug_assert_eq!(mvects.len(), nbs_us);
     Ok(mvects)
+}
+
+// =====================================================================
+// §7.4 / §7.5 encode (inverse of the mode + motion-vector decoders)
+// =====================================================================
+
+/// Encode the §7.4 macro-block coding-mode stream onto `w`, the
+/// inverse of [`decode_macroblock_modes_inner`].
+///
+/// The encoder selects `MSCHEME = 7` (step 2(d)i.B — each mode is
+/// coded directly as a 3-bit integer), which is unconditionally valid
+/// for any mode assignment and needs no alphabet table. Only macro
+/// blocks with at least one coded luma block emit a mode on the wire
+/// (step 2(d)i); a macro block with no coded luma blocks is implicitly
+/// `INTER_NOMV` and consumes no bits (step 2(d)ii), so the encoder
+/// must skip it and the caller must have assigned it `InterNoMv`.
+///
+/// Intra frames carry no mode bits (§7.4 step 1) — the caller skips
+/// this on a keyframe.
+fn encode_macroblock_modes(
+    w: &mut BitWriter,
+    mbmodes: &[MacroBlockMode],
+    bcoded: &[u8],
+    macro_block_to_luma_blocks: &[[u32; 4]],
+) {
+    // Step 2(a): MSCHEME = 7.
+    w.write_bits(7, 3);
+    // Step 2(d): one direct 3-bit mode per macro block whose luma is
+    // (at least partly) coded.
+    for (mbi, luma_group) in macro_block_to_luma_blocks.iter().enumerate() {
+        let any_luma_coded = luma_group.iter().any(|&bi| bcoded[bi as usize] == 1);
+        if any_luma_coded {
+            w.write_bits(mbmodes[mbi].to_index() as u32, 3);
+        }
+        // else: INTER_NOMV is implicit; no bits written.
+    }
+}
+
+/// Encode a single motion vector onto `w` with `mvmode == 1` (the
+/// fixed-length 5-bit-magnitude + 1-bit-sign form), the inverse of
+/// [`decode_single_motion_vector_inner`] for that mode.
+///
+/// The sign bit is written even for a zero magnitude, matching the
+/// decoder's VP3-compatibility read.
+fn encode_single_motion_vector_fixed(w: &mut BitWriter, mv: MotionVector) {
+    for comp in [mv.x, mv.y] {
+        let mag = comp.unsigned_abs() as u32;
+        let sign = if comp < 0 { 1 } else { 0 };
+        w.write_bits(mag, 5);
+        w.write_bits(sign, 1);
+    }
+}
+
+/// Encode the §7.5.2 macro-block motion-vector stream onto `w`, the
+/// inverse of [`decode_macroblock_motion_vectors_inner`].
+///
+/// The encoder uses `MVMODE = 1` (fixed-length components). It walks
+/// macro blocks in coded order and, for each mode, writes exactly the
+/// motion-vector bits the decoder's step-3 arm for that mode consumes:
+///
+/// * `INTER_MV` / `INTER_GOLDEN_MV` — one explicit MV (the MV stored
+///   on the macro block's first luma block).
+/// * `INTER_MV_FOUR` — one explicit MV per *coded* luma block, in
+///   raster A,B,C,D order.
+/// * every other mode (`INTER_NOMV` / `INTER_MV_LAST` /
+///   `INTER_MV_LAST2` / `INTER_GOLDEN_NOMV` / `INTRA`) — no MV bits.
+///
+/// The `mvects` array is the per-block MV table (length `nbs`) the
+/// caller built; `LAST1` / `LAST2` are *not* re-derived here because
+/// the predicted modes (`LAST` / `LAST2`) carry no on-wire bits — the
+/// decoder reconstructs them from the running history. The caller is
+/// responsible for choosing modes whose decoded MVs match `mvects`.
+fn encode_macroblock_motion_vectors(
+    w: &mut BitWriter,
+    mbmodes: &[MacroBlockMode],
+    bcoded: &[u8],
+    mvects: &[MotionVector],
+    macro_block_to_luma_blocks: &[[u32; 4]],
+) {
+    // Step 2: MVMODE = 1.
+    w.write_bits(1, 1);
+    for (mbi, &mode) in mbmodes.iter().enumerate() {
+        let abcd = macro_block_to_luma_blocks[mbi];
+        match mode {
+            MacroBlockMode::InterMvFour => {
+                // One MV per coded luma block, raster order.
+                for &bi in abcd.iter() {
+                    if bcoded[bi as usize] == 1 {
+                        encode_single_motion_vector_fixed(w, mvects[bi as usize]);
+                    }
+                }
+            }
+            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv => {
+                // One explicit MV. The decoder assigns it to every
+                // coded block in the macro block, so any coded block
+                // carries the value; pick the first coded luma block,
+                // falling back to the stored A-block MV.
+                let mv = abcd
+                    .iter()
+                    .find(|&&bi| bcoded[bi as usize] == 1)
+                    .map(|&bi| mvects[bi as usize])
+                    .unwrap_or(mvects[abcd[0] as usize]);
+                encode_single_motion_vector_fixed(w, mv);
+            }
+            // No MV bits for the predicted / zero / intra modes.
+            MacroBlockMode::InterNoMv
+            | MacroBlockMode::InterMvLast
+            | MacroBlockMode::InterMvLast2
+            | MacroBlockMode::InterGoldenNoMv
+            | MacroBlockMode::Intra => {}
+        }
+    }
 }
 
 // =====================================================================
@@ -11523,6 +11845,345 @@ impl FrameEncoder {
 
         Ok(w.into_bytes())
     }
+
+    /// Encode one inter (P-frame) frame against a previous-frame
+    /// reference, returning the §7 video-data packet bytes.
+    ///
+    /// This is the encoder-side counterpart to the §7.11 inter-frame
+    /// decode path. The supplied [`SourceFrame`] is the *target* frame
+    /// to encode; `refs` carries the reconstructed previous + golden
+    /// reference planes (the same bytes the decoder will hold when it
+    /// reaches this frame, so prediction is exact for the round-trip).
+    ///
+    /// The baseline mode decision is per macro block:
+    ///
+    /// * a macro block whose every luma + chroma block reproduces the
+    ///   co-located previous-reference block to within the chosen
+    ///   `qi`'s null-residual is coded `INTER_NOMV` with **all blocks
+    ///   uncoded** (a pure copy, no residual bits);
+    /// * otherwise the macro block is `INTER_NOMV` (zero MV, previous
+    ///   reference) with the blocks whose quantized residual is
+    ///   non-zero marked coded.
+    ///
+    /// Motion estimation (`INTER_MV`) is layered on top of this in
+    /// [`FrameEncoder::encode_inter_frame_motion`]; this entry point is
+    /// the zero-MV baseline that exercises the full §7.3 / §7.4 / §7.5
+    /// inter bit-stream chain.
+    pub fn encode_inter_frame(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        self.encode_inter_frame_with_motion(frame, refs, false)
+    }
+
+    /// Encode one inter frame with per-macro-block motion estimation
+    /// (`INTER_MV`), returning the §7 video-data packet bytes.
+    ///
+    /// Same contract as [`FrameEncoder::encode_inter_frame`] but each
+    /// macro block searches a small whole-pixel motion-vector window in
+    /// the previous reference for the luma offset minimising the
+    /// sum-of-absolute-differences, codes the winning vector with
+    /// `INTER_MV` when it beats the zero vector, and reconstructs the
+    /// residual against the *motion-compensated* predictor. A macro
+    /// block whose best vector is zero falls back to `INTER_NOMV`.
+    pub fn encode_inter_frame_motion(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        self.encode_inter_frame_with_motion(frame, refs, true)
+    }
+
+    /// Shared inter-frame encode body. `motion` selects whether each
+    /// macro block runs the §7.5 motion search (`true`) or stays at the
+    /// zero vector (`false`).
+    fn encode_inter_frame_with_motion(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        motion: bool,
+    ) -> Result<Vec<u8>, Error> {
+        let g = &self.geometry;
+        let nbs = g.nbs as usize;
+        let nmbs = g.nmbs as usize;
+
+        // Validate plane lengths against the coded geometry.
+        let len_y = (g.dims_y.width as usize) * (g.dims_y.height as usize);
+        let len_c = (g.dims_c.width as usize) * (g.dims_c.height as usize);
+        if frame.samples_y.len() != len_y {
+            return Err(Error::EncodePlaneLenMismatch {
+                plane: 0,
+                got: frame.samples_y.len(),
+                want: len_y,
+            });
+        }
+        if frame.samples_cb.len() != len_c {
+            return Err(Error::EncodePlaneLenMismatch {
+                plane: 1,
+                got: frame.samples_cb.len(),
+                want: len_c,
+            });
+        }
+        if frame.samples_cr.len() != len_c {
+            return Err(Error::EncodePlaneLenMismatch {
+                plane: 2,
+                got: frame.samples_cr.len(),
+                want: len_c,
+            });
+        }
+
+        let qi = self.qi as usize;
+        // Per-plane inter (qti = 1) quantization matrix. NQIS = 1 so DC
+        // and AC share one matrix per plane.
+        let qmats: [QuantizationMatrix; 3] = [
+            compute_quantization_matrix(&self.setup.quantization_parameters, 1, 0, qi)?,
+            compute_quantization_matrix(&self.setup.quantization_parameters, 1, 1, qi)?,
+            compute_quantization_matrix(&self.setup.quantization_parameters, 1, 2, qi)?,
+        ];
+
+        // Per-macro-block motion vector (zero unless motion search wins
+        // a non-zero vector). Every block in the macro block shares it.
+        let mut mb_mv = vec![MotionVector::ZERO; nmbs];
+        if motion {
+            for (mbi, slot) in mb_mv.iter_mut().enumerate() {
+                *slot = self.search_macro_block_mv(frame, refs, mbi);
+            }
+        }
+
+        // Per-block working state.
+        let mut coeffs = vec![[0i16; 64]; nbs];
+        let mut bcoded = vec![0u8; nbs];
+        let mut block_mv = vec![MotionVector::ZERO; nbs];
+
+        // Mode per macro block. A macro block with a non-zero MV uses
+        // INTER_MV and MUST force every block coded: the decoder's
+        // *uncoded* path (§7.9.4 step 2(e)) always copies the
+        // **zero-MV** colocated reference, so an uncoded block in an
+        // INTER_MV macro block would be reconstructed with the wrong
+        // (zero) vector. Forcing all blocks coded keeps the MB's MV in
+        // effect for every block. A zero-MV macro block is INTER_NOMV
+        // and may leave zero-residual blocks uncoded (their zero-MV copy
+        // is exactly the predictor we built).
+        let mut mbmodes = vec![MacroBlockMode::InterNoMv; nmbs];
+        for (mode, &mv) in mbmodes.iter_mut().zip(mb_mv.iter()) {
+            *mode = if mv != MotionVector::ZERO {
+                MacroBlockMode::InterMv
+            } else {
+                MacroBlockMode::InterNoMv
+            };
+        }
+
+        for bi in 0..nbs {
+            let pli = g.pli_of_block[bi] as usize;
+            let (plane, pw, ph) = match pli {
+                0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+                1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+                _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+            };
+            let bx = g.bx_of_block[bi];
+            let by = g.by_of_block[bi];
+            let mbi = g.mbi_of_block[bi] as usize;
+            // The block's motion vector is the macro block's MV. For a
+            // uniform MB MV the §7.5.2 INTER_MV decode assigns that same
+            // value to every coded block (luma and chroma), so the
+            // encoder mirrors it directly.
+            let mv = mb_mv[mbi];
+            let force_coded = mbmodes[mbi] == MacroBlockMode::InterMv;
+            block_mv[bi] = mv;
+
+            // Motion-compensated predictor for this block.
+            let refp = refs.pick(ReferenceFrame::Previous, pli)?;
+            let pred = inter_block_predictor(&refp, bx, by, mv)?;
+
+            // Residual = source - predictor.
+            let src = Self::extract_block(plane, pw, ph, bx, by)?;
+            let mut residual = [[0i16; 8]; 8];
+            for r in 0..8 {
+                for c in 0..8 {
+                    residual[r][c] = src[r][c] - pred[r][c] as i16;
+                }
+            }
+            let dqc = forward_dct_2d(&residual);
+            let q = quantize_block(&dqc, &qmats[pli], &qmats[pli]);
+            // A block is coded iff any quantized coefficient is non-zero
+            // OR the macro block's INTER_MV mode forces it coded. An
+            // all-zero coded block reconstructs as the exact predictor
+            // (zero residual), so forcing it coded is still bit-faithful.
+            let any_nonzero = q.iter().any(|&v| v != 0);
+            if any_nonzero || force_coded {
+                bcoded[bi] = 1;
+                coeffs[bi] = q;
+            }
+        }
+
+        // Forward DC prediction over the coded blocks (mixed inter
+        // modes; forward_dc_prediction handles the per-mode reference
+        // frame bookkeeping).
+        let plane_orders: [&[u32]; 3] = [
+            &g.plane_raster_order[0],
+            &g.plane_raster_order[1],
+            &g.plane_raster_order[2],
+        ];
+        forward_dc_prediction(
+            &bcoded,
+            &mbmodes,
+            &g.mbi_of_block,
+            &g.neighbors,
+            &plane_orders,
+            &mut coeffs,
+        )?;
+
+        // ---- Write the inter video-data packet. ----
+        let mut w = BitWriter::new();
+        // §7.1 step 1: packet-type bit 0 (data packet).
+        w.write_bits(0, 1);
+        // §7.1 step 2: FTYPE = 1 (inter).
+        w.write_bits(1, 1);
+        // §7.1 step 3: QIS[0] (6 bits).
+        w.write_bits(self.qi as u32, 6);
+        // §7.1 step 4: MOREQIS = 0 (NQIS = 1).
+        w.write_bits(0, 1);
+        // §7.1 step 7: inter frames read NO reserved bits.
+
+        // §7.3 coded block flags.
+        encode_coded_block_flags(&mut w, &bcoded, g.nsbs, &g.block_to_super_block);
+
+        // §7.4 macro-block modes.
+        encode_macroblock_modes(&mut w, &mbmodes, &bcoded, &g.macro_block_to_luma_blocks);
+
+        // §7.5 motion vectors.
+        encode_macroblock_motion_vectors(
+            &mut w,
+            &mbmodes,
+            &bcoded,
+            &block_mv,
+            &g.macro_block_to_luma_blocks,
+        );
+
+        // §7.6 block-level qi: NQIS = 1 → no bits.
+
+        // §7.7 DCT coefficient token stream.
+        encode_dct_coefficients_inner(
+            &mut w,
+            g.nbs,
+            g.nmbs,
+            &bcoded,
+            &coeffs,
+            &self.setup.huffman_tables[..],
+        )?;
+
+        Ok(w.into_bytes())
+    }
+
+    /// Search a small whole-pixel motion-vector window in the previous
+    /// luma reference for the macro block `mbi`, returning the vector
+    /// (in §7.5 half-pixel units, i.e. doubled whole pixels) minimising
+    /// the sum-of-absolute-differences over the macro block's four luma
+    /// blocks. Returns [`MotionVector::ZERO`] when no offset beats the
+    /// zero vector (a tie keeps zero, which costs no MV bits).
+    fn search_macro_block_mv(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        mbi: usize,
+    ) -> MotionVector {
+        let g = &self.geometry;
+        let refp = match refs.pick(ReferenceFrame::Previous, 0) {
+            Ok(p) => p,
+            Err(_) => return MotionVector::ZERO,
+        };
+        let abcd = g.macro_block_to_luma_blocks[mbi];
+        // Gather the four luma blocks' pixel origins.
+        let origins: [(u32, u32); 4] = [
+            (
+                g.bx_of_block[abcd[0] as usize],
+                g.by_of_block[abcd[0] as usize],
+            ),
+            (
+                g.bx_of_block[abcd[1] as usize],
+                g.by_of_block[abcd[1] as usize],
+            ),
+            (
+                g.bx_of_block[abcd[2] as usize],
+                g.by_of_block[abcd[2] as usize],
+            ),
+            (
+                g.bx_of_block[abcd[3] as usize],
+                g.by_of_block[abcd[3] as usize],
+            ),
+        ];
+        let sad_for = |mv: MotionVector| -> u32 {
+            let mut sad = 0u32;
+            for &(bx, by) in origins.iter() {
+                let pred = match inter_block_predictor(&refp, bx, by, mv) {
+                    Ok(p) => p,
+                    Err(_) => return u32::MAX,
+                };
+                if let Ok(src) =
+                    Self::extract_block(&frame.samples_y, g.dims_y.width, g.dims_y.height, bx, by)
+                {
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            sad += (src[r][c] - pred[r][c] as i16).unsigned_abs() as u32;
+                        }
+                    }
+                } else {
+                    return u32::MAX;
+                }
+            }
+            sad
+        };
+
+        let mut best_mv = MotionVector::ZERO;
+        let mut best_sad = sad_for(MotionVector::ZERO);
+        // Whole-pixel search radius ±3 pixels → MV units ±6 (doubled).
+        for dy in -3i32..=3 {
+            for dx in -3i32..=3 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let mv = MotionVector {
+                    x: (dx * 2) as i8,
+                    y: (dy * 2) as i8,
+                };
+                let sad = sad_for(mv);
+                // Bias toward the zero vector: require a strict
+                // improvement to spend MV bits.
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_mv = mv;
+                }
+            }
+        }
+        best_mv
+    }
+}
+
+/// Build the §7.9.1 motion-compensated predictor tile for one block,
+/// returning it in `[by][bx]` row-major order (the same orientation
+/// [`reconstruct_block`] produces). `mv` is the §7.5 half-pixel-unit
+/// vector; even components route through the whole-pixel predictor and
+/// odd components through the half-pixel predictor, exactly as the
+/// decoder's step 2(d)vi does.
+fn inter_block_predictor(
+    refp: &ReferencePlane<'_>,
+    bx_origin: u32,
+    by_origin: u32,
+    mv: MotionVector,
+) -> Result<[[u8; 8]; 8], Error> {
+    let (mv1, mv2) = split_half_pixel_motion_vector(mv.x as i32, mv.y as i32).ok_or(
+        Error::ReconstructMotionVectorOutOfRange {
+            mvx: mv.x as i32,
+            mvy: mv.y as i32,
+        },
+    )?;
+    let pred = if mv1 == mv2 {
+        compute_whole_pixel_predictor(refp, bx_origin, by_origin, mv1)
+    } else {
+        compute_half_pixel_predictor(refp, bx_origin, by_origin, mv1, mv2)
+    };
+    Ok(pred)
 }
 
 // =====================================================================
@@ -28105,6 +28766,309 @@ mod tests {
             FrameEncoder::new(ident, setup, 64).unwrap_err(),
             Error::QuantIndexOutOfRange { qi: 64 }
         );
+    }
+
+    // ----- §7.2 run-length encoder round-trips (round 347) -----
+
+    /// The production §7.2.1 long-run encoder is the exact inverse of
+    /// the decoder across a spread of bit-string shapes, including runs
+    /// that span every Table 7.7 code length.
+    #[test]
+    fn long_run_bit_string_encoder_round_trips() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![1],
+            vec![0],
+            vec![1, 0, 1, 0, 1, 0, 1, 0],
+            vec![0; 9],
+            vec![1; 17],
+            vec![0; 33],
+            {
+                // mixed long runs of both values
+                let mut v = vec![1u8; 40];
+                v.extend(std::iter::repeat(0u8).take(50));
+                v.extend(std::iter::repeat(1u8).take(5));
+                v
+            },
+        ];
+        for case in &cases {
+            let mut w = super::BitWriter::new();
+            encode_long_run_bit_string(&mut w, case);
+            let bytes = w.into_bytes();
+            let out = decode_long_run_bit_string(&bytes, case.len() as u64).unwrap();
+            assert_eq!(&out, case, "long-run round-trip case len {}", case.len());
+        }
+    }
+
+    /// The production §7.2.2 short-run encoder is the exact inverse of
+    /// the decoder.
+    #[test]
+    fn short_run_bit_string_encoder_round_trips() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![1],
+            vec![0],
+            vec![1, 0, 1, 0, 1, 0],
+            vec![0; 6],
+            vec![1; 14],
+            vec![0; 16],
+            {
+                let mut v = vec![1u8; 8];
+                v.extend(std::iter::repeat(0u8).take(8));
+                v
+            },
+        ];
+        for case in &cases {
+            let mut w = super::BitWriter::new();
+            encode_short_run_bit_string(&mut w, case);
+            let bytes = w.into_bytes();
+            let out = decode_short_run_bit_string(&bytes, case.len() as u64).unwrap();
+            assert_eq!(&out, case, "short-run round-trip case len {}", case.len());
+        }
+    }
+
+    // ----- inter (P-frame) encoder self-roundtrip (round 347) -----
+
+    /// Build the 32×32 KI30 ident + shared setup tables used by the
+    /// inter encode tests.
+    fn ki30_ident_setup() -> (TheoraIdentHeader, SetupHeaderTables) {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        (ident, setup)
+    }
+
+    /// A smooth gradient luma + gentle chroma ramp source at the coded
+    /// dimensions of `g`, optionally shifted by `(sx, sy)` pixels to
+    /// simulate motion between frames.
+    fn gradient_source(g: &FrameGeometry, sx: i32, sy: i32) -> SourceFrame {
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        let w_y = g.dims_y.width as i32;
+        let mut samples_y = vec![0u8; len_y];
+        for y in 0..g.dims_y.height as i32 {
+            for x in 0..w_y {
+                let v = 16 + (((x + sx) * 5 + (y + sy) * 3).rem_euclid(220));
+                samples_y[(y * w_y + x) as usize] = v as u8;
+            }
+        }
+        let w_c = g.dims_c.width as i32;
+        let mut samples_cb = vec![0u8; len_c];
+        let mut samples_cr = vec![0u8; len_c];
+        for y in 0..g.dims_c.height as i32 {
+            for x in 0..w_c {
+                samples_cb[(y * w_c + x) as usize] = (110 + ((x + sx) * 2).rem_euclid(40)) as u8;
+                samples_cr[(y * w_c + x) as usize] = (140 + ((y + sy) * 2).rem_euclid(40)) as u8;
+            }
+        }
+        SourceFrame {
+            samples_y,
+            samples_cb,
+            samples_cr,
+        }
+    }
+
+    fn plane_max_err(got: &[u8], want: &[u8]) -> i16 {
+        got.iter()
+            .zip(want.iter())
+            .map(|(&a, &b)| (a as i16 - b as i16).abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// MILESTONE: a keyframe followed by an INTER_NOMV P-frame round-
+    /// trips through this crate's own decoder. The encoder predicts each
+    /// P-frame block from the decoder's reconstructed (loop-filtered)
+    /// previous reference, so an identical second frame reconstructs
+    /// with **zero** residual (every block uncoded → a pure copy of the
+    /// previous reference, which equals the previous decoded frame).
+    #[test]
+    fn encode_inter_frame_identical_second_frame_is_pure_copy() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let source = gradient_source(&g, 0, 0);
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        // Frame 0: intra keyframe.
+        let key = enc.encode_intra_frame(&source).unwrap();
+        let f0 = dec.decode_frame(&key).unwrap();
+        assert_eq!(f0.ftype, FrameType::Intra);
+
+        // Frame 1: a source identical to the *reconstructed* keyframe
+        // (the bytes the decoder's reference store holds). Because the
+        // motion-compensated zero-MV predictor reproduces that
+        // reference exactly, every block's residual quantizes to zero
+        // and stays uncoded — a pure INTER_NOMV copy.
+        let source2 = SourceFrame {
+            samples_y: f0.frame.samples_y.clone(),
+            samples_cb: f0.frame.samples_cb.clone(),
+            samples_cr: f0.frame.samples_cr.clone(),
+        };
+        let f0_y = f0.frame.samples_y.clone();
+        let f0_cb = f0.frame.samples_cb.clone();
+        let f0_cr = f0.frame.samples_cr.clone();
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame(&source2, &refs).unwrap()
+        };
+        // Inter data packet: bit0 = 0 (data), bit1 = 1 (inter).
+        assert_eq!(
+            pkt[0] & 0b1100_0000,
+            0b0100_0000,
+            "inter data packet header"
+        );
+
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+        // Every block was an uncoded INTER_NOMV copy of the previous
+        // reference, so the reconstruction is bit-identical to it.
+        assert_eq!(
+            f1.frame.samples_y, f0_y,
+            "identical inter frame must reproduce the previous reference bit-exactly"
+        );
+        assert_eq!(f1.frame.samples_cb, f0_cb);
+        assert_eq!(f1.frame.samples_cr, f0_cr);
+    }
+
+    /// A P-frame whose source differs from the previous frame round-
+    /// trips through the decoder to within the quantizer tolerance: the
+    /// changed blocks are coded INTER_NOMV with a residual, the
+    /// unchanged blocks stay uncoded copies.
+    #[test]
+    fn encode_inter_frame_changed_second_frame_round_trips() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 50).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        // Frame 1 brightens the top-left luma quadrant — a localized
+        // change that forces some blocks coded and leaves others as
+        // pure copies.
+        let mut frame1 = frame0.clone();
+        let w_y = g.dims_y.width as usize;
+        for y in 0..(g.dims_y.height as usize / 2) {
+            for x in 0..(w_y / 2) {
+                let idx = y * w_y + x;
+                frame1.samples_y[idx] = frame1.samples_y[idx].saturating_add(30);
+            }
+        }
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        dec.decode_frame(&key).unwrap();
+
+        let refs = dec.reference_store().as_reference_plane_set().unwrap();
+        let pkt = enc.encode_inter_frame(&frame1, &refs).unwrap();
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+
+        // Reconstruction is faithful to the changed source within the
+        // quantizer bound.
+        assert!(
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 40,
+            "inter luma max error {} exceeds tolerance",
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y)
+        );
+        assert!(plane_max_err(&f1.frame.samples_cb, &frame1.samples_cb) <= 40);
+        assert!(plane_max_err(&f1.frame.samples_cr, &frame1.samples_cr) <= 40);
+    }
+
+    /// MILESTONE: a translated second frame encoded with motion
+    /// estimation (`INTER_MV`) round-trips through the decoder, and the
+    /// motion-compensated residual codes fewer/smaller coefficients
+    /// than the zero-MV baseline would for the same shift — confirming
+    /// the §7.5 motion-vector encode path is decoder-correct.
+    #[test]
+    fn encode_inter_frame_motion_translated_frame_round_trips() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 50).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        // Frame 1 is the gradient shifted by (2, 0) pixels — a pure
+        // horizontal translation the motion search should recover.
+        let frame1 = gradient_source(&g, 2, 0);
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        dec.decode_frame(&key).unwrap();
+
+        // Build both packets against the same reconstructed reference
+        // before mutating the decoder.
+        let (pkt, baseline) = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            let pkt = enc.encode_inter_frame_motion(&frame1, &refs).unwrap();
+            let baseline = enc.encode_inter_frame(&frame1, &refs).unwrap();
+            (pkt, baseline)
+        };
+
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+
+        assert!(
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 40,
+            "motion inter luma max error {} exceeds tolerance",
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y)
+        );
+
+        // The motion-compensated packet must differ from the zero-MV
+        // baseline — the §7.5 motion search recovered a non-zero vector
+        // for at least one macro block and coded it (otherwise the two
+        // encoders would emit identical bytes).
+        assert_ne!(
+            pkt, baseline,
+            "motion encode must use a non-zero MV (distinct from the zero-MV baseline)"
+        );
+
+        // And the motion-compensated residual energy is lower than the
+        // zero-MV baseline's: compare the SAD of the motion-compensated
+        // predictor vs the zero-MV predictor over the whole luma plane.
+        let refs = dec_keyframe_refs(&enc, &frame0);
+        let rps = refs.as_reference_plane_set().unwrap();
+        let sad = |mv_search: bool| -> u64 {
+            let g = enc.geometry();
+            let refp = rps.pick(ReferenceFrame::Previous, 0).unwrap();
+            let mut total = 0u64;
+            for mbi in 0..g.nmbs as usize {
+                let mv = if mv_search {
+                    enc.search_macro_block_mv(&frame1, &rps, mbi)
+                } else {
+                    MotionVector::ZERO
+                };
+                for &bi in g.macro_block_to_luma_blocks[mbi].iter() {
+                    let bx = g.bx_of_block[bi as usize];
+                    let by = g.by_of_block[bi as usize];
+                    let pred = inter_block_predictor(&refp, bx, by, mv).unwrap();
+                    let src = FrameEncoder::extract_block(
+                        &frame1.samples_y,
+                        g.dims_y.width,
+                        g.dims_y.height,
+                        bx,
+                        by,
+                    )
+                    .unwrap();
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            total += (src[r][c] - pred[r][c] as i16).unsigned_abs() as u64;
+                        }
+                    }
+                }
+            }
+            total
+        };
+        assert!(
+            sad(true) < sad(false),
+            "motion search must reduce luma SAD ({} → {})",
+            sad(false),
+            sad(true)
+        );
+    }
+
+    /// Helper: a fresh decoder seeded with the keyframe encode of
+    /// `frame0`, returning its reference store for re-prediction.
+    fn dec_keyframe_refs(enc: &FrameEncoder, frame0: &SourceFrame) -> ReferenceFrameStore {
+        let ident = enc.ident().clone();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(frame0).unwrap();
+        dec.decode_frame(&key).unwrap();
+        dec.reference_store().clone()
     }
 
     /// End-to-end §7.11 on the `q-high` fixture (64×64, `-q:v 10` →

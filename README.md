@@ -55,6 +55,29 @@ packets are handled as duplicate-frame markers.
   gradient round-trips with max luma error 5 / mean 0.27 at the weakest
   quantiser, chroma exact; a flat frame is lossless).
 
+* **Inter (P-frame) encoder** — `FrameEncoder::encode_inter_frame`
+  (zero-MV baseline) and `encode_inter_frame_motion` (with motion
+  estimation) emit a §7 *inter* video-data packet that round-trips
+  through this crate's own decoder. The forward pipeline drives the
+  complete inter bit-stream chain: the §7.2.1 / §7.2.2 run-length
+  bit-string encoders (`encode_long_run_bit_string` /
+  `encode_short_run_bit_string`, exact inverses of the decoders), the
+  §7.3 coded-block-flag encoder (`encode_coded_block_flags`, deriving
+  the `SBPCODED` / `SBFCODED` / per-block streams from a `bcoded`
+  array), the §7.4 macro-block-mode encoder (`MSCHEME = 7` direct
+  modes), the §7.5 motion-vector encoder (`MVMODE = 1` fixed-length
+  components), and the shared §7.7 token writer. Each block is
+  predicted from the **reconstructed** previous reference (the bytes
+  the decoder holds), so an unchanged second frame reconstructs
+  bit-exactly as an all-uncoded `INTER_NOMV` pure copy; a changed
+  frame stays within the quantizer bound. The motion path runs a small
+  whole-pixel SAD search per macro block, codes the winning vector with
+  `INTER_MV`, and forces its blocks coded (an uncoded inter block always
+  copies the zero-MV colocated reference, so a non-zero MV requires
+  coded blocks). A horizontally translated frame round-trips and the
+  motion search measurably reduces the luma SAD versus the zero-MV
+  baseline.
+
 * **Framework `Decoder` integration** — `TheoraDecoder` implements
   `oxideav_core::Decoder`, and `register` installs it into a
   `RuntimeContext` (reachable through the shared `CodecRegistry`). Packets
@@ -104,14 +127,21 @@ inter branches (asserted in addition to the sample-exact pixel match).
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **Inter-frame encoding** — the encoder is intra (keyframe) only.
-  Header serialization and the `oxideav_core::Encoder` trait integration
-  are now wired (a full stream of headers + intra data packets is
-  emitted), but inter prediction, motion estimation, mode decision, and
-  rate control remain future work, so every emitted frame is a keyframe.
-  The setup header (§6.4 quantization parameters + Huffman tables) is
-  supplied by the caller via `TheoraEncoder::new` / `extradata` rather
-  than synthesized from scratch.
+* **Inter encode via the `oxideav_core::Encoder` trait** — the
+  packet-level inter encoder (`FrameEncoder::encode_inter_frame` /
+  `encode_inter_frame_motion`) round-trips through this crate's own
+  decoder, but `TheoraEncoder` (the `oxideav_core::Encoder` adapter)
+  still emits every frame as a keyframe; wiring a keyframe-interval +
+  reference-tracking policy into the trait adapter (so `send_frame`
+  alternates I/P frames) is the next step. The setup header (§6.4
+  quantization parameters + Huffman tables) is supplied by the caller
+  via `TheoraEncoder::new` / `extradata` rather than synthesized from
+  scratch.
+* **`INTER_MV_LAST` / `INTER_MV_LAST2` / golden / four-MV encode
+  modes** — the inter encoder codes `INTER_NOMV` and `INTER_MV` only;
+  the predicted-MV, golden-reference, and four-MV modes are decoded but
+  not yet *chosen* by the encoder's mode decision, and rate control /
+  RD-optimal mode selection remain future work.
 * **Golden-reference and four-MV inter modes** (`INTER_GOLDEN_MV` /
   `INTER_MV_FOUR`) — implemented in the reconstruction code paths and
   now exercised through the full `reconstruct_frame` driver

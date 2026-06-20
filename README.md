@@ -74,9 +74,13 @@ packets are handled as duplicate-frame markers.
   whole-pixel SAD search per macro block, codes the winning vector with
   `INTER_MV`, and forces its blocks coded (an uncoded inter block always
   copies the zero-MV colocated reference, so a non-zero MV requires
-  coded blocks). A horizontally translated frame round-trips and the
-  motion search measurably reduces the luma SAD versus the zero-MV
-  baseline.
+  coded blocks). A forward §7.5.2 LAST1 / LAST2 pass then recodes a
+  macro block whose vector matches the running last vectors as the
+  predicted `INTER_MV_LAST` / `INTER_MV_LAST2` mode (no explicit MV
+  bits, identical reconstruction). A horizontally translated frame
+  round-trips and the motion search measurably reduces the luma SAD
+  versus the zero-MV baseline; a uniformly translated frame drives most
+  macro blocks through the predicted-MV modes.
 
 * **Framework `Decoder` integration** — `TheoraDecoder` implements
   `oxideav_core::Decoder`, and `register` installs it into a
@@ -134,14 +138,15 @@ inter branches (asserted in addition to the sample-exact pixel match).
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **`INTER_MV_LAST` / `INTER_MV_LAST2` / golden / four-MV encode
-  modes** — the inter encoder codes `INTER_NOMV` and `INTER_MV` only;
-  the predicted-MV, golden-reference, and four-MV modes are decoded but
-  not yet *chosen* by the encoder's mode decision, and rate control /
-  RD-optimal mode selection remain future work. The setup header (§6.4
-  quantization parameters + Huffman tables) is supplied by the caller
-  via `TheoraEncoder::new` / `extradata` rather than synthesized from
-  scratch.
+* **Golden-reference / four-MV encode modes + RD mode decision** — the
+  inter encoder codes `INTER_NOMV`, `INTER_MV`, `INTER_MV_LAST`, and
+  `INTER_MV_LAST2` (the last two chosen by the §7.5.2 LAST1 / LAST2
+  recode pass). The golden-reference (`INTER_GOLDEN_*`) and four-MV
+  (`INTER_MV_FOUR`) modes are decoded but not yet *chosen* by the
+  encoder's mode decision, and rate control / RD-optimal mode selection
+  remain future work. The setup header (§6.4 quantization parameters +
+  Huffman tables) is supplied by the caller via `TheoraEncoder::new` /
+  `extradata` rather than synthesized from scratch.
 * **Golden-reference and four-MV inter modes** (`INTER_GOLDEN_MV` /
   `INTER_MV_FOUR`) — implemented in the reconstruction code paths and
   now exercised through the full `reconstruct_frame` driver

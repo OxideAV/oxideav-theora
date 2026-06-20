@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **`INTER_MV_LAST` / `INTER_MV_LAST2` mode selection (round 347, third
+  commit)**. The inter encoder now runs the §7.5.2 LAST1 / LAST2 state
+  machine forward over the coded macro-block order and recodes an
+  `INTER_MV` macro block whose vector equals the running LAST1 / LAST2 as
+  the predicted `INTER_MV_LAST` / `INTER_MV_LAST2` mode — identical
+  reconstruction (the reference frame is Previous for all three modes,
+  so the residual and DC predictor are unaffected) but no explicit MV
+  bits. A uniformly translated frame drives many macro blocks to the same
+  vector, so most reuse LAST1; the packet round-trips through the decoder
+  and exercises the predicted-MV decode arms end-to-end. +1 test.
+
 - **`oxideav_core::Encoder` P-frame wiring (round 347, second commit)**.
   `TheoraEncoder::with_keyframe_interval` adds a `-g`-style keyframe
   interval: the first frame and every interval-boundary frame is an

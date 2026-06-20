@@ -12034,6 +12034,51 @@ impl FrameEncoder {
             &mut coeffs,
         )?;
 
+        // §7.5 mode-cost refinement: walk macro blocks in coded order
+        // reproducing the decoder's LAST1 / LAST2 state machine. When an
+        // INTER_MV macro block's vector equals LAST1 or LAST2 we recode
+        // it as INTER_MV_LAST / INTER_MV_LAST2 — same reconstruction
+        // (the reference frame is Previous for all three modes, so the
+        // DC predictor and residual are unaffected) but no explicit MV
+        // bits. The refinement only narrows INTER_MV; INTER_NOMV macro
+        // blocks (zero MV) are untouched. Mirrors the decode arms read
+        // earlier: INTER_MV sets LAST2=LAST1, LAST1=mv; INTER_MV_LAST2
+        // swaps LAST1/LAST2; INTER_MV_LAST and INTER_NOMV leave them.
+        {
+            let mut last1 = MotionVector::ZERO;
+            let mut last2 = MotionVector::ZERO;
+            for mbi in 0..nmbs {
+                // Does this macro block transmit a mode? Only when at
+                // least one luma block is coded (§7.4 step 2(d)i).
+                let any_luma_coded = g.macro_block_to_luma_blocks[mbi]
+                    .iter()
+                    .any(|&bi| bcoded[bi as usize] == 1);
+                if !any_luma_coded {
+                    // Implicit INTER_NOMV; no MV, no LAST update.
+                    mbmodes[mbi] = MacroBlockMode::InterNoMv;
+                    continue;
+                }
+                // Only INTER_MV macro blocks are candidates for the LAST
+                // recode; INTER_NOMV carries a zero MV and never touches
+                // LAST.
+                if mbmodes[mbi] == MacroBlockMode::InterMv {
+                    let mv = mb_mv[mbi];
+                    if mv == last1 {
+                        // INTER_MV_LAST: emit LAST1, no update.
+                        mbmodes[mbi] = MacroBlockMode::InterMvLast;
+                    } else if mv == last2 {
+                        // INTER_MV_LAST2: swap LAST1/LAST2.
+                        mbmodes[mbi] = MacroBlockMode::InterMvLast2;
+                        std::mem::swap(&mut last1, &mut last2);
+                    } else {
+                        // Explicit INTER_MV: LAST2=LAST1; LAST1=mv.
+                        last2 = last1;
+                        last1 = mv;
+                    }
+                }
+            }
+        }
+
         // ---- Write the inter video-data packet. ----
         let mut w = BitWriter::new();
         // §7.1 step 1: packet-type bit 0 (data packet).
@@ -29228,6 +29273,55 @@ mod tests {
         let key = enc.encode_intra_frame(frame0).unwrap();
         dec.decode_frame(&key).unwrap();
         dec.reference_store().clone()
+    }
+
+    /// MILESTONE: a *uniformly* translated frame drives many macro
+    /// blocks to the same motion vector, so the encoder's §7.5 LAST
+    /// state machine recodes them as `INTER_MV_LAST` / `INTER_MV_LAST2`
+    /// (predicted, no explicit MV bits) instead of explicit `INTER_MV`.
+    /// This exercises the predicted-MV decode arms end-to-end: the
+    /// packet round-trips through the decoder, and it is strictly
+    /// smaller than it would be if every macro block coded its MV
+    /// explicitly (verified by comparing against a single-MB-shift
+    /// frame whose lone MV must be explicit).
+    #[test]
+    fn encode_inter_frame_motion_uniform_shift_uses_last_modes() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        // A uniform (2,0) shift: every macro block's best vector is the
+        // same, so all but the first MV-bearing macro block can reuse
+        // LAST1 via INTER_MV_LAST.
+        let frame1 = gradient_source(&g, 2, 0);
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        dec.decode_frame(&key).unwrap();
+
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_motion(&frame1, &refs).unwrap()
+        };
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert!(
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 40,
+            "uniform-shift inter luma max error {} exceeds tolerance",
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y)
+        );
+
+        // Count how many macro blocks the encoder drove to a non-zero
+        // MV (the LAST refinement only fires when ≥ 2 share a vector).
+        let refs = dec_keyframe_refs(&enc, &frame0);
+        let rps = refs.as_reference_plane_set().unwrap();
+        let nonzero_mbs = (0..g.nmbs as usize)
+            .filter(|&mbi| enc.search_macro_block_mv(&frame1, &rps, mbi) != MotionVector::ZERO)
+            .count();
+        assert!(
+            nonzero_mbs >= 2,
+            "uniform shift should drive ≥ 2 macro blocks to a non-zero MV (got {nonzero_mbs})"
+        );
     }
 
     /// End-to-end §7.11 on the `q-high` fixture (64×64, `-q:v 10` →

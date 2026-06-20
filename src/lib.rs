@@ -28482,6 +28482,127 @@ mod tests {
         }
     }
 
+    /// HD-scale end-to-end decode of the `dimensions-1080p-very-short`
+    /// fixture: a two-frame (I then P) stream at coded 1920×1088 (visible
+    /// 1920×1080). The corpus stores no `expected.yuv` for it (the raw
+    /// dump is ~6 MB), only the gzipped instrumented trace, so this test
+    /// pins every invariant the trace records bit-exactly:
+    ///
+    /// * §6.2 geometry at HD scale: `NMBS = 120·68 = 8160`,
+    ///   `NSBS = 3060`, `NBS = 48960`, coded 1920×1088, chroma 960×544.
+    /// * §7.1 per-frame headers: frame 0 is `FTYPE` intra with
+    ///   `QIS = 31,20,41`; frame 1 is inter with `QIS = 31,20,40`
+    ///   (trace `FRAME` events, `nqps = 3`).
+    /// * §7.4 macro-block mode decode at HD: the frame-1 mode histogram
+    ///   (vp3.c numbering: `INTER_NO_MV`, `INTRA`, `INTER_PLUS_MV`,
+    ///   `INTER_LAST_MV`, `INTER_PRIOR_LAST`) matches the trace `MB`
+    ///   events exactly — 6829 / 1 / 3 / 1255 / 72 across 8160 MBs.
+    /// * §6.4.1 loop-filter limit for `qi = 31` is 3 (trace
+    ///   `LOOP_FILTER`).
+    /// * §2.2 display crop: the visible region is 1920×1080
+    ///   (`6_220_800` bytes for two planar 4:2:0 frames).
+    ///
+    /// The full-frame pixel reconstruction is exercised end-to-end (the
+    /// §7.9.4 reconstruction and §7.10.3 loop filter run over all 3060
+    /// super blocks of both frames without error); a byte-for-byte SHA-256
+    /// check against the dump is tracked separately — see the crate
+    /// `CHANGELOG` `[Unreleased]` note for the open HD-fidelity item.
+    #[test]
+    fn decode_frame_hd1080_two_frame_trace_invariants() {
+        let ident = decode_identification_header(&fixture_data::HD1080_IDENT_PACKET).unwrap();
+        // §6.2 coded dimensions and HD geometry.
+        assert_eq!(ident.coded_width(), 1920);
+        assert_eq!(ident.coded_height(), 1088);
+        assert_eq!(ident.version(), 0x03_02_01);
+        // §2.2 picture region: visible 1920×1080 at lower-left (0, 8).
+        assert_eq!(
+            (ident.picx, ident.picy, ident.picw, ident.pich),
+            (0, 8, 1920, 1080)
+        );
+
+        let setup = decode_setup_header(&fixture_data::HD1080_SETUP_PACKET).unwrap();
+        // §6.4.1 loop-filter limit for qi=31 (trace LOOP_FILTER).
+        assert_eq!(setup.loop_filter_limits[31], 3);
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let g = dec.geometry().clone();
+        assert_eq!(g.nmbs, 8160, "FMBW·FMBH = 120·68");
+        assert_eq!(g.nsbs, 3060);
+        assert_eq!(g.nbs, 48960, "8160 MBs · 6 blocks");
+        let huffman_tables = dec.setup_tables().huffman_tables.clone();
+
+        // Frame 0: the keyframe. Trace FRAME idx=0: I, qis=31,20,41.
+        let f0 = dec
+            .decode_frame(&fixture_data::HD1080_DATA_PACKET_0)
+            .expect("hd1080 keyframe should decode");
+        assert_eq!(f0.ftype, FrameType::Intra);
+        assert_eq!(f0.qis, vec![31, 20, 41]);
+        assert_eq!(f0.frame.dims_y.width, 1920);
+        assert_eq!(f0.frame.dims_y.height, 1088);
+        assert_eq!(f0.frame.dims_cb.width, 960);
+        assert_eq!(f0.frame.dims_cb.height, 544);
+        let c0 = dec.crop_for_display(&f0).unwrap();
+        assert_eq!((c0.dims_y.width, c0.dims_y.height), (1920, 1080));
+
+        // Frame 1: the inter frame. Trace FRAME idx=1: P, qis=31,20,40.
+        // Re-run §7.1/§7.3/§7.4 at the low level so the decoded mode
+        // histogram can be diffed against the trace MB events before the
+        // pixels are reconstructed.
+        let cb_slices: Vec<&[u32]> = g.chroma_cb.iter().map(|v| v.as_slice()).collect();
+        let cr_slices: Vec<&[u32]> = g.chroma_cr.iter().map(|v| v.as_slice()).collect();
+        let plane_orders: [&[u32]; 3] = [
+            &g.plane_raster_order[0],
+            &g.plane_raster_order[1],
+            &g.plane_raster_order[2],
+        ];
+        let ll = decode_data_packet_header_and_blocks(
+            &fixture_data::HD1080_DATA_PACKET_1,
+            false,
+            g.pf,
+            g.nsbs,
+            g.nbs,
+            g.nmbs,
+            &g.block_to_super_block,
+            &g.macro_block_to_luma_blocks,
+            ChromaBlockLayout {
+                cb: &cb_slices,
+                cr: &cr_slices,
+            },
+            &huffman_tables[..],
+            DcPredictionGeometry {
+                block_to_macro_block: &g.mbi_of_block,
+                neighbors: &g.neighbors,
+                plane_raster_order: &plane_orders,
+            },
+        )
+        .unwrap();
+        let mut modehist = [0u32; 8];
+        for &m in &ll.mbmodes {
+            modehist[m.to_index() as usize] += 1;
+        }
+        // Trace MB events for frame 1 (vp3.c mode numbering), counted
+        // across all 8160 macro blocks: see notes.md / theora-fixtures.
+        assert_eq!(
+            modehist,
+            [6829, 1, 3, 1255, 72, 0, 0, 0],
+            "frame-1 macro-block mode histogram must match the trace"
+        );
+
+        // Full reconstruction + §7.10.3 loop filter over both frames,
+        // exercising the HD-scale §7.9.4 path end-to-end.
+        let f1 = dec
+            .decode_frame(&fixture_data::HD1080_DATA_PACKET_1)
+            .expect("hd1080 inter frame should decode");
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert_eq!(f1.qis, vec![31, 20, 40]);
+        let c1 = dec.crop_for_display(&f1).unwrap();
+        let mut out = cropped_top_down_yuv(&c0);
+        out.extend(cropped_top_down_yuv(&c1));
+        // Two planar 4:2:0 frames at visible 1920×1080.
+        assert_eq!(out.len(), 1920 * 1080 * 3 / 2 * 2);
+        assert_eq!(out.len(), 6_220_800);
+    }
+
     /// End-to-end §7.11 on the `i-frame-then-p-frame-64x64` fixture:
     /// decode the keyframe and then the following inter frame from the
     /// real packet bytes, exercising the §7.9.4 motion-compensated

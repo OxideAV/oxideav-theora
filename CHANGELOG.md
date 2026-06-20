@@ -6,6 +6,35 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **HD (1920×1088) two-frame decode integration test (round 350)**. The
+  `dimensions-1080p-very-short` corpus fixture is now exercised
+  end-to-end. Its Ogg-encapsulated Theora packets were demuxed offline
+  (the corpus README's documented framing-strip step) into
+  `HD1080_IDENT_PACKET` / `HD1080_SETUP_PACKET` / `HD1080_DATA_PACKET_0`
+  (intra) / `HD1080_DATA_PACKET_1` (inter). The new test
+  `decode_frame_hd1080_two_frame_trace_invariants` decodes both frames
+  and pins every invariant the staged instrumented trace records
+  bit-exactly: §6.2 geometry at scale (`NMBS = 8160`, `NSBS = 3060`,
+  `NBS = 48960`), the §7.1 per-frame headers (I `qis = 31,20,41`; P
+  `qis = 31,20,40`), the §6.4.1 loop-filter limit (`qi = 31 → 3`), the
+  full §7.4 frame-1 macro-block mode histogram across all 8160 MBs
+  (`6829/1/3/1255/72`, matching the trace `MB` events exactly), and the
+  §2.2 visible crop dimensions (1920×1080, `6_220_800` bytes for two
+  4:2:0 frames). This is the crate's first end-to-end coverage of the
+  large-frame geometry and the complete inter-mode set
+  (`INTER_NO_MV` / `INTER_MV` / `INTER_MV_LAST` / `INTER_MV_LAST2`).
+  +1 test.
+
+  **Open item (HD pixel fidelity):** the full §7.9.4 reconstruction and
+  §7.10.3 loop filter run over all 3060 super blocks of both frames
+  without error, and every trace-recorded invariant matches, but the
+  byte-for-byte SHA-256 of the cropped output does not yet equal the
+  value recorded in the fixture's `notes.md`. The discrepancy is in
+  pixel reconstruction (not in header/geometry/mode/MV/coded-flag decode,
+  all of which are confirmed bit-exact against the trace). Localizing it
+  needs a per-block or per-coefficient reference signal finer than the
+  whole-stream SHA the corpus currently provides; see the round report.
+
 - **`INTER_MV_LAST` / `INTER_MV_LAST2` mode selection (round 347, third
   commit)**. The inter encoder now runs the §7.5.2 LAST1 / LAST2 state
   machine forward over the coded macro-block order and recodes an

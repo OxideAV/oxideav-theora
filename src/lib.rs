@@ -22131,6 +22131,35 @@ mod tests {
         assert!(r.is_none(), "300/2 = 150 > i8::MAX");
     }
 
+    /// §7.5.1 per-axis fractional resolution: `split_motion_vector_per_axis`
+    /// divides a half-pixel axis by 2 and a quarter-pixel (sub-sampled
+    /// chroma) axis by 4, with the toward-zero / away-from-zero pair.
+    #[test]
+    fn split_motion_vector_per_axis_divisors() {
+        // div == 2 on both axes must agree with the half-pixel helper.
+        for (mx, my) in [(6, -4), (5, 7), (-5, -7), (3, -3), (0, 0)] {
+            assert_eq!(
+                split_motion_vector_per_axis(mx, my, 2, 2),
+                split_half_pixel_motion_vector(mx, my),
+                "div 2/2 must match split_half_pixel_motion_vector for ({mx},{my})"
+            );
+        }
+        // 4:2:0 chroma: both axes quarter-pixel (÷4). MVECTS (17, -17):
+        //   17/4 -> toward 0 = 4, away = 5; -17/4 -> toward 0 = -4, away = -5.
+        let (mv1, mv2) = split_motion_vector_per_axis(17, -17, 4, 4).expect("in range");
+        assert_eq!(mv1, MotionVector::new(4, -4));
+        assert_eq!(mv2, MotionVector::new(5, -5));
+        // An exact multiple of 4 collapses to a single whole-pixel vector.
+        let (mv1, mv2) = split_motion_vector_per_axis(8, -8, 4, 4).expect("in range");
+        assert_eq!(mv1, mv2);
+        assert_eq!(mv1, MotionVector::new(2, -2));
+        // 4:2:2 chroma: horizontal sub-sampled (÷4), vertical not (÷2).
+        // (10, 10): x -> 10/4 = (2, 3); y -> 10/2 = (5, 5).
+        let (mv1, mv2) = split_motion_vector_per_axis(10, 10, 4, 2).expect("in range");
+        assert_eq!(mv1, MotionVector::new(2, 5));
+        assert_eq!(mv2, MotionVector::new(3, 5));
+    }
+
     #[test]
     fn half_pixel_predictor_with_split_helper_round_trip() {
         // Drive the half-pixel predictor via the split helper to

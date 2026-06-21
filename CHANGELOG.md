@@ -4,6 +4,29 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **§7.5.1 quarter-pixel chroma motion compensation (round 356)** — the
+  §7.9.4 step 2(d)vi conversion of a per-block motion vector to its
+  whole-pixel reference offsets now honours the *per-axis* fractional
+  resolution the spec fixes in §7.5.1: a luma component (and any
+  non-sub-sampled chroma axis) is half-pixel and divides by 2, but a
+  **sub-sampled chroma axis** (horizontal in 4:2:2; both in 4:2:0) is
+  **quarter-pixel** (−7.75…7.75 px) and divides by 4. The previous code
+  divided every component by 2, so 4:2:0 chroma blocks with a non-zero
+  motion vector fetched reference samples twice as far as they should,
+  leaving the luma plane bit-exact while chroma drifted (±1 at block
+  edges, larger inside) wherever a frame carried real motion. New
+  `split_motion_vector_per_axis` performs the per-axis divide; the frame
+  driver derives each block's `(hsub, vsub)` from `PF` and `pli` and
+  threads them through `ReconstructBlockInputs`. This makes the
+  `dimensions-1080p-very-short` HD fixture **pixel-exact**: the SHA-256
+  of the two concatenated cropped display frames now equals the
+  `c48344b1…` digest recorded in the corpus `notes.md`, closing the
+  prior open HD-fidelity item. `reconstruct_frame` gains a trailing
+  `pf: PixelFormat` argument. +1 helper-validation test (`sha256_hex`
+  known-vector guard); the HD test now asserts the pixel SHA.
+
 ### Added
 
 - **HD (1920×1088) two-frame decode integration test (round 350)**. The
@@ -25,15 +48,11 @@ All notable changes to `oxideav-theora` are recorded here.
   (`INTER_NO_MV` / `INTER_MV` / `INTER_MV_LAST` / `INTER_MV_LAST2`).
   +1 test.
 
-  **Open item (HD pixel fidelity):** the full §7.9.4 reconstruction and
-  §7.10.3 loop filter run over all 3060 super blocks of both frames
-  without error, and every trace-recorded invariant matches, but the
-  byte-for-byte SHA-256 of the cropped output does not yet equal the
-  value recorded in the fixture's `notes.md`. The discrepancy is in
-  pixel reconstruction (not in header/geometry/mode/MV/coded-flag decode,
-  all of which are confirmed bit-exact against the trace). Localizing it
-  needs a per-block or per-coefficient reference signal finer than the
-  whole-stream SHA the corpus currently provides; see the round report.
+  **Update (round 356): this HD pixel-fidelity item is now resolved.**
+  The discrepancy was the §7.5.1 quarter-pixel chroma motion-vector
+  interpretation (see the round-356 *Fixed* entry above); the HD test
+  now asserts the cropped-output SHA-256 equals the fixture's recorded
+  `c48344b1…` digest.
 
 - **`INTER_MV_LAST` / `INTER_MV_LAST2` mode selection (round 347, third
   commit)**. The inter encoder now runs the §7.5.2 LAST1 / LAST2 state

@@ -7724,6 +7724,65 @@ pub fn split_half_pixel_motion_vector(
     Some((mv1, mv2))
 }
 
+/// Split a per-block motion vector into the §7.9.1.3 round-toward-zero
+/// / round-away-from-zero whole-pixel pair, dividing each component by
+/// a *per-axis* fractional-resolution divisor.
+///
+/// §7.5.1 fixes the interpreted resolution of a `MVECTS` component by
+/// the plane axis it addresses: the luma plane (and any non-sub-sampled
+/// chroma axis) stores components at **half-pixel** resolution, so the
+/// §7.9.4 step 2(d)vi conversion to a whole-pixel reference offset is a
+/// divide-by-2. A **sub-sampled** chroma axis (horizontal in 4:2:2;
+/// both in 4:2:0) stores the *same* numeric component but interpreted
+/// at **quarter-pixel** resolution (−7.75…7.75 px), so the conversion
+/// to whole-pixel is a divide-by-4. Either way the non-zero fractional
+/// remainder selects the §7.9.1.3 two-tap half-pixel predictor; an
+/// exact whole-pixel result collapses to the §7.9.1.2 single-tap path.
+///
+/// `div_x` / `div_y` are each `2` (half-pixel axis) or `4`
+/// (quarter-pixel sub-sampled axis). [`split_half_pixel_motion_vector`]
+/// is the `div_x == div_y == 2` special case.
+///
+/// Returns `None` if any whole-pixel offset escapes the `i8` range the
+/// [`MotionVector`] wrapper stores.
+pub fn split_motion_vector_per_axis(
+    mvx: i32,
+    mvy: i32,
+    div_x: i32,
+    div_y: i32,
+) -> Option<(MotionVector, MotionVector)> {
+    debug_assert!(div_x == 2 || div_x == 4);
+    debug_assert!(div_y == 2 || div_y == 4);
+    // Round toward zero: signed integer division in Rust truncates
+    // toward zero, matching the spec's "truncating … towards zero".
+    let toward_zero = |v: i32, d: i32| -> i32 { v / d };
+    // Round away from zero: bump the quotient by one in the sign
+    // direction whenever the division left a non-zero remainder.
+    let away_zero = |v: i32, d: i32| -> i32 {
+        let q = v / d;
+        if v % d == 0 {
+            q
+        } else if v > 0 {
+            q + 1
+        } else {
+            q - 1
+        }
+    };
+    let to_i8 = |v: i32| -> Option<i8> {
+        if (i8::MIN as i32) <= v && v <= (i8::MAX as i32) {
+            Some(v as i8)
+        } else {
+            None
+        }
+    };
+    let mv1 = MotionVector::new(
+        to_i8(toward_zero(mvx, div_x))?,
+        to_i8(toward_zero(mvy, div_y))?,
+    );
+    let mv2 = MotionVector::new(to_i8(away_zero(mvx, div_x))?, to_i8(away_zero(mvy, div_y))?);
+    Some((mv1, mv2))
+}
+
 /// 16-bit cosine/sine approximations from Table 7.65.
 ///
 /// The §7.9.3.1 1D inverse DCT scales every signal-flow rotation by
@@ -8464,6 +8523,22 @@ pub struct ReconstructBlockInputs {
     /// `QIIS[bi]` — the per-block `qi` selector index. Step
     /// 2(d)viii.A reads `QIS[qii]` to get the AC `qi`.
     pub qii: u8,
+    /// Whether this block's plane is sub-sampled along the
+    /// horizontal axis (Cb/Cr in 4:2:0 and 4:2:2; never luma).
+    ///
+    /// §7.5.1 specifies that on a sub-sampled chroma axis the
+    /// `MVECTS` component is interpreted at *quarter-pixel*
+    /// resolution (−7.75…7.75 px) rather than the luma plane's
+    /// half-pixel resolution (−15.5…15.5 px). The §7.9.4 step
+    /// 2(d)vi conversion to whole-pixel reference offsets therefore
+    /// divides a sub-sampled component by 4 (quarter-pel → whole),
+    /// versus 2 for a non-sub-sampled component (half-pel → whole).
+    /// `false` for every luma block and for 4:4:4 chroma.
+    pub hsub: bool,
+    /// Whether this block's plane is sub-sampled along the vertical
+    /// axis (Cb/Cr in 4:2:0 only; never 4:2:2 or 4:4:4, never luma).
+    /// See [`Self::hsub`] for the quarter-pixel interpretation.
+    pub vsub: bool,
 }
 
 /// Reconstruct a single block per §7.9.4 ("The Complete
@@ -8617,27 +8692,39 @@ fn coded_block_pred_res(
             // Step 2(d)vi: rfi != 0 → inter predictor branch.
             let refp = refs.pick(rfi, pli)?;
             // The §7.5.1 motion-vector components stored in `MVECTS`
-            // are in *half-pixel* units in the luma plane (an integer
-            // in -31..=31 spanning -15.5..=15.5 pixels), and in
-            // quarter-pixel units along each sub-sampled chroma axis.
-            // §7.9.4 step 2(d)vi.B–E convert each component to the
-            // pair of whole-pixel offsets the §7.9.1.2 / §7.9.1.3
-            // predictors consume:
+            // are interpreted at the *native fractional resolution* of
+            // the plane axis they address: half-pixel on the luma plane
+            // (an integer in -31..=31 spanning -15.5..=15.5 pixels) and
+            // on a non-sub-sampled chroma axis, but **quarter-pixel**
+            // (-7.75..=7.75 pixels) on each sub-sampled chroma axis
+            // (horizontal in 4:2:2; both in 4:2:0). §7.9.4 step
+            // 2(d)vi.B–E convert each component to the pair of
+            // whole-pixel offsets the §7.9.1.2 / §7.9.1.3 predictors
+            // consume by dividing out that resolution — a divide-by-2
+            // for a half-pixel axis and a divide-by-4 for a
+            // quarter-pixel (sub-sampled) axis:
             //
-            //   MVX  = ⌊|MVECTS[bi]ₓ| / 2⌋ · sign(MVECTS[bi]ₓ)   (toward zero)
-            //   MVX2 = ⌈|MVECTS[bi]ₓ| / 2⌉ · sign(MVECTS[bi]ₓ)   (away from zero)
+            //   MVX  = ⌊|MVECTS[bi]ₓ| / Dₓ⌋ · sign(MVECTS[bi]ₓ)   (toward zero)
+            //   MVX2 = ⌈|MVECTS[bi]ₓ| / Dₓ⌉ · sign(MVECTS[bi]ₓ)   (away from zero)
             //
-            // (and likewise for the y component). `split_half_pixel_
-            // motion_vector` performs exactly this round-toward-zero /
-            // round-away-from-zero halving on the doubled integer
-            // value, i.e. on `MVECTS[bi]` itself. When a component is
-            // even the two offsets coincide and step 2(d)vi.F routes
-            // through the whole-pixel predictor; an odd component
-            // leaves a half-pixel fractional part and step 2(d)vi.G
-            // selects the half-pixel predictor.
+            // with Dₓ = 2 (half-pixel) or 4 (quarter-pixel), and
+            // likewise Dy for the y component. `split_motion_vector_
+            // per_axis` performs exactly this round-toward-zero /
+            // round-away-from-zero division per axis. When the two
+            // offsets coincide step 2(d)vi.F routes through the
+            // whole-pixel predictor; a non-zero remainder leaves a
+            // half-pixel fractional part and step 2(d)vi.G selects the
+            // half-pixel predictor (which treats a chroma quarter-pixel
+            // fraction "exactly the same as" a half-pixel one).
             let mvx = inputs.mvect.x as i32;
             let mvy = inputs.mvect.y as i32;
-            let (mv1, mv2) = split_half_pixel_motion_vector(mvx, mvy)
+            // §7.5.1: a sub-sampled chroma axis interprets its MVECTS
+            // component at quarter-pixel resolution, so the whole-pixel
+            // conversion divides by 4 there and by 2 on a half-pixel
+            // (luma or non-sub-sampled) axis.
+            let div_x = if inputs.hsub { 4 } else { 2 };
+            let div_y = if inputs.vsub { 4 } else { 2 };
+            let (mv1, mv2) = split_motion_vector_per_axis(mvx, mvy, div_x, div_y)
                 .ok_or(Error::ReconstructMotionVectorOutOfRange { mvx, mvy })?;
             if mv1 == mv2 {
                 // Step 2(d)vi.F: §7.9.1.2 whole-pixel predictor.
@@ -8828,6 +8915,7 @@ pub fn reconstruct_frame(
     dims_y: PlaneDimensions,
     dims_cb: PlaneDimensions,
     dims_cr: PlaneDimensions,
+    pf: PixelFormat,
 ) -> Result<ReconstructedFrame, Error> {
     let nbs = bcoded.len();
     let nmbs = mb_modes.len();
@@ -8930,6 +9018,20 @@ pub fn reconstruct_frame(
             MacroBlockMode::Intra
         };
 
+        // §7.5.1 quarter-pixel chroma axes: luma (pli == 0) is never
+        // sub-sampled; the chroma planes follow `pf` per §4.4 (4:2:0
+        // sub-samples both axes, 4:2:2 only the horizontal one, 4:4:4
+        // neither).
+        let (hsub, vsub) = if pli == 0 {
+            (false, false)
+        } else {
+            match pf {
+                PixelFormat::Yuv420 => (true, true),
+                PixelFormat::Yuv422 => (true, false),
+                PixelFormat::Yuv444 => (false, false),
+            }
+        };
+
         let inputs = ReconstructBlockInputs {
             bcoded: bcoded[bi],
             mb_mode,
@@ -8937,6 +9039,8 @@ pub fn reconstruct_frame(
             coeffs_zz: coeffs[bi],
             ncoeffs: ncoeffs[bi],
             qii: qiis[bi],
+            hsub,
+            vsub,
         };
 
         let block = reconstruct_block(&inputs, pli, bx, by, qis, params, refs)?;
@@ -11564,6 +11668,7 @@ impl FrameDecoder {
                 g.dims_y,
                 g.dims_c,
                 g.dims_c,
+                g.pf,
             )?
         };
 
@@ -22574,6 +22679,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
@@ -22611,6 +22718,8 @@ mod tests {
             coeffs_zz: coeffs,
             ncoeffs: 1,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
@@ -22662,6 +22771,8 @@ mod tests {
             coeffs_zz: coeffs,
             ncoeffs: 1,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [40u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
@@ -22689,6 +22800,8 @@ mod tests {
             coeffs_zz: coeffs,
             ncoeffs: 1,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [40u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
@@ -22722,6 +22835,8 @@ mod tests {
             coeffs_zz: [12345i16; 64],          // ignored on the uncoded branch
             ncoeffs: 64,                        // ignored on the uncoded branch
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [25u8];
         let out = reconstruct_block(&inputs, 0, 4, 4, &qis, &params, &refs).unwrap();
@@ -22757,6 +22872,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [25u8];
         let out = reconstruct_block(&inputs, 1, 0, 0, &qis, &params, &refs).unwrap();
@@ -22786,6 +22903,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [25u8];
         let out = reconstruct_block(&inputs, 2, 0, 0, &qis, &params, &refs).unwrap();
@@ -22816,6 +22935,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
@@ -22848,6 +22969,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8];
         let out = reconstruct_block(&inputs, 2, 0, 0, &qis, &params, &refs).unwrap();
@@ -22878,6 +23001,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
@@ -22914,6 +23039,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
@@ -22955,6 +23082,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 64, // forces the full-DCT branch
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8];
         let out = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap();
@@ -22986,6 +23115,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis: [u8; 0] = [];
         let err = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap_err();
@@ -23013,6 +23144,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 64, // forces the QIS[QIIS[bi]] path
             qii: 5,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8, 20u8];
         let err = reconstruct_block(&inputs, 0, 0, 0, &qis, &params, &refs).unwrap_err();
@@ -23043,6 +23176,8 @@ mod tests {
             coeffs_zz: [0i16; 64],
             ncoeffs: 0,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [10u8];
         let err = reconstruct_block(&inputs, 3, 0, 0, &qis, &params, &refs).unwrap_err();
@@ -23129,6 +23264,8 @@ mod tests {
             coeffs_zz: coeffs,
             ncoeffs: 1,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qi0 = 10usize;
         let qis = [qi0 as u8];
@@ -23198,6 +23335,8 @@ mod tests {
             coeffs_zz: coeffs,
             ncoeffs: 8,
             qii: 0,
+            hsub: false,
+            vsub: false,
         };
         let qis = [20u8, 30u8];
         let a = reconstruct_block(&inputs, 0, 4, 4, &qis, &params, &refs).unwrap();
@@ -23300,6 +23439,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            PixelFormat::Yuv420,
         )
         .unwrap();
         assert_eq!(out.samples_y.len(), 256);
@@ -23374,6 +23514,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            PixelFormat::Yuv420,
         )
         .unwrap();
         // The uncoded luma block at (BX=0, BY=0) should equal the
@@ -23467,6 +23608,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            PixelFormat::Yuv420,
         )
         .unwrap();
         // Every luma sample equals the GOLDEN-Y ramp (bias 50), not the
@@ -23544,12 +23686,13 @@ mod tests {
         // BY=8) take a zero offset on the edge-facing axis so the
         // 8-pixel footprint cannot run past pixel 15.
         //
-        // Chroma blocks 4 (Cb) / 5 (Cr) consume MVECTS[4]/[5] verbatim:
-        // the frame driver does not recompute the §7.5.2 four-MV chroma
-        // average — that resolution happened upstream in
-        // decode_macroblock_motion_vectors. We therefore set the chroma
-        // entries explicitly and assert the driver applies exactly
-        // those values.
+        // Chroma blocks 4 (Cb) / 5 (Cr) consume MVECTS[4]/[5] as their
+        // stored value: the frame driver does not recompute the §7.5.2
+        // four-MV chroma average — that resolution happened upstream in
+        // decode_macroblock_motion_vectors. We set the chroma entries
+        // explicitly and assert the driver applies the §7.5.1
+        // quarter-pixel interpretation when converting them to
+        // whole-pixel reference offsets (divide-by-4 in 4:2:0).
         let mv0 = MotionVector::new(0, 2);
         let mv1 = MotionVector::new(0, 0);
         let mv2 = MotionVector::new(2, 0);
@@ -23588,6 +23731,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            PixelFormat::Yuv420,
         )
         .unwrap();
         // Each luma block is the previous-Y ramp shifted by its own
@@ -23612,27 +23756,45 @@ mod tests {
                 }
             }
         }
-        // Chroma blocks use the averaged MV (2,2) → whole-pixel offset
-        // (1,1) against previous Cb (bias 100) / Cr (bias 110). The 8×8
-        // chroma block fills its whole 8×8 plane, so the +1 offset
-        // pushes the right column / bottom row one past the edge; the
-        // §7.9.1.2 step 1(b)/1(d) coordinate clamp folds those reads
-        // back to index 7. A clamped sample proves the MV was applied
-        // (the interior pattern is shifted) without going out of bounds.
+        // Chroma blocks use the averaged MV (2,2). In 4:2:0 *both*
+        // chroma axes are sub-sampled, so each component is interpreted
+        // at quarter-pixel resolution (§7.5.1) and §7.9.4 step 2(d)vi
+        // divides it by 4 (not 2) to reach whole-pixel reference
+        // offsets: MVX = ⌊2/4⌋ = 0 (toward zero), MVX2 = ⌈2/4⌉ = 1
+        // (away from zero), likewise for y. The two offsets differ, so
+        // the §7.9.1.3 half-pixel predictor runs, averaging the
+        // co-located sample (offset 0,0) with the +1,+1-shifted sample
+        // (clamped at the plane edge) via (s1 + s2) >> 1. The previous
+        // Cb ramp is bias 100, Cr bias 110, value = (u + v + bias).
+        let half_pixel_chroma = |bias: u32| -> [[u8; 8]; 8] {
+            let mut exp = [[0u8; 8]; 8];
+            for (cy, row) in exp.iter_mut().enumerate() {
+                for (cx, cell) in row.iter_mut().enumerate() {
+                    // mv1 = (0,0): co-located. mv2 = (1,1): shifted,
+                    // clamped to the 8×8 plane's last index 7.
+                    let u1 = cx;
+                    let v1 = cy;
+                    let u2 = (cx + 1).min(7);
+                    let v2 = (cy + 1).min(7);
+                    let s1 = (u1 + v1) as u32 + bias;
+                    let s2 = (u2 + v2) as u32 + bias;
+                    *cell = (((s1 + s2) >> 1) % 256) as u8;
+                }
+            }
+            exp
+        };
+        let exp_cb = half_pixel_chroma(100);
+        let exp_cr = half_pixel_chroma(110);
         for cy in 0..8u32 {
             for cx in 0..8u32 {
                 let idx = (cy * 8 + cx) as usize;
-                let u = (cx + 1).min(7); // BX=0 + ox=1, clamped to [0,7]
-                let v = (cy + 1).min(7); // BY=0 + oy=1, clamped to [0,7]
                 assert_eq!(
-                    out.samples_cb[idx],
-                    ((u + v + 100) % 256) as u8,
-                    "Cb ({cx},{cy}) must sample previous Cb at clamped averaged MV"
+                    out.samples_cb[idx], exp_cb[cy as usize][cx as usize],
+                    "Cb ({cx},{cy}) must sample previous Cb at the quarter-pel averaged MV"
                 );
                 assert_eq!(
-                    out.samples_cr[idx],
-                    ((u + v + 110) % 256) as u8,
-                    "Cr ({cx},{cy}) must sample previous Cr at clamped averaged MV"
+                    out.samples_cr[idx], exp_cr[cy as usize][cx as usize],
+                    "Cr ({cx},{cy}) must sample previous Cr at the quarter-pel averaged MV"
                 );
             }
         }
@@ -23689,6 +23851,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            PixelFormat::Yuv420,
         )
         .unwrap_err();
         assert_eq!(err, Error::ReconstructFramePliOutOfRange { bi: 4, pli: 3 });
@@ -23745,6 +23908,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            PixelFormat::Yuv420,
         )
         .unwrap_err();
         assert_eq!(
@@ -23809,6 +23973,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            PixelFormat::Yuv420,
         )
         .unwrap_err();
         match err {
@@ -23882,6 +24047,7 @@ mod tests {
                 width: 8,
                 height: 8,
             },
+            PixelFormat::Yuv420,
         )
         .unwrap_err();
         assert_eq!(
@@ -23986,13 +24152,43 @@ mod tests {
             height: 8,
         };
         let a = reconstruct_frame(
-            &bcoded, &mb_modes, &mvects, &coeffs, &ncoeffs, &qiis, &pli, &bx, &by, &mbi, &qis,
-            &params, &refs, dy, dc, dc,
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            dy,
+            dc,
+            dc,
+            PixelFormat::Yuv420,
         )
         .unwrap();
         let b = reconstruct_frame(
-            &bcoded, &mb_modes, &mvects, &coeffs, &ncoeffs, &qiis, &pli, &bx, &by, &mbi, &qis,
-            &params, &refs, dy, dc, dc,
+            &bcoded,
+            &mb_modes,
+            &mvects,
+            &coeffs,
+            &ncoeffs,
+            &qiis,
+            &pli,
+            &bx,
+            &by,
+            &mbi,
+            &qis,
+            &params,
+            &refs,
+            dy,
+            dc,
+            dc,
+            PixelFormat::Yuv420,
         )
         .unwrap();
         assert_eq!(a, b);
@@ -28360,6 +28556,118 @@ mod tests {
         out
     }
 
+    /// Self-contained SHA-256 (FIPS 180-4) over a byte slice, returning
+    /// the 64-char lowercase hex digest. Used to pin the HD fixture's
+    /// reconstructed output against the digest recorded in the corpus
+    /// `notes.md` without taking a hashing dependency. This is a test
+    /// helper only; the decoder itself never hashes.
+    fn sha256_hex(data: &[u8]) -> String {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut h: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        // Pre-process: append 0x80, pad with zeros to 56 mod 64, then
+        // the 64-bit big-endian bit length.
+        let mut msg = data.to_vec();
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+
+        for chunk in msg.chunks_exact(64) {
+            let mut w = [0u32; 64];
+            for (i, word) in w.iter_mut().enumerate().take(16) {
+                *word = u32::from_be_bytes([
+                    chunk[i * 4],
+                    chunk[i * 4 + 1],
+                    chunk[i * 4 + 2],
+                    chunk[i * 4 + 3],
+                ]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let mut a = h[0];
+            let mut b = h[1];
+            let mut c = h[2];
+            let mut d = h[3];
+            let mut e = h[4];
+            let mut f = h[5];
+            let mut g = h[6];
+            let mut hh = h[7];
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+            h[5] = h[5].wrapping_add(f);
+            h[6] = h[6].wrapping_add(g);
+            h[7] = h[7].wrapping_add(hh);
+        }
+
+        let mut hex = String::with_capacity(64);
+        for word in h {
+            for byte in word.to_be_bytes() {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+        }
+        hex
+    }
+
+    /// The `sha256_hex` test helper reproduces the standard FIPS 180-4
+    /// digests for the empty input and "abc" (the spec's own example
+    /// vectors), guarding the HD pixel-SHA pin against a helper bug.
+    #[test]
+    fn sha256_helper_matches_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     /// End-to-end §7.11 on the `tiny-i-only-16x16` fixture: decode
     /// the single intra frame from the real packet bytes and compare
     /// every sample against the staged reference dump.
@@ -28504,9 +28812,11 @@ mod tests {
     ///
     /// The full-frame pixel reconstruction is exercised end-to-end (the
     /// §7.9.4 reconstruction and §7.10.3 loop filter run over all 3060
-    /// super blocks of both frames without error); a byte-for-byte SHA-256
-    /// check against the dump is tracked separately — see the crate
-    /// `CHANGELOG` `[Unreleased]` note for the open HD-fidelity item.
+    /// super blocks of both frames), and the two concatenated display
+    /// frames are pinned **pixel-exactly** by the SHA-256 digest recorded
+    /// in the corpus `notes.md` (`c48344b1…`). This closes the prior
+    /// HD-fidelity gap: the §7.5.1 quarter-pixel chroma motion-vector
+    /// interpretation is what the digest now exercises sample-exactly.
     #[test]
     fn decode_frame_hd1080_two_frame_trace_invariants() {
         let ident = decode_identification_header(&fixture_data::HD1080_IDENT_PACKET).unwrap();
@@ -28601,6 +28911,18 @@ mod tests {
         // Two planar 4:2:0 frames at visible 1920×1080.
         assert_eq!(out.len(), 1920 * 1080 * 3 / 2 * 2);
         assert_eq!(out.len(), 6_220_800);
+        // Pixel-exact pin: the SHA-256 of the two concatenated display
+        // frames (cropped 1920×1080 planar 4:2:0, top-down row order)
+        // equals the digest recorded in the corpus `notes.md`. Frame 0
+        // is the all-intra keyframe; frame 1 exercises the §7.9.4
+        // inter path including §7.5.1 quarter-pixel chroma motion
+        // compensation — the band of nonzero-MV chroma blocks that this
+        // digest now reconstructs sample-exactly.
+        assert_eq!(
+            sha256_hex(&out),
+            "c48344b1a3febb0154d4a8b7abdbc61d551fb48d2863e8a733d68665504b158c",
+            "HD 1080p two-frame display output must match the recorded pixel SHA-256"
+        );
     }
 
     /// End-to-end §7.11 on the `i-frame-then-p-frame-64x64` fixture:

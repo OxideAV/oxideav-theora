@@ -23,8 +23,11 @@ against reference output.
   decode.
 * **Reconstruction** — DC prediction and inversion, the inverse DCT
   (DC-only shortcut plus the full two-pass path), intra and
-  motion-compensated inter reconstruction, the complete frame-level
-  reconstruction driver, and reference-frame promotion.
+  motion-compensated inter reconstruction (with the §7.5.1 per-axis
+  fractional-resolution motion vectors: half-pixel on luma /
+  non-sub-sampled axes, quarter-pixel on each sub-sampled chroma axis,
+  validated pixel-exact at HD), the complete frame-level reconstruction
+  driver, and reference-frame promotion.
 * **Loop filter** — the edge primitives, `lflim()` response, and the
   complete raster-order loop-filter driver (applied in place; collapses
   to identity at a zero filter limit).
@@ -142,22 +145,14 @@ bit-exactly: the HD §6.2 geometry (`NMBS = 8160`, `NSBS = 3060`,
 the §2.2 visible-crop dimensions, and the complete §7.4 frame-1
 macro-block mode histogram across all 8160 macro blocks (the full
 inter-mode set — `INTER_NO_MV`, `INTER_MV`, `INTER_MV_LAST`,
-`INTER_MV_LAST2`). This is the first end-to-end exercise of the
-large-frame geometry and the full inter-mode mix; the byte-exact pixel
-SHA-256 is an open item (see below).
+`INTER_MV_LAST2`). It is also pinned **pixel-exactly**: the SHA-256 of
+the two concatenated cropped display frames equals the `c48344b1…`
+digest recorded in the fixture's `notes.md`. Frame 0 is the all-intra
+keyframe; frame 1 exercises the §7.9.4 inter path including the §7.5.1
+quarter-pixel chroma motion compensation — the band of nonzero-MV
+chroma blocks that earlier diverged is now sample-exact.
 
 ## Not yet supported
-
-* **HD (1920×1088) byte-exact pixel reconstruction** — the
-  `dimensions-1080p-very-short` fixture decodes end-to-end without error
-  and matches every trace-recorded invariant (geometry, frame headers,
-  loop-filter limit, the full frame-1 macro-block mode histogram, and the
-  visible-crop size), but the SHA-256 of the cropped output does not yet
-  equal the value the fixture's `notes.md` records. The discrepancy is in
-  pixel reconstruction (header / geometry / mode / MV / coded-flag decode
-  are all confirmed bit-exact against the trace); pinning it needs a
-  per-block or per-coefficient reference signal finer than the
-  whole-stream SHA the corpus currently provides.
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.

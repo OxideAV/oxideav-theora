@@ -28562,6 +28562,21 @@ mod tests {
 
     // ------- §7.11 complete frame decode (fixture end-to-end) -------
 
+    /// Per-plane / per-frame SHA-256 digests of the
+    /// `dimensions-1080p-very-short` decoded display output, top-down
+    /// row order, in the order `[f0 Y, f0 Cb, f0 Cr, f1 Y, f1 Cb, f1
+    /// Cr]`. These localise a regression to a single (frame, plane);
+    /// concatenating the six planes back in YUV order and re-hashing
+    /// reproduces the authoritative combined `c48344b1…` corpus digest.
+    const HD1080_PLANE_DIGESTS: [&str; 6] = [
+        "769c98907b9822b3e291461a59bde8e13ad89295de0ac5fa23550c556ac5ccb6",
+        "6ac3cc9a4ace5fb81bc9b0c8049c3dda28e34b55d53649b4ed63b1c5417b171b",
+        "1a851dc5d8329a21e22d99e8ba548bc619201b9c4d58819266d38e44bd4dca48",
+        "cb954bbda62611b96217e74c3ddafb2db5f68dce62f671e03271a60dcbfccbbb",
+        "78bec5e8255b073172700d17b055facc6af1644159e5d845d0a49f01e63c0edf",
+        "f1a748b9b61170869cd399d24072f639f0d4190a8335f18de800d28fbb2ff44b",
+    ];
+
     /// Reorder a decoder plane (lower-left origin, bottom-up rows per
     /// §2.1) into the top-down row order the corpus `expected.yuv`
     /// dumps use.
@@ -28987,6 +29002,47 @@ mod tests {
         assert_eq!(f1.ftype, FrameType::Inter);
         assert_eq!(f1.qis, vec![31, 20, 40]);
         let c1 = dec.crop_for_display(&f1).unwrap();
+
+        // Per-plane / per-frame digest localisation. The combined SHA
+        // below is the authoritative pixel pin, but a single digest over
+        // 6.2 MB cannot tell a luma-only divergence from a chroma-only
+        // one, nor an intra (frame 0) regression from an inter (frame 1)
+        // one. Pinning each plane of each frame separately means a future
+        // break reports *where* it diverged (which frame, which plane)
+        // rather than just "the digest changed". These sub-digests are
+        // implied by — and consistent with — the combined `c48344b1…`
+        // pin: re-deriving the whole-output digest from these six planes
+        // reproduces it (asserted at the end).
+        let plane_digests = [
+            (
+                sha256_hex(&plane_top_down(&c0.samples_y, c0.dims_y)),
+                "frame0 Y",
+            ),
+            (
+                sha256_hex(&plane_top_down(&c0.samples_cb, c0.dims_c)),
+                "frame0 Cb",
+            ),
+            (
+                sha256_hex(&plane_top_down(&c0.samples_cr, c0.dims_c)),
+                "frame0 Cr",
+            ),
+            (
+                sha256_hex(&plane_top_down(&c1.samples_y, c1.dims_y)),
+                "frame1 Y",
+            ),
+            (
+                sha256_hex(&plane_top_down(&c1.samples_cb, c1.dims_c)),
+                "frame1 Cb",
+            ),
+            (
+                sha256_hex(&plane_top_down(&c1.samples_cr, c1.dims_c)),
+                "frame1 Cr",
+            ),
+        ];
+        for ((got, label), want) in plane_digests.iter().zip(HD1080_PLANE_DIGESTS.iter()) {
+            assert_eq!(got, want, "HD {label} plane digest must match");
+        }
+
         let mut out = cropped_top_down_yuv(&c0);
         out.extend(cropped_top_down_yuv(&c1));
         // Two planar 4:2:0 frames at visible 1920×1080.

@@ -6,6 +6,15 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Per-plane / per-frame HD digest localisation (round 360)** — the HD
+  `dimensions-1080p-very-short` decode is now pinned by six SHA-256
+  sub-digests (frame 0 / frame 1 × Y / Cb / Cr) in addition to the
+  single authoritative `c48344b1…` combined digest. The combined pin
+  proves the bytes correct; the sub-digests localise any future
+  regression to a specific frame and plane (intra vs inter, luma vs
+  chroma) instead of only reporting "the digest changed". The
+  sub-digests are derived from the same display bytes the combined pin
+  hashes, so they are consistent by construction.
 - **Per-position §7.4 macro-block trace pin on the HD fixture (round
   360)** — the `dimensions-1080p-very-short` decode test previously
   checked only the 5-bucket frame-1 mode histogram. It now pins **every

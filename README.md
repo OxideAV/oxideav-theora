@@ -142,10 +142,14 @@ The `dimensions-1080p-very-short` fixture (coded 1920×1088, visible
 against every invariant the staged instrumented trace records
 bit-exactly: the HD §6.2 geometry (`NMBS = 8160`, `NSBS = 3060`,
 `NBS = 48960`), both §7.1 frame headers, the §6.4.1 loop-filter limit,
-the §2.2 visible-crop dimensions, and the complete §7.4 frame-1
-macro-block mode histogram across all 8160 macro blocks (the full
-inter-mode set — `INTER_NO_MV`, `INTER_MV`, `INTER_MV_LAST`,
-`INTER_MV_LAST2`). It is also pinned **pixel-exactly**: the SHA-256 of
+the §2.2 visible-crop dimensions, and the §7.4 frame-1 macro-block
+modes — not just the 5-bucket histogram but **every one of the 8160
+macro blocks** pinned at its exact super-block coded-order position
+against the trace (mode index + derived MB-coded flag), so a raster /
+Hilbert-order / mode-decode-position regression can no longer pass a
+bucket-total check. The decoded mode set spans the full inter range
+(`INTER_NO_MV`, `INTER_MV`, `INTER_MV_LAST`, `INTER_MV_LAST2`). It is
+also pinned **pixel-exactly**: the SHA-256 of
 the two concatenated cropped display frames equals the `c48344b1…`
 digest recorded in the fixture's `notes.md`. Frame 0 is the all-intra
 keyframe; frame 1 exercises the §7.9.4 inter path including the §7.5.1

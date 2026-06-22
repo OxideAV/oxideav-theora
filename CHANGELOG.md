@@ -4,6 +4,20 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-position §7.4 macro-block trace pin on the HD fixture (round
+  360)** — the `dimensions-1080p-very-short` decode test previously
+  checked only the 5-bucket frame-1 mode histogram. It now pins **every
+  one of the 8160 macro blocks** at its exact super-block coded-order
+  position against the staged instrumented trace: both the §7.4 mode
+  index and the §7.4 step 2(d)i MB-coded flag (derived from the §7.3
+  `BCODED` luma blocks). The two trace arrays are staged run-length-
+  encoded in `fixture_data.rs` (`HD1080_FRAME1_MODE_CODED_ORDER_RLE`,
+  `HD1080_FRAME1_CODED_FLAG_ORDER_RLE`; 397 + 253 runs). This catches
+  any raster / Hilbert coded-order or mode-decode-position regression a
+  bucket-total histogram would silently pass.
+
 ### Fixed
 
 - **§7.5.1 quarter-pixel chroma motion compensation (round 356)** — the

@@ -28590,6 +28590,19 @@ mod tests {
     /// reconstructed output against the digest recorded in the corpus
     /// `notes.md` without taking a hashing dependency. This is a test
     /// helper only; the decoder itself never hashes.
+    /// Expand a `(value, run_length)` run-length-encoded `u8` sequence
+    /// back into the flat per-element array. Used to decompress the
+    /// staged HD frame-1 per-macro-block mode / coded-flag trace arrays
+    /// (`HD1080_FRAME1_*_RLE`) so a decode can be pinned at every
+    /// super-block coded-order position.
+    fn expand_rle_u8(rle: &[(u8, u16)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &(v, n) in rle {
+            out.extend(std::iter::repeat_n(v, n as usize));
+        }
+        out
+    }
+
     fn sha256_hex(data: &[u8]) -> String {
         const K: [u32; 64] = [
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -28926,6 +28939,45 @@ mod tests {
             [6829, 1, 3, 1255, 72, 0, 0, 0],
             "frame-1 macro-block mode histogram must match the trace"
         );
+
+        // Per-position §7.4 mode pin: the histogram above only checks the
+        // 5-bucket totals; this asserts every one of the 8160 macro
+        // blocks decodes to the mode the trace recorded at that exact
+        // super-block coded-order position. `mbmodes` is indexed by `mbi`
+        // (the order `PlaneMacroBlockCodedOrder` visits the macro blocks),
+        // so the staged RLE — captured in that same coded order — pins
+        // any raster / Hilbert-order / mode-decode-position regression a
+        // bucket histogram would silently pass.
+        let expected_modes = expand_rle_u8(&fixture_data::HD1080_FRAME1_MODE_CODED_ORDER_RLE);
+        assert_eq!(expected_modes.len(), g.nmbs as usize);
+        for (mbi, (&m, &exp)) in ll.mbmodes.iter().zip(expected_modes.iter()).enumerate() {
+            assert_eq!(
+                m.to_index(),
+                exp,
+                "frame-1 mode mismatch at coded-order macro block {mbi}"
+            );
+        }
+
+        // Per-position MB-coded pin. Per §7.4 step 2(d)i a macro block is
+        // "coded" — i.e. has its `MBMODES` entry transmitted rather than
+        // defaulting to `INTER_NOMV` — exactly when at least one of its
+        // four **luma** blocks carries residual (`BCODED == 1`); chroma
+        // coding does not make the macro block coded. Derive the flag from
+        // the §7.3 `BCODED` array via the geometry's macro-block→luma-block
+        // map and pin every position against the staged trace flags.
+        let expected_coded = expand_rle_u8(&fixture_data::HD1080_FRAME1_CODED_FLAG_ORDER_RLE);
+        assert_eq!(expected_coded.len(), g.nmbs as usize);
+        let mut mb_coded = vec![0u8; g.nmbs as usize];
+        for (mbi, luma) in g.macro_block_to_luma_blocks.iter().enumerate() {
+            let any = luma.iter().any(|&bi| ll.bcoded[bi as usize] != 0);
+            mb_coded[mbi] = u8::from(any);
+        }
+        for (mbi, (&got, &exp)) in mb_coded.iter().zip(expected_coded.iter()).enumerate() {
+            assert_eq!(
+                got, exp,
+                "frame-1 MB-coded flag mismatch at coded-order macro block {mbi}"
+            );
+        }
 
         // Full reconstruction + §7.10.3 loop filter over both frames,
         // exercising the HD-scale §7.9.4 path end-to-end.

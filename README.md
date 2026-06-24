@@ -100,7 +100,32 @@ packets are handled as duplicate-frame markers.
   golden copy of a re-shown reference reconstructs bit-exactly, and a
   per-luma-block-displaced frame reconstructs within the quantizer
   bound — so every §7.5.2 inter mode is now reachable from the encoder.
-  RD-optimal mode selection and rate control remain future work.
+
+  A **unified rate-distortion mode decision**
+  (`encode_inter_frame_rd`) replaces the fixed per-entry-point SAD
+  heuristic with one joint per-macro-block Lagrangian choice. Each macro
+  block evaluates every reachable uniform inter mode (`INTER_NOMV`,
+  `INTER_MV`, `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`) by its true cost
+  `D + λ·R` and codes the cheapest. The distortion `D` is the sum of
+  squared errors between the source and the block the decoder will
+  actually reconstruct — the encoder runs its own forward
+  quantize → dequantize → inverse-DCT → clamp (`block_rd_cost`), so a
+  candidate is scored on *delivered* fidelity rather than a
+  pre-quantization SAD proxy; the rate `R` folds in the §7.4 mode code
+  and §7.5 `MVMODE = 1` explicit-MV bits, weighted by a
+  quantizer-derived multiplier λ (`inter_rd_lambda`, monotone in `qi`).
+  This subsumes the raw-SAD previous-vs-golden choice into one decision
+  on reconstructed distortion; `INTER_MV` winners still flow through the
+  §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode. On a scene the golden
+  reference predicts perfectly the RD path codes a distortion-free golden
+  copy (SSD 0, 25 B) where the previous-reference-only motion path must
+  code a large residual against the unrelated previous reference
+  (SSD 50264, 252 B) — a measured strict win on both distortion and
+  rate. The mode decision has **no bitstream-syntax effect**: every
+  chosen mode emits the same §7 bytes the existing writers produce.
+  `TheoraEncoder` drives its P-frames through this RD path by default
+  (selectable via `InterModeStrategy` / `with_inter_mode`). A
+  target-bitrate rate-control loop remains future work.
 
 * **Framework `Decoder` integration** — `TheoraDecoder` implements
   `oxideav_core::Decoder`, and `register` installs it into a
@@ -177,16 +202,18 @@ chroma blocks that earlier diverged is now sample-exact.
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **RD-optimal mode decision + rate control** — every §7.5.2 inter
+* **Rate control + four-MV in the RD decision** — every §7.5.2 inter
   mode (`INTER_NOMV`, `INTER_MV`, `INTER_MV_LAST`, `INTER_MV_LAST2`,
-  `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`, `INTER_MV_FOUR`) is now
-  reachable from the encoder (see the inter-encoder bullet above), but
-  the per-frame mode decision is a fixed SAD heuristic per entry point
-  rather than a rate-distortion-optimal joint choice, and there is no
-  rate control / target-bitrate loop. The setup header (§6.4
-  quantization parameters + Huffman tables) is supplied by the caller
-  via `TheoraEncoder::new` / `extradata` rather than synthesized from
-  scratch.
+  `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`, `INTER_MV_FOUR`) is reachable
+  from the encoder, and the **uniform** inter modes are now chosen by a
+  joint rate-distortion decision (`encode_inter_frame_rd`, the
+  `TheoraEncoder` P-frame default — see the inter-encoder bullet above).
+  Still future work: folding `INTER_MV_FOUR` into the same RD candidate
+  set (its per-luma-block search remains a separate entry point), and a
+  rate control / target-bitrate loop (the frame quantizer is fixed at
+  construction). The setup header (§6.4 quantization parameters +
+  Huffman tables) is supplied by the caller via `TheoraEncoder::new` /
+  `extradata` rather than synthesized from scratch.
 * **Reference-captured golden / four-MV corpus fixture** — the
   golden-reference and four-MV inter modes are exercised
   top-to-bottom through this crate's own encoder→decoder round trip

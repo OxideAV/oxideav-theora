@@ -31283,6 +31283,93 @@ mod tests {
         }
     }
 
+    /// MILESTONE (measurable delta): on a scene where the golden
+    /// reference is the only good predictor, the rate-distortion decision
+    /// delivers **strictly lower reconstructed distortion** *and* a
+    /// **strictly smaller packet** than the previous-reference-only SAD
+    /// motion path. The golden-perfect frame is a pure golden copy under
+    /// RD (zero distortion, no residual bits), whereas the previous-only
+    /// path must code a large residual against the unrelated previous
+    /// reference. This quantifies the value of folding the
+    /// previous/golden choice into one Lagrangian decision rather than
+    /// leaving golden access to a separate SAD-only entry point.
+    #[test]
+    fn encode_inter_frame_rd_beats_previous_only_on_golden_scene() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        // Flat A: lossless intra → a perfect golden copy.
+        let frame_a = SourceFrame {
+            samples_y: vec![96u8; len_y],
+            samples_cb: vec![128u8; len_c],
+            samples_cr: vec![128u8; len_c],
+        };
+        let frame_b = gradient_source(&g, 7, 5);
+
+        // Drive two independent decoders to the same state (intra A,
+        // inter B), then encode frame 2 (= rec(A)) two ways against the
+        // identical reference store.
+        let ssd_of = |source: &SourceFrame, recon: &ReconstructedFrame| -> u64 {
+            let plane_ssd = |a: &[u8], b: &[u8]| -> u64 {
+                a.iter()
+                    .zip(b.iter())
+                    .map(|(&x, &y)| {
+                        let d = x as i64 - y as i64;
+                        (d * d) as u64
+                    })
+                    .sum()
+            };
+            plane_ssd(&source.samples_y, &recon.samples_y)
+                + plane_ssd(&source.samples_cb, &recon.samples_cb)
+                + plane_ssd(&source.samples_cr, &recon.samples_cr)
+        };
+
+        let run = |strategy: InterModeStrategy| -> (u64, usize) {
+            let mut dec = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+            let key = enc.encode_intra_frame(&frame_a).unwrap();
+            let rec_a = dec.decode_frame(&key).unwrap().frame.clone();
+            let pkt_b = {
+                let refs = dec.reference_store().as_reference_plane_set().unwrap();
+                enc.encode_inter_frame_motion(&frame_b, &refs).unwrap()
+            };
+            dec.decode_frame(&pkt_b).unwrap();
+            let source_back_to_a = SourceFrame {
+                samples_y: rec_a.samples_y.clone(),
+                samples_cb: rec_a.samples_cb.clone(),
+                samples_cr: rec_a.samples_cr.clone(),
+            };
+            let pkt = {
+                let refs = dec.reference_store().as_reference_plane_set().unwrap();
+                match strategy {
+                    InterModeStrategy::RateDistortion => {
+                        enc.encode_inter_frame_rd(&source_back_to_a, &refs).unwrap()
+                    }
+                    InterModeStrategy::PreviousMotion => enc
+                        .encode_inter_frame_motion(&source_back_to_a, &refs)
+                        .unwrap(),
+                }
+            };
+            let f2 = dec.decode_frame(&pkt).unwrap();
+            (ssd_of(&source_back_to_a, &f2.frame), pkt.len())
+        };
+
+        let (rd_ssd, rd_bytes) = run(InterModeStrategy::RateDistortion);
+        let (prev_ssd, prev_bytes) = run(InterModeStrategy::PreviousMotion);
+
+        // RD reproduces the golden reference exactly (zero distortion).
+        assert_eq!(rd_ssd, 0, "RD golden copy must be distortion-free");
+        assert!(
+            rd_ssd < prev_ssd,
+            "RD distortion {rd_ssd} must beat previous-only {prev_ssd}"
+        );
+        assert!(
+            rd_bytes < prev_bytes,
+            "RD packet {rd_bytes} B must be smaller than previous-only {prev_bytes} B"
+        );
+    }
+
     /// End-to-end §7.11 on the `q-high` fixture (64×64, `-q:v 10` →
     /// qi=63, `ac_scale=10`). This is the weak-quant extreme: the
     /// quantiser is the smallest available, so many DCT AC

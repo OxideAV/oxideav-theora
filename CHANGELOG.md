@@ -6,6 +6,14 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Measured RD vs previous-only delta (round 368)** — a new test
+  quantifies the rate-distortion decision's value on a scene the golden
+  reference predicts perfectly: the RD path codes a distortion-free
+  golden copy (SSD 0 in 25 B) where the previous-reference-only motion
+  path must code a large residual against the unrelated previous
+  reference (SSD 50264 in 252 B) — a strict win on both delivered
+  distortion and packet size, asserted in-test.
+
 - **`TheoraEncoder` P-frames default to the rate-distortion decision
   (round 368)** — the framework `Encoder` integration now drives its
   inter (P) frames through `encode_inter_frame_rd` by default, so a full

@@ -6,6 +6,27 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Four-MV inter encoder (round 364)** —
+  `FrameEncoder::encode_inter_frame_four_mv` searches the previous
+  reference for an independent vector per luma block and codes
+  `INTER_MV_FOUR` when the four winning vectors disagree (collapsing to
+  the cheaper uniform `INTER_MV` / `INTER_NOMV` when they agree). Each
+  luma block carries its own vector; each chroma block carries the
+  §7.5.2 step 3(a)x..xii average of the four luma vectors for the pixel
+  format, computed by the new `four_mv_chroma_average` helper (the
+  exact inverse of the decoder's chroma-MV assignment). The shared
+  encode body now builds a per-block motion-vector table up front (luma
+  per-block, chroma averaged) and the §7.5 LAST recode pass tracks the
+  four-MV step 3(a)xiii/xiv predictor update (LAST1 = the last coded
+  luma block's vector) so a following `INTER_MV` stays in sync with the
+  decoder. This is the first encoder path that emits per-luma-block
+  motion vectors, so the decoder's §7.5.2 four-MV decode + chroma
+  averaging + §7.9.4 per-block reconstruction is now exercised
+  top-to-bottom from a real self-encoded bitstream (a new round-trip
+  test displaces each 8×8 luma block of the previous reference by a
+  distinct whole-pixel vector, asserts `INTER_MV_FOUR` lands on the
+  wire, and checks the reconstruction within the quantizer bound).
+
 - **Golden-reference inter encoder (round 364)** —
   `FrameEncoder::encode_inter_frame_golden` is a new inter-frame entry
   point that runs the §7.5 motion search against **both** the previous

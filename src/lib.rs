@@ -4814,6 +4814,42 @@ fn round_div(num: i32, den: i32) -> i32 {
     }
 }
 
+/// Compute the §7.5.2 step 3(a)x..xii chroma motion vectors for an
+/// `INTER_MV_FOUR` macro block from its four raster-order luma vectors
+/// `[A, B, C, D]`, returning one vector per Cb (and equivalently Cr)
+/// chroma block in the macro block's chroma-block raster order:
+///
+/// * 4:2:0 (`PF=0`) — one block: `round((A+B+C+D)/4)`.
+/// * 4:2:2 (`PF=2`) — two blocks, bottom then top: `round((A+B)/2)`,
+///   `round((C+D)/2)`.
+/// * 4:4:4 (`PF=3`) — four blocks: `A, B, C, D` (a copy, no average).
+///
+/// The returned `Vec` length matches the `chroma_cb` / `chroma_cr`
+/// inner length the geometry builds for the pixel format, so the
+/// encoder can zip it straight onto those block-index slots. This is
+/// the exact inverse of the decoder's chroma-MV assignment in
+/// [`decode_macroblock_motion_vectors_inner`].
+fn four_mv_chroma_average(luma: [MotionVector; 4], pf: PixelFormat) -> Vec<MotionVector> {
+    let [a, b, c, d] = luma;
+    match pf {
+        PixelFormat::Yuv420 => vec![MotionVector {
+            x: round_div(a.x as i32 + b.x as i32 + c.x as i32 + d.x as i32, 4) as i8,
+            y: round_div(a.y as i32 + b.y as i32 + c.y as i32 + d.y as i32, 4) as i8,
+        }],
+        PixelFormat::Yuv422 => vec![
+            MotionVector {
+                x: round_div(a.x as i32 + b.x as i32, 2) as i8,
+                y: round_div(a.y as i32 + b.y as i32, 2) as i8,
+            },
+            MotionVector {
+                x: round_div(c.x as i32 + d.x as i32, 2) as i8,
+                y: round_div(c.y as i32 + d.y as i32, 2) as i8,
+            },
+        ],
+        PixelFormat::Yuv444 => vec![a, b, c, d],
+    }
+}
+
 /// Decode the per-block `MVECTS` array for a frame per §7.5.2 of the
 /// Xiph Theora I Specification ("Macro Block Motion Vector Decode").
 ///
@@ -11808,6 +11844,14 @@ enum MotionPlan {
     /// `LAST` predicted mode, so it always spends a mode code and,
     /// when non-zero, full MV bits).
     SearchPreviousOrGolden,
+    /// Each macro block searches the **previous** reference for one
+    /// vector **per luma block** and codes `INTER_MV_FOUR` when the
+    /// four winning vectors are not all identical (otherwise the macro
+    /// block collapses to the cheaper uniform `INTER_MV` / `INTER_NOMV`
+    /// path). The chroma blocks receive the §7.5.2 step 3(a)x..xii
+    /// averaged vector for the pixel format. This is the only encoder
+    /// path that emits per-luma-block motion vectors.
+    SearchFourMv,
 }
 
 impl FrameEncoder {
@@ -12049,9 +12093,35 @@ impl FrameEncoder {
         self.encode_inter_frame_with_motion(frame, refs, MotionPlan::SearchPreviousOrGolden)
     }
 
+    /// Encode one inter frame with **per-luma-block** motion estimation,
+    /// returning the §7 video-data packet bytes.
+    ///
+    /// Same contract as [`FrameEncoder::encode_inter_frame_motion`] but
+    /// each macro block searches the previous reference for an
+    /// independent vector for each of its four luma blocks. When the
+    /// four winning vectors disagree the macro block is coded
+    /// `INTER_MV_FOUR`: every luma block carries its own vector and each
+    /// chroma block carries the §7.5.2 step 3(a)x..xii average of the
+    /// four luma vectors for the pixel format. When the four vectors
+    /// agree the macro block collapses to the cheaper uniform
+    /// `INTER_MV` / `INTER_NOMV` (and may then participate in the
+    /// `INTER_MV_LAST` / `INTER_MV_LAST2` recode). This is the only
+    /// encoder entry point that emits per-luma-block motion vectors, so
+    /// the decoder's §7.5.2 four-MV decode + chroma averaging and the
+    /// §7.9.4 per-block reconstruction are exercised top-to-bottom from
+    /// a real bitstream.
+    pub fn encode_inter_frame_four_mv(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        self.encode_inter_frame_with_motion(frame, refs, MotionPlan::SearchFourMv)
+    }
+
     /// Shared inter-frame encode body. `plan` selects the per-macro-
     /// block motion strategy (see [`MotionPlan`]): zero-vector only,
-    /// previous-reference search, or previous-or-golden search.
+    /// previous-reference search, previous-or-golden search, or
+    /// per-luma-block (four-MV) search.
     fn encode_inter_frame_with_motion(
         &self,
         frame: &SourceFrame,
@@ -12104,6 +12174,11 @@ impl FrameEncoder {
         // reference.
         let mut mb_mv = vec![MotionVector::ZERO; nmbs];
         let mut mbmodes = vec![MacroBlockMode::InterNoMv; nmbs];
+        // For INTER_MV_FOUR macro blocks, the four per-luma-block
+        // vectors in raster [A, B, C, D] order. `None` for any macro
+        // block that did not choose INTER_MV_FOUR (its blocks use the
+        // uniform `mb_mv[mbi]` instead).
+        let mut four_mv_luma: Vec<Option<[MotionVector; 4]>> = vec![None; nmbs];
         match plan {
             MotionPlan::ZeroPrevious => {
                 // mb_mv stays zero, modes stay INTER_NOMV.
@@ -12146,12 +12221,62 @@ impl FrameEncoder {
                     }
                 }
             }
+            MotionPlan::SearchFourMv => {
+                for mbi in 0..nmbs {
+                    let abcd = g.macro_block_to_luma_blocks[mbi];
+                    let per_block = [
+                        self.search_luma_block_mv(frame, refs, abcd[0] as usize),
+                        self.search_luma_block_mv(frame, refs, abcd[1] as usize),
+                        self.search_luma_block_mv(frame, refs, abcd[2] as usize),
+                        self.search_luma_block_mv(frame, refs, abcd[3] as usize),
+                    ];
+                    let all_equal = per_block.iter().all(|&mv| mv == per_block[0]);
+                    if all_equal {
+                        // Four identical vectors collapse to the cheaper
+                        // uniform mode (no per-block MV bits).
+                        mb_mv[mbi] = per_block[0];
+                        mbmodes[mbi] = if per_block[0] != MotionVector::ZERO {
+                            MacroBlockMode::InterMv
+                        } else {
+                            MacroBlockMode::InterNoMv
+                        };
+                    } else {
+                        mbmodes[mbi] = MacroBlockMode::InterMvFour;
+                        four_mv_luma[mbi] = Some(per_block);
+                        // `mb_mv` is unused for four-MV blocks (each block
+                        // carries its own vector); leave it zero.
+                    }
+                }
+            }
         }
 
         // Per-block working state.
         let mut coeffs = vec![[0i16; 64]; nbs];
         let mut bcoded = vec![0u8; nbs];
+
+        // Per-block motion vectors. For uniform modes every block shares
+        // `mb_mv[mbi]`; for INTER_MV_FOUR each luma block carries its own
+        // vector and each chroma block carries the §7.5.2 step 3(a)x..xii
+        // average of the four luma vectors for the pixel format. Built
+        // here so the per-block loop and the §7.5 MV writer read the same
+        // table the decoder reconstructs.
+        // Uniform modes leave `block_mv` zero here and fill it from
+        // `mb_mv[mbi]` in the per-block loop below; only the four-MV
+        // macro blocks need their per-block table built up front.
         let mut block_mv = vec![MotionVector::ZERO; nbs];
+        for (mbi, slot) in four_mv_luma.iter().enumerate() {
+            let Some(luma) = *slot else { continue };
+            let abcd = g.macro_block_to_luma_blocks[mbi];
+            for (raster, &bi) in abcd.iter().enumerate() {
+                block_mv[bi as usize] = luma[raster];
+            }
+            let chroma_mv = four_mv_chroma_average(luma, g.pf);
+            for plane_map in [&g.chroma_cb[mbi], &g.chroma_cr[mbi]] {
+                for (&bi, &mv) in plane_map.iter().zip(chroma_mv.iter()) {
+                    block_mv[bi as usize] = mv;
+                }
+            }
+        }
 
         // A macro block whose reconstruction reads anything other than
         // the zero-MV previous reference MUST force every block coded:
@@ -12176,14 +12301,17 @@ impl FrameEncoder {
             let bx = g.bx_of_block[bi];
             let by = g.by_of_block[bi];
             let mbi = g.mbi_of_block[bi] as usize;
-            // The block's motion vector is the macro block's MV. For a
-            // uniform MB MV the §7.5.2 INTER_MV / INTER_GOLDEN_MV decode
-            // assigns that same value to every coded block (luma and
-            // chroma), so the encoder mirrors it directly.
-            let mv = mb_mv[mbi];
             let mode = mbmodes[mbi];
             let force_coded = force_coded_for(mode);
-            block_mv[bi] = mv;
+            // The block's motion vector. INTER_MV_FOUR macro blocks
+            // already populated `block_mv` per block (luma per-block,
+            // chroma averaged) above; every other mode shares the macro
+            // block's uniform vector, which the §7.5.2 INTER_MV /
+            // INTER_GOLDEN_MV decode assigns to every coded block.
+            if mode != MacroBlockMode::InterMvFour {
+                block_mv[bi] = mb_mv[mbi];
+            }
+            let mv = block_mv[bi];
 
             // Motion-compensated predictor for this block, read from the
             // reference frame the macro block's mode selects (§7.9.4
@@ -12279,6 +12407,24 @@ impl FrameEncoder {
                         last2 = last1;
                         last1 = mv;
                     }
+                } else if mbmodes[mbi] == MacroBlockMode::InterMvFour {
+                    // INTER_MV_FOUR is never recoded (its per-block MVs
+                    // must always be transmitted), but step 3(a)xiii /
+                    // xiv still update the running predictor: LAST2 =
+                    // LAST1, then LAST1 = the vector of the **last coded
+                    // luma block in raster order** (the spec guarantees
+                    // ≥ 1 coded luma block). Mirroring this keeps a
+                    // following INTER_MV's LAST/LAST2 decision in sync
+                    // with the decoder.
+                    let abcd = g.macro_block_to_luma_blocks[mbi];
+                    let mut last_coded = MotionVector::ZERO;
+                    for &bi in abcd.iter() {
+                        if bcoded[bi as usize] == 1 {
+                            last_coded = block_mv[bi as usize];
+                        }
+                    }
+                    last2 = last1;
+                    last1 = last_coded;
                 }
             }
         }
@@ -12426,6 +12572,65 @@ impl FrameEncoder {
             }
         }
         (best_mv, best_sad)
+    }
+
+    /// Search the previous luma reference for the single best
+    /// whole-pixel vector for one luma block `bi` (origin
+    /// `(bx_of_block[bi], by_of_block[bi])`), minimising the block's
+    /// 8×8 SAD. Returns [`MotionVector::ZERO`] when no offset strictly
+    /// beats the zero vector. Used by the `INTER_MV_FOUR` mode
+    /// decision, which needs an independent vector for each of a macro
+    /// block's four luma blocks.
+    fn search_luma_block_mv(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        bi: usize,
+    ) -> MotionVector {
+        let g = &self.geometry;
+        let refp = match refs.pick(ReferenceFrame::Previous, 0) {
+            Ok(p) => p,
+            Err(_) => return MotionVector::ZERO,
+        };
+        let bx = g.bx_of_block[bi];
+        let by = g.by_of_block[bi];
+        let src =
+            match Self::extract_block(&frame.samples_y, g.dims_y.width, g.dims_y.height, bx, by) {
+                Ok(s) => s,
+                Err(_) => return MotionVector::ZERO,
+            };
+        let sad_for = |mv: MotionVector| -> u32 {
+            let pred = match inter_block_predictor(&refp, bx, by, mv) {
+                Ok(p) => p,
+                Err(_) => return u32::MAX,
+            };
+            let mut sad = 0u32;
+            for r in 0..8 {
+                for c in 0..8 {
+                    sad += (src[r][c] - pred[r][c] as i16).unsigned_abs() as u32;
+                }
+            }
+            sad
+        };
+        let mut best_mv = MotionVector::ZERO;
+        let mut best_sad = sad_for(MotionVector::ZERO);
+        for dy in -3i32..=3 {
+            for dx in -3i32..=3 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let mv = MotionVector {
+                    x: (dx * 2) as i8,
+                    y: (dy * 2) as i8,
+                };
+                let sad = sad_for(mv);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_mv = mv;
+                }
+            }
+        }
+        best_mv
     }
 }
 
@@ -30264,6 +30469,117 @@ mod tests {
             plane_max_err(&f2.frame.samples_y, &shifted.samples_y) <= 40,
             "golden-MV inter luma max error {} exceeds tolerance",
             plane_max_err(&f2.frame.samples_y, &shifted.samples_y)
+        );
+    }
+
+    /// MILESTONE: the four-MV inter encoder
+    /// ([`FrameEncoder::encode_inter_frame_four_mv`]) emits
+    /// `INTER_MV_FOUR` macro blocks — one motion vector per luma block,
+    /// chroma vectors the §7.5.2 average — and the full encode→decode
+    /// round trip reconstructs them within the quantizer bound through
+    /// the decoder's per-block §7.9.4 path.
+    ///
+    /// The corpus reference encoder never selects four-MV on its
+    /// `testsrc` inputs, so no captured fixture exercises the decoder's
+    /// four-MV decode + chroma averaging + per-block reconstruction
+    /// top-to-bottom from a real bitstream. This builds one: frame 1 is
+    /// a textured keyframe; frame 2's luma is that frame's *decoded*
+    /// reconstruction displaced by a **different whole-pixel vector in
+    /// each 8×8 luma block** (so the per-luma-block search recovers four
+    /// disagreeing vectors and codes the macro block `INTER_MV_FOUR`).
+    /// The chroma planes are left equal to the previous reference, so
+    /// the averaged chroma vector reconstructs them as near-copies.
+    #[test]
+    fn encode_inter_frame_four_mv_round_trips_through_decoder() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        // A high-frequency texture so a per-block shift is unambiguous
+        // for the SAD search to recover.
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        let w_y = g.dims_y.width as i32;
+        let mut samples_y = vec![0u8; len_y];
+        for y in 0..g.dims_y.height as i32 {
+            for x in 0..w_y {
+                // A diagonal ramp with enough local variation that a
+                // shifted copy is the unique SAD minimum.
+                let v = 16 + ((x * 9 + y * 13).rem_euclid(200));
+                samples_y[(y * w_y + x) as usize] = v as u8;
+            }
+        }
+        let frame0 = SourceFrame {
+            samples_y,
+            samples_cb: vec![128u8; len_c],
+            samples_cr: vec![128u8; len_c],
+        };
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        let f0 = dec.decode_frame(&key).unwrap();
+        let prev = f0.frame.clone();
+
+        // Build frame 2's luma by displacing each 8×8 luma block of the
+        // decoded previous reference by a per-block-distinct whole-pixel
+        // vector (clamped to stay in-plane). The four luma blocks of a
+        // macro block get four different vectors, forcing INTER_MV_FOUR.
+        // The per-block vector pattern cycles by block index so adjacent
+        // luma blocks disagree.
+        let per_block_offsets = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+        let pw = g.dims_y.width as i32;
+        let ph = g.dims_y.height as i32;
+        let mut src_y = prev.samples_y.clone();
+        for abcd in g.macro_block_to_luma_blocks.iter() {
+            for (slot, &lblock) in abcd.iter().enumerate() {
+                // `slot` is the raster position 0..3 within the macro
+                // block; pick its distinct offset.
+                let (ox, oy) = per_block_offsets[slot];
+                let bx = g.bx_of_block[lblock as usize] as i32;
+                let by = g.by_of_block[lblock as usize] as i32;
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let tx = bx + dx;
+                        let ty = by + dy;
+                        let sx = (tx - ox).clamp(0, pw - 1);
+                        let sy = (ty - oy).clamp(0, ph - 1);
+                        src_y[(ty * pw + tx) as usize] = prev.samples_y[(sy * pw + sx) as usize];
+                    }
+                }
+            }
+        }
+        let source = SourceFrame {
+            samples_y: src_y,
+            samples_cb: prev.samples_cb.clone(),
+            samples_cr: prev.samples_cr.clone(),
+        };
+
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_four_mv(&source, &refs).unwrap()
+        };
+
+        // The encoder must have emitted at least one INTER_MV_FOUR
+        // macro block.
+        let modes = decode_packet_mbmodes(&enc, false, &pkt);
+        let four_mv_count = modes
+            .iter()
+            .filter(|m| matches!(m, MacroBlockMode::InterMvFour))
+            .count();
+        assert!(
+            four_mv_count >= 1,
+            "four-MV encoder must emit ≥ 1 INTER_MV_FOUR macro block (got modes {modes:?})"
+        );
+
+        // The round trip reconstructs the per-block-displaced source
+        // within the quantizer bound: each luma block's own vector and
+        // the averaged chroma vectors decode through the production
+        // §7.9.4 per-block path.
+        let f2 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f2.ftype, FrameType::Inter);
+        assert!(
+            plane_max_err(&f2.frame.samples_y, &source.samples_y) <= 40,
+            "four-MV inter luma max error {} exceeds tolerance",
+            plane_max_err(&f2.frame.samples_y, &source.samples_y)
         );
     }
 

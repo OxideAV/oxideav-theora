@@ -6,6 +6,18 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Four-MV chroma averaging round-tripped across 4:2:0 / 4:2:2 / 4:4:4
+  (round 364)** — a new round-trip test drives `INTER_MV_FOUR` through
+  `encode_inter_frame_four_mv` for all three pixel formats, validating
+  the §7.5.2 step 3(a)x..xii chroma-MV averaging end-to-end for the
+  4:2:2 (bottom/top half-average, two chroma blocks) and 4:4:4
+  (per-block copy, four chroma blocks) layouts. The fixture corpus is
+  4:2:0-only, so these chroma-averaging paths had never been exercised
+  through a real bitstream before — only by synthetic
+  `decode_macroblock_motion_vectors` unit tests. The encoder's
+  `four_mv_chroma_average` and the decoder's chroma-MV assignment now
+  agree for every layout under a full encode→decode reconstruction.
+
 - **Four-MV inter encoder (round 364)** —
   `FrameEncoder::encode_inter_frame_four_mv` searches the previous
   reference for an independent vector per luma block and codes

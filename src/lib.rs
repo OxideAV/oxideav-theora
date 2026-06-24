@@ -30583,6 +30583,126 @@ mod tests {
         );
     }
 
+    /// MILESTONE: four-MV round-trips across **all three** chroma
+    /// formats (4:2:0 / 4:2:2 / 4:4:4), validating the §7.5.2 step
+    /// 3(a)x..xii chroma-MV averaging end-to-end for the 4:2:2
+    /// (bottom/top half-average) and 4:4:4 (per-block copy) layouts that
+    /// the 4:2:0-only fixture corpus can never reach from a real
+    /// bitstream. For each format frame 1 is a textured keyframe and
+    /// frame 2 displaces each 8×8 luma block of the decoded previous
+    /// reference by a distinct whole-pixel vector, forcing
+    /// `INTER_MV_FOUR`; the chroma planes are carried straight from the
+    /// previous reference so the format-specific averaged chroma vector
+    /// reconstructs them faithfully. The encoder's
+    /// `four_mv_chroma_average` and the decoder's chroma-MV assignment
+    /// must agree for every layout or the chroma reconstruction would
+    /// diverge.
+    #[test]
+    fn encode_inter_frame_four_mv_all_chroma_formats_round_trip() {
+        for pf in [
+            PixelFormat::Yuv420,
+            PixelFormat::Yuv422,
+            PixelFormat::Yuv444,
+        ] {
+            let ident = tiny_ident_with_pf(pf);
+            let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+            let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+            let g = enc.geometry().clone();
+
+            // Textured luma; mid-grey chroma with a mild ramp so the
+            // averaged chroma copy is exercised on non-flat data.
+            let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+            let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+            let w_y = g.dims_y.width as i32;
+            let mut samples_y = vec![0u8; len_y];
+            for y in 0..g.dims_y.height as i32 {
+                for x in 0..w_y {
+                    samples_y[(y * w_y + x) as usize] =
+                        (16 + ((x * 9 + y * 13).rem_euclid(200))) as u8;
+                }
+            }
+            let w_c = g.dims_c.width as i32;
+            let mut samples_cb = vec![0u8; len_c];
+            let mut samples_cr = vec![0u8; len_c];
+            for y in 0..g.dims_c.height as i32 {
+                for x in 0..w_c {
+                    samples_cb[(y * w_c + x) as usize] = (112 + (x).rem_euclid(32)) as u8;
+                    samples_cr[(y * w_c + x) as usize] = (140 + (y).rem_euclid(32)) as u8;
+                }
+            }
+            let frame0 = SourceFrame {
+                samples_y,
+                samples_cb,
+                samples_cr,
+            };
+
+            let mut dec = FrameDecoder::new(ident, setup).unwrap();
+            let key = enc.encode_intra_frame(&frame0).unwrap();
+            let prev = dec.decode_frame(&key).unwrap().frame;
+
+            // Displace each luma block of the decoded reference by a
+            // distinct whole-pixel vector (raster slot → offset).
+            let per_block_offsets = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+            let pw = g.dims_y.width as i32;
+            let ph = g.dims_y.height as i32;
+            let mut src_y = prev.samples_y.clone();
+            for abcd in g.macro_block_to_luma_blocks.iter() {
+                for (slot, &lblock) in abcd.iter().enumerate() {
+                    let (ox, oy) = per_block_offsets[slot];
+                    let bx = g.bx_of_block[lblock as usize] as i32;
+                    let by = g.by_of_block[lblock as usize] as i32;
+                    for dy in 0..8 {
+                        for dx in 0..8 {
+                            let tx = bx + dx;
+                            let ty = by + dy;
+                            let sx = (tx - ox).clamp(0, pw - 1);
+                            let sy = (ty - oy).clamp(0, ph - 1);
+                            src_y[(ty * pw + tx) as usize] =
+                                prev.samples_y[(sy * pw + sx) as usize];
+                        }
+                    }
+                }
+            }
+            let source = SourceFrame {
+                samples_y: src_y,
+                samples_cb: prev.samples_cb.clone(),
+                samples_cr: prev.samples_cr.clone(),
+            };
+
+            let pkt = {
+                let refs = dec.reference_store().as_reference_plane_set().unwrap();
+                enc.encode_inter_frame_four_mv(&source, &refs).unwrap()
+            };
+            let modes = decode_packet_mbmodes(&enc, false, &pkt);
+            assert!(
+                modes
+                    .iter()
+                    .any(|m| matches!(m, MacroBlockMode::InterMvFour)),
+                "{pf:?}: four-MV encoder must emit ≥ 1 INTER_MV_FOUR (got {modes:?})"
+            );
+
+            let f2 = dec.decode_frame(&pkt).unwrap();
+            assert_eq!(f2.ftype, FrameType::Inter);
+            assert!(
+                plane_max_err(&f2.frame.samples_y, &source.samples_y) <= 40,
+                "{pf:?}: four-MV luma max error {} exceeds tolerance",
+                plane_max_err(&f2.frame.samples_y, &source.samples_y)
+            );
+            // Chroma is carried unchanged through a small averaged MV, so
+            // it reconstructs close to the previous reference.
+            assert!(
+                plane_max_err(&f2.frame.samples_cb, &source.samples_cb) <= 40,
+                "{pf:?}: four-MV Cb max error {} exceeds tolerance",
+                plane_max_err(&f2.frame.samples_cb, &source.samples_cb)
+            );
+            assert!(
+                plane_max_err(&f2.frame.samples_cr, &source.samples_cr) <= 40,
+                "{pf:?}: four-MV Cr max error {} exceeds tolerance",
+                plane_max_err(&f2.frame.samples_cr, &source.samples_cr)
+            );
+        }
+    }
+
     /// End-to-end §7.11 on the `q-high` fixture (64×64, `-q:v 10` →
     /// qi=63, `ac_scale=10`). This is the weak-quant extreme: the
     /// quantiser is the smallest available, so many DCT AC

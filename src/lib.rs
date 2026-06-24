@@ -13626,9 +13626,11 @@ fn top_down_plane_to_lower_left(
 /// predicted from the reconstructed previous reference. The encoder
 /// mirrors its own output through an internal [`FrameDecoder`] so the
 /// reference it predicts from is byte-identical to the one a downstream
-/// decoder reconstructs. RD-optimal mode decision and rate control
-/// remain future work — the inter path uses a whole-pixel SAD motion
-/// search and a fixed frame-level quantizer.
+/// decoder reconstructs. P-frames default to the unified
+/// rate-distortion mode decision ([`FrameEncoder::encode_inter_frame_rd`],
+/// selectable via [`TheoraEncoder::with_inter_mode`]); a target-bitrate
+/// rate-control loop remains future work, and the frame-level quantizer
+/// is fixed at construction.
 pub struct TheoraEncoder {
     codec_id: oxideav_core::CodecId,
     output_params: Box<oxideav_core::CodecParameters>,
@@ -13655,6 +13657,26 @@ pub struct TheoraEncoder {
     /// Cached ident + setup for (re)building the mirror decoder.
     ident: TheoraIdentHeader,
     setup: SetupHeaderTables,
+    /// How P-frames choose their per-macro-block inter mode.
+    inter_mode: InterModeStrategy,
+}
+
+/// The per-macro-block inter mode-decision strategy a [`TheoraEncoder`]
+/// applies to its P-frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InterModeStrategy {
+    /// The unified rate-distortion decision
+    /// ([`FrameEncoder::encode_inter_frame_rd`]): each macro block codes
+    /// the mode minimising `D + λ·R` over `INTER_NOMV` / `INTER_MV` /
+    /// `INTER_GOLDEN_*`. This is the default.
+    #[default]
+    RateDistortion,
+    /// The previous-reference SAD motion search
+    /// ([`FrameEncoder::encode_inter_frame_motion`]): each macro block
+    /// codes `INTER_NOMV` or `INTER_MV` against the previous reference,
+    /// chosen on raw SAD. Retained for callers that want the historical
+    /// behaviour.
+    PreviousMotion,
 }
 
 impl std::fmt::Debug for TheoraEncoder {
@@ -13733,7 +13755,16 @@ impl TheoraEncoder {
             mirror: None,
             ident,
             setup,
+            inter_mode: InterModeStrategy::default(),
         })
+    }
+
+    /// Set the P-frame inter mode-decision strategy (see
+    /// [`InterModeStrategy`]). Returns `self` for builder chaining. The
+    /// default is [`InterModeStrategy::RateDistortion`].
+    pub fn with_inter_mode(mut self, inter_mode: InterModeStrategy) -> Self {
+        self.inter_mode = inter_mode;
+        self
     }
 
     /// Encode one already-converted [`SourceFrame`] into a queued §7
@@ -13756,7 +13787,14 @@ impl TheoraEncoder {
                 .as_ref()
                 .expect("mirror is Some on the inter branch");
             let refs = mirror.reference_store().as_reference_plane_set()?;
-            self.frame_encoder.encode_inter_frame_motion(frame, &refs)?
+            match self.inter_mode {
+                InterModeStrategy::RateDistortion => {
+                    self.frame_encoder.encode_inter_frame_rd(frame, &refs)?
+                }
+                InterModeStrategy::PreviousMotion => {
+                    self.frame_encoder.encode_inter_frame_motion(frame, &refs)?
+                }
+            }
         };
 
         // Mirror the emitted packet so the reference store stays in
@@ -29013,6 +29051,87 @@ mod tests {
                 max_err <= 8,
                 "frame {i} luma max error {max_err} exceeds tolerance"
             );
+        }
+    }
+
+    /// MILESTONE: an I,P,P sequence emitted through the framework
+    /// `Encoder` trait with the default (rate-distortion) P-frame mode
+    /// decision round-trips through the framework `Decoder` trait within
+    /// the quantizer bound — the unified `D + λ·R` choice is wired into
+    /// `TheoraEncoder` and produces a decoder-valid stream end-to-end.
+    /// Also exercises the explicit `with_inter_mode` selector for the
+    /// historical previous-motion path so both strategies stay live.
+    #[test]
+    fn encoder_trait_rd_inter_mode_round_trips() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        for mode in [
+            InterModeStrategy::RateDistortion,
+            InterModeStrategy::PreviousMotion,
+        ] {
+            let mut enc = TheoraEncoder::with_keyframe_interval(
+                codec_id.clone(),
+                ident.clone(),
+                setup.clone(),
+                32,
+                3,
+            )
+            .unwrap()
+            .with_inter_mode(mode);
+
+            // Three frames: flat, flat, brightened — frame 2's P-frame
+            // codes a residual, frame 1's is a pure copy.
+            let vals = [100u8, 100, 130];
+            for &v in &vals {
+                let mut vf = flat_video_frame(&ident, v, 128, 128, 0);
+                vf.pts = None;
+                enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+            }
+
+            let mut header_pkts: Vec<oxideav_core::Packet> = Vec::new();
+            let mut data_pkts: Vec<oxideav_core::Packet> = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => {
+                        if p.flags.header {
+                            header_pkts.push(p);
+                        } else {
+                            data_pkts.push(p);
+                        }
+                    }
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("{mode:?}: encoder error {e}"),
+                }
+            }
+            assert_eq!(data_pkts.len(), 3);
+            assert!(data_pkts[0].flags.keyframe, "{mode:?}: frame 0 keyframe");
+            assert!(!data_pkts[1].flags.keyframe, "{mode:?}: frame 1 P");
+            assert!(!data_pkts[2].flags.keyframe, "{mode:?}: frame 2 P");
+
+            let mut dec = TheoraDecoder::new(codec_id.clone());
+            for p in &header_pkts {
+                dec.send_packet(p).unwrap();
+            }
+            for (i, p) in data_pkts.iter().enumerate() {
+                dec.send_packet(p).unwrap();
+                let oxideav_core::Frame::Video(vf) = dec.receive_frame().unwrap() else {
+                    panic!("{mode:?}: expected video frame");
+                };
+                let want = vals[i] as i16;
+                let max_err = vf.planes[0]
+                    .data
+                    .iter()
+                    .map(|&p| (p as i16 - want).abs())
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    max_err <= 8,
+                    "{mode:?}: frame {i} luma max error {max_err} exceeds tolerance"
+                );
+            }
         }
     }
 

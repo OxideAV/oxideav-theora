@@ -6,6 +6,16 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **`TheoraEncoder` P-frames default to the rate-distortion decision
+  (round 368)** — the framework `Encoder` integration now drives its
+  inter (P) frames through `encode_inter_frame_rd` by default, so a full
+  encode → decode loop through the `oxideav_core` traits benefits from
+  the joint `D + λ·R` mode decision. A new `InterModeStrategy` enum plus
+  `TheoraEncoder::with_inter_mode` builder selects between the
+  rate-distortion default and the historical previous-reference SAD
+  motion path (`PreviousMotion`). A new I,P,P round-trip test exercises
+  both strategies end-to-end through the `Encoder` + `Decoder` traits.
+
 - **Unified rate-distortion inter mode decision (round 368)** — a new
   `FrameEncoder::encode_inter_frame_rd` entry point replaces the
   fixed-per-strategy SAD heuristic with a single joint per-macro-block

@@ -11852,6 +11852,20 @@ enum MotionPlan {
     /// averaged vector for the pixel format. This is the only encoder
     /// path that emits per-luma-block motion vectors.
     SearchFourMv,
+    /// Each macro block evaluates **every** reachable uniform inter mode
+    /// — `INTER_NOMV`, `INTER_MV` (previous-reference search),
+    /// `INTER_GOLDEN_NOMV`, and `INTER_GOLDEN_MV` (golden-reference
+    /// search) — by its true rate-distortion cost `D + λ·R` and codes the
+    /// minimum. `D` is the sum of squared errors between the source and
+    /// the block the decoder will actually reconstruct (forward
+    /// quantize → dequantize → inverse DCT → clamp), so the decision is
+    /// scored on delivered distortion rather than a pre-quantization SAD
+    /// proxy; `R` folds in the §7.4 mode code and the §7.5 explicit-MV
+    /// bits. Unlike [`MotionPlan::SearchPreviousOrGolden`] (raw-SAD
+    /// previous-vs-golden) this makes the previous/golden/zero choice a
+    /// single joint Lagrangian decision. `INTER_MV` winners still flow
+    /// through the `INTER_MV_LAST` / `INTER_MV_LAST2` recode.
+    RateDistortion,
 }
 
 impl FrameEncoder {
@@ -12118,6 +12132,56 @@ impl FrameEncoder {
         self.encode_inter_frame_with_motion(frame, refs, MotionPlan::SearchFourMv)
     }
 
+    /// Encode one inter frame with a unified rate-distortion mode
+    /// decision, returning the §7 video-data packet bytes.
+    ///
+    /// Same contract as [`FrameEncoder::encode_inter_frame_motion`], but
+    /// each macro block evaluates **every** reachable uniform inter mode
+    /// (`INTER_NOMV`, `INTER_MV`, `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`)
+    /// by its true rate-distortion cost `D + λ·R` and codes the cheapest.
+    /// The distortion `D` is the sum of squared errors between the source
+    /// and the block the decoder will actually reconstruct — the encoder
+    /// runs its own forward quantize → dequantize → inverse-DCT → clamp
+    /// to measure delivered fidelity rather than scoring on a
+    /// pre-quantization SAD proxy; the rate `R` folds in the §7.4 mode
+    /// code and §7.5 explicit-MV bits, weighted by a quantizer-derived
+    /// Lagrange multiplier λ.
+    ///
+    /// This subsumes the previous-vs-golden choice that
+    /// [`FrameEncoder::encode_inter_frame_golden`] makes on raw SAD into
+    /// a single joint Lagrangian decision: a golden candidate is chosen
+    /// only when its delivered distortion plus guaranteed mode/MV rate
+    /// beats every previous-reference candidate. `INTER_MV` winners still
+    /// flow through the §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode.
+    /// `INTER_MV_FOUR` is out of scope for this entry point (its
+    /// per-luma-block search remains [`FrameEncoder::encode_inter_frame_four_mv`]).
+    pub fn encode_inter_frame_rd(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        self.encode_inter_frame_with_motion(frame, refs, MotionPlan::RateDistortion)
+    }
+
+    /// The Lagrange multiplier λ trading distortion (SSD) for estimated
+    /// rate (bits) in the [`MotionPlan::RateDistortion`] mode decision.
+    ///
+    /// A monotone function of the frame quantizer index: a weaker
+    /// quantizer (higher `qi`) preserves more residual energy, so a bit
+    /// spent on an alternative mode buys less distortion reduction —
+    /// raising λ there makes the decision favour the cheaper-header mode.
+    /// The shape (a small affine ramp in `qi`) is an encoder tuning
+    /// choice with no normative status; it only steers mode selection and
+    /// never changes the bitstream syntax a chosen mode emits.
+    fn inter_rd_lambda(&self) -> u64 {
+        // qi ∈ 0..=63; λ ramps from a small floor at the strongest
+        // quantizer to a larger value at the weakest. The squared form
+        // matches the SSD distortion metric's units (rate is linear in
+        // bits, distortion is quadratic in error).
+        let qi = self.qi as u64;
+        4 + qi * qi / 16
+    }
+
     /// Shared inter-frame encode body. `plan` selects the per-macro-
     /// block motion strategy (see [`MotionPlan`]): zero-vector only,
     /// previous-reference search, previous-or-golden search, or
@@ -12246,6 +12310,62 @@ impl FrameEncoder {
                         // `mb_mv` is unused for four-MV blocks (each block
                         // carries its own vector); leave it zero.
                     }
+                }
+            }
+            MotionPlan::RateDistortion => {
+                // Lagrange multiplier trading distortion (SSD) for rate
+                // (estimated token + header bits). A weaker quantizer
+                // (higher `qi`) keeps more residual energy, so the same
+                // bit buys less distortion reduction — scale λ with the
+                // quantizer index so the rate term carries more weight at
+                // low bitrates. The exact constant is an encoder tuning
+                // choice, not a normative quantity.
+                let lambda = self.inter_rd_lambda();
+                for mbi in 0..nmbs {
+                    let (prev_mv, _) =
+                        self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Previous);
+                    let (gold_mv, _) =
+                        self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Golden);
+
+                    // Candidate uniform modes, each scored by its true
+                    // rate-distortion cost. INTER_NOMV is always a
+                    // candidate (zero MV, previous reference, no MV bits);
+                    // the searched previous / golden vectors add their
+                    // explicit-MV and zero-MV golden variants.
+                    let candidates = [
+                        (MacroBlockMode::InterNoMv, MotionVector::ZERO),
+                        (MacroBlockMode::InterMv, prev_mv),
+                        (MacroBlockMode::InterGoldenNoMv, MotionVector::ZERO),
+                        (MacroBlockMode::InterGoldenMv, gold_mv),
+                    ];
+
+                    let mut best_mode = MacroBlockMode::InterNoMv;
+                    let mut best_mv = MotionVector::ZERO;
+                    let mut best_cost = u64::MAX;
+                    for &(mode, mv) in candidates.iter() {
+                        // An explicit-MV candidate whose vector is zero is
+                        // redundant with its NOMV sibling (same predictor,
+                        // but it would spend MV bits) — skip it.
+                        if matches!(
+                            mode,
+                            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv
+                        ) && mv == MotionVector::ZERO
+                        {
+                            continue;
+                        }
+                        let cost =
+                            self.mb_uniform_mode_cost(frame, refs, &qmats, mbi, mode, mv, lambda)?;
+                        // Strict improvement keeps the earlier (cheaper-
+                        // header) candidate on ties, biasing toward
+                        // INTER_NOMV / previous-reference modes.
+                        if cost < best_cost {
+                            best_cost = cost;
+                            best_mode = mode;
+                            best_mv = mv;
+                        }
+                    }
+                    mbmodes[mbi] = best_mode;
+                    mb_mv[mbi] = best_mv;
                 }
             }
         }
@@ -12632,6 +12752,179 @@ impl FrameEncoder {
         }
         best_mv
     }
+
+    /// Rate-distortion cost of coding one block (luma or chroma) with a
+    /// given reference frame and motion vector.
+    ///
+    /// This drives the unified per-macro-block mode decision
+    /// ([`MotionPlan::RateDistortion`]). It runs the **exact** forward
+    /// quantization the encode body would run for this block —
+    /// `residual → forward_dct_2d → quantize_block` — and then mirrors
+    /// the decoder's own reconstruction —
+    /// `dequantize_block → inverse_dct_2d → clamp(PRED + RES)` — to
+    /// recover the bytes the downstream decoder will actually hold. The
+    /// returned distortion is the true sum of squared errors between the
+    /// source block and that reconstructed block, so a candidate mode is
+    /// scored on the distortion it *delivers*, not on a pre-quantization
+    /// SAD proxy. It also reports whether the block ends up coded (any
+    /// non-zero quantized coefficient) and a coarse estimate of the
+    /// token bits the §7.7 stream would spend on it, so the caller can
+    /// fold a rate term into the decision.
+    ///
+    /// `force_coded` forces the block coded even when its quantized
+    /// residual is all-zero (required for any non-zero-MV / golden macro
+    /// block, whose uncoded path would copy the wrong predictor — see
+    /// `force_coded_for` in the encode body); the reconstruction is the
+    /// same either way (an all-zero coded block reconstructs as the
+    /// exact predictor), only the coded flag and rate change.
+    #[allow(clippy::too_many_arguments)]
+    fn block_rd_cost(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        qmats: &[QuantizationMatrix; 3],
+        bi: usize,
+        refframe: ReferenceFrame,
+        mv: MotionVector,
+        force_coded: bool,
+    ) -> Result<BlockRdCost, Error> {
+        let g = &self.geometry;
+        let pli = g.pli_of_block[bi] as usize;
+        let (plane, pw, ph) = match pli {
+            0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+            1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+            _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+        };
+        let bx = g.bx_of_block[bi];
+        let by = g.by_of_block[bi];
+
+        let refp = refs.pick(refframe, pli)?;
+        let pred = inter_block_predictor(&refp, bx, by, mv)?;
+        let src = Self::extract_block(plane, pw, ph, bx, by)?;
+
+        // Forward path: residual → DCT → quantize.
+        let mut residual = [[0i16; 8]; 8];
+        for r in 0..8 {
+            for c in 0..8 {
+                residual[r][c] = src[r][c] - pred[r][c] as i16;
+            }
+        }
+        let dqc_fwd = forward_dct_2d(&residual);
+        let q = quantize_block(&dqc_fwd, &qmats[pli], &qmats[pli]);
+        let any_nonzero = q.iter().any(|&v| v != 0);
+        let coded = any_nonzero || force_coded;
+
+        // Reconstruct exactly as the decoder will: an uncoded block is a
+        // pure predictor copy (RES = 0); a coded block dequantizes its
+        // own quantized coefficients and inverse-transforms them.
+        let recon_res = if coded {
+            let dqc_rec = dequantize_block(&q, &qmats[pli], &qmats[pli]);
+            inverse_dct_2d(&dqc_rec)
+        } else {
+            [[0i16; 8]; 8]
+        };
+
+        // Distortion = SSD(source, clamp(PRED + RES)).
+        let mut ssd = 0u64;
+        for r in 0..8 {
+            for c in 0..8 {
+                let p = pred[r][c] as i32 + recon_res[r][c] as i32;
+                let recon = p.clamp(0, 255);
+                let d = src[r][c] as i32 - recon;
+                ssd += (d * d) as u64;
+            }
+        }
+
+        // Coarse token-bit estimate: a self-terminating EOB costs a few
+        // bits, and each non-zero quantized coefficient costs a token
+        // plus its magnitude bits. This is a rate *proxy* for the mode
+        // decision, not an exact §7.7 bit count — the actual stream is
+        // emitted unchanged by the shared token writer.
+        let token_bits = if coded {
+            let nz = q.iter().filter(|&&v| v != 0).count() as u32;
+            // ~6 bits per non-zero coefficient (token + magnitude) plus
+            // a small EOB tail; an all-zero forced-coded block still
+            // spends its EOB.
+            nz.saturating_mul(6).saturating_add(3)
+        } else {
+            0
+        };
+
+        Ok(BlockRdCost {
+            distortion: ssd,
+            token_bits,
+        })
+    }
+
+    /// Evaluate the rate-distortion cost of coding one macro block in a
+    /// candidate uniform inter mode (a single reference frame + motion
+    /// vector shared by every block in the macro block). Sums
+    /// [`FrameEncoder::block_rd_cost`] over the macro block's luma blocks
+    /// and the chroma blocks the [`FrameGeometry`] assigns to it, then
+    /// folds in the per-mode header rate (the §7.4 mode code plus, for an
+    /// explicit-MV mode, the §7.5 `MVMODE = 1` fixed-length components).
+    /// The Lagrangian cost is `D + λ·R`.
+    #[allow(clippy::too_many_arguments)]
+    fn mb_uniform_mode_cost(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        qmats: &[QuantizationMatrix; 3],
+        mbi: usize,
+        mode: MacroBlockMode,
+        mv: MotionVector,
+        lambda: u64,
+    ) -> Result<u64, Error> {
+        let g = &self.geometry;
+        let force_coded = !matches!(mode, MacroBlockMode::InterNoMv);
+        let refframe = reference_frame_for_mb_mode(mode);
+
+        let mut distortion = 0u64;
+        let mut rate = 0u32;
+
+        // Luma blocks.
+        for &bi in g.macro_block_to_luma_blocks[mbi].iter() {
+            let c =
+                self.block_rd_cost(frame, refs, qmats, bi as usize, refframe, mv, force_coded)?;
+            distortion += c.distortion;
+            rate += c.token_bits;
+        }
+        // Chroma blocks (Cb then Cr). A uniform inter macro block shares
+        // its single vector with every coded chroma block, exactly as the
+        // §7.5.2 decode assigns it.
+        for plane_map in [&g.chroma_cb[mbi], &g.chroma_cr[mbi]] {
+            for &bi in plane_map.iter() {
+                let c =
+                    self.block_rd_cost(frame, refs, qmats, bi as usize, refframe, mv, force_coded)?;
+                distortion += c.distortion;
+                rate += c.token_bits;
+            }
+        }
+
+        // Header rate: the §7.4 mode code (~3 bits in the encoder's
+        // MSCHEME = 7 direct scheme) plus the §7.5 explicit-MV bits when
+        // the mode transmits a vector (MVMODE = 1: 6 bits per component).
+        rate += 3;
+        if matches!(
+            mode,
+            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv
+        ) {
+            rate += 12;
+        }
+
+        Ok(distortion + lambda.saturating_mul(rate as u64))
+    }
+}
+
+/// Per-block rate-distortion accounting returned by
+/// [`FrameEncoder::block_rd_cost`].
+struct BlockRdCost {
+    /// Sum of squared errors between the source block and the block the
+    /// decoder will reconstruct from this candidate.
+    distortion: u64,
+    /// Coarse estimate of the §7.7 token bits this block would spend.
+    /// Zero for an uncoded block (no residual transmitted).
+    token_bits: u32,
 }
 
 /// Build the §7.9.1 motion-compensated predictor tile for one block,
@@ -30700,6 +30993,174 @@ mod tests {
                 "{pf:?}: four-MV Cr max error {} exceeds tolerance",
                 plane_max_err(&f2.frame.samples_cr, &source.samples_cr)
             );
+        }
+    }
+
+    // ----- unified rate-distortion inter mode decision (round 368) -----
+
+    /// MILESTONE: the rate-distortion mode decision
+    /// ([`FrameEncoder::encode_inter_frame_rd`]) round-trips a changed
+    /// second frame through this crate's own decoder within the
+    /// quantizer bound. The per-macro-block joint `D + λ·R` choice over
+    /// `INTER_NOMV` / `INTER_MV` / `INTER_GOLDEN_*` must still produce a
+    /// decoder-valid bitstream.
+    #[test]
+    fn encode_inter_frame_rd_changed_frame_round_trips() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 50).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        // Frame 1 brightens the top-left luma quadrant.
+        let mut frame1 = frame0.clone();
+        let w_y = g.dims_y.width as usize;
+        for y in 0..(g.dims_y.height as usize / 2) {
+            for x in 0..(w_y / 2) {
+                let idx = y * w_y + x;
+                frame1.samples_y[idx] = frame1.samples_y[idx].saturating_add(30);
+            }
+        }
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        dec.decode_frame(&key).unwrap();
+
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd(&frame1, &refs).unwrap()
+        };
+        // Inter data packet header.
+        assert_eq!(pkt[0] & 0b1100_0000, 0b0100_0000);
+
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert!(
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 40,
+            "RD inter luma max error {} exceeds tolerance",
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y)
+        );
+        assert!(plane_max_err(&f1.frame.samples_cb, &frame1.samples_cb) <= 40);
+        assert!(plane_max_err(&f1.frame.samples_cr, &frame1.samples_cr) <= 40);
+    }
+
+    /// MILESTONE: an identical second frame drives the rate-distortion
+    /// decision to the cheapest mode — `INTER_NOMV` with every block
+    /// uncoded — so the reconstruction is a bit-exact copy of the
+    /// previous reference and the chosen mode costs no MV or token bits.
+    /// This pins the λ·R rate term: the zero-distortion `INTER_NOMV`
+    /// candidate must win against the (equally zero-distortion but
+    /// MV-bit-spending) golden / explicit-MV candidates on rate alone.
+    #[test]
+    fn encode_inter_frame_rd_identical_frame_picks_nomv_pure_copy() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let source = gradient_source(&g, 0, 0);
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&source).unwrap();
+        let f0 = dec.decode_frame(&key).unwrap();
+        let source2 = SourceFrame {
+            samples_y: f0.frame.samples_y.clone(),
+            samples_cb: f0.frame.samples_cb.clone(),
+            samples_cr: f0.frame.samples_cr.clone(),
+        };
+        let (f0_y, f0_cb, f0_cr) = (
+            f0.frame.samples_y.clone(),
+            f0.frame.samples_cb.clone(),
+            f0.frame.samples_cr.clone(),
+        );
+
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd(&source2, &refs).unwrap()
+        };
+        let modes = decode_packet_mbmodes(&enc, false, &pkt);
+        assert!(
+            modes.iter().all(|m| matches!(m, MacroBlockMode::InterNoMv)),
+            "RD decision on an identical frame must pick INTER_NOMV everywhere (got {modes:?})"
+        );
+
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.frame.samples_y, f0_y);
+        assert_eq!(f1.frame.samples_cb, f0_cb);
+        assert_eq!(f1.frame.samples_cr, f0_cr);
+    }
+
+    /// MILESTONE: when the golden reference predicts a frame perfectly
+    /// and the previous reference does not, the rate-distortion decision
+    /// chooses the golden mode — its lower delivered distortion outweighs
+    /// the guaranteed mode-code rate. This confirms the unified `D + λ·R`
+    /// choice subsumes the previous-vs-golden decision the SAD-only
+    /// [`FrameEncoder::encode_inter_frame_golden`] makes, but now on true
+    /// reconstructed distortion.
+    #[test]
+    fn encode_inter_frame_rd_picks_golden_when_golden_predicts_perfectly() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        // Flat A: lossless intra → rec(A) == A, a perfect golden copy.
+        let frame_a = SourceFrame {
+            samples_y: vec![96u8; len_y],
+            samples_cb: vec![128u8; len_c],
+            samples_cr: vec![128u8; len_c],
+        };
+        let frame_b = gradient_source(&g, 7, 5);
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame_a).unwrap();
+        let rec_a = dec.decode_frame(&key).unwrap().frame.clone();
+
+        // Frame 1: inter B → previous becomes rec(B); golden stays A.
+        let pkt_b = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_motion(&frame_b, &refs).unwrap()
+        };
+        dec.decode_frame(&pkt_b).unwrap();
+
+        // Frame 2: source = rec(A). Golden predicts perfectly (zero
+        // distortion), previous (gradient B) does not.
+        let source_back_to_a = SourceFrame {
+            samples_y: rec_a.samples_y.clone(),
+            samples_cb: rec_a.samples_cb.clone(),
+            samples_cr: rec_a.samples_cr.clone(),
+        };
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd(&source_back_to_a, &refs).unwrap()
+        };
+        let modes = decode_packet_mbmodes(&enc, false, &pkt);
+        assert!(
+            modes.iter().all(|m| matches!(
+                m,
+                MacroBlockMode::InterGoldenNoMv | MacroBlockMode::InterGoldenMv
+            )),
+            "RD decision must pick golden when golden predicts perfectly (got {modes:?})"
+        );
+
+        let f2 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f2.frame.samples_y, rec_a.samples_y);
+        assert_eq!(f2.frame.samples_cb, rec_a.samples_cb);
+        assert_eq!(f2.frame.samples_cr, rec_a.samples_cr);
+    }
+
+    /// The Lagrange multiplier λ is monotone non-decreasing in the
+    /// quantizer index — a structural property the mode decision relies
+    /// on (a weaker quantizer weights rate more heavily).
+    #[test]
+    fn inter_rd_lambda_is_monotone_in_qi() {
+        let (ident, setup) = ki30_ident_setup();
+        let mut prev = 0u64;
+        for qi in 0u8..=63 {
+            let enc = FrameEncoder::new(ident.clone(), setup.clone(), qi).unwrap();
+            let l = enc.inter_rd_lambda();
+            assert!(
+                l >= prev,
+                "λ must be monotone in qi: λ({qi}) = {l} < λ({}) = {prev}",
+                qi.saturating_sub(1)
+            );
+            prev = l;
         }
     }
 

@@ -6,6 +6,31 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Unified rate-distortion inter mode decision (round 368)** — a new
+  `FrameEncoder::encode_inter_frame_rd` entry point replaces the
+  fixed-per-strategy SAD heuristic with a single joint per-macro-block
+  Lagrangian choice. Each macro block evaluates every reachable uniform
+  inter mode (`INTER_NOMV`, `INTER_MV`, `INTER_GOLDEN_NOMV`,
+  `INTER_GOLDEN_MV`) by its true rate-distortion cost `D + λ·R` and codes
+  the cheapest. The distortion `D` is the sum of squared errors between
+  the source and the block the decoder will actually reconstruct — the
+  encoder runs its own forward quantize → dequantize → inverse-DCT →
+  clamp (`block_rd_cost`) to measure *delivered* fidelity rather than
+  scoring on a pre-quantization SAD proxy; the rate `R` folds in the §7.4
+  mode code and the §7.5 `MVMODE = 1` explicit-MV bits, weighted by a
+  quantizer-derived Lagrange multiplier λ (`inter_rd_lambda`, monotone in
+  `qi`). This subsumes the raw-SAD previous-vs-golden choice
+  `encode_inter_frame_golden` makes into one decision on reconstructed
+  distortion; `INTER_MV` winners still flow through the §7.5.2
+  `INTER_MV_LAST` / `INTER_MV_LAST2` recode. New tests pin: a changed
+  frame round-trips within the quantizer bound, an identical frame
+  collapses to an all-`INTER_NOMV` pure copy (the λ·R rate term picking
+  the no-MV mode over equally-distortion golden/MV candidates), and a
+  frame the golden reference predicts perfectly is coded golden
+  everywhere. The mode decision is an encoder engineering choice with no
+  bitstream-syntax effect; every chosen mode emits the same §7 bytes the
+  existing writers produce.
+
 - **Four-MV chroma averaging round-tripped across 4:2:0 / 4:2:2 / 4:4:4
   (round 364)** — a new round-trip test drives `INTER_MV_FOUR` through
   `encode_inter_frame_four_mv` for all three pixel formats, validating

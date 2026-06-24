@@ -85,6 +85,23 @@ packets are handled as duplicate-frame markers.
   versus the zero-MV baseline; a uniformly translated frame drives most
   macro blocks through the predicted-MV modes.
 
+  Two further entry points emit the remaining inter modes:
+  `encode_inter_frame_golden` searches **both** the previous and golden
+  references per macro block and codes `INTER_GOLDEN_NOMV` /
+  `INTER_GOLDEN_MV` when the golden reference predicts the block's four
+  luma sub-blocks with the smaller SAD (reconstructing against the
+  golden motion-compensated predictor), and `encode_inter_frame_four_mv`
+  searches one vector **per luma block** and codes `INTER_MV_FOUR` when
+  the four vectors disagree — each luma block carrying its own vector
+  and each chroma block the §7.5.2 averaged vector for the pixel format.
+  Both modes are correctly handled by the §7.5.2 LAST1 / LAST2 predictor
+  history (golden excluded; four-MV updating LAST1 to its last coded
+  luma vector). Each round-trips through this crate's own decoder: a
+  golden copy of a re-shown reference reconstructs bit-exactly, and a
+  per-luma-block-displaced frame reconstructs within the quantizer
+  bound — so every §7.5.2 inter mode is now reachable from the encoder.
+  RD-optimal mode selection and rate control remain future work.
+
 * **Framework `Decoder` integration** — `TheoraDecoder` implements
   `oxideav_core::Decoder`, and `register` installs it into a
   `RuntimeContext` (reachable through the shared `CodecRegistry`). Packets
@@ -160,23 +177,24 @@ chroma blocks that earlier diverged is now sample-exact.
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **Golden-reference / four-MV encode modes + RD mode decision** — the
-  inter encoder codes `INTER_NOMV`, `INTER_MV`, `INTER_MV_LAST`, and
-  `INTER_MV_LAST2` (the last two chosen by the §7.5.2 LAST1 / LAST2
-  recode pass). The golden-reference (`INTER_GOLDEN_*`) and four-MV
-  (`INTER_MV_FOUR`) modes are decoded but not yet *chosen* by the
-  encoder's mode decision, and rate control / RD-optimal mode selection
-  remain future work. The setup header (§6.4 quantization parameters +
-  Huffman tables) is supplied by the caller via `TheoraEncoder::new` /
-  `extradata` rather than synthesized from scratch.
-* **Golden-reference and four-MV inter modes** (`INTER_GOLDEN_MV` /
-  `INTER_MV_FOUR`) — implemented in the reconstruction code paths and
-  now exercised through the full `reconstruct_frame` driver
-  (golden-reference plane selection and per-block four-MV luma motion
-  with the averaged chroma MV), but not yet by a *reference-captured*
-  corpus fixture: the reference encoder's `testsrc`-class encodes never emit a
-  golden or four-MV macroblock, so no `expected.yuv` fixture covers
-  these modes top-to-bottom from a real bitstream.
+* **RD-optimal mode decision + rate control** — every §7.5.2 inter
+  mode (`INTER_NOMV`, `INTER_MV`, `INTER_MV_LAST`, `INTER_MV_LAST2`,
+  `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`, `INTER_MV_FOUR`) is now
+  reachable from the encoder (see the inter-encoder bullet above), but
+  the per-frame mode decision is a fixed SAD heuristic per entry point
+  rather than a rate-distortion-optimal joint choice, and there is no
+  rate control / target-bitrate loop. The setup header (§6.4
+  quantization parameters + Huffman tables) is supplied by the caller
+  via `TheoraEncoder::new` / `extradata` rather than synthesized from
+  scratch.
+* **Reference-captured golden / four-MV corpus fixture** — the
+  golden-reference and four-MV inter modes are exercised
+  top-to-bottom through this crate's own encoder→decoder round trip
+  (the §7.5.2 four-MV decode + chroma averaging and §7.9.4 golden /
+  per-block reconstruction all run against a real, self-encoded
+  bitstream). A *third-party*-captured `expected.yuv` fixture for these
+  modes is still absent because the reference encoder's `testsrc`-class
+  encodes never emit a golden or four-MV macroblock.
 
 ## Usage
 

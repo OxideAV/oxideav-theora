@@ -6,6 +6,28 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Golden-reference inter encoder (round 364)** —
+  `FrameEncoder::encode_inter_frame_golden` is a new inter-frame entry
+  point that runs the §7.5 motion search against **both** the previous
+  and golden references per macro block and codes whichever predicts
+  its four luma blocks with the smaller SAD: `INTER_GOLDEN_NOMV` /
+  `INTER_GOLDEN_MV` for a golden win (reconstructing the residual
+  against the golden motion-compensated predictor), `INTER_NOMV` /
+  `INTER_MV` otherwise. The golden modes are correctly excluded from
+  the §7.5.2 LAST1 / LAST2 predictor history. This is the first encoder
+  path that emits the golden-reference inter modes, so the decoder's
+  §7.9.4 Table 7.75 golden reconstruction is now exercised
+  **top-to-bottom from a real (self-encoded) bitstream** — two new
+  encode→decode round-trip tests assert the golden modes appear on the
+  wire and that a golden copy reproduces the golden reference
+  bit-exactly (NOMV) / within the quantizer bound (MV). Previously the
+  golden reconstruction path was only validated by synthetic
+  `reconstruct_frame` unit tests with hand-built mode arrays, never
+  from a packet the production encoder assembled. The shared inter
+  encode body now selects its per-block reference frame from the macro
+  block's mode (`reference_frame_for_mb_mode`) rather than hard-coding
+  the previous reference.
+
 - **Per-plane / per-frame HD digest localisation (round 360)** — the HD
   `dimensions-1080p-very-short` decode is now pinned by six SHA-256
   sub-digests (frame 0 / frame 1 × Y / Cb / Cr) in addition to the

@@ -11783,6 +11783,33 @@ pub struct FrameEncoder {
     qi: u8,
 }
 
+/// Per-macro-block motion strategy the shared inter-frame encode body
+/// applies. Distinct from a full RD mode decision — each variant
+/// selects which references the per-macro-block search considers, and
+/// the body then emits the §7.5.2 mode (`INTER_NOMV` / `INTER_MV` /
+/// `INTER_GOLDEN_*`) implied by the winning candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionPlan {
+    /// Every macro block stays at the zero previous-reference vector
+    /// (`INTER_NOMV`). The §7.5 motion search is skipped entirely.
+    ZeroPrevious,
+    /// Each macro block searches the **previous** reference only and
+    /// codes `INTER_NOMV` (zero winner) or `INTER_MV` (non-zero
+    /// winner). The `INTER_MV_LAST` / `INTER_MV_LAST2` recode pass
+    /// then narrows the explicit vectors that match the running
+    /// history.
+    SearchPrevious,
+    /// Each macro block searches **both** the previous and golden
+    /// references and codes whichever predicts its four luma blocks
+    /// with the strictly smaller SAD: `INTER_NOMV` / `INTER_MV` for a
+    /// previous-reference win, `INTER_GOLDEN_NOMV` / `INTER_GOLDEN_MV`
+    /// for a golden-reference win. The golden candidate must beat the
+    /// previous one by a margin (it cannot be re-expressed as a
+    /// `LAST` predicted mode, so it always spends a mode code and,
+    /// when non-zero, full MV bits).
+    SearchPreviousOrGolden,
+}
+
 impl FrameEncoder {
     /// Build an intra encoder from the identification header, decoded
     /// setup tables, and a frame-level quantization index `qi`
@@ -11979,7 +12006,7 @@ impl FrameEncoder {
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
     ) -> Result<Vec<u8>, Error> {
-        self.encode_inter_frame_with_motion(frame, refs, false)
+        self.encode_inter_frame_with_motion(frame, refs, MotionPlan::ZeroPrevious)
     }
 
     /// Encode one inter frame with per-macro-block motion estimation
@@ -11997,17 +12024,39 @@ impl FrameEncoder {
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
     ) -> Result<Vec<u8>, Error> {
-        self.encode_inter_frame_with_motion(frame, refs, true)
+        self.encode_inter_frame_with_motion(frame, refs, MotionPlan::SearchPrevious)
     }
 
-    /// Shared inter-frame encode body. `motion` selects whether each
-    /// macro block runs the §7.5 motion search (`true`) or stays at the
-    /// zero vector (`false`).
+    /// Encode one inter frame considering **both** the previous and
+    /// golden references per macro block, returning the §7 video-data
+    /// packet bytes.
+    ///
+    /// Same contract as [`FrameEncoder::encode_inter_frame_motion`] but
+    /// each macro block also runs the §7.5 motion search against the
+    /// golden reference; when the golden candidate predicts the macro
+    /// block's four luma blocks with a strictly smaller SAD than the
+    /// best previous-reference candidate it is coded
+    /// `INTER_GOLDEN_NOMV` (zero golden vector) or `INTER_GOLDEN_MV`
+    /// (non-zero golden vector), reconstructing the residual against
+    /// the **golden** motion-compensated predictor. This is the only
+    /// encoder entry point that emits the golden-reference inter modes
+    /// the decoder's §7.9.4 Table 7.75 golden path reconstructs.
+    pub fn encode_inter_frame_golden(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        self.encode_inter_frame_with_motion(frame, refs, MotionPlan::SearchPreviousOrGolden)
+    }
+
+    /// Shared inter-frame encode body. `plan` selects the per-macro-
+    /// block motion strategy (see [`MotionPlan`]): zero-vector only,
+    /// previous-reference search, or previous-or-golden search.
     fn encode_inter_frame_with_motion(
         &self,
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
-        motion: bool,
+        plan: MotionPlan,
     ) -> Result<Vec<u8>, Error> {
         let g = &self.geometry;
         let nbs = g.nbs as usize;
@@ -12047,12 +12096,55 @@ impl FrameEncoder {
             compute_quantization_matrix(&self.setup.quantization_parameters, 1, 2, qi)?,
         ];
 
-        // Per-macro-block motion vector (zero unless motion search wins
-        // a non-zero vector). Every block in the macro block shares it.
+        // Per-macro-block motion vector + mode. The mode determines
+        // both the on-wire §7.5.2 mode code and the reference frame the
+        // per-block predictor reads (Previous for INTER_NOMV / INTER_MV,
+        // Golden for INTER_GOLDEN_NOMV / INTER_GOLDEN_MV). Every block
+        // in the macro block shares the macro block's vector and
+        // reference.
         let mut mb_mv = vec![MotionVector::ZERO; nmbs];
-        if motion {
-            for (mbi, slot) in mb_mv.iter_mut().enumerate() {
-                *slot = self.search_macro_block_mv(frame, refs, mbi);
+        let mut mbmodes = vec![MacroBlockMode::InterNoMv; nmbs];
+        match plan {
+            MotionPlan::ZeroPrevious => {
+                // mb_mv stays zero, modes stay INTER_NOMV.
+            }
+            MotionPlan::SearchPrevious => {
+                for mbi in 0..nmbs {
+                    let mv = self.search_macro_block_mv(frame, refs, mbi);
+                    mb_mv[mbi] = mv;
+                    mbmodes[mbi] = if mv != MotionVector::ZERO {
+                        MacroBlockMode::InterMv
+                    } else {
+                        MacroBlockMode::InterNoMv
+                    };
+                }
+            }
+            MotionPlan::SearchPreviousOrGolden => {
+                for mbi in 0..nmbs {
+                    let (prev_mv, prev_sad) =
+                        self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Previous);
+                    let (gold_mv, gold_sad) =
+                        self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Golden);
+                    // The golden candidate spends a guaranteed mode code
+                    // (it can never be re-expressed as a LAST predicted
+                    // mode) so it must beat the previous candidate by a
+                    // strict margin to be worth choosing.
+                    if gold_sad < prev_sad {
+                        mb_mv[mbi] = gold_mv;
+                        mbmodes[mbi] = if gold_mv != MotionVector::ZERO {
+                            MacroBlockMode::InterGoldenMv
+                        } else {
+                            MacroBlockMode::InterGoldenNoMv
+                        };
+                    } else {
+                        mb_mv[mbi] = prev_mv;
+                        mbmodes[mbi] = if prev_mv != MotionVector::ZERO {
+                            MacroBlockMode::InterMv
+                        } else {
+                            MacroBlockMode::InterNoMv
+                        };
+                    }
+                }
             }
         }
 
@@ -12061,23 +12153,18 @@ impl FrameEncoder {
         let mut bcoded = vec![0u8; nbs];
         let mut block_mv = vec![MotionVector::ZERO; nbs];
 
-        // Mode per macro block. A macro block with a non-zero MV uses
-        // INTER_MV and MUST force every block coded: the decoder's
-        // *uncoded* path (§7.9.4 step 2(e)) always copies the
-        // **zero-MV** colocated reference, so an uncoded block in an
-        // INTER_MV macro block would be reconstructed with the wrong
-        // (zero) vector. Forcing all blocks coded keeps the MB's MV in
-        // effect for every block. A zero-MV macro block is INTER_NOMV
-        // and may leave zero-residual blocks uncoded (their zero-MV copy
-        // is exactly the predictor we built).
-        let mut mbmodes = vec![MacroBlockMode::InterNoMv; nmbs];
-        for (mode, &mv) in mbmodes.iter_mut().zip(mb_mv.iter()) {
-            *mode = if mv != MotionVector::ZERO {
-                MacroBlockMode::InterMv
-            } else {
-                MacroBlockMode::InterNoMv
-            };
-        }
+        // A macro block whose reconstruction reads anything other than
+        // the zero-MV previous reference MUST force every block coded:
+        // the decoder's *uncoded* path (§7.9.4 step 2(e)) always copies
+        // the **zero-MV colocated previous** reference, so an uncoded
+        // block in an INTER_MV / INTER_GOLDEN_* macro block would be
+        // reconstructed from the wrong predictor. Forcing all blocks
+        // coded keeps the macro block's MV + reference in effect for
+        // every block. Only a zero-MV INTER_NOMV macro block may leave
+        // zero-residual blocks uncoded (their zero-MV previous copy is
+        // exactly the predictor we built).
+        let force_coded_for =
+            |mode: MacroBlockMode| -> bool { !matches!(mode, MacroBlockMode::InterNoMv) };
 
         for bi in 0..nbs {
             let pli = g.pli_of_block[bi] as usize;
@@ -12090,15 +12177,20 @@ impl FrameEncoder {
             let by = g.by_of_block[bi];
             let mbi = g.mbi_of_block[bi] as usize;
             // The block's motion vector is the macro block's MV. For a
-            // uniform MB MV the §7.5.2 INTER_MV decode assigns that same
-            // value to every coded block (luma and chroma), so the
-            // encoder mirrors it directly.
+            // uniform MB MV the §7.5.2 INTER_MV / INTER_GOLDEN_MV decode
+            // assigns that same value to every coded block (luma and
+            // chroma), so the encoder mirrors it directly.
             let mv = mb_mv[mbi];
-            let force_coded = mbmodes[mbi] == MacroBlockMode::InterMv;
+            let mode = mbmodes[mbi];
+            let force_coded = force_coded_for(mode);
             block_mv[bi] = mv;
 
-            // Motion-compensated predictor for this block.
-            let refp = refs.pick(ReferenceFrame::Previous, pli)?;
+            // Motion-compensated predictor for this block, read from the
+            // reference frame the macro block's mode selects (§7.9.4
+            // Table 7.75: Golden for the GOLDEN modes, Previous
+            // otherwise).
+            let refframe = reference_frame_for_mb_mode(mode);
+            let refp = refs.pick(refframe, pli)?;
             let pred = inter_block_predictor(&refp, bx, by, mv)?;
 
             // Residual = source - predictor.
@@ -12112,9 +12204,11 @@ impl FrameEncoder {
             let dqc = forward_dct_2d(&residual);
             let q = quantize_block(&dqc, &qmats[pli], &qmats[pli]);
             // A block is coded iff any quantized coefficient is non-zero
-            // OR the macro block's INTER_MV mode forces it coded. An
-            // all-zero coded block reconstructs as the exact predictor
-            // (zero residual), so forcing it coded is still bit-faithful.
+            // OR the macro block's mode forces it coded (any non-zero-MV
+            // INTER_MV / INTER_GOLDEN_* macro block — see
+            // `force_coded_for`). An all-zero coded block reconstructs
+            // as the exact predictor (zero residual), so forcing it
+            // coded is still bit-faithful.
             let any_nonzero = q.iter().any(|&v| v != 0);
             if any_nonzero || force_coded {
                 bcoded[bi] = 1;
@@ -12146,9 +12240,14 @@ impl FrameEncoder {
         // (the reference frame is Previous for all three modes, so the
         // DC predictor and residual are unaffected) but no explicit MV
         // bits. The refinement only narrows INTER_MV; INTER_NOMV macro
-        // blocks (zero MV) are untouched. Mirrors the decode arms read
-        // earlier: INTER_MV sets LAST2=LAST1, LAST1=mv; INTER_MV_LAST2
-        // swaps LAST1/LAST2; INTER_MV_LAST and INTER_NOMV leave them.
+        // blocks (zero MV) are untouched, and the GOLDEN modes are
+        // **excluded** from the LAST1 / LAST2 history entirely (§7.5.2:
+        // "Macro blocks coded in INTRA mode or one of the GOLDEN modes
+        // are not considered in this process"), so a golden macro block
+        // neither recodes to a LAST mode nor perturbs the running
+        // predictor. Mirrors the decode arms read earlier: INTER_MV
+        // sets LAST2=LAST1, LAST1=mv; INTER_MV_LAST2 swaps LAST1/LAST2;
+        // INTER_MV_LAST and INTER_NOMV leave them.
         {
             let mut last1 = MotionVector::ZERO;
             let mut last2 = MotionVector::ZERO;
@@ -12238,10 +12337,30 @@ impl FrameEncoder {
         refs: &ReferencePlaneSet<'_>,
         mbi: usize,
     ) -> MotionVector {
+        self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Previous)
+            .0
+    }
+
+    /// Generalisation of [`FrameEncoder::search_macro_block_mv`] that
+    /// searches a chosen reference frame (`Previous` or `Golden`) and
+    /// returns both the winning luma vector **and** its
+    /// macro-block-level SAD. The SAD lets a caller compare the
+    /// previous-reference and golden-reference candidates and pick the
+    /// cheaper one for the §7.5.2 `INTER_MV` / `INTER_GOLDEN_MV` mode
+    /// decision. The vector is in §7.5 half-pixel units (doubled whole
+    /// pixels); a tie keeps the zero vector so the common case still
+    /// costs no MV bits.
+    fn search_macro_block_mv_ref(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        mbi: usize,
+        which: ReferenceFrame,
+    ) -> (MotionVector, u32) {
         let g = &self.geometry;
-        let refp = match refs.pick(ReferenceFrame::Previous, 0) {
+        let refp = match refs.pick(which, 0) {
             Ok(p) => p,
-            Err(_) => return MotionVector::ZERO,
+            Err(_) => return (MotionVector::ZERO, u32::MAX),
         };
         let abcd = g.macro_block_to_luma_blocks[mbi];
         // Gather the four luma blocks' pixel origins.
@@ -12306,7 +12425,7 @@ impl FrameEncoder {
                 }
             }
         }
-        best_mv
+        (best_mv, best_sad)
     }
 }
 
@@ -29649,6 +29768,35 @@ mod tests {
         }
     }
 
+    /// Shift every plane of a reconstructed frame by `(sx, sy)` whole
+    /// pixels (sampling `src[x - sx, y - sy]`, edge-clamped), producing
+    /// a `SourceFrame` at the same coded dimensions. Used to build a
+    /// translation of a reference frame for the motion-search tests.
+    fn shift_source(
+        frame: &ReconstructedFrame,
+        g: &FrameGeometry,
+        sx: i32,
+        sy: i32,
+    ) -> SourceFrame {
+        let shift_plane = |src: &[u8], w: u32, h: u32| -> Vec<u8> {
+            let (w, h) = (w as i32, h as i32);
+            let mut out = vec![0u8; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let srcx = (x - sx).clamp(0, w - 1);
+                    let srcy = (y - sy).clamp(0, h - 1);
+                    out[(y * w + x) as usize] = src[(srcy * w + srcx) as usize];
+                }
+            }
+            out
+        };
+        SourceFrame {
+            samples_y: shift_plane(&frame.samples_y, g.dims_y.width, g.dims_y.height),
+            samples_cb: shift_plane(&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+            samples_cr: shift_plane(&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+        }
+    }
+
     fn plane_max_err(got: &[u8], want: &[u8]) -> i16 {
         got.iter()
             .zip(want.iter())
@@ -29901,6 +30049,221 @@ mod tests {
         assert!(
             nonzero_mbs >= 2,
             "uniform shift should drive ≥ 2 macro blocks to a non-zero MV (got {nonzero_mbs})"
+        );
+    }
+
+    /// Re-parse an encoded inter video-data packet through the
+    /// production [`decode_data_packet_header_and_blocks`] using an
+    /// encoder's geometry, returning the decoded per-macro-block mode
+    /// array. Lets the encode→decode round-trip tests assert which
+    /// §7.5.2 modes the encoder actually put on the wire (rather than
+    /// only checking the reconstructed pixels).
+    fn decode_packet_mbmodes(
+        enc: &FrameEncoder,
+        first_frame: bool,
+        pkt: &[u8],
+    ) -> Vec<MacroBlockMode> {
+        let g = enc.geometry();
+        let cb_slices: Vec<&[u32]> = g.chroma_cb.iter().map(|v| v.as_slice()).collect();
+        let cr_slices: Vec<&[u32]> = g.chroma_cr.iter().map(|v| v.as_slice()).collect();
+        let plane_orders: [&[u32]; 3] = [
+            &g.plane_raster_order[0],
+            &g.plane_raster_order[1],
+            &g.plane_raster_order[2],
+        ];
+        let out = decode_data_packet_header_and_blocks(
+            pkt,
+            first_frame,
+            g.pf,
+            g.nsbs,
+            g.nbs,
+            g.nmbs,
+            &g.block_to_super_block,
+            &g.macro_block_to_luma_blocks,
+            ChromaBlockLayout {
+                cb: &cb_slices,
+                cr: &cr_slices,
+            },
+            &enc.setup.huffman_tables[..],
+            DcPredictionGeometry {
+                block_to_macro_block: &g.mbi_of_block,
+                neighbors: &g.neighbors,
+                plane_raster_order: &plane_orders,
+            },
+        )
+        .map(|d| d.mbmodes)
+        .unwrap_or_else(|e| panic!("re-decode of encoded packet failed: {e:?}"));
+        out
+    }
+
+    /// MILESTONE: the golden-reference inter encoder
+    /// ([`FrameEncoder::encode_inter_frame_golden`]) emits
+    /// `INTER_GOLDEN_NOMV` macro blocks and the full encode→decode
+    /// round trip reconstructs them sample-exactly through the §7.9.4
+    /// Table 7.75 golden path.
+    ///
+    /// The corpus reference encoder never produces a golden macro block
+    /// from its `testsrc`-class inputs, so no captured `.ogv` fixture
+    /// exercises the decoder's golden reconstruction top-to-bottom from
+    /// a real bitstream. This builds such a bitstream from this crate's
+    /// own encoder and decodes it back through the production
+    /// `FrameDecoder`:
+    ///
+    /// * Frame 0 (intra A) seeds golden = previous = reconstruction(A).
+    /// * Frame 1 (inter, source B ≠ A) overwrites the **previous**
+    ///   reference with reconstruction(B); golden still holds A.
+    /// * Frame 2 has source = reconstruction(A) again. Its golden
+    ///   reference (A) predicts every block perfectly (zero residual)
+    ///   while the previous reference (B) does not, so the
+    ///   previous-or-golden mode decision codes every macro block
+    ///   `INTER_GOLDEN_NOMV`, and the decoder reconstructs frame 2
+    ///   bit-identically to reconstruction(A).
+    #[test]
+    fn encode_inter_frame_golden_nomv_round_trips_through_decoder() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        // A *flat* image A: the intra encoder is lossless on a constant
+        // frame, so rec(A) == A exactly and a zero-residual golden copy
+        // of it is bit-exact. A flat plane also guarantees B (a
+        // gradient) differs from A at *every* block, so the
+        // previous-or-golden decision never ties to previous.
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        let frame_a = SourceFrame {
+            samples_y: vec![96u8; len_y],
+            samples_cb: vec![128u8; len_c],
+            samples_cr: vec![128u8; len_c],
+        };
+        // A clearly different image B (a gradient) so the previous
+        // reference is a poor predictor for a return to the flat A.
+        let frame_b = gradient_source(&g, 7, 5);
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+
+        // Frame 0: intra keyframe A → seeds golden = previous = rec(A).
+        let key = enc.encode_intra_frame(&frame_a).unwrap();
+        let f0 = dec.decode_frame(&key).unwrap();
+        assert_eq!(f0.ftype, FrameType::Intra);
+        let rec_a = f0.frame.clone();
+        assert_eq!(dec.reference_store().golden_y, rec_a.samples_y);
+
+        // Frame 1: inter B → previous becomes rec(B); golden stays A.
+        let pkt_b = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_motion(&frame_b, &refs).unwrap()
+        };
+        let f1 = dec.decode_frame(&pkt_b).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+        // Golden untouched on an inter frame; previous now holds rec(B).
+        assert_eq!(dec.reference_store().golden_y, rec_a.samples_y);
+        assert_ne!(dec.reference_store().previous_y, rec_a.samples_y);
+
+        // Frame 2: source = rec(A). Golden (A) predicts perfectly,
+        // previous (B) does not → golden mode decision picks
+        // INTER_GOLDEN_NOMV for every macro block.
+        let source_back_to_a = SourceFrame {
+            samples_y: rec_a.samples_y.clone(),
+            samples_cb: rec_a.samples_cb.clone(),
+            samples_cr: rec_a.samples_cr.clone(),
+        };
+        let pkt_golden = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_golden(&source_back_to_a, &refs)
+                .unwrap()
+        };
+
+        // Every macro block must have been coded golden: the flat A is
+        // reproduced exactly by the golden predictor, while the previous
+        // reference (gradient B) differs at every block.
+        let modes = decode_packet_mbmodes(&enc, false, &pkt_golden);
+        assert!(
+            modes.iter().all(|m| matches!(
+                m,
+                MacroBlockMode::InterGoldenNoMv | MacroBlockMode::InterGoldenMv
+            )),
+            "golden encoder must code every macro block INTER_GOLDEN_* (got modes {modes:?})"
+        );
+
+        // The decoded frame must reconstruct rec(A) bit-exactly: a
+        // zero-residual golden copy reproduces the golden reference.
+        let f2 = dec.decode_frame(&pkt_golden).unwrap();
+        assert_eq!(f2.ftype, FrameType::Inter);
+        assert_eq!(
+            f2.frame.samples_y, rec_a.samples_y,
+            "golden-mode inter frame must reproduce the golden reference luma bit-exactly"
+        );
+        assert_eq!(f2.frame.samples_cb, rec_a.samples_cb);
+        assert_eq!(f2.frame.samples_cr, rec_a.samples_cr);
+    }
+
+    /// MILESTONE: the golden-reference inter encoder also emits
+    /// `INTER_GOLDEN_MV` (a non-zero golden vector) when the frame is a
+    /// *translation* of the golden reference, and the full
+    /// encode→decode round trip reconstructs the golden
+    /// motion-compensated predictor within the quantizer bound.
+    ///
+    /// Layout mirrors the NOMV test but frame 2 is the golden gradient
+    /// A shifted by a whole-pixel offset, so the golden search finds a
+    /// non-zero vector and reconstructs from the *displaced* golden
+    /// plane (the §7.9.4 Table 7.75 golden path combined with the §7.9.1
+    /// whole-pixel predictor). The previous reference (an unrelated
+    /// image B) is a poor predictor, so the mode decision still favours
+    /// golden.
+    #[test]
+    fn encode_inter_frame_golden_mv_translation_round_trips() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        // Golden A is a gradient so a translation is detectable.
+        let frame_a = gradient_source(&g, 0, 0);
+        // B is the *negated* gradient (very different) so previous never
+        // wins the SAD comparison against a return-to-A translation.
+        let mut frame_b = gradient_source(&g, 0, 0);
+        for v in frame_b.samples_y.iter_mut() {
+            *v = 255 - *v;
+        }
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame_a).unwrap();
+        let f0 = dec.decode_frame(&key).unwrap();
+        let rec_a = f0.frame.clone();
+
+        // Frame 1: inter B → previous becomes rec(B); golden stays A.
+        let pkt_b = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_motion(&frame_b, &refs).unwrap()
+        };
+        dec.decode_frame(&pkt_b).unwrap();
+        assert_eq!(dec.reference_store().golden_y, rec_a.samples_y);
+
+        // Frame 2: a (2,0)-shifted copy of rec(A). The golden search
+        // recovers that whole-pixel vector; previous (rec(B)) cannot
+        // match it.
+        let shifted = shift_source(&rec_a, &g, 2, 0);
+        let pkt_golden = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_golden(&shifted, &refs).unwrap()
+        };
+
+        let modes = decode_packet_mbmodes(&enc, false, &pkt_golden);
+        let golden_mv = modes
+            .iter()
+            .filter(|m| matches!(m, MacroBlockMode::InterGoldenMv))
+            .count();
+        assert!(
+            golden_mv >= 1,
+            "translation should emit ≥ 1 INTER_GOLDEN_MV macro block (got modes {modes:?})"
+        );
+
+        let f2 = dec.decode_frame(&pkt_golden).unwrap();
+        assert_eq!(f2.ftype, FrameType::Inter);
+        // The interior (away from the plane edges the shift pulls from)
+        // reconstructs the shifted golden plane within the quantizer.
+        assert!(
+            plane_max_err(&f2.frame.samples_y, &shifted.samples_y) <= 40,
+            "golden-MV inter luma max error {} exceeds tolerance",
+            plane_max_err(&f2.frame.samples_y, &shifted.samples_y)
         );
     }
 

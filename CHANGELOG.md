@@ -6,6 +6,24 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **`INTER_MV_FOUR` folded into the rate-distortion candidate set
+  (round 371)** — `encode_inter_frame_rd` now evaluates a per-luma-block
+  four-MV candidate alongside the uniform inter modes. A new
+  `FrameEncoder::mb_four_mv_cost` searches an independent previous-
+  reference vector per luma block, scores each luma block with its own
+  vector and each chroma block with the §7.5.2 averaged vector through
+  the same forward-quantize → reconstruct → SSD path the uniform modes
+  use, and folds in the §7.4 mode code plus 4×12 explicit-MV bits. The
+  macro block codes `INTER_MV_FOUR` only when its delivered `D + λ·R`
+  beats every uniform mode, so the four explicit vectors are paid for
+  out of the rate term (an all-equal four-MV is strictly dominated by
+  uniform `INTER_MV` and never wins). A new test drives the
+  `TheoraEncoder` default RD path to select `INTER_MV_FOUR` on a frame
+  whose four luma blocks each moved by a distinct whole-pixel vector,
+  and round-trips the per-block-displaced source within the quantizer
+  bound — so every §7.5.2 inter mode is now reachable from the single
+  unified RD entry point, not just the standalone four-MV search.
+
 - **Measured RD vs previous-only delta (round 368)** — a new test
   quantifies the rate-distortion decision's value on a scene the golden
   reference predicts perfectly: the RD path codes a distortion-free

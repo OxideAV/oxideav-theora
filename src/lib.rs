@@ -11863,8 +11863,10 @@ enum MotionPlan {
     /// proxy; `R` folds in the §7.4 mode code and the §7.5 explicit-MV
     /// bits. Unlike [`MotionPlan::SearchPreviousOrGolden`] (raw-SAD
     /// previous-vs-golden) this makes the previous/golden/zero choice a
-    /// single joint Lagrangian decision. `INTER_MV` winners still flow
-    /// through the `INTER_MV_LAST` / `INTER_MV_LAST2` recode.
+    /// single joint Lagrangian decision. `INTER_MV_FOUR` (a per-luma-block
+    /// search, chroma averaged) is also in the candidate set and is coded
+    /// when its `D + λ·R` beats every uniform mode. `INTER_MV` winners
+    /// still flow through the `INTER_MV_LAST` / `INTER_MV_LAST2` recode.
     RateDistortion,
 }
 
@@ -12153,8 +12155,13 @@ impl FrameEncoder {
     /// only when its delivered distortion plus guaranteed mode/MV rate
     /// beats every previous-reference candidate. `INTER_MV` winners still
     /// flow through the §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode.
-    /// `INTER_MV_FOUR` is out of scope for this entry point (its
-    /// per-luma-block search remains [`FrameEncoder::encode_inter_frame_four_mv`]).
+    ///
+    /// `INTER_MV_FOUR` is part of the same candidate set: each macro block
+    /// also evaluates a per-luma-block search (four independent vectors,
+    /// chroma averaged) by its true `D + λ·R` cost and codes four-MV when
+    /// it beats every uniform mode — its four explicit vectors are paid
+    /// for out of the rate term, so it is chosen only when the
+    /// per-block fidelity gain justifies them.
     pub fn encode_inter_frame_rd(
         &self,
         frame: &SourceFrame,
@@ -12364,8 +12371,28 @@ impl FrameEncoder {
                             best_mv = mv;
                         }
                     }
-                    mbmodes[mbi] = best_mode;
-                    mb_mv[mbi] = best_mv;
+
+                    // Four-MV candidate: an independent vector per luma
+                    // block. Only worth coding when its delivered
+                    // distortion beats every uniform mode by enough to
+                    // pay for the four explicit vectors; the §7.4 mode
+                    // code + 4×12 MV bits are already folded into its
+                    // cost. A four-MV whose searched vectors are all
+                    // identical is strictly dominated by the uniform
+                    // INTER_MV (same predictor, fewer MV bits), so it can
+                    // never win the strict comparison and falls back to
+                    // the uniform winner.
+                    let (four_cost, four_luma) =
+                        self.mb_four_mv_cost(frame, refs, &qmats, mbi, lambda)?;
+                    if four_cost < best_cost {
+                        mbmodes[mbi] = MacroBlockMode::InterMvFour;
+                        four_mv_luma[mbi] = Some(four_luma);
+                        // `mb_mv` is unused for four-MV blocks; leave it
+                        // at the zero default.
+                    } else {
+                        mbmodes[mbi] = best_mode;
+                        mb_mv[mbi] = best_mv;
+                    }
                 }
             }
         }
@@ -12913,6 +12940,92 @@ impl FrameEncoder {
         }
 
         Ok(distortion + lambda.saturating_mul(rate as u64))
+    }
+
+    /// Evaluate the rate-distortion cost of coding one macro block in
+    /// `INTER_MV_FOUR` mode: an independent previous-reference vector per
+    /// luma block, with each chroma block carrying the §7.5.2 averaged
+    /// vector for the pixel format.
+    ///
+    /// Returns the Lagrangian cost `D + λ·R` together with the four
+    /// per-luma-block vectors (raster `[A, B, C, D]`) that produced it, so
+    /// the [`MotionPlan::RateDistortion`] decision can fold four-MV into
+    /// the same candidate set as the uniform modes and, when it wins, hand
+    /// those vectors straight to the per-block encode table.
+    ///
+    /// The distortion is summed over the macro block's luma blocks (each
+    /// scored with its own searched vector) and its chroma blocks (each
+    /// scored with the averaged vector), through the same
+    /// forward-quantize → reconstruct → SSD path [`block_rd_cost`] runs for
+    /// the uniform modes — so a four-MV candidate is judged on delivered
+    /// fidelity, not a pre-quantization SAD proxy. Every block is always
+    /// coded (the §7.9.4 uncoded path would copy the wrong zero-MV
+    /// predictor), so the rate folds in the §7.4 mode code plus one §7.5
+    /// `MVMODE = 1` explicit vector per luma block (12 bits each).
+    fn mb_four_mv_cost(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        qmats: &[QuantizationMatrix; 3],
+        mbi: usize,
+        lambda: u64,
+    ) -> Result<(u64, [MotionVector; 4]), Error> {
+        let g = &self.geometry;
+        let abcd = g.macro_block_to_luma_blocks[mbi];
+        // Per-luma-block search (the same per-block estimator
+        // `MotionPlan::SearchFourMv` uses).
+        let luma = [
+            self.search_luma_block_mv(frame, refs, abcd[0] as usize),
+            self.search_luma_block_mv(frame, refs, abcd[1] as usize),
+            self.search_luma_block_mv(frame, refs, abcd[2] as usize),
+            self.search_luma_block_mv(frame, refs, abcd[3] as usize),
+        ];
+
+        let mut distortion = 0u64;
+        let mut rate = 0u32;
+
+        // Luma blocks, each scored with its own vector. Four-MV always
+        // forces every block coded.
+        for (raster, &bi) in abcd.iter().enumerate() {
+            let c = self.block_rd_cost(
+                frame,
+                refs,
+                qmats,
+                bi as usize,
+                ReferenceFrame::Previous,
+                luma[raster],
+                true,
+            )?;
+            distortion += c.distortion;
+            rate += c.token_bits;
+        }
+        // Chroma blocks, each scored with the §7.5.2 averaged vector for
+        // the pixel format. `four_mv_chroma_average` returns one vector
+        // per chroma block in the same order `chroma_cb` / `chroma_cr`
+        // enumerate.
+        let chroma_mv = four_mv_chroma_average(luma, g.pf);
+        for plane_map in [&g.chroma_cb[mbi], &g.chroma_cr[mbi]] {
+            for (&bi, &mv) in plane_map.iter().zip(chroma_mv.iter()) {
+                let c = self.block_rd_cost(
+                    frame,
+                    refs,
+                    qmats,
+                    bi as usize,
+                    ReferenceFrame::Previous,
+                    mv,
+                    true,
+                )?;
+                distortion += c.distortion;
+                rate += c.token_bits;
+            }
+        }
+
+        // Header rate: the §7.4 mode code (~3 bits) plus one §7.5
+        // explicit MV per luma block (every luma block is coded, so all
+        // four vectors are transmitted: 12 bits each).
+        rate += 3 + 4 * 12;
+
+        Ok((distortion + lambda.saturating_mul(rate as u64), luma))
     }
 }
 
@@ -31367,6 +31480,97 @@ mod tests {
         assert!(
             rd_bytes < prev_bytes,
             "RD packet {rd_bytes} B must be smaller than previous-only {prev_bytes} B"
+        );
+    }
+
+    /// MILESTONE: `INTER_MV_FOUR` is now part of the unified
+    /// rate-distortion candidate set. On a frame whose four luma blocks
+    /// in a macro block each moved by a **different** whole-pixel vector,
+    /// no single uniform vector predicts the whole macro block, so the
+    /// four-MV candidate's lower delivered distortion overcomes the cost
+    /// of its four explicit vectors and the RD decision codes
+    /// `INTER_MV_FOUR`. The full encode→decode round trip reconstructs
+    /// the per-block-displaced source within the quantizer bound through
+    /// the decoder's §7.9.4 per-block path — proving four-MV is reachable
+    /// from the `TheoraEncoder` default RD entry point, not just the
+    /// standalone [`FrameEncoder::encode_inter_frame_four_mv`] search.
+    #[test]
+    fn encode_inter_frame_rd_picks_four_mv_on_per_block_motion() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        // Textured luma so a per-block shift is the unique SAD minimum.
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        let w_y = g.dims_y.width as i32;
+        let mut samples_y = vec![0u8; len_y];
+        for y in 0..g.dims_y.height as i32 {
+            for x in 0..w_y {
+                samples_y[(y * w_y + x) as usize] = (16 + ((x * 9 + y * 13).rem_euclid(200))) as u8;
+            }
+        }
+        let frame0 = SourceFrame {
+            samples_y,
+            samples_cb: vec![128u8; len_c],
+            samples_cr: vec![128u8; len_c],
+        };
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        let prev = dec.decode_frame(&key).unwrap().frame.clone();
+
+        // Displace each luma block of the decoded reference by a distinct
+        // whole-pixel vector (raster slot → offset) so the four luma
+        // blocks of every macro block disagree.
+        let per_block_offsets = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+        let pw = g.dims_y.width as i32;
+        let ph = g.dims_y.height as i32;
+        let mut src_y = prev.samples_y.clone();
+        for abcd in g.macro_block_to_luma_blocks.iter() {
+            for (slot, &lblock) in abcd.iter().enumerate() {
+                let (ox, oy) = per_block_offsets[slot];
+                let bx = g.bx_of_block[lblock as usize] as i32;
+                let by = g.by_of_block[lblock as usize] as i32;
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let tx = bx + dx;
+                        let ty = by + dy;
+                        let sx = (tx - ox).clamp(0, pw - 1);
+                        let sy = (ty - oy).clamp(0, ph - 1);
+                        src_y[(ty * pw + tx) as usize] = prev.samples_y[(sy * pw + sx) as usize];
+                    }
+                }
+            }
+        }
+        let source = SourceFrame {
+            samples_y: src_y,
+            samples_cb: prev.samples_cb.clone(),
+            samples_cr: prev.samples_cr.clone(),
+        };
+
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd(&source, &refs).unwrap()
+        };
+
+        // The unified RD decision — not the standalone four-MV search —
+        // must have selected at least one INTER_MV_FOUR macro block.
+        let modes = decode_packet_mbmodes(&enc, false, &pkt);
+        let four_mv_count = modes
+            .iter()
+            .filter(|m| matches!(m, MacroBlockMode::InterMvFour))
+            .count();
+        assert!(
+            four_mv_count >= 1,
+            "RD decision must fold in INTER_MV_FOUR on per-block motion (got modes {modes:?})"
+        );
+
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert!(
+            plane_max_err(&f1.frame.samples_y, &source.samples_y) <= 40,
+            "RD four-MV inter luma max error {} exceeds tolerance",
+            plane_max_err(&f1.frame.samples_y, &source.samples_y)
         );
     }
 

@@ -116,7 +116,14 @@ packets are handled as duplicate-frame markers.
   quantizer-derived multiplier λ (`inter_rd_lambda`, monotone in `qi`).
   This subsumes the raw-SAD previous-vs-golden choice into one decision
   on reconstructed distortion; `INTER_MV` winners still flow through the
-  §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode. On a scene the golden
+  §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode. **`INTER_MV_FOUR` is
+  part of the same candidate set**: each macro block also evaluates a
+  per-luma-block search (four independent vectors, chroma averaged) by its
+  true `D + λ·R` cost and codes four-MV when it beats every uniform mode —
+  its four explicit vectors are paid for out of the rate term, so it is
+  chosen only when the per-block fidelity gain justifies them (an
+  all-equal four-MV is strictly dominated by uniform `INTER_MV` and never
+  wins). On a scene the golden
   reference predicts perfectly the RD path codes a distortion-free golden
   copy (SSD 0, 25 B) where the previous-reference-only motion path must
   code a large residual against the unrelated previous reference
@@ -202,15 +209,14 @@ chroma blocks that earlier diverged is now sample-exact.
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **Rate control + four-MV in the RD decision** — every §7.5.2 inter
-  mode (`INTER_NOMV`, `INTER_MV`, `INTER_MV_LAST`, `INTER_MV_LAST2`,
-  `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`, `INTER_MV_FOUR`) is reachable
-  from the encoder, and the **uniform** inter modes are now chosen by a
-  joint rate-distortion decision (`encode_inter_frame_rd`, the
-  `TheoraEncoder` P-frame default — see the inter-encoder bullet above).
-  Still future work: folding `INTER_MV_FOUR` into the same RD candidate
-  set (its per-luma-block search remains a separate entry point), and a
-  rate control / target-bitrate loop (the frame quantizer is fixed at
+* **Rate control** — every §7.5.2 inter mode (`INTER_NOMV`, `INTER_MV`,
+  `INTER_MV_LAST`, `INTER_MV_LAST2`, `INTER_GOLDEN_NOMV`,
+  `INTER_GOLDEN_MV`, `INTER_MV_FOUR`) is reachable from the encoder, and
+  **all** of them — including `INTER_MV_FOUR` (a per-luma-block search,
+  chroma averaged) — are now chosen by the one joint rate-distortion
+  decision (`encode_inter_frame_rd`, the `TheoraEncoder` P-frame default
+  — see the inter-encoder bullet above). Still future work: a rate
+  control / target-bitrate loop (the frame quantizer is fixed at
   construction). The setup header (§6.4 quantization parameters +
   Huffman tables) is supplied by the caller via `TheoraEncoder::new` /
   `extradata` rather than synthesized from scratch.

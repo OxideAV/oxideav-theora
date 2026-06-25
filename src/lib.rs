@@ -1284,6 +1284,14 @@ pub enum Error {
     /// (§6.2 step 23 derives `NBS` from `FMBW * FMBH` and both are
     /// `>= 1`, so `NBS >= 1` for any well-formed Theora stream).
     EmptyPacketFrameStateZeroNbs,
+    /// The first packet handed to the decoder was a zero-byte
+    /// duplicate-frame marker (§7.11 step 2). An empty packet duplicates
+    /// the previous reconstructed frame, but at stream start there is no
+    /// reference to duplicate — the first decoded frame must be a §7.1
+    /// intra keyframe carried in a non-empty packet. Surfaced before any
+    /// reconstruction so the caller gets a clear error instead of a frame
+    /// reconstructed from the zero-initialized reference store.
+    FirstFrameEmptyPacket,
     /// A count derived by the §2.3 / §2.4 frame-geometry walk
     /// disagrees with the corresponding §6.2-derived total from the
     /// identification header (`NBS` per Table 6.6, `NSBS` per Table
@@ -1933,6 +1941,10 @@ impl core::fmt::Display for Error {
             Error::EmptyPacketFrameStateZeroNbs => write!(
                 f,
                 "oxideav-theora: §7.11 step 2 empty-packet synthesis requires NBS >= 1 (got 0)"
+            ),
+            Error::FirstFrameEmptyPacket => write!(
+                f,
+                "oxideav-theora: first packet is a zero-byte duplicate-frame marker, but the first decoded frame must be a §7.1 intra keyframe (no reference to duplicate at stream start)"
             ),
             Error::FrameGeometryCountMismatch {
                 which,
@@ -11615,8 +11627,11 @@ impl FrameDecoder {
     ///   ([`ReferenceFrameStore::promote_from_reconstructed`]).
     ///
     /// The first packet of a stream must decode to an intra frame
-    /// (§7.1 step 2); [`Error::FirstFrameMustBeIntra`] surfaces
-    /// otherwise.
+    /// (§7.1 step 2); [`Error::FirstFrameMustBeIntra`] surfaces when a
+    /// non-empty first packet carries `FTYPE = 1`, and
+    /// [`Error::FirstFrameEmptyPacket`] when the first packet is a
+    /// zero-byte duplicate-frame marker (there is no reference frame to
+    /// duplicate at stream start).
     pub fn decode_frame(&mut self, packet: &[u8]) -> Result<DecodedFrame, Error> {
         let g = &self.geometry;
         let nbs = g.nbs as usize;
@@ -11626,6 +11641,14 @@ impl FrameDecoder {
         let (header, bcoded_u8, mbmodes, mvects, qiis, coeffs, ncoeffs) =
             match classify_frame_decode_packet(packet) {
                 FrameDecodePacket::Empty => {
+                    // §7.11 step 2: an empty packet duplicates the previous
+                    // reconstructed frame. At stream start there is no
+                    // such frame — the reference store is still its
+                    // zero-initialized allocation — so reject rather than
+                    // emit a frame reconstructed from zeros.
+                    if self.frames_decoded == 0 {
+                        return Err(Error::FirstFrameEmptyPacket);
+                    }
                     let st = synthesize_empty_packet_frame_state(nbs)?;
                     let header = TheoraFrameHeader::from(&st);
                     (
@@ -30097,6 +30120,54 @@ mod tests {
         match dec.decode_frame(&inter_packet) {
             Err(Error::FirstFrameMustBeIntra { .. }) => {}
             other => panic!("expected FirstFrameMustBeIntra, got {other:?}"),
+        }
+    }
+
+    /// §7.11 step 2 edge case: a zero-byte duplicate-frame marker as the
+    /// **first** packet has no reference frame to duplicate, so the
+    /// decoder rejects it with [`Error::FirstFrameEmptyPacket`] rather
+    /// than reconstructing a frame from the zero-initialized reference
+    /// store. After a real intra keyframe the same empty packet decodes
+    /// normally (the existing replay test covers that path), so the guard
+    /// is scoped strictly to stream start.
+    #[test]
+    fn decode_frame_first_packet_empty_is_rejected() {
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        match dec.decode_frame(&[]) {
+            Err(Error::FirstFrameEmptyPacket) => {}
+            other => panic!("expected FirstFrameEmptyPacket, got {other:?}"),
+        }
+        // The rejection must not have advanced any decode state: a real
+        // keyframe still decodes, and the empty packet then replays it.
+        dec.decode_frame(&fixture_data::TINY_DATA_PACKET_0).unwrap();
+        let replay = dec
+            .decode_frame(&[])
+            .expect("empty packet replays after a keyframe");
+        assert_eq!(replay.ftype, FrameType::Inter);
+    }
+
+    /// The framework `Decoder` trait surfaces the same first-empty-packet
+    /// rejection: a zero-byte data packet sent before any keyframe (but
+    /// after the headers) fails `receive_frame` with an `invalid` error
+    /// rather than yielding a garbage frame.
+    #[test]
+    fn decoder_trait_first_packet_empty_is_rejected() {
+        use oxideav_core::{Decoder, Packet, TimeBase};
+        let ident_pkt = TINY_HEADER.to_vec();
+        let setup_pkt = fixture_data::FIXTURE_SETUP_PACKET.to_vec();
+        let mut dec = TheoraDecoder::with_headers(
+            oxideav_core::CodecId::new(THEORA_CODEC_ID),
+            &[&ident_pkt, &setup_pkt],
+        )
+        .unwrap();
+        // A zero-byte data packet before any keyframe.
+        dec.send_packet(&Packet::new(0, TimeBase::from_rate(1), Vec::new()))
+            .unwrap();
+        match dec.receive_frame() {
+            Err(oxideav_core::Error::InvalidData(_)) => {}
+            other => panic!("expected InvalidData error, got {other:?}"),
         }
     }
 

@@ -42,7 +42,10 @@ against reference output.
 `FrameDecoder::decode_frame` chains the per-packet path
 (header → block decode → reconstruction → in-place loop filter →
 reference promotion) and is the high-level entry point. Empty (zero-byte)
-packets are handled as duplicate-frame markers.
+packets are handled as duplicate-frame markers — except as the very first
+packet, where there is no reference to duplicate: that is rejected with
+`Error::FirstFrameEmptyPacket` rather than reconstructing a frame from the
+zero-initialized reference store.
 
 * **Intra encoder** — `FrameEncoder` turns a macro-block-aligned
   `SourceFrame` into a §7 video-data packet. The forward pipeline

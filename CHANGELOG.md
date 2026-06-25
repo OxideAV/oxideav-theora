@@ -4,6 +4,19 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reject a zero-byte first packet (round 371)** — a §7.11 step-2
+  duplicate-frame marker (empty packet) as the very first packet had no
+  reference frame to duplicate, yet the decoder previously synthesized an
+  all-uncoded inter frame and reconstructed it from the zero-initialized
+  reference store, silently emitting a garbage frame. `FrameDecoder`
+  now returns the new `Error::FirstFrameEmptyPacket` (surfaced as an
+  `InvalidData` error through the framework `Decoder` trait) before any
+  reconstruction, and the rejection leaves decode state untouched so a
+  subsequent real keyframe still decodes. Tests cover both the direct and
+  trait paths.
+
 ### Added
 
 - **Target-bitrate rate-control loop (round 371)** —

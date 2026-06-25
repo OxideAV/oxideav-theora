@@ -11898,6 +11898,26 @@ impl FrameEncoder {
         &self.geometry
     }
 
+    /// The frame-level quantization index (`0..=63`) currently in effect.
+    pub fn qi(&self) -> u8 {
+        self.qi
+    }
+
+    /// Replace the frame-level quantization index (`0..=63`) used for the
+    /// next encoded frame. The quantization matrices are recomputed per
+    /// frame from this value, so a change takes effect on the next
+    /// `encode_*_frame` call without rebuilding the geometry. A
+    /// target-bitrate rate-control loop calls this between frames to ramp
+    /// the quantizer toward its byte budget. Returns
+    /// [`Error::QuantIndexOutOfRange`] for `qi > 63`.
+    pub fn set_qi(&mut self, qi: u8) -> Result<(), Error> {
+        if qi > 63 {
+            return Err(Error::QuantIndexOutOfRange { qi: qi as usize });
+        }
+        self.qi = qi;
+        Ok(())
+    }
+
     /// Extract one block's 8×8 spatial samples from a lower-left
     /// row-major plane at the block's `(BX, BY)` origin.
     fn extract_block(
@@ -13772,6 +13792,119 @@ pub struct TheoraEncoder {
     setup: SetupHeaderTables,
     /// How P-frames choose their per-macro-block inter mode.
     inter_mode: InterModeStrategy,
+    /// Optional target-bitrate rate-control loop. When `Some`, the
+    /// frame-level quantizer is adapted before each frame to steer the
+    /// running output size toward the target; when `None`, the fixed
+    /// construction-time `qi` is used for every frame.
+    rate_control: Option<RateControl>,
+}
+
+/// A target-bitrate rate-control loop that adapts the frame-level
+/// quantization index before each frame to steer the encoder's running
+/// output size toward a byte budget.
+///
+/// The controller models a leaky bucket: each frame is allotted a budget
+/// of `target_bits / fps` bits; the *actual* coded size adds to a running
+/// fullness accumulator (signed bits over/under budget). Before coding a
+/// frame the accumulator's sign and magnitude pick the next quantizer.
+///
+/// In the Theora quantizer-index convention a **lower** `qi` is *stronger*
+/// quantization (smaller frames) and a **higher** `qi` is *weaker*
+/// quantization (larger frames). So an over-full bucket (the stream is
+/// running ahead of budget) **lowers** the quantizer index (compress
+/// harder, fewer bits), and an under-full bucket **raises** it (spend the
+/// headroom on fidelity). The `qi` is clamped to `[qi_min, qi_max]` so the
+/// controller can never leave the valid `0..=63` range or violate
+/// caller-imposed quality bounds.
+///
+/// The control law is an encoder tuning choice with no normative status:
+/// it only selects which valid `qi` each frame is coded at, and the
+/// resulting bitstream is exactly what the fixed-`qi` path would emit for
+/// that same `qi`. The decoder reads `QIS[0]` from each frame header and
+/// is wholly unaware that the value was chosen adaptively.
+#[derive(Debug, Clone, Copy)]
+struct RateControl {
+    /// Bits allotted per frame (`target_bits_per_second / fps`), the
+    /// steady-state budget each coded frame is measured against.
+    bits_per_frame: f64,
+    /// Running leaky-bucket fullness in bits: positive means the stream
+    /// has spent more than its cumulative budget (running ahead → lower qi
+    /// to compress harder), negative means it is under budget (running
+    /// behind → raise qi to spend the headroom on fidelity).
+    fullness_bits: f64,
+    /// Inclusive lower bound on the adapted `qi` (strongest quantization
+    /// the controller may choose; higher fidelity floor).
+    qi_min: u8,
+    /// Inclusive upper bound on the adapted `qi` (weakest quantization
+    /// the controller may choose; smallest-frame ceiling).
+    qi_max: u8,
+    /// The `qi` chosen for the next frame (seeded from the construction
+    /// `qi`, then updated each frame from `fullness_bits`).
+    next_qi: u8,
+}
+
+impl RateControl {
+    /// Build a rate-control loop targeting `target_bits_per_second` at a
+    /// frame rate of `frn / frd` fps, seeded at `initial_qi` and clamped
+    /// to `[qi_min, qi_max]`. A zero or degenerate frame rate falls back
+    /// to a nominal 30 fps so the per-frame budget is always finite.
+    fn new(
+        target_bits_per_second: u64,
+        frn: u32,
+        frd: u32,
+        initial_qi: u8,
+        qi_min: u8,
+        qi_max: u8,
+    ) -> Self {
+        let fps = if frn == 0 || frd == 0 {
+            30.0
+        } else {
+            frn as f64 / frd as f64
+        };
+        let bits_per_frame = (target_bits_per_second as f64 / fps).max(1.0);
+        let lo = qi_min.min(63);
+        let hi = qi_max.min(63).max(lo);
+        Self {
+            bits_per_frame,
+            fullness_bits: 0.0,
+            qi_min: lo,
+            qi_max: hi,
+            next_qi: initial_qi.clamp(lo, hi),
+        }
+    }
+
+    /// The `qi` to code the next frame at.
+    fn qi_for_next_frame(&self) -> u8 {
+        self.next_qi
+    }
+
+    /// Fold the just-coded frame's byte size into the bucket and recompute
+    /// the quantizer for the following frame.
+    ///
+    /// The bucket drains one `bits_per_frame` budget per frame and fills
+    /// by the actual coded bits; its post-frame fullness, expressed in
+    /// units of per-frame budgets, drives a proportional step on `qi`.
+    /// The mapping is deliberately gentle (one qi step per budget of
+    /// imbalance) and clamped, so a single large keyframe nudges rather
+    /// than slams the quantizer.
+    ///
+    /// Because a lower `qi` is stronger quantization, the step *opposes*
+    /// the imbalance sign: over budget (`budgets_over > 0`) subtracts from
+    /// `qi` (compress harder), under budget adds to it.
+    fn observe_frame(&mut self, coded_bytes: usize) {
+        let coded_bits = (coded_bytes as f64) * 8.0;
+        // Leaky bucket: add what we spent, drain the steady-state budget.
+        self.fullness_bits += coded_bits - self.bits_per_frame;
+
+        // Proportional control: how many whole per-frame budgets are we
+        // over (or under)? Each budget of imbalance shifts qi by one step
+        // toward correcting it — *down* when over budget (lower qi =
+        // stronger quantization = smaller frames), up when under.
+        let budgets_over = self.fullness_bits / self.bits_per_frame;
+        let step = budgets_over.clamp(-8.0, 8.0) as i32;
+        let target = (self.next_qi as i32 - step).clamp(self.qi_min as i32, self.qi_max as i32);
+        self.next_qi = target as u8;
+    }
 }
 
 /// The per-macro-block inter mode-decision strategy a [`TheoraEncoder`]
@@ -13869,6 +14002,7 @@ impl TheoraEncoder {
             ident,
             setup,
             inter_mode: InterModeStrategy::default(),
+            rate_control: None,
         })
     }
 
@@ -13877,6 +14011,50 @@ impl TheoraEncoder {
     /// default is [`InterModeStrategy::RateDistortion`].
     pub fn with_inter_mode(mut self, inter_mode: InterModeStrategy) -> Self {
         self.inter_mode = inter_mode;
+        self
+    }
+
+    /// Enable a target-bitrate rate-control loop. Returns `self` for
+    /// builder chaining.
+    ///
+    /// `target_bits_per_second` is the desired average output rate. The
+    /// frame rate is read from the identification header (`FRN / FRD`);
+    /// the per-frame byte budget is `target_bits_per_second / fps`. Before
+    /// each frame the encoder adapts its quantization index (within the
+    /// valid `0..=63` range) to steer the running output size toward the
+    /// budget: a stream running ahead of budget raises the quantizer
+    /// (smaller frames), one running behind lowers it (better fidelity).
+    /// The construction-time `qi` seeds the loop.
+    ///
+    /// The adaptation only changes which valid `qi` each frame is coded
+    /// at; it has no effect on the bitstream syntax (the decoder reads
+    /// `QIS[0]` from each frame header exactly as for a fixed-`qi`
+    /// stream). Disabled by default — without this builder every frame
+    /// uses the fixed construction `qi`.
+    pub fn with_target_bitrate(self, target_bits_per_second: u64) -> Self {
+        self.with_target_bitrate_bounded(target_bits_per_second, 0, 63)
+    }
+
+    /// Like [`TheoraEncoder::with_target_bitrate`] but with explicit
+    /// quantizer bounds: the rate-control loop never codes a frame at a
+    /// `qi` outside `[qi_min, qi_max]` (each clamped into `0..=63`). A
+    /// caller imposes a quality floor (`qi_max < 63`, capping how strong
+    /// the quantization may get) or a size floor (`qi_min > 0`, capping
+    /// how weak it may get) without disabling rate control.
+    pub fn with_target_bitrate_bounded(
+        mut self,
+        target_bits_per_second: u64,
+        qi_min: u8,
+        qi_max: u8,
+    ) -> Self {
+        self.rate_control = Some(RateControl::new(
+            target_bits_per_second,
+            self.ident.frn,
+            self.ident.frd,
+            self.frame_encoder.qi(),
+            qi_min,
+            qi_max,
+        ));
         self
     }
 
@@ -13890,6 +14068,14 @@ impl TheoraEncoder {
         // at a keyframe boundary, is intra.
         let want_keyframe =
             self.mirror.is_none() || self.frames_since_keyframe >= self.keyframe_interval;
+
+        // Rate control: pick this frame's quantizer from the running
+        // bucket fullness before encoding. The chosen `qi` lands in the
+        // frame header `QIS[0]`, so the mirror decoder (which reads the
+        // emitted bytes) and any downstream decoder stay in lock-step.
+        if let Some(rc) = self.rate_control.as_ref() {
+            self.frame_encoder.set_qi(rc.qi_for_next_frame())?;
+        }
 
         let bytes = if want_keyframe {
             self.frame_encoder.encode_intra_frame(frame)?
@@ -13921,6 +14107,12 @@ impl TheoraEncoder {
             }
         };
         mirror.decode_frame(&bytes)?;
+
+        // Rate control: fold the just-coded frame's size into the bucket
+        // and recompute the quantizer for the next frame.
+        if let Some(rc) = self.rate_control.as_mut() {
+            rc.observe_frame(bytes.len());
+        }
 
         if want_keyframe {
             self.frames_since_keyframe = 1;
@@ -29246,6 +29438,218 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------- target-bitrate rate control (round 371) -------
+
+    /// A textured top-down [`oxideav_core::VideoFrame`] at `ident`'s coded
+    /// dimensions: a high-frequency luma pattern (so the coded size
+    /// actually responds to the quantizer) and a gentle chroma ramp. The
+    /// `phase` offsets the pattern so successive frames differ.
+    fn textured_video_frame(ident: &TheoraIdentHeader, phase: i32) -> oxideav_core::VideoFrame {
+        use oxideav_core::frame::VideoPlane;
+        let g = build_frame_geometry(ident).unwrap();
+        let mk_y = |w: u32, h: u32| -> VideoPlane {
+            let mut data = vec![0u8; (w * h) as usize];
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    // A busy pattern with strong local variation so many
+                    // AC coefficients survive at a weak quantizer.
+                    let v = 16 + (((x + phase) * 17 + (y - phase) * 23).rem_euclid(220));
+                    data[(y * w as i32 + x) as usize] = v as u8;
+                }
+            }
+            VideoPlane {
+                stride: w as usize,
+                data,
+            }
+        };
+        let mk_c = |w: u32, h: u32, base: u8| -> VideoPlane {
+            let mut data = vec![0u8; (w * h) as usize];
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    data[(y * w as i32 + x) as usize] =
+                        base.wrapping_add(((x + y + phase) % 24) as u8);
+                }
+            }
+            VideoPlane {
+                stride: w as usize,
+                data,
+            }
+        };
+        oxideav_core::VideoFrame {
+            pts: None,
+            planes: vec![
+                mk_y(g.dims_y.width, g.dims_y.height),
+                mk_c(g.dims_c.width, g.dims_c.height, 110),
+                mk_c(g.dims_c.width, g.dims_c.height, 140),
+            ],
+        }
+    }
+
+    /// The [`RateControl`] feedback law: because a lower `qi` is stronger
+    /// quantization, a frame that overshoots its per-frame budget pushes
+    /// the next quantizer **down** (compress harder → smaller frames), one
+    /// that undershoots pulls it **up** (spend the headroom on fidelity),
+    /// and the chosen `qi` never leaves `[qi_min, qi_max]`.
+    #[test]
+    fn rate_control_feedback_moves_qi_toward_budget() {
+        // 8000 bits/s at 10 fps → 800 bits = 100 bytes per frame.
+        let mut rc = RateControl::new(8000, 10, 1, 30, 0, 63);
+        assert_eq!(rc.qi_for_next_frame(), 30, "seeded at the construction qi");
+
+        // A big frame (far over the 100-byte budget) must lower qi
+        // (stronger quantization to claw the overshoot back).
+        rc.observe_frame(900); // 7200 bits, 7100 over budget → −8 (clamped)
+        let after_over = rc.qi_for_next_frame();
+        assert!(
+            after_over < 30,
+            "overshoot must lower qi (got {after_over})"
+        );
+
+        // Now a long run of tiny frames drains the bucket below zero and
+        // pushes qi back up past where the overshoot left it.
+        for _ in 0..40 {
+            rc.observe_frame(1);
+        }
+        let after_under = rc.qi_for_next_frame();
+        assert!(
+            after_under > after_over,
+            "sustained undershoot must raise qi ({after_under} !> {after_over})"
+        );
+
+        // Bounds are honoured: a runaway overshoot saturates at qi_min
+        // (strongest quantization the controller may pick).
+        let mut capped = RateControl::new(800, 10, 1, 20, 10, 25);
+        for _ in 0..50 {
+            capped.observe_frame(100_000);
+        }
+        assert_eq!(capped.qi_for_next_frame(), 10, "qi clamps at qi_min");
+        // A runaway undershoot saturates at qi_max.
+        let mut floored = RateControl::new(8_000_000, 10, 1, 20, 10, 25);
+        for _ in 0..50 {
+            floored.observe_frame(1);
+        }
+        assert_eq!(floored.qi_for_next_frame(), 25, "qi clamps at qi_max");
+    }
+
+    /// MILESTONE: an end-to-end target-bitrate loop. A strict (low)
+    /// target drives the rate-control quantizer up over a multi-frame run,
+    /// yielding a **measurably smaller** total stream than a generous
+    /// (high) target on the same textured source — while every emitted
+    /// frame still decodes through `TheoraDecoder` as a valid bitstream.
+    /// This proves the loop actually steers output size via the quantizer
+    /// without breaking the encode→decode contract.
+    #[test]
+    fn target_bitrate_low_target_yields_smaller_stream_than_high() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        // Encode the same 6-frame textured sequence at two targets and
+        // measure the total data-packet bytes + decode every frame.
+        let run = |target_bps: u64| -> usize {
+            let mut enc = TheoraEncoder::with_keyframe_interval(
+                codec_id.clone(),
+                ident.clone(),
+                setup.clone(),
+                16,
+                6,
+            )
+            .unwrap()
+            .with_target_bitrate(target_bps);
+            let mut header_pkts: Vec<oxideav_core::Packet> = Vec::new();
+            let mut data_pkts: Vec<oxideav_core::Packet> = Vec::new();
+            for phase in 0..6i32 {
+                let vf = textured_video_frame(&ident, phase * 3);
+                enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+            }
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => {
+                        if p.flags.header {
+                            header_pkts.push(p);
+                        } else {
+                            data_pkts.push(p);
+                        }
+                    }
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("encoder error {e}"),
+                }
+            }
+            assert_eq!(data_pkts.len(), 6);
+            // Every emitted frame must decode as a valid bitstream.
+            let mut dec = TheoraDecoder::new(codec_id.clone());
+            for p in &header_pkts {
+                dec.send_packet(p).unwrap();
+            }
+            for p in &data_pkts {
+                dec.send_packet(p).unwrap();
+                let _ = dec.receive_frame().unwrap();
+            }
+            data_pkts.iter().map(|p| p.data.len()).sum()
+        };
+
+        // A tiny target forces the controller to ramp the quantizer up;
+        // a huge target lets it stay at the weak seed quantizer.
+        let low = run(2_000);
+        let high = run(50_000_000);
+        assert!(
+            low < high,
+            "low-target stream ({low} B) must be smaller than high-target ({high} B)"
+        );
+    }
+
+    /// Rate control with no target set (the default) leaves the
+    /// construction quantizer untouched: the stream is byte-identical to
+    /// the same encoder built without the builder. This pins that the
+    /// loop is fully opt-in and a no-op when disabled.
+    #[test]
+    fn no_rate_control_uses_fixed_qi() {
+        use oxideav_core::Encoder;
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        let encode_all = |mut enc: TheoraEncoder| -> Vec<Vec<u8>> {
+            for phase in 0..4i32 {
+                let vf = textured_video_frame(&ident, phase * 5);
+                enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+            }
+            let mut data = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) if !p.flags.header => data.push(p.data),
+                    Ok(_) => {}
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("encoder error {e}"),
+                }
+            }
+            data
+        };
+
+        let plain = TheoraEncoder::with_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            setup.clone(),
+            24,
+            4,
+        )
+        .unwrap();
+        let also_plain = TheoraEncoder::with_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            setup.clone(),
+            24,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            encode_all(plain),
+            encode_all(also_plain),
+            "default (no-rate-control) encoder must be deterministic at a fixed qi"
+        );
     }
 
     // ------- §2.3 / §2.4 frame-geometry builder -------

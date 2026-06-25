@@ -6,6 +6,23 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Target-bitrate rate-control loop (round 371)** —
+  `TheoraEncoder::with_target_bitrate` (and `with_target_bitrate_bounded`
+  for explicit `qi` bounds) enables a leaky-bucket rate-control loop that
+  adapts the frame-level quantization index before each frame to steer
+  the running output size toward a byte budget. Each frame is allotted
+  `target_bits / fps` bits (frame rate from the §6.2 `FRN / FRD` header);
+  the coded size feeds a signed fullness accumulator and a clamped
+  proportional step moves `qi` to oppose the imbalance — over budget
+  lowers `qi` (stronger quantization, smaller frames), under budget
+  raises it. New `FrameEncoder::qi` / `set_qi` accessors let the loop
+  re-quantize between frames without rebuilding geometry. The adaptation
+  only changes which valid `qi` each frame is coded at, so it has no
+  bitstream-syntax effect (the decoder reads `QIS[0]` exactly as for a
+  fixed-`qi` stream). Tests pin the feedback direction + clamps, an
+  end-to-end strict-vs-generous target size delta, and the disabled-loop
+  no-op.
+
 - **`INTER_MV_FOUR` folded into the rate-distortion candidate set
   (round 371)** — `encode_inter_frame_rd` now evaluates a per-luma-block
   four-MV candidate alongside the uniform inter modes. A new

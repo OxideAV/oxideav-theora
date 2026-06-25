@@ -174,6 +174,24 @@ packets are handled as duplicate-frame markers.
   gradient stays within the quantizer bound, and an I,P,P interval-3
   sequence reconstructs every frame within the quantizer bound.
 
+* **Target-bitrate rate control** — `TheoraEncoder::with_target_bitrate`
+  (and the `with_target_bitrate_bounded` variant for explicit `qi`
+  bounds) enables a leaky-bucket rate-control loop that adapts the
+  frame-level quantization index before each frame to steer the running
+  output size toward a byte budget. Each frame is allotted
+  `target_bits / fps` bits (the frame rate read from the §6.2 `FRN / FRD`
+  header); the actual coded size feeds a signed fullness accumulator, and
+  a proportional, clamped step moves `qi` to oppose the imbalance — a
+  stream running ahead of budget *lowers* `qi` (stronger quantization,
+  smaller frames; recall a lower `qi` is stronger in Theora), one running
+  behind *raises* it (better fidelity). The chosen `qi` lands in the
+  frame header `QIS[0]`, so the adaptation has **no bitstream-syntax
+  effect**: a downstream decoder reads each frame exactly as it would a
+  fixed-`qi` stream. The loop is fully opt-in (disabled by default, a
+  no-op), and over a multi-frame textured run a strict target produces a
+  measurably smaller stream than a generous one while every frame still
+  decodes valid through `TheoraDecoder`.
+
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation
 tables, weakest- and strongest-quantiser streams, a non-MB-aligned
@@ -209,17 +227,18 @@ chroma blocks that earlier diverged is now sample-exact.
 
 * **Ogg container parsing** — out of scope here; packets are supplied
   pre-de-framed by the caller.
-* **Rate control** — every §7.5.2 inter mode (`INTER_NOMV`, `INTER_MV`,
-  `INTER_MV_LAST`, `INTER_MV_LAST2`, `INTER_GOLDEN_NOMV`,
-  `INTER_GOLDEN_MV`, `INTER_MV_FOUR`) is reachable from the encoder, and
-  **all** of them — including `INTER_MV_FOUR` (a per-luma-block search,
-  chroma averaged) — are now chosen by the one joint rate-distortion
-  decision (`encode_inter_frame_rd`, the `TheoraEncoder` P-frame default
-  — see the inter-encoder bullet above). Still future work: a rate
-  control / target-bitrate loop (the frame quantizer is fixed at
-  construction). The setup header (§6.4 quantization parameters +
-  Huffman tables) is supplied by the caller via `TheoraEncoder::new` /
-  `extradata` rather than synthesized from scratch.
+* **Encoder mode coverage is complete** — every §7.5.2 inter mode
+  (`INTER_NOMV`, `INTER_MV`, `INTER_MV_LAST`, `INTER_MV_LAST2`,
+  `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`, `INTER_MV_FOUR`) is reachable
+  from the encoder, and **all** of them — including `INTER_MV_FOUR` (a
+  per-luma-block search, chroma averaged) — are chosen by the one joint
+  rate-distortion decision (`encode_inter_frame_rd`, the `TheoraEncoder`
+  P-frame default — see the inter-encoder bullet above). A
+  **target-bitrate rate-control loop** is now wired in too (see the
+  rate-control bullet above). The setup header (§6.4 quantization
+  parameters + Huffman tables) is supplied by the caller via
+  `TheoraEncoder::new` / `extradata` rather than synthesized from
+  scratch (the one remaining encoder simplification).
 * **Reference-captured golden / four-MV corpus fixture** — the
   golden-reference and four-MV inter modes are exercised
   top-to-bottom through this crate's own encoder→decoder round trip

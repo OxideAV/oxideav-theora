@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Changed
 
+- **Rate control is keyframe-aware (round 375)** — the target-bitrate
+  leaky-bucket loop no longer charges a large keyframe against a single
+  per-frame budget (which spiked the bucket and slammed the quantizer for
+  the P-frames after every GOP boundary). A keyframe now drains a weighted
+  budget (`keyframe_weight × bits_per_frame`) and the surplus is repaid in
+  equal shares across the GOP's inter frames, so the long-run average
+  target is preserved exactly while a keyframe's bulk no longer perturbs
+  the frames that follow it. `RateControl` learns the GOP length from the
+  encoder's keyframe interval; an all-keyframe stream (`interval = 1`)
+  leaves the bonus path inert (flat per-frame budget). No bitstream-syntax
+  change.
 - **RD mode decision folds the §7.5.2 LAST-mode rate discount (round
   375)** — the unified `D + λ·R` inter mode decision now tracks the
   running `LAST1` / `LAST2` motion-vector predictor and charges an

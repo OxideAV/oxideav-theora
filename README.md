@@ -197,10 +197,18 @@ zero-initialized reference store.
   behind *raises* it (better fidelity). The chosen `qi` lands in the
   frame header `QIS[0]`, so the adaptation has **no bitstream-syntax
   effect**: a downstream decoder reads each frame exactly as it would a
-  fixed-`qi` stream. The loop is fully opt-in (disabled by default, a
-  no-op), and over a multi-frame textured run a strict target produces a
-  measurably smaller stream than a generous one while every frame still
-  decodes valid through `TheoraDecoder`.
+  fixed-`qi` stream. The loop is **keyframe-aware**: because an intra frame
+  is typically several times larger than the inter frames around it,
+  charging it against a single per-frame budget would spike the bucket and
+  slam the quantizer at every GOP boundary; instead a keyframe drains a
+  weighted budget (`keyframe_weight × bits_per_frame`) and the surplus is
+  repaid in equal shares across the GOP's inter frames, so the long-run
+  average target is preserved exactly while a keyframe no longer perturbs
+  the frames after it (the controller learns the GOP length from the
+  encoder's keyframe interval). The loop is fully opt-in (disabled by
+  default, a no-op), and over a multi-frame textured run a strict target
+  produces a measurably smaller stream than a generous one while every
+  frame still decodes valid through `TheoraDecoder`.
 
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation

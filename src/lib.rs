@@ -13896,6 +13896,17 @@ pub struct TheoraEncoder {
 /// controller can never leave the valid `0..=63` range or violate
 /// caller-imposed quality bounds.
 ///
+/// Because a keyframe (intra frame) is typically several times larger than
+/// the inter frames around it, charging it against a single steady-state
+/// per-frame budget would spike the bucket on every GOP boundary and slam
+/// the quantizer for the frames immediately after — a periodic
+/// quality oscillation locked to the keyframe interval. The controller
+/// instead gives a keyframe a larger one-time budget (a complexity weight ×
+/// the per-frame budget) and repays that bonus gradually across the GOP's
+/// inter frames, so the long-run average budget still equals
+/// `target_bits / fps` while a keyframe's expected bulk no longer perturbs
+/// the following frames' quantizer.
+///
 /// The control law is an encoder tuning choice with no normative status:
 /// it only selects which valid `qi` each frame is coded at, and the
 /// resulting bitstream is exactly what the fixed-`qi` path would emit for
@@ -13920,13 +13931,39 @@ struct RateControl {
     /// The `qi` chosen for the next frame (seeded from the construction
     /// `qi`, then updated each frame from `fullness_bits`).
     next_qi: u8,
+    /// Number of inter frames over which a keyframe's budget bonus is
+    /// repaid — the keyframe interval minus one (the keyframe itself).
+    /// Zero when every frame is a keyframe (no inter frames to amortize
+    /// across), which disables the keyframe-bonus path.
+    inter_frames_per_gop: u32,
+    /// Per-frame share of a keyframe's outstanding budget bonus still to
+    /// be repaid. Each inter frame's budget is reduced by this amount
+    /// (draining the bonus) until the next keyframe re-arms it. The bonus
+    /// is `(keyframe_weight − 1) × bits_per_frame`, spread over
+    /// `inter_frames_per_gop` frames.
+    bonus_repay_per_inter: f64,
+    /// The keyframe budget multiplier: a keyframe is allotted
+    /// `keyframe_weight × bits_per_frame` bits before it perturbs the
+    /// bucket. `1.0` reproduces the flat per-frame budget.
+    keyframe_weight: f64,
 }
 
 impl RateControl {
+    /// The keyframe budget multiplier. A keyframe is allotted this many
+    /// times the steady-state per-frame budget before it perturbs the
+    /// bucket; the surplus is repaid over the GOP's inter frames. The value
+    /// is a gentle tuning constant with no normative status.
+    const KEYFRAME_WEIGHT: f64 = 3.0;
+
     /// Build a rate-control loop targeting `target_bits_per_second` at a
     /// frame rate of `frn / frd` fps, seeded at `initial_qi` and clamped
     /// to `[qi_min, qi_max]`. A zero or degenerate frame rate falls back
     /// to a nominal 30 fps so the per-frame budget is always finite.
+    ///
+    /// `keyframe_interval` is the GOP length (`-g`): a keyframe followed by
+    /// `keyframe_interval − 1` inter frames. It sizes the keyframe budget
+    /// bonus and how it is amortized — a value of `1` (all-keyframe) leaves
+    /// the bonus path inert (every frame uses the flat per-frame budget).
     fn new(
         target_bits_per_second: u64,
         frn: u32,
@@ -13934,6 +13971,7 @@ impl RateControl {
         initial_qi: u8,
         qi_min: u8,
         qi_max: u8,
+        keyframe_interval: u32,
     ) -> Self {
         let fps = if frn == 0 || frd == 0 {
             30.0
@@ -13943,12 +13981,24 @@ impl RateControl {
         let bits_per_frame = (target_bits_per_second as f64 / fps).max(1.0);
         let lo = qi_min.min(63);
         let hi = qi_max.min(63).max(lo);
+        // Inter frames available to amortize a keyframe's budget bonus.
+        // When the GOP is a single keyframe there are none, so the bonus
+        // path stays inert (keyframe_weight collapses to the flat budget).
+        let inter_frames_per_gop = keyframe_interval.saturating_sub(1);
+        let keyframe_weight = if inter_frames_per_gop == 0 {
+            1.0
+        } else {
+            Self::KEYFRAME_WEIGHT
+        };
         Self {
             bits_per_frame,
             fullness_bits: 0.0,
             qi_min: lo,
             qi_max: hi,
             next_qi: initial_qi.clamp(lo, hi),
+            inter_frames_per_gop,
+            bonus_repay_per_inter: 0.0,
+            keyframe_weight,
         }
     }
 
@@ -13960,20 +14010,45 @@ impl RateControl {
     /// Fold the just-coded frame's byte size into the bucket and recompute
     /// the quantizer for the following frame.
     ///
-    /// The bucket drains one `bits_per_frame` budget per frame and fills
-    /// by the actual coded bits; its post-frame fullness, expressed in
-    /// units of per-frame budgets, drives a proportional step on `qi`.
-    /// The mapping is deliberately gentle (one qi step per budget of
-    /// imbalance) and clamped, so a single large keyframe nudges rather
-    /// than slams the quantizer.
+    /// The bucket fills by the actual coded bits and drains a per-frame
+    /// budget; its post-frame fullness, in units of per-frame budgets,
+    /// drives a gentle clamped proportional step on `qi` (one step per
+    /// budget of imbalance), so a transient overshoot nudges rather than
+    /// slams the quantizer.
+    ///
+    /// `was_keyframe` makes the drain keyframe-aware. A keyframe drains a
+    /// larger budget (`keyframe_weight × bits_per_frame`) so its expected
+    /// bulk does not spike the bucket; the surplus
+    /// `(keyframe_weight − 1) × bits_per_frame` is then repaid in equal
+    /// shares over the GOP's inter frames (each inter frame drains
+    /// `bits_per_frame` *minus* its repay share). Over a full GOP the
+    /// total drained is exactly `keyframe_interval × bits_per_frame`, so
+    /// the long-run average target is preserved while the keyframe no
+    /// longer perturbs the frames after it.
     ///
     /// Because a lower `qi` is stronger quantization, the step *opposes*
-    /// the imbalance sign: over budget (`budgets_over > 0`) subtracts from
-    /// `qi` (compress harder), under budget adds to it.
-    fn observe_frame(&mut self, coded_bytes: usize) {
+    /// the imbalance sign: over budget subtracts from `qi` (compress
+    /// harder), under budget adds to it.
+    fn observe_frame(&mut self, coded_bytes: usize, was_keyframe: bool) {
         let coded_bits = (coded_bytes as f64) * 8.0;
-        // Leaky bucket: add what we spent, drain the steady-state budget.
-        self.fullness_bits += coded_bits - self.bits_per_frame;
+
+        // Budget drained by this frame. A keyframe is allotted the weighted
+        // budget and arms the repayment schedule; an inter frame drains the
+        // steady-state budget less its share of any outstanding bonus.
+        let drained = if was_keyframe {
+            let bonus = (self.keyframe_weight - 1.0) * self.bits_per_frame;
+            self.bonus_repay_per_inter = if self.inter_frames_per_gop > 0 {
+                bonus / self.inter_frames_per_gop as f64
+            } else {
+                0.0
+            };
+            self.bits_per_frame + bonus
+        } else {
+            self.bits_per_frame - self.bonus_repay_per_inter
+        };
+
+        // Leaky bucket: add what we spent, drain this frame's budget.
+        self.fullness_bits += coded_bits - drained;
 
         // Proportional control: how many whole per-frame budgets are we
         // over (or under)? Each budget of imbalance shifts qi by one step
@@ -14154,6 +14229,7 @@ impl TheoraEncoder {
             self.frame_encoder.qi(),
             qi_min,
             qi_max,
+            self.keyframe_interval,
         ));
         self
     }
@@ -14215,9 +14291,12 @@ impl TheoraEncoder {
         mirror.decode_frame(&bytes)?;
 
         // Rate control: fold the just-coded frame's size into the bucket
-        // and recompute the quantizer for the next frame.
+        // and recompute the quantizer for the next frame. The keyframe flag
+        // makes the bucket drain a larger (weighted) budget for an intra
+        // frame so its bulk does not spike the quantizer for the P-frames
+        // that follow.
         if let Some(rc) = self.rate_control.as_mut() {
-            rc.observe_frame(bytes.len());
+            rc.observe_frame(bytes.len(), want_keyframe);
         }
 
         if want_keyframe {
@@ -29604,13 +29683,15 @@ mod tests {
     /// and the chosen `qi` never leaves `[qi_min, qi_max]`.
     #[test]
     fn rate_control_feedback_moves_qi_toward_budget() {
-        // 8000 bits/s at 10 fps → 800 bits = 100 bytes per frame.
-        let mut rc = RateControl::new(8000, 10, 1, 30, 0, 63);
+        // 8000 bits/s at 10 fps → 800 bits = 100 bytes per frame. An
+        // all-keyframe GOP (interval 1) keeps the keyframe-bonus path inert
+        // so every frame measures against the flat per-frame budget.
+        let mut rc = RateControl::new(8000, 10, 1, 30, 0, 63, 1);
         assert_eq!(rc.qi_for_next_frame(), 30, "seeded at the construction qi");
 
         // A big frame (far over the 100-byte budget) must lower qi
         // (stronger quantization to claw the overshoot back).
-        rc.observe_frame(900); // 7200 bits, 7100 over budget → −8 (clamped)
+        rc.observe_frame(900, false); // 7200 bits, 7100 over budget → −8 (clamped)
         let after_over = rc.qi_for_next_frame();
         assert!(
             after_over < 30,
@@ -29620,7 +29701,7 @@ mod tests {
         // Now a long run of tiny frames drains the bucket below zero and
         // pushes qi back up past where the overshoot left it.
         for _ in 0..40 {
-            rc.observe_frame(1);
+            rc.observe_frame(1, false);
         }
         let after_under = rc.qi_for_next_frame();
         assert!(
@@ -29630,17 +29711,83 @@ mod tests {
 
         // Bounds are honoured: a runaway overshoot saturates at qi_min
         // (strongest quantization the controller may pick).
-        let mut capped = RateControl::new(800, 10, 1, 20, 10, 25);
+        let mut capped = RateControl::new(800, 10, 1, 20, 10, 25, 1);
         for _ in 0..50 {
-            capped.observe_frame(100_000);
+            capped.observe_frame(100_000, false);
         }
         assert_eq!(capped.qi_for_next_frame(), 10, "qi clamps at qi_min");
         // A runaway undershoot saturates at qi_max.
-        let mut floored = RateControl::new(8_000_000, 10, 1, 20, 10, 25);
+        let mut floored = RateControl::new(8_000_000, 10, 1, 20, 10, 25, 1);
         for _ in 0..50 {
-            floored.observe_frame(1);
+            floored.observe_frame(1, false);
         }
         assert_eq!(floored.qi_for_next_frame(), 25, "qi clamps at qi_max");
+    }
+
+    /// MILESTONE: keyframe-aware budgeting. Charging a large keyframe
+    /// against a single per-frame budget would spike the bucket and slam
+    /// the quantizer for the inter frames after it. With a GOP-length
+    /// keyframe weight the keyframe drains a larger budget and the surplus
+    /// is repaid across the GOP's inter frames, so:
+    ///
+    /// * a keyframe followed by typically-sized inter frames perturbs the
+    ///   next quantizer **less** than the flat-budget controller would, and
+    /// * the long-run average target is preserved — over a full GOP the
+    ///   keyframe-aware bucket reaches the **same** fullness as the
+    ///   flat-budget bucket fed the identical frame sizes (the bonus is
+    ///   fully repaid, nothing leaks).
+    #[test]
+    fn rate_control_keyframe_budget_amortizes_over_gop() {
+        // 80_000 bits/s at 10 fps → 8000 bits = 1000 bytes per frame.
+        // GOP of 10 (one keyframe + 9 inter frames).
+        let bps = 80_000u64;
+        let gop = 10u32;
+        // A keyframe roughly the weighted budget, inter frames at budget.
+        let key_bytes = 3000usize; // ~ keyframe_weight × 1000
+        let inter_bytes = 1000usize; // ~ per-frame budget
+
+        // Keyframe-aware controller.
+        let mut aware = RateControl::new(bps, 10, 1, 30, 0, 63, gop);
+        aware.observe_frame(key_bytes, true);
+        let aware_after_key = aware.qi_for_next_frame();
+
+        // Flat-budget controller (interval 1 disables the bonus path),
+        // fed the same keyframe size as a plain frame.
+        let mut flat = RateControl::new(bps, 10, 1, 30, 0, 63, 1);
+        flat.observe_frame(key_bytes, false);
+        let flat_after_key = flat.qi_for_next_frame();
+
+        // The keyframe spends well over a flat per-frame budget, so the
+        // flat controller drops qi hard; the keyframe-aware one absorbs the
+        // bulk into the weighted budget and barely moves.
+        assert!(
+            aware_after_key >= flat_after_key,
+            "keyframe-aware qi {aware_after_key} must not drop below flat {flat_after_key}"
+        );
+        assert!(
+            aware_after_key >= 29,
+            "keyframe-aware qi {aware_after_key} should barely move off the seed (30)"
+        );
+
+        // Budget preservation: feed both controllers an identical GOP
+        // (keyframe + (gop−1) inter frames) and compare bucket fullness.
+        // Both must end at the same place — the keyframe bonus is fully
+        // repaid over the inter frames, so nothing leaks.
+        let mut a = RateControl::new(bps, 10, 1, 30, 0, 63, gop);
+        let mut f = RateControl::new(bps, 10, 1, 30, 0, 63, 1);
+        a.observe_frame(key_bytes, true);
+        f.observe_frame(key_bytes, false);
+        for _ in 0..(gop - 1) {
+            a.observe_frame(inter_bytes, false);
+            f.observe_frame(inter_bytes, false);
+        }
+        assert!(
+            (a.fullness_bits - f.fullness_bits).abs() < 1e-6,
+            "over a full GOP the keyframe-aware bucket ({}) must equal the \
+             flat bucket ({}) — bonus fully repaid",
+            a.fullness_bits,
+            f.fullness_bits
+        );
     }
 
     /// MILESTONE: an end-to-end target-bitrate loop. A strict (low)

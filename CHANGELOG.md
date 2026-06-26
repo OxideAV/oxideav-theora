@@ -4,6 +4,20 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **RD mode decision folds the §7.5.2 LAST-mode rate discount (round
+  375)** — the unified `D + λ·R` inter mode decision now tracks the
+  running `LAST1` / `LAST2` motion-vector predictor and charges an
+  `INTER_MV` candidate zero explicit-MV bits when its vector matches the
+  predictor (it will recode to a no-MV-bit `INTER_MV_LAST` /
+  `INTER_MV_LAST2`), instead of a flat 12-bit charge for every explicit
+  vector. A vector the predictor already supplies for free is no longer
+  over-penalised, so on global / repeated motion the RD decision codes
+  `INTER_MV` widely and the recode pass collapses the repeats to LAST
+  modes. No bitstream-syntax change; the chosen modes emit identical §7
+  bytes.
+
 ### Added
 
 - **Golden-aware and four-MV P-frame strategies on the high-level encoder

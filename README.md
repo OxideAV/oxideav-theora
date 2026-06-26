@@ -119,7 +119,12 @@ zero-initialized reference store.
   quantizer-derived multiplier λ (`inter_rd_lambda`, monotone in `qi`).
   This subsumes the raw-SAD previous-vs-golden choice into one decision
   on reconstructed distortion; `INTER_MV` winners still flow through the
-  §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode. **`INTER_MV_FOUR` is
+  §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode. The RD rate term is
+  **predictor-aware**: the decision tracks the running `LAST1` / `LAST2`
+  motion-vector predictor and charges an `INTER_MV` candidate zero
+  explicit-MV bits when its vector matches the predictor (it will recode
+  to a no-MV-bit LAST mode), so a vector the predictor already supplies
+  for free is not over-penalised against `INTER_NOMV`. **`INTER_MV_FOUR` is
   part of the same candidate set**: each macro block also evaluates a
   per-luma-block search (four independent vectors, chroma averaged) by its
   true `D + λ·R` cost and codes four-MV when it beats every uniform mode —

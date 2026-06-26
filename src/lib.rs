@@ -12371,6 +12371,19 @@ impl FrameEncoder {
                 // low bitrates. The exact constant is an encoder tuning
                 // choice, not a normative quantity.
                 let lambda = self.inter_rd_lambda();
+                // Running §7.5.2 LAST1 / LAST2 motion-vector predictor
+                // state, advanced exactly as the post-decision recode pass
+                // (and the decoder) advance it. An `INTER_MV` candidate
+                // whose vector already equals `last1` or `last2` will be
+                // recoded as `INTER_MV_LAST` / `INTER_MV_LAST2` (no
+                // explicit MV bits), so the RD rate term must charge it
+                // zero MV bits here too — otherwise the decision would
+                // over-penalise a vector the predictor already supplies for
+                // free. Predicting the discount inside the loop lets a
+                // predictor-matching `INTER_MV` win where a flat 12-bit MV
+                // charge would have lost to `INTER_NOMV`.
+                let mut last1 = MotionVector::ZERO;
+                let mut last2 = MotionVector::ZERO;
                 for mbi in 0..nmbs {
                     let (prev_mv, _) =
                         self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Previous);
@@ -12403,8 +12416,19 @@ impl FrameEncoder {
                         {
                             continue;
                         }
-                        let cost =
-                            self.mb_uniform_mode_cost(frame, refs, &qmats, mbi, mode, mv, lambda)?;
+                        // MV-bit charge: an `INTER_MV` whose vector matches
+                        // the running predictor recodes to a LAST mode and
+                        // spends no MV bits; the GOLDEN explicit mode is
+                        // never in the LAST history so always pays full
+                        // bits; zero-MV / NOMV modes pay nothing.
+                        let mv_bits = match mode {
+                            MacroBlockMode::InterMv if mv == last1 || mv == last2 => 0,
+                            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv => 12,
+                            _ => 0,
+                        };
+                        let cost = self.mb_uniform_mode_cost(
+                            frame, refs, &qmats, mbi, mode, mv, lambda, mv_bits,
+                        )?;
                         // Strict improvement keeps the earlier (cheaper-
                         // header) candidate on ties, biasing toward
                         // INTER_NOMV / previous-reference modes.
@@ -12427,14 +12451,47 @@ impl FrameEncoder {
                     // the uniform winner.
                     let (four_cost, four_luma) =
                         self.mb_four_mv_cost(frame, refs, &qmats, mbi, lambda)?;
+                    let chosen_mode;
                     if four_cost < best_cost {
+                        chosen_mode = MacroBlockMode::InterMvFour;
                         mbmodes[mbi] = MacroBlockMode::InterMvFour;
                         four_mv_luma[mbi] = Some(four_luma);
                         // `mb_mv` is unused for four-MV blocks; leave it
                         // at the zero default.
                     } else {
+                        chosen_mode = best_mode;
                         mbmodes[mbi] = best_mode;
                         mb_mv[mbi] = best_mv;
+                    }
+
+                    // Advance the LAST1 / LAST2 predictor mirroring the
+                    // recode pass. Only previous-reference explicit-MV
+                    // modes update it: an `INTER_MV` that matches the
+                    // predictor recodes to a LAST mode (LAST1 unchanged for
+                    // LAST1, LAST1/LAST2 swap for LAST2), a non-matching
+                    // `INTER_MV` shifts (LAST2 = LAST1, LAST1 = mv), and
+                    // `INTER_MV_FOUR` shifts in its last coded luma vector
+                    // (here approximated by the macro block's searched
+                    // previous vector — the four searched vectors only
+                    // differ when four-MV wins, and the recode pass applies
+                    // the exact rule against the real coded table). NOMV /
+                    // GOLDEN modes leave the predictor untouched.
+                    match chosen_mode {
+                        MacroBlockMode::InterMv => {
+                            if best_mv == last1 {
+                                // INTER_MV_LAST: no update.
+                            } else if best_mv == last2 {
+                                std::mem::swap(&mut last1, &mut last2);
+                            } else {
+                                last2 = last1;
+                                last1 = best_mv;
+                            }
+                        }
+                        MacroBlockMode::InterMvFour => {
+                            last2 = last1;
+                            last1 = prev_mv;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -12944,6 +13001,7 @@ impl FrameEncoder {
         mode: MacroBlockMode,
         mv: MotionVector,
         lambda: u64,
+        mv_bits: u32,
     ) -> Result<u64, Error> {
         let g = &self.geometry;
         let force_coded = !matches!(mode, MacroBlockMode::InterNoMv);
@@ -12972,15 +13030,13 @@ impl FrameEncoder {
         }
 
         // Header rate: the §7.4 mode code (~3 bits in the encoder's
-        // MSCHEME = 7 direct scheme) plus the §7.5 explicit-MV bits when
-        // the mode transmits a vector (MVMODE = 1: 6 bits per component).
-        rate += 3;
-        if matches!(
-            mode,
-            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv
-        ) {
-            rate += 12;
-        }
+        // MSCHEME = 7 direct scheme) plus the caller-supplied §7.5
+        // explicit-MV bit charge. The caller predicts whether an
+        // `INTER_MV` candidate will recode to a zero-MV-bit
+        // `INTER_MV_LAST` / `INTER_MV_LAST2` mode (matching the running
+        // §7.5.2 predictor) and passes `0`, or the full 12 bits
+        // (MVMODE = 1: 6 bits per component) otherwise.
+        rate += 3 + mv_bits;
 
         Ok(distortion + lambda.saturating_mul(rate as u64))
     }
@@ -32082,6 +32138,94 @@ mod tests {
         assert!(
             plane_max_err(&f1.frame.samples_y, &source.samples_y) <= 40,
             "RD four-MV inter luma max error {} exceeds tolerance",
+            plane_max_err(&f1.frame.samples_y, &source.samples_y)
+        );
+    }
+
+    /// MILESTONE: the unified RD decision folds the §7.5.2 `INTER_MV_LAST`
+    /// predicted-rate discount into its mode choice. On a frame translated
+    /// by one global whole-pixel vector, every macro block's best
+    /// previous-reference vector is identical. The first `INTER_MV` macro
+    /// block seeds `LAST1`; every later macro block whose chosen vector
+    /// equals `LAST1` recodes to `INTER_MV_LAST`, which spends **no**
+    /// explicit MV bits. Because the RD rate term now charges those
+    /// macro blocks zero MV bits (instead of a flat 12), an `INTER_MV`
+    /// that the predictor already supplies for free is no longer
+    /// over-penalised — so the RD decision codes `INTER_MV` widely and the
+    /// recode pass turns the repeats into `INTER_MV_LAST`. The full
+    /// round trip reconstructs the translated source within the quantizer
+    /// bound, and at least one `INTER_MV_LAST` macro block proves the
+    /// discount drove a predictor-matching vector to win.
+    #[test]
+    fn encode_inter_frame_rd_global_motion_uses_last_mode_discount() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        let w_y = g.dims_y.width as i32;
+        let h_y = g.dims_y.height as i32;
+        // Textured luma so a single global shift is the unique SAD minimum
+        // for every macro block.
+        let mut samples_y = vec![0u8; len_y];
+        for y in 0..h_y {
+            for x in 0..w_y {
+                samples_y[(y * w_y + x) as usize] = (16 + ((x * 7 + y * 11).rem_euclid(200))) as u8;
+            }
+        }
+        let frame0 = SourceFrame {
+            samples_y,
+            samples_cb: vec![128u8; len_c],
+            samples_cr: vec![128u8; len_c],
+        };
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        let prev = dec.decode_frame(&key).unwrap().frame.clone();
+
+        // Translate the whole decoded reference by one global vector so
+        // every macro block shares the same best previous-reference MV.
+        let (ox, oy) = (1i32, 0i32);
+        let mut src_y = prev.samples_y.clone();
+        for ty in 0..h_y {
+            for tx in 0..w_y {
+                let sx = (tx - ox).clamp(0, w_y - 1);
+                let sy = (ty - oy).clamp(0, h_y - 1);
+                src_y[(ty * w_y + tx) as usize] = prev.samples_y[(sy * w_y + sx) as usize];
+            }
+        }
+        let source = SourceFrame {
+            samples_y: src_y,
+            samples_cb: prev.samples_cb.clone(),
+            samples_cr: prev.samples_cr.clone(),
+        };
+
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd(&source, &refs).unwrap()
+        };
+
+        let modes = decode_packet_mbmodes(&enc, false, &pkt);
+        let last_count = modes
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    MacroBlockMode::InterMvLast | MacroBlockMode::InterMvLast2
+                )
+            })
+            .count();
+        assert!(
+            last_count >= 1,
+            "global-motion RD must recode repeated vectors to a LAST mode \
+             (got modes {modes:?})"
+        );
+
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert!(
+            plane_max_err(&f1.frame.samples_y, &source.samples_y) <= 40,
+            "RD global-motion inter luma max error {} exceeds tolerance",
             plane_max_err(&f1.frame.samples_y, &source.samples_y)
         );
     }

@@ -13880,6 +13880,15 @@ pub struct TheoraEncoder {
     /// running output size toward the target; when `None`, the fixed
     /// construction-time `qi` is used for every frame.
     rate_control: Option<RateControl>,
+    /// Optional scene-cut threshold (mean absolute luma difference, in
+    /// 0..=255 sample units, between the incoming source and the previous
+    /// reconstructed reference). When `Some(t)`, a frame whose mean
+    /// absolute difference exceeds `t` is coded as a fresh keyframe even
+    /// mid-GOP — a scene change makes inter prediction worthless, so an
+    /// intra frame is both smaller and resets the reference cleanly.
+    /// `None` disables scene-cut detection (keyframes are purely
+    /// interval-driven).
+    scene_cut_threshold: Option<f64>,
 }
 
 /// A target-bitrate rate-control loop that adapts the frame-level
@@ -14182,6 +14191,7 @@ impl TheoraEncoder {
             setup,
             inter_mode: InterModeStrategy::default(),
             rate_control: None,
+            scene_cut_threshold: None,
         })
     }
 
@@ -14190,6 +14200,30 @@ impl TheoraEncoder {
     /// default is [`InterModeStrategy::RateDistortion`].
     pub fn with_inter_mode(mut self, inter_mode: InterModeStrategy) -> Self {
         self.inter_mode = inter_mode;
+        self
+    }
+
+    /// Enable scene-cut keyframe insertion. Returns `self` for builder
+    /// chaining.
+    ///
+    /// Before coding a non-boundary frame as an inter (P) frame, the
+    /// encoder measures the mean absolute luma difference (in 0..=255
+    /// sample units) between the incoming source and the previous
+    /// reconstructed reference. When that difference exceeds `threshold`
+    /// the frame is coded as a fresh keyframe instead — a scene change
+    /// makes inter prediction worthless (the residual would be nearly as
+    /// large as a fresh intra frame anyway), so an intra frame is both
+    /// smaller and resets the golden / previous references cleanly. The
+    /// keyframe-interval counter restarts from the inserted keyframe, so
+    /// the next forced keyframe is a full interval later.
+    ///
+    /// A typical threshold is in the 20–40 range (a fifth of the dynamic
+    /// range); lower thresholds insert keyframes more eagerly. Scene-cut
+    /// detection is disabled by default — without this builder keyframes
+    /// are purely interval-driven. The decision only changes which frames
+    /// are intra vs inter; both paths emit conformant §7 bitstreams.
+    pub fn with_scene_cut_threshold(mut self, threshold: f64) -> Self {
+        self.scene_cut_threshold = Some(threshold);
         self
     }
 
@@ -14246,8 +14280,35 @@ impl TheoraEncoder {
     fn push_source_frame(&mut self, frame: &SourceFrame, pts: Option<i64>) -> Result<(), Error> {
         // Decide intra vs inter: the very first frame, and every frame
         // at a keyframe boundary, is intra.
-        let want_keyframe =
+        let mut want_keyframe =
             self.mirror.is_none() || self.frames_since_keyframe >= self.keyframe_interval;
+
+        // Scene-cut detection: when enabled and this frame would otherwise
+        // be an inter frame, compare the incoming source luma against the
+        // previous reconstructed reference. A mean absolute difference past
+        // the threshold signals a scene change — inter prediction against
+        // an unrelated reference would code a residual nearly as large as a
+        // fresh keyframe, so force a keyframe instead (smaller, and it
+        // resets the references cleanly).
+        if !want_keyframe {
+            if let (Some(threshold), Some(mirror)) =
+                (self.scene_cut_threshold, self.mirror.as_ref())
+            {
+                let prev_y = &mirror.reference_store().previous_y;
+                if prev_y.len() == frame.samples_y.len() && !prev_y.is_empty() {
+                    let total: u64 = frame
+                        .samples_y
+                        .iter()
+                        .zip(prev_y.iter())
+                        .map(|(&s, &p)| (s as i16 - p as i16).unsigned_abs() as u64)
+                        .sum();
+                    let mad = total as f64 / frame.samples_y.len() as f64;
+                    if mad > threshold {
+                        want_keyframe = true;
+                    }
+                }
+            }
+        }
 
         // Rate control: pick this frame's quantizer from the running
         // bucket fullness before encoding. The chosen `qi` lands in the
@@ -29631,6 +29692,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// MILESTONE: scene-cut keyframe insertion. With a large keyframe
+    /// interval every frame after the first would normally be inter; with
+    /// `with_scene_cut_threshold` a frame whose mean absolute luma
+    /// difference against the previous reconstruction exceeds the
+    /// threshold is coded as a fresh keyframe mid-GOP. A run of flat
+    /// frames at one level followed by a sudden jump to a very different
+    /// level triggers the cut: the jump frame is flagged a keyframe, the
+    /// keyframe counter resets, and the whole sequence still round-trips
+    /// through `TheoraDecoder`. The same sequence with detection disabled
+    /// emits exactly one keyframe (the first frame).
+    #[test]
+    fn encoder_scene_cut_inserts_keyframe_on_large_change() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        // Frame luma levels: a flat run, then a large jump (scene cut),
+        // then steady again. The jump's MAD against the previous
+        // reconstruction is ~120, well past the threshold; the steady
+        // frames' MAD is ~0.
+        let levels = [40u8, 40, 40, 160, 160, 160];
+
+        let run = |scene_cut: Option<f64>| -> Vec<bool> {
+            // Interval 100 so no interval-driven keyframe fires within the
+            // six-frame run — every keyframe past the first is scene-cut.
+            let mut enc = TheoraEncoder::with_keyframe_interval(
+                codec_id.clone(),
+                ident.clone(),
+                setup.clone(),
+                32,
+                100,
+            )
+            .unwrap();
+            if let Some(t) = scene_cut {
+                enc = enc.with_scene_cut_threshold(t);
+            }
+            for &v in &levels {
+                let mut vf = flat_video_frame(&ident, v, 128, 128, 0);
+                vf.pts = None;
+                enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+            }
+            let mut header_pkts: Vec<oxideav_core::Packet> = Vec::new();
+            let mut keyframe_flags: Vec<bool> = Vec::new();
+            let mut data_pkts: Vec<oxideav_core::Packet> = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => {
+                        if p.flags.header {
+                            header_pkts.push(p);
+                        } else {
+                            keyframe_flags.push(p.flags.keyframe);
+                            data_pkts.push(p);
+                        }
+                    }
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("encoder error {e}"),
+                }
+            }
+            // Every emitted stream must round-trip through the decoder.
+            let mut dec = TheoraDecoder::new(codec_id.clone());
+            for p in &header_pkts {
+                dec.send_packet(p).unwrap();
+            }
+            for p in &data_pkts {
+                dec.send_packet(p).unwrap();
+                let oxideav_core::Frame::Video(_) = dec.receive_frame().unwrap() else {
+                    panic!("expected video frame");
+                };
+            }
+            keyframe_flags
+        };
+
+        // Detection off: only the first frame is a keyframe.
+        let off = run(None);
+        assert_eq!(off.len(), 6);
+        assert!(off[0], "frame 0 is always a keyframe");
+        assert_eq!(
+            off.iter().filter(|&&k| k).count(),
+            1,
+            "without scene-cut detection only the first frame is intra (got {off:?})"
+        );
+
+        // Detection on (threshold 30): the scene cut at frame 3 forces a
+        // second keyframe.
+        let on = run(Some(30.0));
+        assert_eq!(on.len(), 6);
+        assert!(on[0], "frame 0 is always a keyframe");
+        assert!(
+            on[3],
+            "the large jump at frame 3 must be coded as a scene-cut keyframe (got {on:?})"
+        );
+        assert!(
+            !on[1] && !on[2] && !on[4] && !on[5],
+            "steady frames must stay inter (got {on:?})"
+        );
     }
 
     // ------- target-bitrate rate control (round 371) -------

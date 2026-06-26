@@ -31,6 +31,16 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Scene-cut keyframe insertion (round 375)** —
+  `TheoraEncoder::with_scene_cut_threshold` enables an opt-in detector:
+  before coding a non-boundary frame as inter, the encoder measures the
+  mean absolute luma difference between the incoming source and the
+  previous reconstructed reference, and when it exceeds the threshold
+  codes a fresh keyframe mid-GOP instead (resetting the keyframe-interval
+  counter). A scene change makes inter prediction worthless, so an intra
+  frame is both smaller and resets the references cleanly. Disabled by
+  default (keyframes stay interval-driven); the decision only changes
+  which frames are intra vs inter, both emitting conformant §7 streams.
 - **Golden-aware and four-MV P-frame strategies on the high-level encoder
   (round 375)** — `InterModeStrategy` gains `GoldenMotion` and `FourMv`
   variants alongside `RateDistortion` (default) and `PreviousMotion`.

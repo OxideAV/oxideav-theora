@@ -174,7 +174,13 @@ zero-initialized reference store.
   `TheoraEncoder::with_keyframe_interval`, default 1) decides intra vs
   inter: interval-boundary frames are intra keyframes, the frames
   between are inter (P) frames predicted from the reconstructed previous
-  reference. The encoder mirrors its own output through an internal
+  reference. Optional **scene-cut detection**
+  (`with_scene_cut_threshold`) inserts a fresh keyframe mid-GOP when the
+  mean absolute luma difference between the incoming source and the
+  previous reconstruction exceeds the threshold — a scene change makes
+  inter prediction worthless, so an intra frame is both smaller and
+  resets the references; the keyframe-interval counter restarts from the
+  inserted keyframe. The encoder mirrors its own output through an internal
   `FrameDecoder` so the reference it predicts from is byte-identical to
   the downstream decoder's. `output_params` carries the coded
   dimensions, the mapped pixel format, and a length-prefixed extradata

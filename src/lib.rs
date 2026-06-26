@@ -11830,8 +11830,11 @@ pub struct SourceFrame {
 ///    vectors, and `NQIS = 1`), exactly matching the decoder's
 ///    no-bit-read intra short-circuits.
 ///
-/// Only intra (keyframe) encoding is implemented; inter prediction,
-/// motion estimation, and rate control are future work.
+/// [`FrameEncoder`] also encodes inter (P) frames: the
+/// [`FrameEncoder::encode_inter_frame_rd`] family runs per-macro-block
+/// motion estimation and a unified `D + λ·R` mode decision over the
+/// previous / golden / four-MV inter modes. Target-bitrate rate control
+/// is provided one layer up by [`TheoraEncoder`].
 #[derive(Debug)]
 pub struct FrameEncoder {
     ident: TheoraIdentHeader,
@@ -13840,9 +13843,10 @@ fn top_down_plane_to_lower_left(
 /// reference it predicts from is byte-identical to the one a downstream
 /// decoder reconstructs. P-frames default to the unified
 /// rate-distortion mode decision ([`FrameEncoder::encode_inter_frame_rd`],
-/// selectable via [`TheoraEncoder::with_inter_mode`]); a target-bitrate
-/// rate-control loop remains future work, and the frame-level quantizer
-/// is fixed at construction.
+/// selectable via [`TheoraEncoder::with_inter_mode`]). The frame-level
+/// quantizer is fixed at construction unless an opt-in target-bitrate
+/// rate-control loop ([`TheoraEncoder::with_target_bitrate`]) adapts it
+/// per frame.
 pub struct TheoraEncoder {
     codec_id: oxideav_core::CodecId,
     output_params: Box<oxideav_core::CodecParameters>,

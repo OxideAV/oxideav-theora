@@ -133,9 +133,11 @@ zero-initialized reference store.
   (SSD 50264, 252 B) — a measured strict win on both distortion and
   rate. The mode decision has **no bitstream-syntax effect**: every
   chosen mode emits the same §7 bytes the existing writers produce.
-  `TheoraEncoder` drives its P-frames through this RD path by default
-  (selectable via `InterModeStrategy` / `with_inter_mode`). A
-  target-bitrate rate-control loop remains future work.
+  `TheoraEncoder` drives its P-frames through this RD path by default;
+  `with_inter_mode` selects an alternative `InterModeStrategy` —
+  `PreviousMotion` (previous-reference SAD), `GoldenMotion` (previous-vs-
+  golden raw-SAD), or `FourMv` (per-luma-block four-MV search) — each
+  reachable end-to-end through the framework `Encoder` trait.
 
 * **Framework `Decoder` integration** — `TheoraDecoder` implements
   `oxideav_core::Decoder`, and `register` installs it into a

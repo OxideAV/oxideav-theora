@@ -4,6 +4,20 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Golden-aware and four-MV P-frame strategies on the high-level encoder
+  (round 375)** — `InterModeStrategy` gains `GoldenMotion` and `FourMv`
+  variants alongside `RateDistortion` (default) and `PreviousMotion`.
+  `GoldenMotion` searches both the previous and golden references per
+  macro block and codes the smaller-SAD reference (`INTER_GOLDEN_*` on a
+  golden win); `FourMv` searches an independent previous-reference vector
+  per luma block and emits `INTER_MV_FOUR` (with §7.5.2 chroma averaging)
+  when the four vectors disagree. Both were already reachable on
+  `FrameEncoder` but are now selectable end-to-end through
+  `TheoraEncoder::with_inter_mode` and the framework `Encoder` trait; the
+  inter-mode round-trip test exercises all four strategies.
+
 ### Fixed
 
 - **Reject a zero-byte first packet (round 371)** — a §7.11 step-2

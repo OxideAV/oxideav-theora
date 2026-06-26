@@ -13946,6 +13946,27 @@ pub enum InterModeStrategy {
     /// chosen on raw SAD. Retained for callers that want the historical
     /// behaviour.
     PreviousMotion,
+    /// The golden-aware SAD motion search
+    /// ([`FrameEncoder::encode_inter_frame_golden`]): each macro block
+    /// searches **both** the previous and golden references and codes the
+    /// reference frame predicting its four luma blocks with the strictly
+    /// smaller SAD — `INTER_NOMV` / `INTER_MV` for a previous win,
+    /// `INTER_GOLDEN_NOMV` / `INTER_GOLDEN_MV` for a golden win. Unlike
+    /// [`InterModeStrategy::RateDistortion`] the previous-vs-golden choice
+    /// is made on raw SAD rather than a joint Lagrangian cost, so it is
+    /// cheaper to compute but does not weigh the golden mode's guaranteed
+    /// header rate.
+    GoldenMotion,
+    /// The per-luma-block (four-MV) motion search
+    /// ([`FrameEncoder::encode_inter_frame_four_mv`]): each macro block
+    /// searches the previous reference for an independent vector per luma
+    /// block and codes `INTER_MV_FOUR` when the four winning vectors
+    /// disagree (otherwise it collapses to the cheaper uniform
+    /// `INTER_MV` / `INTER_NOMV`). Emits per-luma-block vectors with the
+    /// §7.5.2 chroma averaging without weighing four-MV's header cost
+    /// against the uniform modes the way
+    /// [`InterModeStrategy::RateDistortion`] does.
+    FourMv,
 }
 
 impl std::fmt::Debug for TheoraEncoder {
@@ -14116,6 +14137,12 @@ impl TheoraEncoder {
                 InterModeStrategy::PreviousMotion => {
                     self.frame_encoder.encode_inter_frame_motion(frame, &refs)?
                 }
+                InterModeStrategy::GoldenMotion => {
+                    self.frame_encoder.encode_inter_frame_golden(frame, &refs)?
+                }
+                InterModeStrategy::FourMv => self
+                    .frame_encoder
+                    .encode_inter_frame_four_mv(frame, &refs)?,
             }
         };
 
@@ -29388,7 +29415,9 @@ mod tests {
     /// the quantizer bound — the unified `D + λ·R` choice is wired into
     /// `TheoraEncoder` and produces a decoder-valid stream end-to-end.
     /// Also exercises the explicit `with_inter_mode` selector for the
-    /// historical previous-motion path so both strategies stay live.
+    /// historical previous-motion path plus the golden-aware SAD and
+    /// per-luma-block four-MV strategies so every public strategy stays
+    /// live through the framework `Encoder` trait.
     #[test]
     fn encoder_trait_rd_inter_mode_round_trips() {
         use oxideav_core::{Decoder, Encoder};
@@ -29399,6 +29428,8 @@ mod tests {
         for mode in [
             InterModeStrategy::RateDistortion,
             InterModeStrategy::PreviousMotion,
+            InterModeStrategy::GoldenMotion,
+            InterModeStrategy::FourMv,
         ] {
             let mut enc = TheoraEncoder::with_keyframe_interval(
                 codec_id.clone(),
@@ -31936,6 +31967,12 @@ mod tests {
                     }
                     InterModeStrategy::PreviousMotion => enc
                         .encode_inter_frame_motion(&source_back_to_a, &refs)
+                        .unwrap(),
+                    InterModeStrategy::GoldenMotion => enc
+                        .encode_inter_frame_golden(&source_back_to_a, &refs)
+                        .unwrap(),
+                    InterModeStrategy::FourMv => enc
+                        .encode_inter_frame_four_mv(&source_back_to_a, &refs)
                         .unwrap(),
                 }
             };

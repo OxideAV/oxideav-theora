@@ -14697,16 +14697,21 @@ impl oxideav_core::Encoder for TheoraEncoder {
 }
 
 /// `make_encoder` factory plugged into the registry. Builds a
-/// [`TheoraEncoder`] from the identification + setup headers carried in
-/// [`CodecParameters::extradata`] (the same length-prefixed header chain
-/// `make_decoder` consumes), at the frame-level quantization index from
-/// the `qi` codec option (default 32).
+/// [`TheoraEncoder`] from the identification (and optionally setup)
+/// header carried in [`CodecParameters::extradata`] (the same
+/// length-prefixed header chain `make_decoder` consumes), at the
+/// frame-level quantization index from the `qi` codec option (default
+/// 32).
 ///
-/// The setup header (§6.4 quantization parameters + Huffman tables)
-/// cannot be synthesized from the spec alone without reconstructing
-/// encoder-private tables, so the caller supplies a complete setup
-/// header via `extradata` — typically taken verbatim from a stream this
-/// crate (or any conformant Theora source) already produced.
+/// The §6.2 identification header is required — it carries the coded
+/// dimensions and pixel format, which cannot be defaulted. The §6.4
+/// setup header is **optional**: when the extradata omits it, the
+/// encoder synthesizes the VP3 default setup bundle
+/// ([`SetupHeaderTables::vp3_defaults`]) and emits it as a header packet,
+/// so a caller that knows only the stream geometry can still produce a
+/// complete, self-describing stream. When the extradata *does* carry a
+/// setup header it is used verbatim (e.g. to match an existing stream's
+/// codebooks).
 pub fn make_encoder(
     params: &oxideav_core::CodecParameters,
 ) -> oxideav_core::Result<Box<dyn oxideav_core::Encoder>> {
@@ -14747,11 +14752,9 @@ pub fn make_encoder(
             "oxideav-theora: encoder needs the §6.2 identification header in extradata",
         )
     })?;
-    let setup = setup.ok_or_else(|| {
-        oxideav_core::Error::invalid(
-            "oxideav-theora: encoder needs the §6.4 setup header in extradata",
-        )
-    })?;
+    // The setup header is optional: synthesize the VP3 default bundle when
+    // the caller supplies only the identification header.
+    let setup = setup.unwrap_or_else(SetupHeaderTables::vp3_defaults);
 
     // Frame-level quantization index from the `qi` option (default 32).
     let qi = params
@@ -29792,6 +29795,61 @@ mod tests {
         let params =
             oxideav_core::CodecParameters::video(oxideav_core::CodecId::new(THEORA_CODEC_ID));
         assert!(make_encoder(&params).is_err());
+    }
+
+    /// `make_encoder` given extradata with only the §6.2 identification
+    /// header (no §6.4 setup) synthesizes the VP3 default setup and emits
+    /// a complete, decodable stream — the registry path no longer needs a
+    /// caller-supplied setup header.
+    #[test]
+    fn make_encoder_synthesizes_setup_from_ident_only() {
+        use oxideav_core::Decoder;
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        // Extradata carrying *only* the ident header.
+        let ident_pkt = encode_identification_header(&ident).unwrap();
+        let extradata = pack_extradata(&[&ident_pkt]).unwrap();
+        let mut params = oxideav_core::CodecParameters::video(codec_id.clone());
+        params.extradata = extradata;
+        params.options.insert("qi".to_string(), "32".to_string());
+
+        let mut enc = make_encoder(&params).expect("ident-only extradata");
+        let vf = flat_video_frame(&ident, 128, 128, 128, 0);
+        enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+
+        let mut header_pkts: Vec<oxideav_core::Packet> = Vec::new();
+        let mut data_pkt = None;
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if p.flags.header {
+                        header_pkts.push(p);
+                    } else {
+                        data_pkt = Some(p);
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("unexpected encoder error: {e}"),
+            }
+        }
+        assert_eq!(header_pkts.len(), 3, "three §6 header packets emitted");
+        // The emitted setup header is the synthesized VP3 default bundle.
+        assert_eq!(
+            decode_setup_header(&header_pkts[2].data).unwrap(),
+            SetupHeaderTables::vp3_defaults()
+        );
+
+        let mut dec = TheoraDecoder::new(codec_id);
+        for h in &header_pkts {
+            dec.send_packet(h).unwrap();
+        }
+        dec.send_packet(&data_pkt.expect("one data packet"))
+            .unwrap();
+        let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!("expected a video frame");
+        };
+        assert!(out.planes[0].data.iter().all(|&b| b == 128), "luma flat");
     }
 
     /// A textured (gradient) frame survives the full trait round-trip to

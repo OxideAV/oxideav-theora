@@ -48,6 +48,12 @@ All notable changes to `oxideav-theora` are recorded here.
   lossless; a textured I,P,P sequence within the quantizer bound). This
   removes the encoder's last simplification — it no longer requires the
   caller to supply pre-decoded setup tables. No bitstream-syntax change.
+  The registry `make_encoder` factory follows suit: the §6.4 setup header
+  in `extradata` is now **optional** — given only the §6.2
+  identification header (which still carries the un-defaultable
+  dimensions / pixel format), the factory synthesizes the VP3 default
+  setup and emits a complete self-describing stream; a setup header in
+  `extradata`, when present, is still honoured verbatim.
 - **Scene-cut keyframe insertion (round 375)** —
   `TheoraEncoder::with_scene_cut_threshold` enables an opt-in detector:
   before coding a non-boundary frame as inter, the encoder measures the

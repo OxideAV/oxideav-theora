@@ -174,8 +174,11 @@ zero-initialized reference store.
 
 * **Framework `Encoder` integration** — `TheoraEncoder` implements
   `oxideav_core::Encoder`, and `register` now installs it (alongside the
-  decoder) via the `make_encoder` factory. The encoder serializes the
-  three §6 headers up front and emits them as the first three packets
+  decoder) via the `make_encoder` factory (which needs only the §6.2
+  identification header in `extradata` — a §6.4 setup header there is
+  optional, synthesized from the VP3 defaults when omitted). The encoder
+  serializes the three §6 headers up front and emits them as the first
+  three packets
   (flagged `header`), then turns each top-down `VideoFrame` at the coded
   dimensions into one §7 data packet. The keyframe interval (`-g`,
   `TheoraEncoder::with_keyframe_interval`, default 1) decides intra vs

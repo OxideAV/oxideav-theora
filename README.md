@@ -54,7 +54,13 @@ zero-initialized reference store.
   of §7.9.2), forward §7.8 DC prediction (`forward_dc_prediction`), and
   the §7.7 token entropy writer (single-coefficient tokens 9–22,
   zero-run token 8, self-terminating EOB) over a new MSb-first
-  `BitWriter`. An intra, all-coded, single-`qi` frame emits no §7.3 /
+  `BitWriter`. The token writer **chooses the §7.7.3 Huffman codebook**
+  for each frame: it tallies the luma and chroma tokens emitted in each
+  Huffman group and selects the `htiL` / `htiC` index (one of 16 per
+  group) that minimizes the frame's summed code length — a pure bit-rate
+  win at zero distortion (the decoder reads whichever selector is
+  written, so reconstruction is unchanged; the optimizer is never worse
+  than the first table). An intra, all-coded, single-`qi` frame emits no §7.3 /
   §7.4 / §7.5 / §7.6 bits, matching the decoder's intra short-circuits.
   An encoded INTRA frame decodes back through this crate's own
   `FrameDecoder` faithfully to within the quantizer step (a 32×32

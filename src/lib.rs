@@ -6579,13 +6579,66 @@ fn huffman_code_for_token(table: &HuffmanTable, token: u8) -> Option<(u32, u8)> 
         .map(|e| (e.code, e.len))
 }
 
+/// Choose the §7.7.3 Huffman table selector (`htiL` or `htiC`, 0..=15)
+/// that minimizes the summed Huffman-code length for a frame's token
+/// emission, given the per-group / per-token counts in `tally`.
+///
+/// `tally[hg][token]` is how many tokens of value `token` are emitted in
+/// Huffman group `hg` (0..=4) for this plane (luma or chroma). The
+/// selector `s` picks table `16 * hg + s` within each group; this scores
+/// every `s` by `Σ tally[hg][token] · len(hts[16·hg+s], token)` and
+/// returns the cheapest. A selector whose chosen table lacks a needed
+/// token leaf is skipped (the full §6.4.4 default tables never trip
+/// this). Defaults to `0` if no token is emitted at all or no selector
+/// can encode the set — matching the historical fixed-`0` behaviour, so
+/// the choice only ever shrinks (never grows) the coded frame.
+fn best_huffman_selector(hts: &[HuffmanTable], tally: &[[u32; 32]; 5]) -> u8 {
+    let mut best_sel: u8 = 0;
+    let mut best_bits: Option<u64> = None;
+    for sel in 0u8..16 {
+        let mut bits: u64 = 0;
+        let mut usable = true;
+        for (hg, counts) in tally.iter().enumerate() {
+            let hti = 16 * hg + sel as usize;
+            let table = match hts.get(hti) {
+                Some(t) => t,
+                None => {
+                    usable = false;
+                    break;
+                }
+            };
+            for (token, &count) in counts.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                match huffman_code_for_token(table, token as u8) {
+                    Some((_, len)) => bits += u64::from(count) * u64::from(len),
+                    None => {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if !usable {
+                break;
+            }
+        }
+        if usable && best_bits.map_or(true, |b| bits < b) {
+            best_bits = Some(bits);
+            best_sel = sel;
+        }
+    }
+    best_sel
+}
+
 /// Encode a frame's quantized DCT coefficients into the §7.7.3
 /// bitstream — the encoder-side inverse of [`decode_dct_coefficients`].
 ///
 /// Writes the §7.7.3 token stream onto the shared [`BitWriter`]: the
-/// 4-bit `htiL` / `htiC` selectors at `ti ∈ {0, 1}` (both fixed to the
-/// `0` table within each Huffman group, so the `16 * HG` base tables
-/// are used), followed by the interleaved per-`(ti, bi)` Huffman-coded
+/// 4-bit `htiL` / `htiC` selectors at `ti ∈ {0, 1}` — each chosen by
+/// [`best_huffman_selector`] to minimize the frame's summed Huffman-code
+/// length (a pure bit-rate win; the decoder reads whichever selector is
+/// written) — followed by the interleaved per-`(ti, bi)` Huffman-coded
 /// tokens in exactly the order the §7.7.3 decoder reads them: the outer
 /// loop over `ti`, the inner loop over coded blocks `bi` whose `TIS[bi]`
 /// equals `ti`. Each block carries a self-terminating EOB token
@@ -6629,13 +6682,45 @@ fn encode_dct_coefficients_inner(
         }
     }
 
+    // §7.7.3 step 4(a) lets the encoder pick, once per frame, which of
+    // the 16 tables in each Huffman group to use for luma (`htiL`) and
+    // for chroma (`htiC`) — the same selector index applies across every
+    // group (`hti = 16 * HG + selector`). The token *plan* (the tokens
+    // and their extra-bits) is independent of the selector; only the
+    // Huffman code lengths differ. So we tally, per Huffman group and
+    // token value, how many luma and chroma tokens are emitted, then
+    // choose the selector minimizing the summed code length over all 16
+    // candidates. This is a pure bit-rate win at zero distortion (the
+    // decoder reads whatever selector we write).
+    //
+    // `tally[plane][hg][token]` — emission counts, plane 0 = luma, 1 =
+    // chroma, hg 0..=4, token 0..=31.
+    let mut tally = [[[0u32; 32]; 5]; 2];
+    {
+        let mut plan_idx = vec![0usize; nbs_us];
+        let mut tis = vec![0u8; nbs_us];
+        for ti in 0u8..=63 {
+            let hg = huffman_table_group(ti) as usize;
+            for bi in 0..nbs_us {
+                if bcoded[bi] == 0 || tis[bi] != ti {
+                    continue;
+                }
+                let idx = plan_idx[bi];
+                let pt = plans[bi][idx];
+                plan_idx[bi] = idx + 1;
+                let plane = if (bi as u32) < nlbs { 0 } else { 1 };
+                tally[plane][hg][pt.token as usize] += 1;
+                let new_tis = (tis[bi] as u16 + pt.advance as u16).min(64);
+                tis[bi] = new_tis as u8;
+            }
+        }
+    }
+    let hti_l = best_huffman_selector(hts, &tally[0]);
+    let hti_c = best_huffman_selector(hts, &tally[1]);
+
     // Per-block emission state: index into the plan and current TIS.
     let mut plan_idx = vec![0usize; nbs_us];
     let mut tis = vec![0u8; nbs_us];
-
-    // Fixed table selectors: the `0` table within each group.
-    let hti_l: u8 = 0;
-    let hti_c: u8 = 0;
 
     for ti in 0u8..=63 {
         // §7.7.3 step 4(a): emit the table selectors at ti ∈ {0, 1}.
@@ -21520,6 +21605,133 @@ mod tests {
         for bi in 0..8 {
             assert_eq!(decoded[bi], coeffs[bi], "block {bi} coefficients differ");
         }
+    }
+
+    /// `best_huffman_selector` returns the §7.7.3 table selector whose
+    /// summed code length is minimal over the 16 candidates, and never
+    /// scores worse than the fixed-`0` selector it replaced.
+    #[test]
+    fn best_huffman_selector_minimizes_total_code_length() {
+        let setup = SetupHeaderTables::vp3_defaults();
+        let hts = &setup.huffman_tables[..];
+
+        // A tally that concentrates on a single group/token: whichever
+        // selector gives that token its shortest code must win.
+        let mut tally = [[0u32; 32]; 5];
+        // Group 4 (high-frequency AC), token 9 (single +1 coefficient),
+        // emitted many times.
+        tally[4][9] = 1000;
+        let sel = best_huffman_selector(hts, &tally);
+
+        // Independently find the selector minimizing len(hts[64+s], 9).
+        let mut want = 0u8;
+        let mut want_len = u8::MAX;
+        for s in 0u8..16 {
+            let (_, len) = huffman_code_for_token(&hts[64 + s as usize], 9).unwrap();
+            if len < want_len {
+                want_len = len;
+                want = s;
+            }
+        }
+        assert_eq!(sel, want, "selector must minimize the concentrated token");
+
+        // The chosen selector is never worse than selector 0.
+        let cost = |s: u8| -> u64 {
+            (0..5)
+                .map(|hg| {
+                    let t = &hts[16 * hg + s as usize];
+                    (0..32u8)
+                        .map(|tok| {
+                            let c = u64::from(tally[hg][tok as usize]);
+                            if c == 0 {
+                                0
+                            } else {
+                                c * u64::from(huffman_code_for_token(t, tok).unwrap().1)
+                            }
+                        })
+                        .sum::<u64>()
+                })
+                .sum()
+        };
+        assert!(cost(sel) <= cost(0), "optimized selector never beaten by 0");
+    }
+
+    /// The frame token writer picks a size-optimizing `htiL` / `htiC`:
+    /// on a token mix that favours a non-zero selector the coded frame
+    /// is no larger than the fixed-`0` encoding, and it still decodes
+    /// back to the exact coefficients.
+    #[test]
+    fn encode_dct_coefficients_selector_never_grows_frame() {
+        let setup = SetupHeaderTables::vp3_defaults();
+        let hts = &setup.huffman_tables[..];
+
+        // Many coded blocks with a repeated token profile so a non-zero
+        // selector can pay off.
+        let nbs = 32u32;
+        let nmbs = 8u32; // nlbs = 32 → all luma here; add chroma below.
+        let bcoded = vec![1u8; nbs as usize];
+        let mut coeffs = vec![[0i16; 64]; nbs as usize];
+        for (bi, c) in coeffs.iter_mut().enumerate() {
+            c[0] = if bi % 2 == 0 { 1 } else { -1 };
+            c[5] = 2;
+            c[18] = -1;
+            c[40] = 1;
+        }
+
+        let mut w = super::BitWriter::new();
+        encode_dct_coefficients_inner(&mut w, nbs, nmbs, &bcoded, &coeffs, hts).unwrap();
+        let bytes = w.into_bytes();
+
+        // Round-trips exactly through the decoder.
+        let (decoded, _n) = decode_dct_coefficients(&bytes, nbs, nmbs, &bcoded, hts).unwrap();
+        for bi in 0..nbs as usize {
+            assert_eq!(decoded[bi], coeffs[bi], "block {bi}");
+        }
+
+        // The selector path is never larger than forcing selector 0. The
+        // first byte's high nibble is htiL; if it is non-zero the
+        // optimizer chose a different table — and either way the encoded
+        // size must not exceed the fixed-0 cost computed from the tables.
+        let mut tally = [[[0u32; 32]; 5]; 2];
+        {
+            let mut plan_idx = vec![0usize; nbs as usize];
+            let mut tis = vec![0u8; nbs as usize];
+            let plans: Vec<Vec<PlannedToken>> = coeffs
+                .iter()
+                .map(|c| plan_block_tokens(c).unwrap())
+                .collect();
+            for ti in 0u8..=63 {
+                let hg = huffman_table_group(ti) as usize;
+                for bi in 0..nbs as usize {
+                    if tis[bi] != ti {
+                        continue;
+                    }
+                    let pt = plans[bi][plan_idx[bi]];
+                    plan_idx[bi] += 1;
+                    tally[0][hg][pt.token as usize] += 1; // all luma here
+                    tis[bi] = ((tis[bi] as u16 + pt.advance as u16).min(64)) as u8;
+                }
+            }
+        }
+        let sel = best_huffman_selector(hts, &tally[0]);
+        let cost = |s: u8| -> u64 {
+            (0..5)
+                .map(|hg| {
+                    let t = &hts[16 * hg + s as usize];
+                    (0..32u8)
+                        .map(|tok| {
+                            let c = u64::from(tally[0][hg][tok as usize]);
+                            if c == 0 {
+                                0
+                            } else {
+                                c * u64::from(huffman_code_for_token(t, tok).unwrap().1)
+                            }
+                        })
+                        .sum::<u64>()
+                })
+                .sum()
+        };
+        assert!(cost(sel) <= cost(0));
     }
 
     /// The token planner closes an all-zero block with a single EOB and

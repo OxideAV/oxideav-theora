@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Changed
 
+- **§7.7.3 Huffman codebook selection (round 379)** — the frame token
+  writer no longer hard-codes the `0` table within each Huffman group.
+  It now tallies, per Huffman group and token value, the luma and chroma
+  tokens a frame emits, then picks the `htiL` / `htiC` selector (one of
+  16 per group) that minimizes the frame's summed Huffman-code length
+  (`best_huffman_selector`). This is a pure bit-rate reduction at zero
+  distortion: the token *plan* is unchanged, only the codebook indices
+  written into the frame header differ, and the decoder reconstructs
+  identically by reading whichever selector was chosen. The optimizer is
+  never worse than the previous fixed-`0` behaviour. No new
+  bitstream-syntax — the same §7.7.3 selector field, now used.
 - **Rate control is keyframe-aware (round 375)** — the target-bitrate
   leaky-bucket loop no longer charges a large keyframe against a single
   per-frame budget (which spiked the bucket and slammed the quantizer for

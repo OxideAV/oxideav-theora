@@ -348,6 +348,8 @@
 #[cfg(test)]
 mod fixture_data;
 
+mod vp31_huffman_data;
+
 use oxideav_core::RuntimeContext;
 
 /// Crate-local error type.
@@ -2678,6 +2680,106 @@ pub struct SetupHeaderTables {
     pub huffman_tables: Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>,
 }
 
+/// The three VP3 default base matrices (`BMS`), Theora §B.4. Row 0 is
+/// the INTRA luma matrix, row 1 the INTRA chroma (Cb/Cr) matrix, and
+/// row 2 the INTER matrix for all planes. Each is a 64-element array in
+/// natural (row-major) coefficient order. Numeric data table only.
+const BMS_VP3: [[u8; 64]; 3] = [
+    // Quant-range base matrix 0 — INTRA, Y′ channel.
+    [
+        16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69,
+        56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 58, 68, 109, 103, 77, 24, 35, 55, 64, 81,
+        104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
+    ],
+    // Quant-range base matrix 1 — INTRA, Cb/Cr channels.
+    [
+        17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99,
+        99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+    ],
+    // Quant-range base matrix 2 — INTER, all channels.
+    [
+        16, 16, 16, 20, 24, 28, 32, 40, 16, 16, 20, 24, 28, 32, 40, 48, 16, 20, 24, 28, 32, 40, 48,
+        64, 20, 24, 28, 32, 40, 48, 64, 64, 24, 28, 32, 40, 48, 64, 64, 64, 28, 32, 40, 48, 64, 64,
+        64, 96, 32, 40, 48, 64, 64, 64, 96, 128, 40, 48, 64, 64, 64, 96, 128, 128,
+    ],
+];
+
+impl SetupHeaderTables {
+    /// Construct the complete VP3 default setup tables (Theora Appendix
+    /// B): the §B.2 loop-filter limits, the §B.3 AC/DC scale tables, the
+    /// §B.4 base matrices with their single-range quant assignment, and
+    /// the §B.4 80 DCT-token Huffman codebooks.
+    ///
+    /// This materializes the same `SetupHeaderTables` a VP3-compatible
+    /// stream's setup header would decode to, but *without* a setup
+    /// packet to parse: it lets an encoder synthesize a conformant,
+    /// self-describing stream from scratch rather than requiring the
+    /// caller to supply pre-decoded tables. The result round-trips
+    /// through [`encode_setup_header`] / [`decode_setup_header`] to an
+    /// equal value, and a frame decoder built on it decodes any §7
+    /// packet a frame encoder built on the same tables produces.
+    ///
+    /// The single quant range per `(qti, pli)` assigns base matrix 0 to
+    /// INTRA luma, base matrix 1 to INTRA chroma, and base matrix 2 to
+    /// every INTER plane (Theora §B.4 `NQRS` / `QRSIZES` / `QRBMIS`).
+    pub fn vp3_defaults() -> Self {
+        // §6.4.2 quantization parameters from the §B.3 / §B.4 data.
+        let mut base_matrices: Vec<[u8; 64]> = Vec::with_capacity(3);
+        base_matrices.extend_from_slice(&BMS_VP3);
+
+        // §B.4: a single quant range (size 63) per quantization type and
+        // colour plane. INTRA (qti 0): Y′→bm0, Cb→bm1, Cr→bm1. INTER
+        // (qti 1): all planes→bm2.
+        let mut quant_range_sizes = [[[0u8; 63]; 3]; 2];
+        let mut quant_range_base_matrix_indices = [[[0u16; 64]; 3]; 2];
+        // QRBMIS = {{{0,0},{1,1},{1,1}}, {{2,2},{2,2},{2,2}}}.
+        let qrbmis: [[[u16; 2]; 3]; 2] = [[[0, 0], [1, 1], [1, 1]], [[2, 2], [2, 2], [2, 2]]];
+        for qti in 0..2 {
+            for pli in 0..3 {
+                quant_range_sizes[qti][pli][0] = 63;
+                quant_range_base_matrix_indices[qti][pli][0] = qrbmis[qti][pli][0];
+                quant_range_base_matrix_indices[qti][pli][1] = qrbmis[qti][pli][1];
+            }
+        }
+
+        let quantization_parameters = QuantizationParameters {
+            ac_scale: ACSCALE_VP3,
+            dc_scale: DCSCALE_VP3,
+            num_base_matrices: 3,
+            base_matrices,
+            num_quant_ranges: [[1, 1, 1], [1, 1, 1]],
+            quant_range_sizes,
+            quant_range_base_matrix_indices,
+        };
+
+        // §6.4.4: the 80 DCT-token Huffman tables, each built from its
+        // §B.4 `(code, length)` codebook keyed by token value.
+        let mut tables: Vec<HuffmanTable> = Vec::with_capacity(NUM_HUFFMAN_TABLES);
+        for (hti, codebook) in vp31_huffman_data::VP31_HUFF_CODES.iter().enumerate() {
+            let codes: Vec<(u16, u8, u8)> = codebook
+                .iter()
+                .enumerate()
+                .map(|(token, &(code, len))| (code, len, token as u8))
+                .collect();
+            tables.push(
+                HuffmanTable::from_code_list(hti, &codes)
+                    .expect("VP3 default codebook is a valid §6.4.4 table"),
+            );
+        }
+        let boxed: Box<[HuffmanTable]> = tables.into_boxed_slice();
+        let huffman_tables: Box<[HuffmanTable; NUM_HUFFMAN_TABLES]> = boxed
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("built exactly NUM_HUFFMAN_TABLES tables"));
+
+        SetupHeaderTables {
+            loop_filter_limits: LFLIMS_VP3,
+            quantization_parameters,
+            huffman_tables,
+        }
+    }
+}
+
 /// Decode the complete Theora setup header per §6.4.5 ("Setup Header
 /// Decode") of the Xiph Theora I Specification.
 ///
@@ -3248,6 +3350,118 @@ impl HuffmanTable {
     /// but the accessor is provided for completeness.)
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Build a [`HuffmanTable`] from a list of `(code, len, token)` codes.
+    ///
+    /// This is the constructor used to materialize the §B.4 VP3 default
+    /// codebooks (and any other code list described by its `(code, len)`
+    /// pairs rather than by the §6.4.4 tree-bit description). Each `code`
+    /// holds its bit string right-aligned in the low `len` bits, MSb
+    /// first on the wire — the same representation [`HuffmanEntry`] uses.
+    ///
+    /// The codes must form a *complete, prefix-free* set (a full binary
+    /// tree: the lengths satisfy the Kraft equality and no code is a
+    /// prefix of another), which every conformant §6.4.4 table does.
+    /// The flat node array and the depth-first (`0`-subtree before
+    /// `1`-subtree) [`HuffmanEntry`] list are reconstructed so the result
+    /// is byte-for-byte what [`decode_one_huffman_table`] would have
+    /// produced for the same codebook — in particular it re-serializes
+    /// through [`encode_one_huffman_table`] to the identical tree bits.
+    ///
+    /// Returns [`Error::HuffmanCodeTooLong`] if any `len` exceeds 32, and
+    /// [`Error::HuffmanTableFull`] if more than [`MAX_HUFFMAN_ENTRIES`]
+    /// codes are supplied. `hti` only tags those errors.
+    pub fn from_code_list(hti: usize, codes: &[(u16, u8, u8)]) -> Result<Self, Error> {
+        if codes.len() > MAX_HUFFMAN_ENTRIES {
+            return Err(Error::HuffmanTableFull { hti });
+        }
+        // Build the flat tree by inserting each code along its bit path,
+        // allocating interior branch nodes as needed. Node 0 is the root.
+        let mut nodes: Vec<HuffmanNode> = vec![HuffmanNode::Branch { zero: 0, one: 0 }];
+        for &(code, len, token) in codes {
+            if len > 32 {
+                return Err(Error::HuffmanCodeTooLong { hti });
+            }
+            let mut idx = 0usize;
+            // Walk MSb-first, creating branches; the final bit lands on a
+            // leaf. A child index is never 0 (the root is never a child),
+            // so a 0 in a `Branch`'s slot reliably means "not yet
+            // allocated".
+            for i in (0..len).rev() {
+                let bit = (u32::from(code) >> i) & 1;
+                let (zero, one) = match nodes[idx] {
+                    HuffmanNode::Branch { zero, one } => (zero, one),
+                    HuffmanNode::Leaf { .. } => {
+                        // A previously-placed code is a strict prefix of this
+                        // one: the supplied set is not prefix-free.
+                        return Err(Error::HuffmanCodeTooLong { hti });
+                    }
+                };
+                let next = if bit == 0 { zero } else { one };
+                let next = if next == 0 {
+                    let allocated = nodes.len() as u32;
+                    nodes.push(HuffmanNode::Branch { zero: 0, one: 0 });
+                    let rewired = if bit == 0 {
+                        HuffmanNode::Branch {
+                            zero: allocated,
+                            one,
+                        }
+                    } else {
+                        HuffmanNode::Branch {
+                            zero,
+                            one: allocated,
+                        }
+                    };
+                    nodes[idx] = rewired;
+                    allocated
+                } else {
+                    next
+                };
+                idx = next as usize;
+            }
+            nodes[idx] = HuffmanNode::Leaf { token };
+        }
+
+        // Re-emit the node array in the exact canonical layout
+        // `decode_one_huffman_table` builds — a pre-order DFS in which each
+        // branch's `0` and `1` children are allocated consecutively the
+        // moment the branch is visited (and the `0` subtree is fully
+        // visited before the `1` subtree). Renumbering this way makes the
+        // result byte-identical to a decoded table (not merely
+        // functionally equivalent), and recovers the same depth-first
+        // `entries` order. The `Vec<(old, new)>` work stack is processed
+        // LIFO with the `1`-child pushed before the `0`-child.
+        let mut canon: Vec<HuffmanNode> = vec![HuffmanNode::Branch { zero: 0, one: 0 }];
+        let mut entries: Vec<HuffmanEntry> = Vec::with_capacity(codes.len());
+        // Stack frames: (old node index, new node index, code-so-far, len).
+        let mut stack: Vec<(usize, usize, u32, u8)> = vec![(0, 0, 0, 0)];
+        while let Some((old, new, code, len)) = stack.pop() {
+            match nodes[old] {
+                HuffmanNode::Leaf { token } => {
+                    canon[new] = HuffmanNode::Leaf { token };
+                    entries.push(HuffmanEntry { code, len, token });
+                }
+                HuffmanNode::Branch { zero, one } => {
+                    let new_zero = canon.len() as u32;
+                    canon.push(HuffmanNode::Branch { zero: 0, one: 0 });
+                    let new_one = canon.len() as u32;
+                    canon.push(HuffmanNode::Branch { zero: 0, one: 0 });
+                    canon[new] = HuffmanNode::Branch {
+                        zero: new_zero,
+                        one: new_one,
+                    };
+                    // Push `1` first so `0` is popped (visited) first.
+                    stack.push((one as usize, new_one as usize, (code << 1) | 1, len + 1));
+                    stack.push((zero as usize, new_zero as usize, code << 1, len + 1));
+                }
+            }
+        }
+
+        Ok(HuffmanTable {
+            entries,
+            nodes: canon,
+        })
     }
 
     /// Look up the token for a given code. `code` holds the bit string
@@ -14193,6 +14407,47 @@ impl TheoraEncoder {
             rate_control: None,
             scene_cut_threshold: None,
         })
+    }
+
+    /// Build a fully self-contained encoder that synthesizes its own
+    /// §6.4 setup header from the VP3 default tables
+    /// ([`SetupHeaderTables::vp3_defaults`]) instead of requiring the
+    /// caller to supply pre-decoded setup tables.
+    ///
+    /// This is the zero-setup entry point: given only the identification
+    /// header and a frame-level quantizer, the encoder builds the §B.4
+    /// quantization parameters and Huffman codebooks itself, serializes
+    /// all three §6 headers, and emits a complete self-describing stream.
+    /// It is otherwise identical to [`TheoraEncoder::new`] — the same
+    /// builder methods ([`with_keyframe_interval`](Self::with_keyframe_interval),
+    /// [`with_inter_mode`](Self::with_inter_mode),
+    /// [`with_target_bitrate`](Self::with_target_bitrate), …) chain off
+    /// it — and produces a stream that decodes through this crate's own
+    /// [`TheoraDecoder`].
+    pub fn with_default_setup(
+        codec_id: oxideav_core::CodecId,
+        ident: TheoraIdentHeader,
+        qi: u8,
+    ) -> Result<Self, Error> {
+        Self::with_keyframe_interval(codec_id, ident, SetupHeaderTables::vp3_defaults(), qi, 1)
+    }
+
+    /// As [`with_default_setup`](Self::with_default_setup) but with an
+    /// explicit keyframe interval (`-g`). The setup header is the VP3
+    /// default bundle.
+    pub fn with_default_setup_keyframe_interval(
+        codec_id: oxideav_core::CodecId,
+        ident: TheoraIdentHeader,
+        qi: u8,
+        keyframe_interval: u32,
+    ) -> Result<Self, Error> {
+        Self::with_keyframe_interval(
+            codec_id,
+            ident,
+            SetupHeaderTables::vp3_defaults(),
+            qi,
+            keyframe_interval,
+        )
     }
 
     /// Set the P-frame inter mode-decision strategy (see
@@ -29090,6 +29345,63 @@ mod tests {
         assert!(setup.huffman_tables.iter().all(|t| !t.entries.is_empty()));
     }
 
+    /// The §B.4 VP3 default Huffman codebooks build into 80 complete,
+    /// prefix-free tables, and each one re-serializes through
+    /// `encode_one_huffman_table` and decodes back to itself — proving
+    /// `HuffmanTable::from_code_list` reconstructs the exact tree the
+    /// §6.4.4 decode would have built for the same codebook.
+    #[test]
+    fn vp3_default_huffman_codebooks_build_and_round_trip() {
+        for (hti, codebook) in vp31_huffman_data::VP31_HUFF_CODES.iter().enumerate() {
+            let codes: Vec<(u16, u8, u8)> = codebook
+                .iter()
+                .enumerate()
+                .map(|(token, &(code, len))| (code, len, token as u8))
+                .collect();
+            let table = HuffmanTable::from_code_list(hti, &codes).unwrap();
+            // 32 token leaves, and every (code, len) looks up to its token.
+            assert_eq!(table.entries.len(), 32, "table {hti} leaf count");
+            for &(code, len, token) in &codes {
+                assert_eq!(
+                    table.lookup(u32::from(code), len),
+                    Some(token),
+                    "table {hti} token {token}"
+                );
+            }
+            // The tree bits re-serialize and decode back to an equal table.
+            let mut w = crate::BitWriter::new();
+            crate::encode_one_huffman_table(&mut w, &table);
+            let bytes = w.into_bytes();
+            let mut r = crate::BitReader::new(&bytes);
+            let decoded = crate::decode_one_huffman_table(&mut r, hti).unwrap();
+            assert_eq!(decoded, table, "table {hti} tree round-trip");
+        }
+    }
+
+    /// `SetupHeaderTables::vp3_defaults` produces a complete §6.4.5
+    /// bundle that survives the `encode_setup_header` →
+    /// `decode_setup_header` round trip unchanged — so an encoder can
+    /// synthesize a conformant, self-describing setup header from scratch
+    /// without a caller-supplied setup packet.
+    #[test]
+    fn vp3_default_setup_tables_round_trip_through_setup_header() {
+        let setup = SetupHeaderTables::vp3_defaults();
+        // Sanity: the §B.2 / §B.3 tables match the published constants.
+        assert_eq!(setup.loop_filter_limits, LFLIMS_VP3);
+        assert_eq!(setup.quantization_parameters.ac_scale, ACSCALE_VP3);
+        assert_eq!(setup.quantization_parameters.dc_scale, DCSCALE_VP3);
+        assert_eq!(setup.quantization_parameters.num_base_matrices, 3);
+        assert_eq!(setup.quantization_parameters.base_matrices.len(), 3);
+        assert_eq!(setup.huffman_tables.len(), NUM_HUFFMAN_TABLES);
+
+        let packet = encode_setup_header(&setup).unwrap();
+        // §6.1 common header is present and well-formed.
+        assert_eq!(packet[0], 0x82);
+        assert_eq!(&packet[1..7], b"theora");
+        let decoded = decode_setup_header(&packet).unwrap();
+        assert_eq!(decoded, setup);
+    }
+
     /// The legacy [`parse_setup_header`] projection must agree with
     /// the full §6.4.5 decode on the fields it retains.
     #[test]
@@ -29325,6 +29637,129 @@ mod tests {
         assert!(out.planes[0].data.iter().all(|&b| b == 128), "luma flat");
         assert!(out.planes[1].data.iter().all(|&b| b == 128), "cb flat");
         assert!(out.planes[2].data.iter().all(|&b| b == 128), "cr flat");
+    }
+
+    /// The zero-setup `with_default_setup` constructor produces a
+    /// complete, self-describing stream that decodes through
+    /// `TheoraDecoder`: the encoder synthesizes its own §6.4 setup header
+    /// from the VP3 default tables, so the caller need only supply the
+    /// identification header. A flat frame is reproduced losslessly.
+    #[test]
+    fn encoder_with_default_setup_round_trips_through_decoder() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        // No setup tables supplied — the encoder builds them itself.
+        let mut enc =
+            TheoraEncoder::with_default_setup(codec_id.clone(), ident.clone(), 32).unwrap();
+        let vf = flat_video_frame(&ident, 128, 128, 128, 0);
+        enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+
+        let mut header_pkts: Vec<oxideav_core::Packet> = Vec::new();
+        let mut data_pkt = None;
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if p.flags.header {
+                        header_pkts.push(p);
+                    } else {
+                        data_pkt = Some(p);
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("unexpected encoder error: {e}"),
+            }
+        }
+        assert_eq!(header_pkts.len(), 3, "three synthesized §6 header packets");
+        // The synthesized setup header is the VP3 default bundle.
+        let setup_from_stream = decode_setup_header(&header_pkts[2].data).unwrap();
+        assert_eq!(setup_from_stream, SetupHeaderTables::vp3_defaults());
+        let data_pkt = data_pkt.expect("one data packet");
+
+        // The whole self-describing stream decodes through a fresh trait
+        // decoder (which reads the synthesized setup from the headers).
+        let mut dec = TheoraDecoder::new(codec_id);
+        for h in &header_pkts {
+            dec.send_packet(h).unwrap();
+        }
+        dec.send_packet(&data_pkt).unwrap();
+        let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!("expected a video frame");
+        };
+        assert!(out.planes[0].data.iter().all(|&b| b == 128), "luma flat");
+        assert!(out.planes[1].data.iter().all(|&b| b == 128), "cb flat");
+        assert!(out.planes[2].data.iter().all(|&b| b == 128), "cr flat");
+    }
+
+    /// A multi-frame I,P,P sequence encoded with the synthesized VP3
+    /// default setup decodes every frame within the quantizer bound —
+    /// exercising the inter path against a from-scratch setup header.
+    #[test]
+    fn encoder_with_default_setup_inter_sequence_decodes() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        let mut enc = TheoraEncoder::with_default_setup_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            24,
+            3,
+        )
+        .unwrap();
+
+        // Three textured frames: I, P, P.
+        let sources: Vec<oxideav_core::VideoFrame> =
+            (0..3).map(|p| textured_video_frame(&ident, p)).collect();
+        for vf in &sources {
+            enc.send_frame(&oxideav_core::Frame::Video(vf.clone()))
+                .unwrap();
+        }
+
+        let mut header_pkts: Vec<oxideav_core::Packet> = Vec::new();
+        let mut data_pkts: Vec<oxideav_core::Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if p.flags.header {
+                        header_pkts.push(p);
+                    } else {
+                        data_pkts.push(p);
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("unexpected encoder error: {e}"),
+            }
+        }
+        assert_eq!(header_pkts.len(), 3);
+        assert_eq!(data_pkts.len(), 3, "one data packet per source frame");
+        assert!(data_pkts[0].flags.keyframe, "frame 0 is a keyframe");
+        assert!(!data_pkts[1].flags.keyframe, "frame 1 is inter");
+
+        let mut dec = TheoraDecoder::new(codec_id);
+        for h in &header_pkts {
+            dec.send_packet(h).unwrap();
+        }
+        for (i, p) in data_pkts.iter().enumerate() {
+            dec.send_packet(p).unwrap();
+            let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+                panic!("frame {i}: expected video");
+            };
+            // Every frame stays within the quantizer bound versus its source.
+            let src = &sources[i];
+            let max_err = out.planes[0]
+                .data
+                .iter()
+                .zip(src.planes[0].data.iter())
+                .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_err <= 64,
+                "frame {i} luma max error {max_err} too large"
+            );
+        }
     }
 
     /// `output_params` advertises the coded dimensions, the mapped pixel

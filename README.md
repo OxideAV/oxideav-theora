@@ -163,7 +163,14 @@ zero-initialized reference store.
   the §6.4.5 body (LFLIMS with minimal `NBITS`, the §6.4.2 quantization
   parameters as fresh `NEWQR=1` ranges, and all 80 §6.4.4 Huffman tables
   via a pre-order tree walk) onto one shared `BitWriter` and round-trips
-  the full setup tables back to an equal `SetupHeaderTables`.
+  the full setup tables back to an equal `SetupHeaderTables`. The full
+  §6.4.5 bundle can also be **synthesized from the published Appendix B
+  data** — `SetupHeaderTables::vp3_defaults()` assembles the §B.2 / §B.3
+  scale tables, the §B.4 base matrices + single-range quant assignment,
+  and the §B.4 80 DCT-token Huffman codebooks (`HuffmanTable::from_code_list`
+  rebuilds each codebook into the byte-identical §6.4.4 tree), so the
+  encoder can emit a conformant setup header with no caller-supplied
+  tables.
 
 * **Framework `Encoder` integration** — `TheoraEncoder` implements
   `oxideav_core::Encoder`, and `register` now installs it (alongside the
@@ -259,10 +266,15 @@ chroma blocks that earlier diverged is now sample-exact.
   rate-distortion decision (`encode_inter_frame_rd`, the `TheoraEncoder`
   P-frame default — see the inter-encoder bullet above). A
   **target-bitrate rate-control loop** is now wired in too (see the
-  rate-control bullet above). The setup header (§6.4 quantization
-  parameters + Huffman tables) is supplied by the caller via
-  `TheoraEncoder::new` / `extradata` rather than synthesized from
-  scratch (the one remaining encoder simplification).
+  rate-control bullet above). The encoder also **synthesizes its own
+  §6.4 setup header** from scratch (`SetupHeaderTables::vp3_defaults()`:
+  the §B.2 loop-filter limits, §B.3 AC/DC scale tables, §B.4 base
+  matrices with their single-range quant assignment, and the §B.4 80
+  DCT-token Huffman codebooks — all from the published Appendix B data),
+  so `TheoraEncoder::with_default_setup` needs only the identification
+  header and a quantizer to emit a complete self-describing stream; a
+  caller may still supply pre-decoded tables via `TheoraEncoder::new` /
+  `extradata` when matching an existing setup.
 * **Reference-captured golden / four-MV corpus fixture** — the
   golden-reference and four-MV inter modes are exercised
   top-to-bottom through this crate's own encoder→decoder round trip

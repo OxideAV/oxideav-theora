@@ -31,6 +31,23 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Synthesized VP3-default setup header (round 379)** —
+  `SetupHeaderTables::vp3_defaults()` builds the complete §6.4.5 setup
+  bundle — the §B.2 loop-filter limits, the §B.3 AC/DC scale tables, the
+  §B.4 base matrices with their single-range quant assignment, and the
+  §B.4 80 DCT-token Huffman codebooks — entirely from the published
+  Appendix B data, with no setup packet to parse. A new
+  `HuffmanTable::from_code_list` constructor materializes each codebook
+  from its `(code, length)` pairs into the exact tree layout the §6.4.4
+  decode would have built (byte-identical, so it re-serializes and
+  decodes back to itself). `TheoraEncoder::with_default_setup` (and the
+  `…_keyframe_interval` variant) are zero-setup constructors: given only
+  the identification header and a quantizer, the encoder synthesizes its
+  own conformant, self-describing setup header and emits a stream that
+  decodes through this crate's own `TheoraDecoder` (a flat frame
+  lossless; a textured I,P,P sequence within the quantizer bound). This
+  removes the encoder's last simplification — it no longer requires the
+  caller to supply pre-decoded setup tables. No bitstream-syntax change.
 - **Scene-cut keyframe insertion (round 375)** —
   `TheoraEncoder::with_scene_cut_threshold` enables an opt-in detector:
   before coding a non-boundary frame as inter, the encoder measures the

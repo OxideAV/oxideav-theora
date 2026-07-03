@@ -4,6 +4,35 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Content-tuned §6.4.4 Huffman codebooks — two-pass encoding (round
+  384)** — the encoder can now build its own optimal DCT-token
+  codebooks from measured statistics instead of relying solely on the
+  Appendix B defaults. `HuffmanTable::from_token_counts` constructs a
+  minimum-redundancy codebook from per-token emission counts (all 32
+  tokens leafed so later frames stay encodable; canonical code
+  assignment satisfying the Kraft equality, i.e. a full §6.4.4 tree;
+  deterministic tie-breaking; lengths capped at 16 bits by iterative
+  weight dampening). `FrameEncoder::intra_token_statistics` is the
+  first pass: it tallies the tokens an intra encode *would* write —
+  combined run+value tokens and coalesced EOB runs included — into a
+  new `TokenStatistics` accumulator without producing a packet.
+  `SetupHeaderTables::with_tuned_huffman_tables` then replaces, per
+  Huffman group, the selector slot scoring **worst** on the sampled
+  luma statistics with the luma-tuned codebook and the worst remaining
+  slot with the chroma-tuned one — sacrificing the least-useful
+  fallbacks, so content resembling the sample keeps the default table
+  it would actually have picked — and the per-frame selector
+  optimization chooses the tuned tables only where they win. The tuned
+  set serializes through `encode_setup_header` like any other, so the
+  stream stays fully self-describing. Measured on the 64×64 intra
+  harness: the textured frame shrinks a further 19–23% versus the
+  VP3-default tables (e.g. 1898 B → 1467 B at qi = 63; 521 B → 420 B at
+  qi = 16) at bit-identical reconstruction; the sparse frame — unlike
+  the tuning-dominant content — stays within ±1 B of its default-table
+  size.
+
 ### Changed
 
 - **Cross-block §7.7.1 EOB runs (tokens 1..=6) in the frame token

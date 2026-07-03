@@ -2778,6 +2778,106 @@ impl SetupHeaderTables {
             huffman_tables,
         }
     }
+
+    /// Derive a setup-table set whose §6.4.4 Huffman codebooks are
+    /// tuned to measured token statistics.
+    ///
+    /// One selector slot per plane is sacrificed: for each of the five
+    /// Huffman groups, the *luma*-tuned optimal codebook
+    /// ([`HuffmanTable::from_token_counts`], built from that group's
+    /// luma counts) replaces the slot whose existing tables score
+    /// **worst** on the sampled luma statistics, and the
+    /// *chroma*-tuned codebook replaces the (distinct) slot scoring
+    /// worst on the chroma statistics. The remaining 14 slots keep this
+    /// set's tables as fallbacks. Sacrificing the worst-scoring slots
+    /// means content resembling the sample never loses the fallback it
+    /// would actually have picked; the frame token writer's per-frame
+    /// selector optimization then chooses the tuned tables exactly when
+    /// they are cheapest for the frame at hand.
+    ///
+    /// Loop-filter limits and quantization parameters are untouched:
+    /// the tuned tables change how the very same quantized coefficients
+    /// are *spelled*, not what the decoder reconstructs. The result is
+    /// a conformant §6.4.5 table set that serializes through
+    /// [`encode_setup_header`] like any other — emit it in the stream's
+    /// setup header and the tuned stream is fully self-describing.
+    pub fn with_tuned_huffman_tables(&self, stats: &TokenStatistics) -> Result<Self, Error> {
+        // Joint cost of selector slot `s` for plane `p` over the
+        // sampled statistics (a slot serves every group, so the score
+        // sums across groups; a missing token leaf makes the slot
+        // unusable for this content — score it maximal).
+        let slot_cost = |p: usize, s: usize| -> u128 {
+            let mut cost: u128 = 0;
+            for hg in 0..5 {
+                let table = &self.huffman_tables[16 * hg + s];
+                for (token, &c) in stats.counts[p][hg].iter().enumerate() {
+                    if c == 0 {
+                        continue;
+                    }
+                    match huffman_code_for_token(table, token as u8) {
+                        Some((_, len)) => cost += u128::from(c) * u128::from(len),
+                        None => return u128::MAX,
+                    }
+                }
+            }
+            cost
+        };
+        // Worst slot for luma; then the worst *other* slot for chroma.
+        let mut s_l = 0usize;
+        for s in 1..16 {
+            if slot_cost(0, s) >= slot_cost(0, s_l) {
+                s_l = s;
+            }
+        }
+        let mut s_c = usize::MAX;
+        for s in 0..16 {
+            if s != s_l && (s_c == usize::MAX || slot_cost(1, s) >= slot_cost(1, s_c)) {
+                s_c = s;
+            }
+        }
+
+        let mut out = self.clone();
+        for hg in 0..5 {
+            out.huffman_tables[16 * hg + s_l] =
+                HuffmanTable::from_token_counts(16 * hg + s_l, &stats.counts[0][hg])?;
+            out.huffman_tables[16 * hg + s_c] =
+                HuffmanTable::from_token_counts(16 * hg + s_c, &stats.counts[1][hg])?;
+        }
+        Ok(out)
+    }
+}
+
+/// Accumulated §7.7 DCT-token emission statistics, the input to
+/// [`SetupHeaderTables::with_tuned_huffman_tables`].
+///
+/// `counts[plane][hg][token]` counts how many times `token` was written
+/// in Huffman group `hg` (0..=4) for `plane` (0 = luma, 1 = chroma)
+/// across every frame sampled. Fill it with
+/// [`FrameEncoder::intra_token_statistics`] over one or more
+/// representative frames (a first pass), then build the tuned setup
+/// tables and encode the stream with them (the second pass).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenStatistics {
+    /// Token emission counts, `[plane][huffman group][token]`.
+    pub counts: [[[u64; 32]; 5]; 2],
+}
+
+impl TokenStatistics {
+    /// An empty tally.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one frame's written-token tally into the running counts.
+    fn accumulate(&mut self, tally: &[[[u32; 32]; 5]; 2]) {
+        for (plane, groups) in tally.iter().enumerate() {
+            for (hg, tokens) in groups.iter().enumerate() {
+                for (token, &c) in tokens.iter().enumerate() {
+                    self.counts[plane][hg][token] += u64::from(c);
+                }
+            }
+        }
+    }
 }
 
 /// Decode the complete Theora setup header per §6.4.5 ("Setup Header
@@ -3339,6 +3439,50 @@ enum HuffmanNode {
     },
 }
 
+/// Compute minimum-redundancy (Huffman) code lengths for 32 symbols
+/// from their weights (all weights must be non-zero).
+///
+/// Classic two-smallest merge over symbol clusters, O(n²) — trivial at
+/// this alphabet size. Ties break toward the earliest cluster position,
+/// making the lengths a deterministic function of the weights.
+fn huffman_code_lengths(weights: &[u64; 32]) -> [u8; 32] {
+    // Each live cluster: (total weight, member tokens).
+    let mut clusters: Vec<(u64, Vec<u8>)> = weights
+        .iter()
+        .enumerate()
+        .map(|(t, &w)| (w, vec![t as u8]))
+        .collect();
+    let mut lens = [0u8; 32];
+    while clusters.len() > 1 {
+        // Two smallest weights; earliest position wins ties.
+        let mut a = 0usize;
+        for i in 1..clusters.len() {
+            if clusters[i].0 < clusters[a].0 {
+                a = i;
+            }
+        }
+        let mut b = usize::MAX;
+        for i in 0..clusters.len() {
+            if i != a && (b == usize::MAX || clusters[i].0 < clusters[b].0) {
+                b = i;
+            }
+        }
+        // Every member of both clusters gains one bit of depth.
+        for &t in clusters[a].1.iter().chain(clusters[b].1.iter()) {
+            lens[t as usize] += 1;
+        }
+        // Merge b into a, drop b (order: remove the later index first
+        // so the earlier index stays valid).
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        let removed = clusters.remove(hi);
+        clusters[lo].0 += removed.0;
+        let mut members = core::mem::take(&mut clusters[lo].1);
+        members.extend(removed.1);
+        clusters[lo].1 = members;
+    }
+    lens
+}
+
 impl HuffmanTable {
     /// Number of decoded leaves (token entries) in this table.
     pub fn len(&self) -> usize {
@@ -3462,6 +3606,63 @@ impl HuffmanTable {
             entries,
             nodes: canon,
         })
+    }
+
+    /// Build an optimal (minimum-redundancy) DCT-token codebook from
+    /// per-token emission counts.
+    ///
+    /// The 32 tokens all receive a leaf — a zero count is floored to
+    /// weight 1 so a token the sample never produced stays encodable
+    /// (frames encoded later may need it, and a §6.4.4 table missing a
+    /// token the stream then emits would be undecodable). Code lengths
+    /// come from the classic two-smallest-weights merge; ties break
+    /// deterministically toward the lower cluster position so the same
+    /// counts always yield the same codebook. Codes are then assigned
+    /// canonically (shorter codes first, ties by token value), which
+    /// satisfies the Kraft equality exactly — the resulting code set is
+    /// complete and prefix-free, i.e. a *full* §6.4.4 binary tree.
+    ///
+    /// Code lengths are capped at 16 bits (the [`Self::from_code_list`]
+    /// `u16` code representation): if an extremely skewed count profile
+    /// pushes the longest code past 16, all weights are halved
+    /// (`(w + 1) / 2`, converging toward the uniform tree of depth 5)
+    /// and the lengths recomputed — the standard flattening trade, a
+    /// few hundredths of a bit per token at these alphabet sizes.
+    ///
+    /// `hti` only tags errors from the final [`Self::from_code_list`]
+    /// assembly (unreachable for the lengths constructed here).
+    pub fn from_token_counts(hti: usize, counts: &[u64; 32]) -> Result<Self, Error> {
+        // Weights: floor zero counts to 1 so every token gets a leaf.
+        let mut weights: [u64; 32] = core::array::from_fn(|t| counts[t].max(1));
+
+        // Compute Huffman code lengths; re-dampen until the longest
+        // fits the 16-bit cap.
+        let lens: [u8; 32] = loop {
+            let lens = huffman_code_lengths(&weights);
+            if lens.iter().all(|&l| l <= 16) {
+                break lens;
+            }
+            for w in weights.iter_mut() {
+                *w = w.div_ceil(2);
+            }
+        };
+
+        // Canonical code assignment: sort by (length, token), then
+        // count upward, left-shifting at each length increase.
+        let mut order: Vec<u8> = (0u8..32).collect();
+        order.sort_by_key(|&t| (lens[t as usize], t));
+        let mut codes: Vec<(u16, u8, u8)> = Vec::with_capacity(32);
+        let mut code: u32 = 0;
+        let mut prev_len: u8 = lens[order[0] as usize];
+        for &t in &order {
+            let len = lens[t as usize];
+            code <<= len - prev_len;
+            prev_len = len;
+            codes.push((code as u16, len, t));
+            code += 1;
+        }
+
+        Self::from_code_list(hti, &codes)
     }
 
     /// Look up the token for a given code. `code` holds the bit string
@@ -12490,13 +12691,14 @@ impl FrameEncoder {
         Ok(block)
     }
 
-    /// Encode one intra (keyframe) frame, returning the §7 video-data
-    /// packet bytes.
-    ///
-    /// The supplied [`SourceFrame`] planes must be sized to the coded
-    /// (macro-block-aligned) dimensions in the encoder's geometry
-    /// (`dims_y` for luma, `dims_c` for chroma), lower-left row-major.
-    pub fn encode_intra_frame(&self, frame: &SourceFrame) -> Result<Vec<u8>, Error> {
+    /// Run the intra forward pipeline — plane validation, per-block
+    /// forward DCT + quantization, forward DC prediction — returning
+    /// the frame's quantized zig-zag coefficients (every block coded,
+    /// DC slots holding the §7.7 residuals). Shared by
+    /// [`Self::encode_intra_frame`] (which writes the packet) and
+    /// [`Self::intra_token_statistics`] (which only tallies the token
+    /// plan).
+    fn intra_coefficients(&self, frame: &SourceFrame) -> Result<Vec<[i16; 64]>, Error> {
         let g = &self.geometry;
         let nbs = g.nbs as usize;
 
@@ -12578,7 +12780,46 @@ impl FrameEncoder {
             &mut coeffs,
         )?;
 
-        // Step 3: write the §7.1 frame header + §7.7.3 token stream.
+        Ok(coeffs)
+    }
+
+    /// Tally the §7.7 tokens an intra encode of `frame` would write
+    /// into `stats`, without producing a packet.
+    ///
+    /// This is the first pass of the two-pass Huffman-tuning flow: run
+    /// it over one or more representative frames, build tuned setup
+    /// tables with [`SetupHeaderTables::with_tuned_huffman_tables`],
+    /// then encode the stream with those tables (they change how the
+    /// same coefficients are spelled, not what a decoder reconstructs).
+    /// The tally counts the tokens *actually written* — combined
+    /// run+value tokens and coalesced cross-block EOB runs included —
+    /// per plane and Huffman group, exactly as the frame writer's own
+    /// selector optimization scores them.
+    pub fn intra_token_statistics(
+        &self,
+        frame: &SourceFrame,
+        stats: &mut TokenStatistics,
+    ) -> Result<(), Error> {
+        let g = &self.geometry;
+        let coeffs = self.intra_coefficients(frame)?;
+        let bcoded = vec![1u8; g.nbs as usize];
+        let plan = plan_frame_tokens(g.nbs, g.nmbs, &bcoded, &coeffs)?;
+        stats.accumulate(&plan.tally);
+        Ok(())
+    }
+
+    /// Encode one intra (keyframe) frame, returning the §7 video-data
+    /// packet bytes.
+    ///
+    /// The supplied [`SourceFrame`] planes must be sized to the coded
+    /// (macro-block-aligned) dimensions in the encoder's geometry
+    /// (`dims_y` for luma, `dims_c` for chroma), lower-left row-major.
+    pub fn encode_intra_frame(&self, frame: &SourceFrame) -> Result<Vec<u8>, Error> {
+        let g = &self.geometry;
+        let coeffs = self.intra_coefficients(frame)?;
+        let bcoded = vec![1u8; g.nbs as usize];
+
+        // Write the §7.1 frame header + §7.7.3 token stream.
         let mut w = BitWriter::new();
         // §7.1 step 1: packet-type bit 0 (data packet).
         w.write_bits(0, 1);
@@ -22344,6 +22585,194 @@ mod tests {
         let bytes = w.into_bytes();
         let (decoded, _nc) = decode_dct_coefficients(&bytes, nbs, nmbs, &bcoded, hts).unwrap();
         assert!(decoded.iter().all(|c| c == &[0i16; 64]));
+    }
+
+    /// `HuffmanTable::from_token_counts` builds a complete (Kraft
+    /// equality), all-32-token, deterministic codebook that is never
+    /// costlier than the VP3 default table for the counts it was built
+    /// from, and caps code lengths at 16 bits under extreme skew.
+    #[test]
+    fn huffman_from_token_counts_properties() {
+        // A skew resembling a real frame: EOB and small-value tokens
+        // dominate, large-magnitude tokens are rare.
+        let mut counts = [0u64; 32];
+        counts[0] = 900;
+        counts[9] = 700;
+        counts[10] = 650;
+        counts[23] = 400;
+        counts[7] = 120;
+        counts[13] = 60;
+        counts[22] = 2;
+        let table = HuffmanTable::from_token_counts(0, &counts).unwrap();
+
+        // All 32 tokens present, exactly once each.
+        assert_eq!(table.len(), 32);
+        let mut seen = [false; 32];
+        for e in &table.entries {
+            assert!(!seen[e.token as usize], "duplicate token {}", e.token);
+            seen[e.token as usize] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
+
+        // Kraft equality — the code set is a full binary tree.
+        let kraft: u64 = table.entries.iter().map(|e| 1u64 << (32 - e.len)).sum();
+        assert_eq!(kraft, 1u64 << 32);
+
+        // Never costlier than the VP3 default group-0 table on the
+        // counts it was tuned for.
+        let vp3 = SetupHeaderTables::vp3_defaults();
+        let cost = |t: &HuffmanTable| -> u64 {
+            counts
+                .iter()
+                .enumerate()
+                .map(|(tok, &c)| c * u64::from(huffman_code_for_token(t, tok as u8).unwrap().1))
+                .sum()
+        };
+        assert!(cost(&table) <= cost(&vp3.huffman_tables[0]));
+
+        // Deterministic: same counts, same codebook.
+        let again = HuffmanTable::from_token_counts(0, &counts).unwrap();
+        assert_eq!(table, again);
+
+        // Extreme skew (Fibonacci-ish weights would push the longest
+        // code far past 16 bits without the cap): all lengths <= 16.
+        let mut fib = [0u64; 32];
+        let (mut a, mut b) = (1u64, 1u64);
+        for slot in fib.iter_mut() {
+            *slot = a;
+            let next = a + b;
+            a = b;
+            b = next;
+        }
+        let capped = HuffmanTable::from_token_counts(0, &fib).unwrap();
+        assert_eq!(capped.len(), 32);
+        assert!(capped.entries.iter().all(|e| e.len <= 16));
+        let kraft: u64 = capped.entries.iter().map(|e| 1u64 << (32 - e.len)).sum();
+        assert_eq!(kraft, 1u64 << 32);
+    }
+
+    /// A tuned setup-table set serializes through the §6.4 setup-header
+    /// round trip like any other: the tuned codebooks land in selector
+    /// slots 0 (luma) / 1 (chroma) of each group, the other 14 slots
+    /// keep the base tables, and decode returns the identical set.
+    #[test]
+    fn tuned_setup_header_round_trips() {
+        let base = SetupHeaderTables::vp3_defaults();
+        let mut stats = TokenStatistics::new();
+        stats.counts[0][0][0] = 500;
+        stats.counts[0][0][9] = 300;
+        stats.counts[0][2][23] = 250;
+        stats.counts[1][1][10] = 200;
+        stats.counts[1][4][8] = 100;
+        let tuned = base.with_tuned_huffman_tables(&stats).unwrap();
+
+        // Exactly two selector slots are sacrificed (discovered by
+        // diffing): one carries the luma-tuned codebooks, the other the
+        // chroma-tuned ones, across every group; the other 14 slots
+        // keep the base tables.
+        let changed: Vec<usize> = (0..16)
+            .filter(|&s| tuned.huffman_tables[s] != base.huffman_tables[s])
+            .collect();
+        assert_eq!(changed.len(), 2, "exactly two slots replaced");
+        let s_l = *changed
+            .iter()
+            .find(|&&s| {
+                tuned.huffman_tables[s]
+                    == HuffmanTable::from_token_counts(s, &stats.counts[0][0]).unwrap()
+            })
+            .expect("one changed slot holds the luma-tuned group-0 codebook");
+        let s_c = *changed.iter().find(|&&s| s != s_l).unwrap();
+        for hg in 0..5 {
+            assert_eq!(
+                tuned.huffman_tables[16 * hg + s_l],
+                HuffmanTable::from_token_counts(16 * hg + s_l, &stats.counts[0][hg]).unwrap()
+            );
+            assert_eq!(
+                tuned.huffman_tables[16 * hg + s_c],
+                HuffmanTable::from_token_counts(16 * hg + s_c, &stats.counts[1][hg]).unwrap()
+            );
+            for s in 0..16 {
+                if s == s_l || s == s_c {
+                    continue;
+                }
+                assert_eq!(
+                    tuned.huffman_tables[16 * hg + s],
+                    base.huffman_tables[16 * hg + s],
+                    "fallback slot {s} of group {hg} must keep the base table"
+                );
+            }
+        }
+        assert_eq!(tuned.loop_filter_limits, base.loop_filter_limits);
+        assert_eq!(tuned.quantization_parameters, base.quantization_parameters);
+
+        let packet = encode_setup_header(&tuned).unwrap();
+        let back = decode_setup_header(&packet).unwrap();
+        assert_eq!(back, tuned, "tuned setup must survive the §6.4 round trip");
+    }
+
+    /// Two-pass Huffman tuning end-to-end: statistics collected from a
+    /// frame, tuned tables built from them, the same frame re-encoded
+    /// against the tuned setup — the packet is strictly smaller and the
+    /// decoder (fed the tuned setup, as a real stream's setup header
+    /// would carry) reconstructs the *identical* pixels.
+    #[test]
+    fn tuned_huffman_tables_shrink_intra_frame() {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        let base = SetupHeaderTables::vp3_defaults();
+        let qi = 48u8;
+
+        let enc = FrameEncoder::new(ident.clone(), base.clone(), qi).unwrap();
+        let g = enc.geometry();
+        let w_y = g.dims_y.width;
+        let mut samples_y = vec![0u8; (g.dims_y.width * g.dims_y.height) as usize];
+        for y in 0..g.dims_y.height {
+            for x in 0..w_y {
+                let tex = if (x / 4 + y / 4) % 2 == 0 { 24 } else { 0 };
+                samples_y[(y * w_y + x) as usize] = (16 + (x * 5 + y * 3) % 200 + tex) as u8;
+            }
+        }
+        let w_c = g.dims_c.width;
+        let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+        let mut samples_cb = vec![0u8; len_c];
+        let mut samples_cr = vec![0u8; len_c];
+        for y in 0..g.dims_c.height {
+            for x in 0..w_c {
+                samples_cb[(y * w_c + x) as usize] = (110 + (x * 3) % 40) as u8;
+                samples_cr[(y * w_c + x) as usize] = (140 + (y * 3) % 40) as u8;
+            }
+        }
+        let source = SourceFrame {
+            samples_y,
+            samples_cb,
+            samples_cr,
+        };
+
+        // Pass 1: collect statistics; pass 2: encode with tuned tables.
+        let mut stats = TokenStatistics::new();
+        enc.intra_token_statistics(&source, &mut stats).unwrap();
+        assert!(
+            stats.counts[0].iter().flatten().any(|&c| c > 0),
+            "sampling must record luma tokens"
+        );
+        let tuned = base.with_tuned_huffman_tables(&stats).unwrap();
+        let enc_tuned = FrameEncoder::new(ident.clone(), tuned.clone(), qi).unwrap();
+
+        let packet_base = enc.encode_intra_frame(&source).unwrap();
+        let packet_tuned = enc_tuned.encode_intra_frame(&source).unwrap();
+        assert!(
+            packet_tuned.len() < packet_base.len(),
+            "tuned {} B must beat default {} B",
+            packet_tuned.len(),
+            packet_base.len()
+        );
+
+        // Identical reconstruction: the tuned tables only re-spell the
+        // same quantized coefficients.
+        let mut dec_base = FrameDecoder::new(ident.clone(), base).unwrap();
+        let mut dec_tuned = FrameDecoder::new(ident, tuned).unwrap();
+        let out_base = dec_base.decode_frame(&packet_base).unwrap();
+        let out_tuned = dec_tuned.decode_frame(&packet_tuned).unwrap();
+        assert_eq!(out_base.frame, out_tuned.frame, "identical pixels");
     }
 
     /// A coefficient beyond the single-coefficient token range is

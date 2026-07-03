@@ -14999,6 +14999,44 @@ impl TheoraEncoder {
         )
     }
 
+    /// Build an encoder whose §6.4.4 Huffman codebooks are tuned to
+    /// sample content — the two-pass tuning flow as one constructor.
+    ///
+    /// The first pass runs here: each `samples` frame (at the coded
+    /// macro-block-aligned dimensions, lower-left row-major like every
+    /// [`SourceFrame`]) is analyzed with
+    /// [`FrameEncoder::intra_token_statistics`] against `base_setup`,
+    /// and [`SetupHeaderTables::with_tuned_huffman_tables`] folds the
+    /// accumulated [`TokenStatistics`] into a tuned table set. The
+    /// encoder is then built on the tuned tables, so the §6.4 setup
+    /// header it queues (and advertises in `extradata`) carries them —
+    /// the stream stays fully self-describing, and every subsequent
+    /// frame benefits from the per-frame selector optimization choosing
+    /// the tuned codebooks wherever they win. Tuning changes how the
+    /// same quantized coefficients are spelled, never what a decoder
+    /// reconstructs.
+    ///
+    /// With an empty `samples` slice the tuned tables degrade to
+    /// near-uniform codebooks in the two sacrificed selector slots (the
+    /// other 14 fallbacks still cover every frame), so callers should
+    /// pass at least one representative frame.
+    pub fn with_tuned_setup_keyframe_interval(
+        codec_id: oxideav_core::CodecId,
+        ident: TheoraIdentHeader,
+        base_setup: SetupHeaderTables,
+        qi: u8,
+        keyframe_interval: u32,
+        samples: &[SourceFrame],
+    ) -> Result<Self, Error> {
+        let sampler = FrameEncoder::new(ident.clone(), base_setup.clone(), qi)?;
+        let mut stats = TokenStatistics::new();
+        for frame in samples {
+            sampler.intra_token_statistics(frame, &mut stats)?;
+        }
+        let tuned = base_setup.with_tuned_huffman_tables(&stats)?;
+        Self::with_keyframe_interval(codec_id, ident, tuned, qi, keyframe_interval)
+    }
+
     /// Set the P-frame inter mode-decision strategy (see
     /// [`InterModeStrategy`]). Returns `self` for builder chaining. The
     /// default is [`InterModeStrategy::RateDistortion`].
@@ -31515,6 +31553,121 @@ mod tests {
             !on[1] && !on[2] && !on[4] && !on[5],
             "steady frames must stay inter (got {on:?})"
         );
+    }
+
+    /// MILESTONE: two-pass Huffman tuning through the framework traits.
+    /// `TheoraEncoder::with_tuned_setup_keyframe_interval` samples a
+    /// frame, tunes the §6.4.4 codebooks, and emits a self-describing
+    /// stream whose setup header carries the tuned tables — the
+    /// downstream `TheoraDecoder` needs nothing but the stream's own
+    /// header packets. The tuned I,P,P stream's data payload is
+    /// strictly smaller than the default-table stream's, and both
+    /// decode to bit-identical pixels (tuning re-spells the same
+    /// coefficients).
+    #[test]
+    fn encoder_trait_tuned_huffman_stream_round_trips_smaller() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let base = SetupHeaderTables::vp3_defaults();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let qi = 48u8;
+
+        // The tuning sample: frame 0's pixels as a lower-left
+        // `SourceFrame` (flip the top-down `VideoFrame` rows).
+        let vf0 = textured_video_frame(&ident, 0);
+        let g = build_frame_geometry(&ident).unwrap();
+        let flip = |p: &oxideav_core::frame::VideoPlane, w: u32, h: u32| -> Vec<u8> {
+            let mut out = Vec::with_capacity((w * h) as usize);
+            for row in (0..h as usize).rev() {
+                out.extend_from_slice(&p.data[row * p.stride..row * p.stride + w as usize]);
+            }
+            out
+        };
+        let sample = SourceFrame {
+            samples_y: flip(&vf0.planes[0], g.dims_y.width, g.dims_y.height),
+            samples_cb: flip(&vf0.planes[1], g.dims_c.width, g.dims_c.height),
+            samples_cr: flip(&vf0.planes[2], g.dims_c.width, g.dims_c.height),
+        };
+
+        // Same I,P,P sequence through a default-table encoder and a
+        // tuned one.
+        let mut enc_default = TheoraEncoder::with_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            base.clone(),
+            qi,
+            3,
+        )
+        .unwrap();
+        let mut enc_tuned = TheoraEncoder::with_tuned_setup_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            base,
+            qi,
+            3,
+            std::slice::from_ref(&sample),
+        )
+        .unwrap();
+
+        let mut streams: Vec<(Vec<oxideav_core::Packet>, Vec<oxideav_core::Packet>)> = Vec::new();
+        for enc in [&mut enc_default, &mut enc_tuned] {
+            for phase in 0..3 {
+                let vf = textured_video_frame(&ident, phase);
+                enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+            }
+            let mut headers = Vec::new();
+            let mut data = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => {
+                        if p.flags.header {
+                            headers.push(p);
+                        } else {
+                            data.push(p);
+                        }
+                    }
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("encoder error {e}"),
+                }
+            }
+            assert_eq!(headers.len(), 3);
+            assert_eq!(data.len(), 3);
+            streams.push((headers, data));
+        }
+
+        let default_bytes: usize = streams[0].1.iter().map(|p| p.data.len()).sum();
+        let tuned_bytes: usize = streams[1].1.iter().map(|p| p.data.len()).sum();
+        assert!(
+            tuned_bytes < default_bytes,
+            "tuned stream {tuned_bytes} B must beat default {default_bytes} B"
+        );
+
+        // Both streams decode from nothing but their own packets, to
+        // bit-identical pixels.
+        let mut decoded: Vec<Vec<oxideav_core::VideoFrame>> = Vec::new();
+        for (headers, data) in &streams {
+            let mut dec = TheoraDecoder::new(codec_id.clone());
+            for p in headers {
+                dec.send_packet(p).unwrap();
+            }
+            let mut frames = Vec::new();
+            for p in data {
+                dec.send_packet(p).unwrap();
+                let oxideav_core::Frame::Video(vf) = dec.receive_frame().unwrap() else {
+                    panic!("expected video frame");
+                };
+                frames.push(vf);
+            }
+            decoded.push(frames);
+        }
+        for (i, (df, tf)) in decoded[0].iter().zip(decoded[1].iter()).enumerate() {
+            for pli in 0..3 {
+                assert_eq!(
+                    df.planes[pli].data, tf.planes[pli].data,
+                    "frame {i} plane {pli}: tuned stream must reconstruct identically"
+                );
+            }
+        }
     }
 
     // ------- target-bitrate rate control (round 371) -------

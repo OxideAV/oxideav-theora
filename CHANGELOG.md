@@ -6,6 +6,20 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Two-pass Huffman tuning on the framework encoder (round 384)** —
+  `TheoraEncoder::with_tuned_setup_keyframe_interval` wraps the
+  two-pass flow in one constructor: it analyzes caller-supplied sample
+  frames (`FrameEncoder::intra_token_statistics`), folds the
+  accumulated `TokenStatistics` into tuned §6.4.4 codebooks
+  (`SetupHeaderTables::with_tuned_huffman_tables`), and builds the
+  encoder on them — so the §6.4 setup header it queues (and the
+  `extradata` chain it advertises) carries the tuned tables and the
+  stream stays fully self-describing. A new end-to-end trait test
+  encodes the same I,P,P sequence through a default-table and a tuned
+  encoder: the tuned stream's data payload is strictly smaller and both
+  streams decode — from nothing but their own packets — to
+  bit-identical pixels.
+
 - **Content-tuned §6.4.4 Huffman codebooks — two-pass encoding (round
   384)** — the encoder can now build its own optimal DCT-token
   codebooks from measured statistics instead of relying solely on the

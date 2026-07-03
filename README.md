@@ -52,20 +52,66 @@ zero-initialized reference store.
   inverts the decoder's: the §7.9.3.3 forward DCT (`forward_dct_1d` /
   `forward_dct_2d`), forward quantization (`quantize_block`, the inverse
   of §7.9.2), forward §7.8 DC prediction (`forward_dc_prediction`), and
-  the §7.7 token entropy writer (single-coefficient tokens 9–22,
-  zero-run token 8, self-terminating EOB) over a new MSb-first
-  `BitWriter`. The token writer **chooses the §7.7.3 Huffman codebook**
-  for each frame: it tallies the luma and chroma tokens emitted in each
-  Huffman group and selects the `htiL` / `htiC` index (one of 16 per
-  group) that minimizes the frame's summed code length — a pure bit-rate
-  win at zero distortion (the decoder reads whichever selector is
-  written, so reconstruction is unchanged; the optimizer is never worse
-  than the first table). An intra, all-coded, single-`qi` frame emits no §7.3 /
+  the §7.7 token entropy writer over a new MSb-first `BitWriter`. The
+  token writer uses the **full §7.7 token alphabet**: single-coefficient
+  tokens 9–22, both pure zero-run tokens (3-bit token 7 for short gaps,
+  6-bit token 8 for long ones), the combined run+value tokens 23–31
+  (folding a zero gap and its terminating coefficient into one Huffman
+  code), and **cross-block §7.7.1 EOB runs** (tokens 0–6): the writer
+  simulates the §7.7.3 decoder's visit order once and coalesces every
+  maximal run of consecutive block-end visits into a single EOB-run
+  token — the rest of the run's blocks consume no bits at all, with
+  runs freely crossing the `ti = 1` selector refresh and the
+  luma/chroma boundary (runs past 4095 split greedily). It also
+  **optimizes the §7.7.3 Huffman selectors independently per range**:
+  the `ti = 0` pair only ever addresses group 0 (DC) and the re-read
+  `ti = 1` pair groups 1–4 (AC), so the writer tallies the tokens
+  actually written and picks each pair's cheapest table separately — a
+  pure bit-rate win at zero distortion. Together these cut the intra
+  measurement harness ~39% versus the round-379 writer at identical
+  reconstruction. An intra, all-coded, single-`qi` frame emits no §7.3 /
   §7.4 / §7.5 / §7.6 bits, matching the decoder's intra short-circuits.
   An encoded INTRA frame decodes back through this crate's own
   `FrameDecoder` faithfully to within the quantizer step (a 32×32
   gradient round-trips with max luma error 5 / mean 0.27 at the weakest
   quantiser, chroma exact; a flat frame is lossless).
+
+* **Adaptive block-level quantization** —
+  `FrameEncoder::encode_intra_frame_with_qiis` is the first encoder
+  path to emit a §7.1 multi-`qi` frame header (the `MOREQIS` / `QIS`
+  chain, up to `NQIS = 3`) and the §7.6 block-level qi stream
+  (`NQIS − 1` §7.2.1 long-run promotion passes, the exact inverse of
+  the decoder's `decode_block_level_qi`): `qis[0]` drives every DC
+  quantizer (the §7.6 preamble's rule, so DC prediction is untouched)
+  and the loop-filter limit, while each block's AC quantizer is
+  `qis[qiis[bi]]`. `encode_intra_frame_adaptive` layers a per-block
+  rate-distortion chooser on top — each block is quantized once per
+  candidate, reconstructed exactly as the decoder will, and scored
+  `D + λ·R` — and `TheoraEncoder::with_adaptive_quant` drives every
+  keyframe through it end-to-end via the framework `Encoder` trait
+  (inter frames keep the single frame-level `qi`). Tests re-parse the
+  emitted packets through the production §7.11 step-1 driver and pin
+  the wire `QIS` / `QIIS` arrays exactly; the `NQIS = 1` case is
+  byte-identical to the single-`qi` packet.
+
+* **Content-tuned Huffman codebooks (two-pass encoding)** —
+  `HuffmanTable::from_token_counts` builds a minimum-redundancy §6.4.4
+  codebook from per-token emission counts (all 32 tokens leafed,
+  canonical codes satisfying the Kraft equality — a full tree —
+  deterministic ties, 16-bit length cap).
+  `FrameEncoder::intra_token_statistics` tallies the tokens an intra
+  encode would write (combined tokens and EOB runs included) into a
+  `TokenStatistics` accumulator without producing a packet, and
+  `SetupHeaderTables::with_tuned_huffman_tables` replaces, per group,
+  the selector slot scoring worst on the sampled luma statistics with
+  the luma-tuned codebook and the worst remaining slot with the
+  chroma-tuned one — so content resembling the sample keeps the
+  fallback it would actually pick. The tuned set serializes through
+  `encode_setup_header`, keeping the stream self-describing;
+  `TheoraEncoder::with_tuned_setup_keyframe_interval` wraps the whole
+  two-pass flow in one constructor. Measured: a textured intra frame
+  shrinks a further 19–23% versus the VP3-default tables at
+  bit-identical reconstruction.
 
 * **Inter (P-frame) encoder** — `FrameEncoder::encode_inter_frame`
   (zero-MV baseline) and `encode_inter_frame_motion` (with motion
@@ -284,6 +330,12 @@ chroma blocks that earlier diverged is now sample-exact.
   header and a quantizer to emit a complete self-describing stream; a
   caller may still supply pre-decoded tables via `TheoraEncoder::new` /
   `extradata` when matching an existing setup.
+* **Inter-frame adaptive quantization / token statistics** — the §7.1
+  multi-`qi` header + §7.6 stream emission and the two-pass
+  `TokenStatistics` collection are wired for **intra** frames; inter
+  (P) frames are still coded at a single frame-level `qi` and do not
+  yet feed the Huffman-tuning tally (their tokens still *benefit* from
+  tuned tables at encode time via the per-frame selector optimization).
 * **Reference-captured golden / four-MV corpus fixture** — the
   golden-reference and four-MV inter modes are exercised
   top-to-bottom through this crate's own encoder→decoder round trip

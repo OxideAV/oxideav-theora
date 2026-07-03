@@ -6,6 +6,24 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Changed
 
+- **Cross-block §7.7.1 EOB runs (tokens 1..=6) in the frame token
+  writer (round 384)** — the writer previously closed every coded block
+  with its own single-block EOB token 0, so a stretch of blocks ending
+  together (all-zero chroma planes, flat regions, sparse frames) paid
+  one Huffman code per block. The frame writer now simulates the
+  §7.7.3 decoder's visit order once (the outer `ti` / inner coded-`bi`
+  interleave is fully determined by the per-block token plans), then
+  coalesces every maximal run of consecutive block-end visits into a
+  single §7.7.1 EOB-run token read at the run's first visit — the
+  remaining ends consume no bits at all (the decoder's step 4(b)ii).
+  Runs freely cross the `ti = 1` selector refresh and the luma / chroma
+  boundary, and runs longer than token 6's 12-bit payload (4095) split
+  greedily. The Huffman selector optimization now scores the tokens
+  actually written (EOB runs included) rather than the per-block plans.
+  Measured on the 64×64 intra harness: 5099 B → 4871 B overall (−4.5%),
+  with the sparse frames shrinking 25–40%. Round-384 cumulative
+  (selector split + combined tokens + EOB runs): 8006 B → 4871 B,
+  −39.2% at identical reconstruction.
 - **Combined run+value tokens 23..=31 and short zero-run token 7 in
   the token planner (round 384)** — the per-block token planner
   previously spelled every zero gap as a 6-bit zero-run token 8 and

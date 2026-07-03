@@ -6731,8 +6731,23 @@ fn best_huffman_selector(
 /// distortion) — followed by the interleaved per-`(ti, bi)`
 /// Huffman-coded tokens in exactly the order the §7.7.3 decoder reads
 /// them: the outer loop over `ti`, the inner loop over coded blocks
-/// `bi` whose `TIS[bi]` equals `ti`. Each block carries a
-/// self-terminating EOB token (token 0), so EOB runs never span blocks.
+/// `bi` whose `TIS[bi]` equals `ti`.
+///
+/// **EOB runs span blocks.** The writer simulates the decoder's visit
+/// order once (the outer `ti` / inner coded-`bi` interleave is fully
+/// determined by the per-block token plans), then coalesces every
+/// maximal run of consecutive block-end visits into a single §7.7.1
+/// EOB-run token (tokens 0..=6) read at the *first* ended block's
+/// visit — the following ends in the run consume no bits at all (the
+/// decoder's step 4(b)ii). A run longer than token 6's 12-bit payload
+/// (4095) is split greedily. This matches the §7.7.1 semantics
+/// exactly: once `EOBS > 0`, every subsequent visit ends its block
+/// until the run is exhausted, so a run is legal precisely when the
+/// covered visits are consecutive — which maximal runs of end-visits
+/// are by construction. Runs freely cross the `ti = 1` pass boundary
+/// (the selector pair is written at the pass start, not per visit) and
+/// the luma / chroma boundary (only the token-reading block's plane
+/// selects the table).
 ///
 /// Inputs:
 ///   * `w` — the shared bit writer (already positioned after §7.6).
@@ -6748,19 +6763,55 @@ fn best_huffman_selector(
 /// [`Error::EncodeHuffmanTokenMissing`] if a selected table lacks a
 /// leaf for a planned token (never happens for the full default
 /// tables).
-fn encode_dct_coefficients_inner(
-    w: &mut BitWriter,
+/// One §7.7.3 decoder visit — a `(ti, coded bi)` pair the step 4(b)
+/// inner loop will reach — as planned by [`plan_frame_tokens`].
+struct PlannedVisit {
+    /// The pass (zig-zag position) at which this visit happens.
+    ti: u8,
+    /// 0 = luma block, 1 = chroma block (selects htiL vs htiC).
+    plane: u8,
+    /// The token written at this visit, or `None` for a block-end
+    /// absorbed into an in-flight EOB run (no bits on the wire).
+    write: Option<PlannedToken>,
+}
+
+/// A frame's fully-planned §7.7.3 token emission: the decoder-order
+/// visit list (EOB runs already coalesced) plus the per-plane /
+/// per-group / per-token emission tally the selector optimization
+/// scores.
+struct FrameTokenPlan {
+    visits: Vec<PlannedVisit>,
+    /// `tally[plane][hg][token]` — counts of tokens written, plane 0 =
+    /// luma, 1 = chroma, hg 0..=4, token 0..=31.
+    tally: [[[u32; 32]; 5]; 2],
+}
+
+/// Plan a frame's complete §7.7.3 token emission.
+///
+/// Pass 1 simulates the decoder's visit order (the outer `ti` / inner
+/// coded-`bi` interleave is fully determined by the per-block token
+/// plans — ending a block by its own token 0 or by an EOB-run
+/// continuation has the identical `TIS` side effect, so the sequence
+/// recorded here is exactly the sequence the decoder will execute
+/// against the coalesced stream). Pass 2 coalesces every maximal run
+/// of consecutive block-end visits into a single §7.7.1 EOB-run token
+/// (tokens 0..=6) carried by the run's first visit; the rest of the
+/// run's visits write nothing (the decoder's step 4(b)ii). Runs longer
+/// than token 6's 12-bit payload (4095) are split greedily.
+fn plan_frame_tokens(
     nbs: u32,
     nmbs: u32,
     bcoded: &[u8],
     coeffs: &[[i16; 64]],
-    hts: &[HuffmanTable],
-) -> Result<(), Error> {
+) -> Result<FrameTokenPlan, Error> {
     let nbs_us = nbs as usize;
     let nlbs = nmbs.saturating_mul(4);
 
-    // Build each coded block's token plan and a per-block cursor.
-    // Uncoded blocks carry an empty plan (never visited).
+    // Build each coded block's token plan. Uncoded blocks carry an
+    // empty plan (never visited). The plan's terminal token 0 marks
+    // where the block ends; whether it is written as-is, widened to a
+    // longer EOB-run token, or absorbed into a preceding run is
+    // decided by the coalescing pass.
     let mut plans: Vec<Vec<PlannedToken>> = Vec::with_capacity(nbs_us);
     for bi in 0..nbs_us {
         if bcoded[bi] != 0 {
@@ -6772,26 +6823,14 @@ fn encode_dct_coefficients_inner(
         }
     }
 
-    // §7.7.3 step 4(a) lets the encoder pick which of the 16 tables in
-    // each Huffman group to use for luma (`htiL`) and for chroma
-    // (`htiC`) — `hti = 16 * HG + selector`, with one selector pair
-    // read at ti = 0 (covering group 0) and a fresh pair at ti = 1
-    // (covering groups 1..=4). The token *plan* (the tokens and their
-    // extra-bits) is independent of the selector; only the Huffman
-    // code lengths differ. So we tally, per Huffman group and token
-    // value, how many luma and chroma tokens are emitted, then choose
-    // each selector minimizing its groups' summed code length over all
-    // 16 candidates. This is a pure bit-rate win at zero distortion
-    // (the decoder reads whatever selectors we write).
-    //
-    // `tally[plane][hg][token]` — emission counts, plane 0 = luma, 1 =
-    // chroma, hg 0..=4, token 0..=31.
-    let mut tally = [[[0u32; 32]; 5]; 2];
+    let mut visits: Vec<PlannedVisit> = Vec::new();
+    // Indices into `visits` of block-end visits (terminal token 0),
+    // for the coalescing pass.
+    let mut end_positions: Vec<usize> = Vec::new();
     {
         let mut plan_idx = vec![0usize; nbs_us];
         let mut tis = vec![0u8; nbs_us];
         for ti in 0u8..=63 {
-            let hg = huffman_table_group(ti) as usize;
             for bi in 0..nbs_us {
                 if bcoded[bi] == 0 || tis[bi] != ti {
                     continue;
@@ -6799,13 +6838,91 @@ fn encode_dct_coefficients_inner(
                 let idx = plan_idx[bi];
                 let pt = plans[bi][idx];
                 plan_idx[bi] = idx + 1;
-                let plane = if (bi as u32) < nlbs { 0 } else { 1 };
-                tally[plane][hg][pt.token as usize] += 1;
-                let new_tis = (tis[bi] as u16 + pt.advance as u16).min(64);
-                tis[bi] = new_tis as u8;
+                let plane = if (bi as u32) < nlbs { 0u8 } else { 1u8 };
+                if pt.token == 0 {
+                    // Terminal EOB: the block ends at this visit.
+                    end_positions.push(visits.len());
+                    tis[bi] = 64;
+                    visits.push(PlannedVisit {
+                        ti,
+                        plane,
+                        write: Some(pt),
+                    });
+                } else {
+                    let new_tis = (tis[bi] as u16 + pt.advance as u16).min(64);
+                    tis[bi] = new_tis as u8;
+                    visits.push(PlannedVisit {
+                        ti,
+                        plane,
+                        write: Some(pt),
+                    });
+                }
             }
         }
     }
+
+    // Pass 2 — coalesce maximal runs of *consecutive* end-visits into
+    // §7.7.1 EOB-run tokens. `end_positions` is ascending; a maximal
+    // run is a maximal stretch of adjacent visit indices within it.
+    let mut i = 0usize;
+    while i < end_positions.len() {
+        // Find the maximal consecutive stretch [i, j).
+        let mut j = i + 1;
+        while j < end_positions.len() && end_positions[j] == end_positions[j - 1] + 1 {
+            j += 1;
+        }
+        let mut remaining = j - i;
+        let mut at = i;
+        while remaining > 0 {
+            // One §7.7.1 token covers up to 4095 ends (token 6's
+            // 12-bit payload); longer runs are split greedily.
+            let k = remaining.min(4095);
+            let eob = match k {
+                1 => PlannedToken::simple(0, 0),
+                2 => PlannedToken::simple(1, 0),
+                3 => PlannedToken::simple(2, 0),
+                4..=7 => PlannedToken::with_extra(3, 0, &[((k - 4) as u32, 2)]),
+                8..=15 => PlannedToken::with_extra(4, 0, &[((k - 8) as u32, 3)]),
+                16..=31 => PlannedToken::with_extra(5, 0, &[((k - 16) as u32, 4)]),
+                // Token 6 carries the run length itself; k >= 32 here
+                // so the payload is never the reserved 0 value.
+                _ => PlannedToken::with_extra(6, 0, &[(k as u32, 12)]),
+            };
+            // The chunk's token is read at its first end-visit; the
+            // rest of the chunk consumes no bits.
+            visits[end_positions[at]].write = Some(eob);
+            for p in &end_positions[at + 1..at + k] {
+                visits[*p].write = None;
+            }
+            at += k;
+            remaining -= k;
+        }
+        i = j;
+    }
+
+    // Tally the tokens actually written, per plane / Huffman group /
+    // token value, for the selector optimization.
+    let mut tally = [[[0u32; 32]; 5]; 2];
+    for v in &visits {
+        if let Some(pt) = &v.write {
+            let hg = huffman_table_group(v.ti) as usize;
+            tally[v.plane as usize][hg][pt.token as usize] += 1;
+        }
+    }
+
+    Ok(FrameTokenPlan { visits, tally })
+}
+
+fn encode_dct_coefficients_inner(
+    w: &mut BitWriter,
+    nbs: u32,
+    nmbs: u32,
+    bcoded: &[u8],
+    coeffs: &[[i16; 64]],
+    hts: &[HuffmanTable],
+) -> Result<(), Error> {
+    let FrameTokenPlan { visits, tally } = plan_frame_tokens(nbs, nmbs, bcoded, coeffs)?;
+
     // §7.7.3 step 4(a) reads a *fresh* selector pair at ti = 1, so the
     // pair written at ti = 0 only ever addresses Huffman group 0 (the
     // DC group; `huffman_table_group(0) = 0` and no later pass maps
@@ -6820,10 +6937,11 @@ fn encode_dct_coefficients_inner(
     let hti_l_ac = best_huffman_selector(hts, &tally[0], 1..=4);
     let hti_c_ac = best_huffman_selector(hts, &tally[1], 1..=4);
 
-    // Per-block emission state: index into the plan and current TIS.
-    let mut plan_idx = vec![0usize; nbs_us];
-    let mut tis = vec![0u8; nbs_us];
-
+    // Pass 3 — emit. Replay the recorded visits pass by pass; the
+    // selector pairs are written at the starts of passes 0 and 1
+    // regardless of whether any visit lands there (the decoder reads
+    // them unconditionally).
+    let mut vi = 0usize;
     for ti in 0u8..=63 {
         // §7.7.3 step 4(a): emit the table selectors at ti ∈ {0, 1} —
         // the DC-optimized pair at ti = 0, the AC-optimized pair at
@@ -6844,27 +6962,21 @@ fn encode_dct_coefficients_inner(
             (hti_l_ac, hti_c_ac)
         };
 
-        // §7.7.3 step 4(b): for each coded block whose TIS matches ti.
-        for bi in 0..nbs_us {
-            if bcoded[bi] == 0 {
+        // §7.7.3 step 4(b): the visits recorded for this pass, in
+        // coded-block order.
+        while vi < visits.len() && visits[vi].ti == ti {
+            let v = &visits[vi];
+            vi += 1;
+            let Some(pt) = &v.write else {
+                // Block-end absorbed into an in-flight EOB run: the
+                // decoder's step 4(b)ii reads no bits here.
                 continue;
-            }
-            if tis[bi] != ti {
-                continue;
-            }
-            // The next planned token for this block.
-            let idx = plan_idx[bi];
-            debug_assert!(
-                idx < plans[bi].len(),
-                "every coded block's plan terminates with an EOB before TIS reaches 64"
-            );
-            let pt = plans[bi][idx];
-            plan_idx[bi] = idx + 1;
+            };
 
             // Select the §6.4.4 Huffman table (Table 7.42 group × luma
             // / chroma selector), matching the decoder's addressing.
             let hg = huffman_table_group(ti);
-            let hti = if (bi as u32) < nlbs {
+            let hti = if v.plane == 0 {
                 16u8 * hg + hti_l
             } else {
                 16u8 * hg + hti_c
@@ -6888,13 +7000,9 @@ fn encode_dct_coefficients_inner(
                 let (val, nbits) = pt.extra[k];
                 w.write_bits(val, nbits);
             }
-
-            // Advance TIS exactly as the §7.7.1 / §7.7.2 side effects
-            // would; the EOB / final token pins it to 64.
-            let new_tis = (tis[bi] as u16 + pt.advance as u16).min(64);
-            tis[bi] = new_tis as u8;
         }
     }
+    debug_assert_eq!(vi, visits.len(), "every recorded visit was replayed");
 
     Ok(())
 }
@@ -21909,37 +22017,24 @@ mod tests {
             assert_eq!(decoded[bi], coeffs[bi], "block {bi}");
         }
 
-        // Rebuild the frame's (group, token) tally and extra-bits total
-        // by replaying the per-block plans, then derive the independent
-        // per-range optima and the exact bit count the split emission
-        // must produce.
-        let mut tally = [[0u32; 32]; 5];
-        let mut extra_bits: u64 = 0;
-        {
-            let plans: Vec<Vec<PlannedToken>> = coeffs
-                .iter()
-                .map(|c| plan_block_tokens(c).unwrap())
-                .collect();
-            let mut plan_idx = vec![0usize; nbs as usize];
-            let mut tis = vec![0u8; nbs as usize];
-            for ti in 0u8..=63 {
-                let hg = huffman_table_group(ti) as usize;
-                for bi in 0..nbs as usize {
-                    if tis[bi] != ti {
-                        continue;
-                    }
-                    let pt = plans[bi][plan_idx[bi]];
-                    plan_idx[bi] += 1;
-                    tally[hg][pt.token as usize] += 1;
-                    extra_bits += (0..pt.n_extra as usize)
-                        .map(|k| u64::from(pt.extra[k].1))
-                        .sum::<u64>();
-                    tis[bi] = ((tis[bi] as u16 + pt.advance as u16).min(64)) as u8;
-                }
-            }
-        }
-        let want_dc = best_huffman_selector(hts, &tally, 0..=0);
-        let want_ac = best_huffman_selector(hts, &tally, 1..=4);
+        // Rebuild the frame's planned emission (visit list with EOB
+        // runs coalesced, plus the written-token tally), then derive
+        // the independent per-range optima and the exact bit count the
+        // split emission must produce.
+        let plan = plan_frame_tokens(nbs, nmbs, &bcoded, &coeffs).unwrap();
+        let tally = &plan.tally[0]; // all-luma frame.
+        let extra_bits: u64 = plan
+            .visits
+            .iter()
+            .filter_map(|v| v.write.as_ref())
+            .map(|pt| {
+                (0..pt.n_extra as usize)
+                    .map(|k| u64::from(pt.extra[k].1))
+                    .sum::<u64>()
+            })
+            .sum();
+        let want_dc = best_huffman_selector(hts, tally, 0..=0);
+        let want_ac = best_huffman_selector(hts, tally, 1..=4);
         assert_ne!(
             want_dc, want_ac,
             "test profile must exercise diverging DC/AC selector preferences"
@@ -22106,6 +22201,149 @@ mod tests {
         for bi in 0..nbs as usize {
             assert_eq!(decoded[bi], coeffs[bi], "block {bi} coefficients differ");
         }
+    }
+
+    /// Consecutive block-end visits coalesce into cross-block §7.7.1
+    /// EOB-run tokens (1..=6), the run's tail visits write nothing, and
+    /// the coalesced stream decodes bit-exactly — including runs that
+    /// cross the luma / chroma boundary and the ti = 1 selector
+    /// refresh.
+    #[test]
+    fn encode_dct_coefficients_cross_block_eob_runs() {
+        let setup = SetupHeaderTables::vp3_defaults();
+        let hts = &setup.huffman_tables[..];
+
+        // 24 coded blocks (8 luma, 16 chroma): block 0 carries one DC
+        // coefficient, blocks 1..24 are all-zero. Pass 0 visits every
+        // block: block 0 writes its DC token, then 23 consecutive
+        // end-visits follow — one token 5 (16-run) + one token 3
+        // (7-run) after greedy chunking... the exact chunking is
+        // asserted below from the plan, the wire from the round trip.
+        let nbs = 24u32;
+        let nmbs = 2u32; // nlbs = 8.
+        let bcoded = vec![1u8; nbs as usize];
+        let mut coeffs = vec![[0i16; 64]; nbs as usize];
+        coeffs[0][0] = 5;
+        // Block 0 ends at ti = 1 (after its DC token) — its own end
+        // visit is *not* adjacent to the pass-0 run of blocks 1..24.
+        let plan = plan_frame_tokens(nbs, nmbs, &bcoded, &coeffs).unwrap();
+
+        // Visit order: (ti=0, bi=0 DC token), (ti=0, bi=1..23 ends),
+        // (ti=1, bi=0 end).
+        assert_eq!(plan.visits.len(), 25);
+        assert_eq!(plan.visits[0].ti, 0);
+        assert!(plan.visits[0].write.is_some());
+        assert_eq!(plan.visits[0].write.as_ref().unwrap().token, 15); // ±5.
+
+        // The end-visits are: blocks 1..24 at ti = 0, then block 0 at
+        // ti = 1 — 24 *consecutive* visits, so they coalesce into ONE
+        // run that crosses the ti = 1 pass boundary: token 5 (16..=31
+        // with 4-bit payload) at the first end, nothing at the other
+        // 23.
+        let first_end = plan.visits[1].write.as_ref().unwrap();
+        assert_eq!(first_end.token, 5);
+        assert_eq!(first_end.extra[0], (24 - 16, 4));
+        for (k, v) in plan.visits[2..25].iter().enumerate() {
+            assert!(v.write.is_none(), "run tail visit {k} must be silent");
+        }
+        // The run crosses the luma / chroma boundary (blocks 8.. are
+        // chroma; visits[k] is block k's end for k in 1..24) — assert
+        // the recorded planes really straddle it — and the ti = 1 pass
+        // boundary (block 0's own end, the run's final visit).
+        assert_eq!(plan.visits[7].plane, 0);
+        assert_eq!(plan.visits[8].plane, 1);
+        assert_eq!(plan.visits[23].ti, 0);
+        assert_eq!(plan.visits[24].ti, 1);
+
+        // The coalesced stream decodes bit-exactly.
+        let mut w = super::BitWriter::new();
+        encode_dct_coefficients_inner(&mut w, nbs, nmbs, &bcoded, &coeffs, hts).unwrap();
+        let bytes = w.into_bytes();
+        let (decoded, _n) = decode_dct_coefficients(&bytes, nbs, nmbs, &bcoded, hts).unwrap();
+        for bi in 0..nbs as usize {
+            assert_eq!(decoded[bi], coeffs[bi], "block {bi}");
+        }
+
+        // And it is strictly smaller than 24 blocks of per-block EOB
+        // termination could ever be: 23 EOB codes (≥ 1 bit each) were
+        // replaced by one token-5 code + 4 payload bits.
+        // (Loose structural bound: the packet must fit in fewer bits
+        // than the DC token + 24 individual shortest-possible codes.)
+        assert!(bytes.len() <= 8, "got {} bytes", bytes.len());
+    }
+
+    /// Every §7.7.1 EOB-run token reach (2, 3, 4..=7, 8..=15, 16..=31,
+    /// 32..=4095) and the > 4095 greedy split are chosen correctly and
+    /// round-trip through the decoder.
+    #[test]
+    fn encode_dct_coefficients_eob_run_token_reaches() {
+        let setup = SetupHeaderTables::vp3_defaults();
+        let hts = &setup.huffman_tables[..];
+
+        // (number of consecutive all-zero blocks, expected first token,
+        //  expected extra field or None).
+        type EobReachCase = (u32, u8, Option<(u32, u32)>);
+        let cases: &[EobReachCase] = &[
+            (2, 1, None),
+            (3, 2, None),
+            (5, 3, Some((1, 2))),
+            (12, 4, Some((4, 3))),
+            (20, 5, Some((4, 4))),
+            (40, 6, Some((40, 12))),
+        ];
+        for &(n, want_token, want_extra) in cases {
+            let nbs = n;
+            let nmbs = n / 4; // any nlbs <= nbs split works.
+            let bcoded = vec![1u8; nbs as usize];
+            let coeffs = vec![[0i16; 64]; nbs as usize];
+            let plan = plan_frame_tokens(nbs, nmbs, &bcoded, &coeffs).unwrap();
+            assert_eq!(plan.visits.len(), n as usize);
+            let first = plan.visits[0].write.as_ref().unwrap();
+            assert_eq!(first.token, want_token, "n={n}");
+            match want_extra {
+                Some(e) => {
+                    assert_eq!(first.n_extra, 1, "n={n}");
+                    assert_eq!(first.extra[0], e, "n={n}");
+                }
+                None => assert_eq!(first.n_extra, 0, "n={n}"),
+            }
+            for v in &plan.visits[1..] {
+                assert!(v.write.is_none(), "n={n}: tail visits are silent");
+            }
+
+            let mut w = super::BitWriter::new();
+            encode_dct_coefficients_inner(&mut w, nbs, nmbs, &bcoded, &coeffs, hts).unwrap();
+            let bytes = w.into_bytes();
+            let (decoded, _nc) = decode_dct_coefficients(&bytes, nbs, nmbs, &bcoded, hts).unwrap();
+            for (bi, blk) in decoded.iter().enumerate() {
+                assert_eq!(blk, &[0i16; 64], "n={n} block {bi}");
+            }
+        }
+
+        // A run longer than token 6's 12-bit payload splits greedily:
+        // 4095 + remainder, the second chunk's token carried by the
+        // 4096th end-visit.
+        let nbs = 5000u32;
+        let nmbs = 1250u32;
+        let bcoded = vec![1u8; nbs as usize];
+        let coeffs = vec![[0i16; 64]; nbs as usize];
+        let plan = plan_frame_tokens(nbs, nmbs, &bcoded, &coeffs).unwrap();
+        let first = plan.visits[0].write.as_ref().unwrap();
+        assert_eq!(first.token, 6);
+        assert_eq!(first.extra[0], (4095, 12));
+        let second = plan.visits[4095].write.as_ref().unwrap();
+        assert_eq!(second.token, 6);
+        assert_eq!(second.extra[0], (905, 12));
+        for (i, v) in plan.visits.iter().enumerate() {
+            if i != 0 && i != 4095 {
+                assert!(v.write.is_none(), "visit {i}");
+            }
+        }
+        let mut w = super::BitWriter::new();
+        encode_dct_coefficients_inner(&mut w, nbs, nmbs, &bcoded, &coeffs, hts).unwrap();
+        let bytes = w.into_bytes();
+        let (decoded, _nc) = decode_dct_coefficients(&bytes, nbs, nmbs, &bcoded, hts).unwrap();
+        assert!(decoded.iter().all(|c| c == &[0i16; 64]));
     }
 
     /// A coefficient beyond the single-coefficient token range is

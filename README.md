@@ -1,5 +1,7 @@
 # oxideav-theora
 
+[![CI](https://github.com/OxideAV/oxideav-theora/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-theora/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-theora.svg)](https://crates.io/crates/oxideav-theora) [![docs.rs](https://docs.rs/oxideav-theora/badge.svg)](https://docs.rs/oxideav-theora) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust Theora video codec — clean-room implementation, in progress.
 The crate works on Theora packets directly (it does not parse the Ogg
 container); callers de-frame the bitstream packets and hand them in. The

@@ -6,6 +6,31 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Adaptive block-level quantization on the intra encoder (round
+  384)** — the first encoder path to emit a §7.1 multi-`qi` frame
+  header (the `MOREQIS` / `QIS` chain, up to `NQIS = 3`) and the §7.6
+  block-level qi stream (`NQIS − 1` §7.2.1 long-run promotion passes
+  over the coded blocks, the exact inverse of
+  `decode_block_level_qi`). `FrameEncoder::encode_intra_frame_with_qiis`
+  takes an explicit frame `qis` list plus a per-block selector array:
+  `qis[0]` drives every DC quantizer (the §7.6 preamble's rule, so DC
+  prediction is untouched) and the loop-filter limit, while each
+  block's AC quantizer is `qis[qiis[bi]]`.
+  `FrameEncoder::encode_intra_frame_adaptive` layers a per-block
+  rate-distortion chooser on top: each block is quantized once per
+  candidate, reconstructed exactly as the decoder will (dequantize →
+  inverse DCT → clamp) and scored `D + λ·R` (delivered SSD + a
+  token-plan bit estimate under the same quadratic λ ramp the inter RD
+  decision uses). New error variants `EncodeQisCountOutOfRange` /
+  `EncodeQiisLenMismatch` / `EncodeQiiOutOfRange` fail malformed
+  shapes closed. Tests re-parse the emitted packet through the
+  production §7.11 step-1 driver and pin the wire `QIS` / `QIIS`
+  arrays exactly (two-qi split, full three-qi chain, RD-chosen mixed
+  split), verify the weak-quantizer region reconstructs strictly
+  better than a uniform strong-quantizer encode, and pin the
+  `NQIS = 1` degenerate case byte-identical to the historical
+  single-qi packet.
+
 - **Two-pass Huffman tuning on the framework encoder (round 384)** —
   `TheoraEncoder::with_tuned_setup_keyframe_interval` wraps the
   two-pass flow in one constructor: it analyzes caller-supplied sample

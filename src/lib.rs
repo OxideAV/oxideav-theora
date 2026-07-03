@@ -879,6 +879,30 @@ pub enum Error {
         /// The block's lower-left pixel row.
         by: u32,
     },
+    /// An adaptive-quantization `qis` list had a length outside the
+    /// §7.1 frame-header range (`NQIS` must be 1..=3).
+    EncodeQisCountOutOfRange {
+        /// The supplied list length.
+        got: usize,
+    },
+    /// A per-block `qiis` array had a different length than the frame's
+    /// block count.
+    EncodeQiisLenMismatch {
+        /// The supplied array length.
+        got: usize,
+        /// The frame's block count `NBS`.
+        nbs: usize,
+    },
+    /// A per-block `qiis` entry referenced a `qis` slot the frame
+    /// header does not carry (`QIIS[bi]` must be `< NQIS` per §7.6).
+    EncodeQiiOutOfRange {
+        /// The offending block index.
+        bi: u32,
+        /// The out-of-range selector value.
+        qii: u8,
+        /// The frame's `qis` list length.
+        nqis: usize,
+    },
     /// A header-serialization field could not be represented on the wire
     /// — e.g. a `picw`/`pich` exceeding the 24-bit field, or a comment
     /// vector longer than the 32-bit length prefix. The encoder builds
@@ -1748,6 +1772,18 @@ impl core::fmt::Display for Error {
             Error::EncodeBlockOutOfPlane { bx, by } => write!(
                 f,
                 "oxideav-theora: encode block at ({bx},{by}) escapes its source plane"
+            ),
+            Error::EncodeQisCountOutOfRange { got } => write!(
+                f,
+                "oxideav-theora: encode qis list length {got} outside §7.1 NQIS range 1..=3"
+            ),
+            Error::EncodeQiisLenMismatch { got, nbs } => write!(
+                f,
+                "oxideav-theora: encode qiis length {got} != nbs {nbs}"
+            ),
+            Error::EncodeQiiOutOfRange { bi, qii, nqis } => write!(
+                f,
+                "oxideav-theora: encode qiis[{bi}] = {qii} >= NQIS {nqis}"
             ),
             Error::EncodeHeaderFieldOutOfRange { field, value } => write!(
                 f,
@@ -12699,6 +12735,22 @@ impl FrameEncoder {
     /// [`Self::intra_token_statistics`] (which only tallies the token
     /// plan).
     fn intra_coefficients(&self, frame: &SourceFrame) -> Result<Vec<[i16; 64]>, Error> {
+        let qiis = vec![0u8; self.geometry.nbs as usize];
+        self.intra_coefficients_with(frame, &[self.qi], &qiis)
+    }
+
+    /// As [`Self::intra_coefficients`], but with an explicit frame `qis`
+    /// list and per-block selector array: the DC quantizer always comes
+    /// from `qis[0]` (the §7.6 preamble's rule, so DC prediction is
+    /// unaffected by the per-block choice) while each block's AC
+    /// quantizer comes from `qis[qiis[bi]]`. Callers validate `qis` /
+    /// `qiis` shape beforehand.
+    fn intra_coefficients_with(
+        &self,
+        frame: &SourceFrame,
+        qis: &[u8],
+        qiis: &[u8],
+    ) -> Result<Vec<[i16; 64]>, Error> {
         let g = &self.geometry;
         let nbs = g.nbs as usize;
 
@@ -12727,17 +12779,51 @@ impl FrameEncoder {
             });
         }
 
-        let qi = self.qi as usize;
-
-        // Pre-build the per-plane intra (qti = 0) quantization matrix
-        // once. For an intra frame `qi0 == qi` (NQIS = 1), so the DC and
-        // AC matrices coincide and a single per-plane matrix serves both
-        // the DC and the AC quantizer in `quantize_block`.
-        let qmats: [QuantizationMatrix; 3] = [
-            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 0, qi)?,
-            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 1, qi)?,
-            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 2, qi)?,
+        // Pre-build the per-plane intra (qti = 0) quantization
+        // matrices: one DC set at qis[0], one AC set per qis entry.
+        let qmats_dc: [QuantizationMatrix; 3] = [
+            compute_quantization_matrix(
+                &self.setup.quantization_parameters,
+                0,
+                0,
+                qis[0] as usize,
+            )?,
+            compute_quantization_matrix(
+                &self.setup.quantization_parameters,
+                0,
+                1,
+                qis[0] as usize,
+            )?,
+            compute_quantization_matrix(
+                &self.setup.quantization_parameters,
+                0,
+                2,
+                qis[0] as usize,
+            )?,
         ];
+        let mut qmats_ac: Vec<[QuantizationMatrix; 3]> = Vec::with_capacity(qis.len());
+        for &qi in qis {
+            qmats_ac.push([
+                compute_quantization_matrix(
+                    &self.setup.quantization_parameters,
+                    0,
+                    0,
+                    qi as usize,
+                )?,
+                compute_quantization_matrix(
+                    &self.setup.quantization_parameters,
+                    0,
+                    1,
+                    qi as usize,
+                )?,
+                compute_quantization_matrix(
+                    &self.setup.quantization_parameters,
+                    0,
+                    2,
+                    qi as usize,
+                )?,
+            ]);
+        }
 
         // Step 1: per-block forward DCT + quantize. The DC slot of each
         // block holds the absolute (reconstructed) quantized DC at this
@@ -12759,7 +12845,7 @@ impl FrameEncoder {
                 }
             }
             let dqc = forward_dct_2d(&residual);
-            *out = quantize_block(&dqc, &qmats[pli], &qmats[pli]);
+            *out = quantize_block(&dqc, &qmats_dc[pli], &qmats_ac[qiis[bi] as usize][pli]);
         }
 
         // Step 2: forward DC prediction. Every block is INTRA so
@@ -12845,6 +12931,256 @@ impl FrameEncoder {
         )?;
 
         Ok(w.into_bytes())
+    }
+
+    /// Encode one intra frame with **adaptive block-level
+    /// quantization** and an explicit per-block selector array.
+    ///
+    /// `qis` is the frame's §7.1 quantization-index list (1..=3
+    /// entries, each `0..=63`): `qis[0]` drives every block's DC
+    /// quantizer (the §7.6 preamble's rule, keeping DC prediction
+    /// uniform) and the §6.4.1 loop-filter limit; each block `bi`'s AC
+    /// quantizer is `qis[qiis[bi]]`. `qiis` must hold one selector per
+    /// block (`< qis.len()`), in coded block order. The packet carries
+    /// the §7.1 `MOREQIS` / `QIS` chain and the §7.6 block-level qi
+    /// stream (`NQIS − 1` §7.2.1 long-run passes over the coded
+    /// blocks) — the first encoder path to emit either.
+    ///
+    /// With `qis.len() == 1` this degrades to exactly
+    /// [`Self::encode_intra_frame`]'s bitstream (the §7.6 loop runs
+    /// zero passes and writes no bits). The encoder's own `qi` is
+    /// unused; the supplied list governs the whole frame.
+    pub fn encode_intra_frame_with_qiis(
+        &self,
+        frame: &SourceFrame,
+        qis: &[u8],
+        qiis: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let g = &self.geometry;
+        let nbs = g.nbs as usize;
+        let nqis = qis.len();
+        if !(1..=3).contains(&nqis) {
+            return Err(Error::EncodeQisCountOutOfRange { got: nqis });
+        }
+        for &qi in qis {
+            if qi > 63 {
+                return Err(Error::QuantIndexOutOfRange { qi: qi as usize });
+            }
+        }
+        if qiis.len() != nbs {
+            return Err(Error::EncodeQiisLenMismatch {
+                got: qiis.len(),
+                nbs,
+            });
+        }
+        for (bi, &qii) in qiis.iter().enumerate() {
+            if qii as usize >= nqis {
+                return Err(Error::EncodeQiiOutOfRange {
+                    bi: bi as u32,
+                    qii,
+                    nqis,
+                });
+            }
+        }
+
+        let coeffs = self.intra_coefficients_with(frame, qis, qiis)?;
+        let bcoded = vec![1u8; nbs];
+
+        // §7.1 frame header with the MOREQIS / QIS chain.
+        let mut w = BitWriter::new();
+        // Step 1: packet-type bit 0 (data packet); step 2: FTYPE = 0.
+        w.write_bits(0, 1);
+        w.write_bits(0, 1);
+        // Step 3: QIS[0]; steps 4–6: the MOREQIS chain.
+        w.write_bits(qis[0] as u32, 6);
+        if nqis >= 2 {
+            w.write_bits(1, 1); // MOREQIS[0]
+            w.write_bits(qis[1] as u32, 6);
+            if nqis == 3 {
+                w.write_bits(1, 1); // MOREQIS[1]
+                w.write_bits(qis[2] as u32, 6);
+            } else {
+                w.write_bits(0, 1);
+            }
+        } else {
+            w.write_bits(0, 1);
+        }
+        // Step 7: 3 reserved bits on intra frames.
+        w.write_bits(0, 3);
+
+        // §7.3 / §7.4 / §7.5 read no bits on an intra all-coded frame.
+        // §7.6 (encoder side): NQIS − 1 §7.2.1 long-run passes. Pass
+        // `qii` visits, in coded order, the coded blocks still sitting
+        // at selector `qii` and writes one bit each: 0 keeps the block,
+        // 1 promotes it to `qii + 1` (putting it in the next pass's
+        // group) — the exact inverse of `decode_block_level_qi`.
+        let mut cur = vec![0u8; nbs];
+        for qii in 0..nqis - 1 {
+            let mut bits: Vec<u8> = Vec::new();
+            for bi in 0..nbs {
+                if bcoded[bi] != 0 && cur[bi] as usize == qii {
+                    let promote = qiis[bi] as usize > qii;
+                    bits.push(promote as u8);
+                    if promote {
+                        cur[bi] += 1;
+                    }
+                }
+            }
+            encode_long_run_bit_string(&mut w, &bits);
+        }
+        debug_assert_eq!(cur, qiis, "the §7.6 promotion passes must land every block");
+
+        encode_dct_coefficients_inner(
+            &mut w,
+            g.nbs,
+            g.nmbs,
+            &bcoded,
+            &coeffs,
+            &self.setup.huffman_tables[..],
+        )?;
+
+        Ok(w.into_bytes())
+    }
+
+    /// Encode one intra frame with adaptive block-level quantization,
+    /// choosing each block's `qi` by rate-distortion.
+    ///
+    /// For every block the encoder quantizes its forward DCT once per
+    /// `qis` candidate, reconstructs it exactly as the decoder will
+    /// (dequantize → inverse DCT → clamp against the §7.9.1.1 intra
+    /// predictor), and scores `D + λ·R`: `D` the delivered SSD against
+    /// the source block, `R` the §7.7 token-plan bit estimate, λ
+    /// derived from `qis[0]` (the same quadratic ramp the inter RD
+    /// decision uses). The cheapest candidate becomes `QIIS[bi]` and
+    /// the frame is emitted through
+    /// [`Self::encode_intra_frame_with_qiis`]. Spending fewer bits on
+    /// blocks that cannot repay them (and more where fidelity is
+    /// cheap) is a pure encoder decision — the bitstream is a
+    /// conformant §7.1 + §7.6 multi-qi frame either way.
+    pub fn encode_intra_frame_adaptive(
+        &self,
+        frame: &SourceFrame,
+        qis: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let g = &self.geometry;
+        let nbs = g.nbs as usize;
+        let nqis = qis.len();
+        if !(1..=3).contains(&nqis) {
+            return Err(Error::EncodeQisCountOutOfRange { got: nqis });
+        }
+        for &qi in qis {
+            if qi > 63 {
+                return Err(Error::QuantIndexOutOfRange { qi: qi as usize });
+            }
+        }
+
+        // λ from qis[0], matching `inter_rd_lambda`'s quadratic ramp.
+        let qi0 = qis[0] as u64;
+        let lambda = 4 + qi0 * qi0 / 16;
+
+        // Per-plane DC matrices at qis[0], AC matrices per candidate.
+        let qmats_dc: [QuantizationMatrix; 3] = [
+            compute_quantization_matrix(
+                &self.setup.quantization_parameters,
+                0,
+                0,
+                qis[0] as usize,
+            )?,
+            compute_quantization_matrix(
+                &self.setup.quantization_parameters,
+                0,
+                1,
+                qis[0] as usize,
+            )?,
+            compute_quantization_matrix(
+                &self.setup.quantization_parameters,
+                0,
+                2,
+                qis[0] as usize,
+            )?,
+        ];
+        let mut qmats_ac: Vec<[QuantizationMatrix; 3]> = Vec::with_capacity(nqis);
+        for &qi in qis {
+            qmats_ac.push([
+                compute_quantization_matrix(
+                    &self.setup.quantization_parameters,
+                    0,
+                    0,
+                    qi as usize,
+                )?,
+                compute_quantization_matrix(
+                    &self.setup.quantization_parameters,
+                    0,
+                    1,
+                    qi as usize,
+                )?,
+                compute_quantization_matrix(
+                    &self.setup.quantization_parameters,
+                    0,
+                    2,
+                    qi as usize,
+                )?,
+            ]);
+        }
+
+        let mut qiis = vec![0u8; nbs];
+        for (bi, qii_out) in qiis.iter_mut().enumerate() {
+            let pli = g.pli_of_block[bi] as usize;
+            let (plane, pw, ph) = match pli {
+                0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+                1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+                _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+            };
+            let src = Self::extract_block(plane, pw, ph, g.bx_of_block[bi], g.by_of_block[bi])?;
+            let mut residual = [[0i16; 8]; 8];
+            for (r, row) in residual.iter_mut().enumerate() {
+                for (c, slot) in row.iter_mut().enumerate() {
+                    *slot = src[r][c] - 128;
+                }
+            }
+            let dqc = forward_dct_2d(&residual);
+
+            let mut best: Option<(u64, u8)> = None;
+            for (cand, ac) in qmats_ac.iter().enumerate() {
+                let q = quantize_block(&dqc, &qmats_dc[pli], &ac[pli]);
+                // Delivered distortion: reconstruct exactly as §7.9
+                // will (128 predictor + dequantized inverse DCT,
+                // clamped) and take the SSD against the source.
+                let dqc_rec = dequantize_block(&q, &qmats_dc[pli], &ac[pli]);
+                let rec = inverse_dct_2d(&dqc_rec);
+                let mut ssd = 0u64;
+                for r in 0..8 {
+                    for c in 0..8 {
+                        let p = (128 + rec[r][c] as i32).clamp(0, 255);
+                        let d = src[r][c] as i32 - p;
+                        ssd += (d * d) as u64;
+                    }
+                }
+                // Rate estimate from the block's token plan: a nominal
+                // 5-bit Huffman code per token plus its extra bits.
+                let Some(plan) = plan_block_tokens(&q) else {
+                    continue;
+                };
+                let bits: u64 = plan
+                    .iter()
+                    .map(|pt| {
+                        5 + (0..pt.n_extra as usize)
+                            .map(|k| u64::from(pt.extra[k].1))
+                            .sum::<u64>()
+                    })
+                    .sum();
+                let cost = ssd + lambda * bits;
+                if best.map_or(true, |(b, _)| cost < b) {
+                    best = Some((cost, cand as u8));
+                }
+            }
+            // Every candidate out of range would mean the source block
+            // overflows the token alphabet at every qi — impossible for
+            // 8-bit input; fall back to selector 0 defensively.
+            *qii_out = best.map_or(0, |(_, c)| c);
+        }
+
+        self.encode_intra_frame_with_qiis(frame, qis, &qiis)
     }
 
     /// Encode one inter (P-frame) frame against a previous-frame
@@ -33574,6 +33910,245 @@ mod tests {
         .map(|d| d.mbmodes)
         .unwrap_or_else(|e| panic!("re-decode of encoded packet failed: {e:?}"));
         out
+    }
+
+    /// Re-parse an encoded video-data packet through the production
+    /// [`decode_data_packet_header_and_blocks`] using an encoder's
+    /// geometry, returning the §7.1 `QIS` list and the §7.6 per-block
+    /// `QIIS` array — so the adaptive-quantization tests can assert
+    /// exactly what landed on the wire.
+    fn decode_packet_qis_and_qiis(
+        enc: &FrameEncoder,
+        first_frame: bool,
+        pkt: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let g = enc.geometry();
+        let cb_slices: Vec<&[u32]> = g.chroma_cb.iter().map(|v| v.as_slice()).collect();
+        let cr_slices: Vec<&[u32]> = g.chroma_cr.iter().map(|v| v.as_slice()).collect();
+        let plane_orders: [&[u32]; 3] = [
+            &g.plane_raster_order[0],
+            &g.plane_raster_order[1],
+            &g.plane_raster_order[2],
+        ];
+        let out = decode_data_packet_header_and_blocks(
+            pkt,
+            first_frame,
+            g.pf,
+            g.nsbs,
+            g.nbs,
+            g.nmbs,
+            &g.block_to_super_block,
+            &g.macro_block_to_luma_blocks,
+            ChromaBlockLayout {
+                cb: &cb_slices,
+                cr: &cr_slices,
+            },
+            &enc.setup.huffman_tables[..],
+            DcPredictionGeometry {
+                block_to_macro_block: &g.mbi_of_block,
+                neighbors: &g.neighbors,
+                plane_raster_order: &plane_orders,
+            },
+        )
+        .unwrap_or_else(|e| panic!("re-decode of encoded packet failed: {e:?}"));
+        (out.header.qis.clone(), out.qiis.clone())
+    }
+
+    /// MILESTONE: adaptive block-level quantization on the intra
+    /// encoder — the first encoder path to emit a §7.1 multi-`qi`
+    /// header (`MOREQIS`) and the §7.6 block-level qi stream. An
+    /// explicit per-block selector split round-trips: the wire carries
+    /// the exact `QIS` list and `QIIS` array, the packet decodes
+    /// through `FrameDecoder`, and the region coded at the weaker
+    /// quantizer reconstructs its busy texture strictly better than a
+    /// uniform strong-quantizer encode of the same frame.
+    #[test]
+    fn encode_intra_frame_with_qiis_round_trips() {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 30).unwrap();
+        let g = enc.geometry();
+        let nbs = g.nbs as usize;
+
+        // Busy texture everywhere (so the AC quantizer choice shows).
+        let mk = |w: u32, h: u32, seed: u32| -> Vec<u8> {
+            let mut v = vec![0u8; (w * h) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    v[(y * w + x) as usize] = (40 + ((x * 13 + y * 29 + seed) % 170)) as u8;
+                }
+            }
+            v
+        };
+        let source = SourceFrame {
+            samples_y: mk(g.dims_y.width, g.dims_y.height, 0),
+            samples_cb: mk(g.dims_c.width, g.dims_c.height, 3),
+            samples_cr: mk(g.dims_c.width, g.dims_c.height, 7),
+        };
+
+        // Split: luma blocks in the upper half of the plane get the
+        // weak quantizer (qii 1 → qi 60), everything else the strong
+        // one (qii 0 → qi 30).
+        let qis = [30u8, 60u8];
+        let mut qiis = vec![0u8; nbs];
+        for (bi, q) in qiis.iter_mut().enumerate() {
+            if g.pli_of_block[bi] == 0 && g.by_of_block[bi] >= g.dims_y.height / 2 {
+                *q = 1;
+            }
+        }
+        let pkt = enc
+            .encode_intra_frame_with_qiis(&source, &qis, &qiis)
+            .unwrap();
+
+        // The wire carries exactly the supplied QIS list and QIIS map.
+        let (wire_qis, wire_qiis) = decode_packet_qis_and_qiis(&enc, true, &pkt);
+        assert_eq!(wire_qis, qis.to_vec());
+        assert_eq!(wire_qiis, qiis);
+
+        // Decodes through the stateful frame decoder; header echoed.
+        let mut dec = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+        let out = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(out.qis, qis.to_vec());
+
+        // The weak-quantizer half reconstructs strictly better than a
+        // uniform qi=30 encode reconstructs the same half.
+        let uniform = enc.encode_intra_frame(&source).unwrap();
+        let mut dec_u = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+        let out_u = dec_u.decode_frame(&uniform).unwrap();
+        let half = (g.dims_y.height / 2) as usize * g.dims_y.width as usize;
+        let ssd = |rec: &[u8]| -> u64 {
+            rec[half..]
+                .iter()
+                .zip(source.samples_y[half..].iter())
+                .map(|(&a, &b)| {
+                    let d = a as i64 - b as i64;
+                    (d * d) as u64
+                })
+                .sum()
+        };
+        let ssd_adaptive = ssd(&out.frame.samples_y);
+        let ssd_uniform = ssd(&out_u.frame.samples_y);
+        assert!(
+            ssd_adaptive < ssd_uniform,
+            "weak-quant half must improve: adaptive SSD {ssd_adaptive} vs uniform {ssd_uniform}"
+        );
+
+        // NQIS = 1 through the same entry point is byte-identical to
+        // the historical single-qi encoder.
+        let single = enc
+            .encode_intra_frame_with_qiis(&source, &[30], &vec![0u8; nbs])
+            .unwrap();
+        assert_eq!(single, uniform);
+
+        // Full three-qi chain: MOREQIS twice, three QIS values, two
+        // §7.6 promotion passes.
+        let qis3 = [20u8, 40, 60];
+        let mut qiis3 = vec![0u8; nbs];
+        for (bi, q) in qiis3.iter_mut().enumerate() {
+            *q = (bi % 3) as u8;
+        }
+        let pkt3 = enc
+            .encode_intra_frame_with_qiis(&source, &qis3, &qiis3)
+            .unwrap();
+        let (wire_qis3, wire_qiis3) = decode_packet_qis_and_qiis(&enc, true, &pkt3);
+        assert_eq!(wire_qis3, qis3.to_vec());
+        assert_eq!(wire_qiis3, qiis3);
+        let mut dec3 = FrameDecoder::new(ident, setup).unwrap();
+        assert_eq!(dec3.decode_frame(&pkt3).unwrap().qis, qis3.to_vec());
+    }
+
+    /// The adaptive entry point rejects malformed `qis` / `qiis` shapes.
+    #[test]
+    fn encode_intra_frame_with_qiis_rejects_bad_shapes() {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let enc = FrameEncoder::new(ident, setup, 30).unwrap();
+        let nbs = enc.geometry().nbs as usize;
+        let src = SourceFrame {
+            samples_y: vec![128; 32 * 32],
+            samples_cb: vec![128; 16 * 16],
+            samples_cr: vec![128; 16 * 16],
+        };
+        assert_eq!(
+            enc.encode_intra_frame_with_qiis(&src, &[], &vec![0; nbs])
+                .unwrap_err(),
+            Error::EncodeQisCountOutOfRange { got: 0 }
+        );
+        assert_eq!(
+            enc.encode_intra_frame_with_qiis(&src, &[1, 2, 3, 4], &vec![0; nbs])
+                .unwrap_err(),
+            Error::EncodeQisCountOutOfRange { got: 4 }
+        );
+        assert_eq!(
+            enc.encode_intra_frame_with_qiis(&src, &[64], &vec![0; nbs])
+                .unwrap_err(),
+            Error::QuantIndexOutOfRange { qi: 64 }
+        );
+        assert_eq!(
+            enc.encode_intra_frame_with_qiis(&src, &[30], &vec![0; nbs - 1])
+                .unwrap_err(),
+            Error::EncodeQiisLenMismatch { got: nbs - 1, nbs }
+        );
+        let mut bad = vec![0u8; nbs];
+        bad[5] = 1;
+        assert_eq!(
+            enc.encode_intra_frame_with_qiis(&src, &[30], &bad)
+                .unwrap_err(),
+            Error::EncodeQiiOutOfRange {
+                bi: 5,
+                qii: 1,
+                nqis: 1
+            }
+        );
+        assert_eq!(
+            enc.encode_intra_frame_adaptive(&src, &[]).unwrap_err(),
+            Error::EncodeQisCountOutOfRange { got: 0 }
+        );
+    }
+
+    /// The rate-distortion `qi` chooser splits a mixed frame: busy
+    /// blocks (where fidelity is expensive) and flat blocks resolve to
+    /// different selectors, the packet round-trips, and the wire QIIS
+    /// really is mixed — the §7.6 stream is exercised by a
+    /// production decision, not just a hand-built map.
+    #[test]
+    fn encode_intra_frame_adaptive_picks_mixed_selectors() {
+        let ident = decode_identification_header(&fixture_data::KI30_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 30).unwrap();
+        let g = enc.geometry();
+
+        // Lower half flat (cheap at any qi), upper half busy noise
+        // (fidelity costs real bits).
+        let w = g.dims_y.width;
+        let h = g.dims_y.height;
+        let mut samples_y = vec![128u8; (w * h) as usize];
+        for y in h / 2..h {
+            for x in 0..w {
+                samples_y[(y * w + x) as usize] = (30 + ((x * 37 + y * 51) % 200)) as u8;
+            }
+        }
+        let source = SourceFrame {
+            samples_y,
+            samples_cb: vec![128; (g.dims_c.width * g.dims_c.height) as usize],
+            samples_cr: vec![128; (g.dims_c.width * g.dims_c.height) as usize],
+        };
+
+        // A decisive spread: qi 16 quantizes the noise half so hard the
+        // delivered SSD dwarfs λ·R for the qi-63 candidate, while the
+        // flat half is free at either (ties resolve to selector 0).
+        let qis = [16u8, 63u8];
+        let pkt = enc.encode_intra_frame_adaptive(&source, &qis).unwrap();
+        let (wire_qis, wire_qiis) = decode_packet_qis_and_qiis(&enc, true, &pkt);
+        assert_eq!(wire_qis, qis.to_vec());
+        assert!(
+            wire_qiis.contains(&0) && wire_qiis.contains(&1),
+            "the RD chooser must actually split the frame (got {wire_qiis:?})"
+        );
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let out = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(out.qis, qis.to_vec());
     }
 
     /// MILESTONE: the golden-reference inter encoder

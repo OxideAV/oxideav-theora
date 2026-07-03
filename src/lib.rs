@@ -5725,16 +5725,112 @@ pub(crate) fn decode_macroblock_motion_vectors_inner(
 // §7.4 / §7.5 encode (inverse of the mode + motion-vector decoders)
 // =====================================================================
 
+/// The on-wire length in bits of the Table 7.19 Huffman code for rank
+/// `mi` (`b0` = 1 bit, `b10` = 2 bits, …, `b111110` = 6 bits,
+/// `b1111110` / `b1111111` = 7 bits each).
+fn table_7_19_code_len(mi: u8) -> u64 {
+    if mi >= 6 {
+        7
+    } else {
+        mi as u64 + 1
+    }
+}
+
+/// Write the Table 7.19 Huffman code for rank `mi` (`0..=7`) onto `w`,
+/// the inverse of [`read_table_7_19_mi`]: `mi` one-bits followed by a
+/// zero terminator for `mi <= 6`, and seven one-bits for `mi = 7`.
+fn write_table_7_19_mi(w: &mut BitWriter, mi: u8) {
+    debug_assert!(mi <= 7);
+    if mi == 7 {
+        w.write_bits(0x7f, 7);
+    } else {
+        // `mi` ones then a zero: value 0b1…10 over mi + 1 bits.
+        w.write_bits((1u32 << (mi as u32 + 1)) - 2, mi as u32 + 1);
+    }
+}
+
+/// Choose the cheapest §7.4 mode-coding scheme for a frame's
+/// transmitted-mode tally.
+///
+/// `counts[mode]` is how many macro blocks will transmit `mode` on the
+/// wire (step 2(d)i — only macro blocks with a coded luma block). The
+/// candidates are exactly the schemes the §7.4 decode accepts:
+///
+/// * **Scheme 7** — each mode coded directly as 3 bits (no alphabet).
+/// * **Schemes 1..=6** — the fixed Table 7.19 alphabets; each mode
+///   costs the Table 7.19 code length of its rank in the alphabet.
+/// * **Scheme 0** — a custom alphabet transmitted as eight 3-bit rank
+///   fields (24 bits, step 2(b)); the optimal assignment ranks the
+///   modes by descending frequency so the most common mode gets the
+///   1-bit code.
+///
+/// Returns the chosen scheme and the `rank_of_mode` mapping
+/// (`rank_of_mode[mode] = mi`; the identity for scheme 7, where it is
+/// unused). Ties keep the earlier candidate in the scan order 7,
+/// 1..=6, 0 — a strict improvement is required to move away from the
+/// table-free direct scheme.
+fn choose_mode_scheme(counts: &[u64; 8]) -> (u8, [u8; 8]) {
+    // Scheme 7 baseline: 3 bits per transmitted mode.
+    let transmitted: u64 = counts.iter().sum();
+    let mut best_scheme = 7u8;
+    let mut best_cost = transmitted * 3;
+    let mut best_rank: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+    // Fixed alphabets 1..=6.
+    for (s, alphabet) in MALPHABETS_SCHEMES_1_TO_6.iter().enumerate() {
+        let mut rank = [0u8; 8];
+        for (mi, &mode) in alphabet.iter().enumerate() {
+            rank[mode as usize] = mi as u8;
+        }
+        let cost: u64 = counts
+            .iter()
+            .enumerate()
+            .map(|(mode, &c)| c * table_7_19_code_len(rank[mode]))
+            .sum();
+        if cost < best_cost {
+            best_cost = cost;
+            best_scheme = (s + 1) as u8;
+            best_rank = rank;
+        }
+    }
+
+    // Custom alphabet (scheme 0): rank by descending count (stable —
+    // equal counts keep mode-index order), 24 bits of header.
+    let mut order: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+    order.sort_by_key(|&mode| std::cmp::Reverse(counts[mode as usize]));
+    let mut rank0 = [0u8; 8];
+    for (mi, &mode) in order.iter().enumerate() {
+        rank0[mode as usize] = mi as u8;
+    }
+    let cost0: u64 = 24
+        + counts
+            .iter()
+            .enumerate()
+            .map(|(mode, &c)| c * table_7_19_code_len(rank0[mode]))
+            .sum::<u64>();
+    if cost0 < best_cost {
+        best_scheme = 0;
+        best_rank = rank0;
+    }
+
+    (best_scheme, best_rank)
+}
+
 /// Encode the §7.4 macro-block coding-mode stream onto `w`, the
 /// inverse of [`decode_macroblock_modes_inner`].
 ///
-/// The encoder selects `MSCHEME = 7` (step 2(d)i.B — each mode is
-/// coded directly as a 3-bit integer), which is unconditionally valid
-/// for any mode assignment and needs no alphabet table. Only macro
-/// blocks with at least one coded luma block emit a mode on the wire
-/// (step 2(d)i); a macro block with no coded luma blocks is implicitly
-/// `INTER_NOMV` and consumes no bits (step 2(d)ii), so the encoder
-/// must skip it and the caller must have assigned it `InterNoMv`.
+/// The encoder chooses the cheapest mode-coding scheme for the frame's
+/// actual mode tally ([`choose_mode_scheme`]): the table-free direct
+/// scheme 7 (3 bits per mode), one of the fixed Table 7.19 alphabets
+/// (schemes 1..=6, the frequent mode costing as little as 1 bit), or a
+/// custom frequency-sorted alphabet (scheme 0, 24 bits of header) —
+/// whichever spends the fewest total bits. Only macro blocks with at
+/// least one coded luma block emit a mode on the wire (step 2(d)i); a
+/// macro block with no coded luma blocks is implicitly `INTER_NOMV`
+/// and consumes no bits (step 2(d)ii), so the encoder must skip it and
+/// the caller must have assigned it `InterNoMv`. The scheme choice
+/// changes only how the very same mode array is spelled — the §7.4
+/// decode recovers it identically under every scheme.
 ///
 /// Intra frames carry no mode bits (§7.4 step 1) — the caller skips
 /// this on a keyframe.
@@ -5744,14 +5840,37 @@ fn encode_macroblock_modes(
     bcoded: &[u8],
     macro_block_to_luma_blocks: &[[u32; 4]],
 ) {
-    // Step 2(a): MSCHEME = 7.
-    w.write_bits(7, 3);
-    // Step 2(d): one direct 3-bit mode per macro block whose luma is
-    // (at least partly) coded.
+    // Tally the modes that will actually be transmitted (step 2(d)i).
+    let mut counts = [0u64; 8];
+    for (mbi, luma_group) in macro_block_to_luma_blocks.iter().enumerate() {
+        if luma_group.iter().any(|&bi| bcoded[bi as usize] == 1) {
+            counts[mbmodes[mbi].to_index() as usize] += 1;
+        }
+    }
+    let (mscheme, rank_of_mode) = choose_mode_scheme(&counts);
+
+    // Step 2(a): MSCHEME.
+    w.write_bits(mscheme as u32, 3);
+    // Step 2(b): a scheme-0 custom alphabet is transmitted as the rank
+    // (mi) of each mode, in mode order — the §7.4 decode's
+    // `MALPHABET[mi] = MODE` loop reads them back in the same order.
+    if mscheme == 0 {
+        for mode in 0..8 {
+            w.write_bits(rank_of_mode[mode] as u32, 3);
+        }
+    }
+    // Step 2(d): one mode per macro block whose luma is (at least
+    // partly) coded — direct 3-bit for scheme 7, the Table 7.19 code
+    // of the mode's alphabet rank otherwise.
     for (mbi, luma_group) in macro_block_to_luma_blocks.iter().enumerate() {
         let any_luma_coded = luma_group.iter().any(|&bi| bcoded[bi as usize] == 1);
         if any_luma_coded {
-            w.write_bits(mbmodes[mbi].to_index() as u32, 3);
+            let mode = mbmodes[mbi].to_index();
+            if mscheme == 7 {
+                w.write_bits(mode as u32, 3);
+            } else {
+                write_table_7_19_mi(w, rank_of_mode[mode as usize]);
+            }
         }
         // else: INTER_NOMV is implicit; no bits written.
     }
@@ -20036,6 +20155,158 @@ mod tests {
             let out = decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map)
                 .unwrap();
             assert_eq!(out.len(), 1);
+        }
+    }
+
+    // ----- §7.4 encoder mode-scheme selection (round 387) -----
+
+    /// A tally dominated by `INTER_MV_LAST` (mode 3, rank 0 in the
+    /// Table 7.19 schemes 1..=4) must pick a fixed alphabet: the
+    /// dominant mode gets the 1-bit code with no 24-bit custom-alphabet
+    /// header to amortize.
+    #[test]
+    fn choose_mode_scheme_skewed_tally_picks_fixed_alphabet() {
+        let mut counts = [0u64; 8];
+        counts[3] = 40;
+        counts[0] = 6;
+        counts[2] = 3;
+        let (scheme, rank) = choose_mode_scheme(&counts);
+        assert!(
+            (1..=6).contains(&scheme),
+            "expected a fixed Table 7.19 alphabet, got scheme {scheme}"
+        );
+        assert_eq!(rank[3], 0, "the dominant mode must get the 1-bit code");
+    }
+
+    /// `INTER_GOLDEN_MV` (mode 6) ranks 6th at best in every fixed
+    /// Table 7.19 alphabet (a 7-bit code), so a golden-heavy tally with
+    /// enough transmitted modes must pay the 24-bit scheme-0 header for
+    /// a frequency-sorted custom alphabet instead.
+    #[test]
+    fn choose_mode_scheme_golden_heavy_tally_picks_custom_alphabet() {
+        let mut counts = [0u64; 8];
+        counts[6] = 100;
+        counts[0] = 10;
+        let (scheme, rank) = choose_mode_scheme(&counts);
+        assert_eq!(scheme, 0, "golden-heavy tally must choose scheme 0");
+        assert_eq!(rank[6], 0, "most frequent mode ranks first");
+        assert_eq!(rank[0], 1, "second most frequent mode ranks second");
+    }
+
+    /// A tiny tally cannot amortize any alphabet: two 7-bit fixed codes
+    /// (14 bits) and the 24-bit custom header both lose to two direct
+    /// 3-bit modes, so the chooser keeps scheme 7.
+    #[test]
+    fn choose_mode_scheme_tiny_tally_keeps_direct_scheme() {
+        let mut counts = [0u64; 8];
+        counts[6] = 2;
+        let (scheme, _) = choose_mode_scheme(&counts);
+        assert_eq!(scheme, 7);
+    }
+
+    /// MILESTONE (round 387): the production §7.4 mode writer picks the
+    /// per-frame cheapest scheme and every choice round-trips through
+    /// the production §7.4 decoder. Three tallies engineered to select
+    /// scheme 7 (balanced), a fixed alphabet (LAST-dominated), and the
+    /// custom scheme 0 (golden-dominated); the golden-dominated stream
+    /// is also strictly smaller than its direct-coded spelling.
+    #[test]
+    fn encode_macroblock_modes_scheme_selection_round_trips() {
+        use MacroBlockMode::*;
+        let cases: Vec<(Vec<MacroBlockMode>, Option<u8>)> = vec![
+            // Balanced mix, few macro blocks: direct scheme 7.
+            (vec![InterNoMv, Intra, InterMv, InterMvFour], Some(7)),
+            // LAST-dominated: a fixed Table 7.19 alphabet (1..=6).
+            (
+                {
+                    let mut v = vec![InterMvLast; 30];
+                    v.push(InterNoMv);
+                    v.push(InterMv);
+                    v
+                },
+                None, // any of 1..=6 (exact pick depends on the tail)
+            ),
+            // Golden-dominated: the custom scheme 0.
+            (
+                {
+                    let mut v = vec![InterGoldenMv; 30];
+                    v.push(InterNoMv);
+                    v
+                },
+                Some(0),
+            ),
+        ];
+        for (modes, expect_scheme) in cases {
+            let nmbs = modes.len() as u32;
+            let nbs = nmbs * 4;
+            let bcoded = vec![1u8; nbs as usize];
+            let map: Vec<[u32; 4]> = (0..nmbs)
+                .map(|mbi| {
+                    let base = mbi * 4;
+                    [base, base + 1, base + 2, base + 3]
+                })
+                .collect();
+            let mut w = super::BitWriter::new();
+            encode_macroblock_modes(&mut w, &modes, &bcoded, &map);
+            let bytes = w.into_bytes();
+            let got_scheme = bytes[0] >> 5;
+            if let Some(s) = expect_scheme {
+                assert_eq!(got_scheme, s, "scheme for {modes:?}");
+            } else {
+                assert!(
+                    (1..=6).contains(&got_scheme),
+                    "expected a fixed alphabet, got scheme {got_scheme}"
+                );
+            }
+            let out = decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map)
+                .unwrap();
+            assert_eq!(out, modes, "§7.4 round trip under scheme {got_scheme}");
+        }
+
+        // The golden-dominated case measured against its direct
+        // spelling: 3 + 31·3 = 96 bits (12 B) direct vs
+        // 3 + 24 + 30·1 + 2 = 59 bits (8 B) chosen.
+        let mut v = vec![InterGoldenMv; 30];
+        v.push(InterNoMv);
+        let nmbs = v.len() as u32;
+        let nbs = nmbs * 4;
+        let bcoded = vec![1u8; nbs as usize];
+        let map: Vec<[u32; 4]> = (0..nmbs)
+            .map(|mbi| {
+                let base = mbi * 4;
+                [base, base + 1, base + 2, base + 3]
+            })
+            .collect();
+        let mut w = super::BitWriter::new();
+        encode_macroblock_modes(&mut w, &v, &bcoded, &map);
+        let chosen = w.into_bytes().len();
+        let direct = (3 + 3 * v.len() + 7) / 8; // MSCHEME + 3 bits/mode, byte-padded
+        assert!(
+            chosen < direct,
+            "scheme selection must save bytes ({chosen} vs direct {direct})"
+        );
+    }
+
+    /// `write_table_7_19_mi` is the exact inverse of
+    /// `read_table_7_19_mi` for every rank, and consumes exactly
+    /// `table_7_19_code_len` bits (validated by chaining a second code
+    /// immediately after the first on the same writer / reader).
+    #[test]
+    fn table_7_19_mi_write_read_inverse() {
+        for mi in 0u8..=7 {
+            for mi2 in 0u8..=7 {
+                let mut w = super::BitWriter::new();
+                write_table_7_19_mi(&mut w, mi);
+                write_table_7_19_mi(&mut w, mi2);
+                let bytes = w.into_bytes();
+                let mut r = super::BitReader::new(&bytes);
+                assert_eq!(read_table_7_19_mi(&mut r).unwrap(), mi, "first rank {mi}");
+                assert_eq!(
+                    read_table_7_19_mi(&mut r).unwrap(),
+                    mi2,
+                    "second rank {mi2} after {mi}"
+                );
+            }
         }
     }
 

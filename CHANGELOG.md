@@ -6,6 +6,19 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Frame-optimal §7.4 mode-coding scheme selection (round 387)** —
+  the inter mode writer no longer hard-codes `MSCHEME = 7` (3 bits per
+  mode): `choose_mode_scheme` tallies the modes a frame actually
+  transmits and picks the cheapest of the direct scheme, the six fixed
+  Table 7.19 alphabets (the dominant mode costing as little as 1 bit),
+  and the custom frequency-sorted scheme-0 alphabet (24-bit header),
+  with ties keeping the earlier candidate. `write_table_7_19_mi` is
+  the exact inverse of the decoder's unary-with-cap code reader. A
+  golden-`MV`-dominated 31-macro-block mode section measures 8 B under
+  the chosen scheme 0 versus 12 B direct; the choice only re-spells
+  the identical mode array (round-tripped through the production §7.4
+  decoder for scheme 7, a fixed alphabet, and scheme 0).
+
 - **Mixed I/P GOP two-pass Huffman tuning (round 387)** —
   `SetupHeaderTables::with_gop_tuned_huffman_tables` tunes **four**
   §6.4.4 codebooks per Huffman group (intra/inter × luma/chroma), each

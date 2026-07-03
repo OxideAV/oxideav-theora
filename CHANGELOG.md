@@ -6,6 +6,22 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Changed
 
+- **Combined run+value tokens 23..=31 and short zero-run token 7 in
+  the token planner (round 384)** — the per-block token planner
+  previously spelled every zero gap as a 6-bit zero-run token 8 and
+  every non-zero coefficient as its own single-coefficient token. It
+  now folds a gap and the coefficient that ends it into one §7.7.2
+  combined run+value token whenever one covers the pair (tokens 23..=29
+  for a trailing `±1` after 1..=17 zeros; tokens 30..=31 for a trailing
+  `±2`/`±3` after a run of 1 / 2..=3) — one Huffman code where two were
+  written — and uses the 3-bit zero-run token 7 for uncombinable gaps
+  of 1..=8 (halving the run payload of token 8). Purely an encoder
+  token-choice change: the decoder already accepted the full §7.7
+  alphabet, and every new token round-trips bit-exactly through
+  `decode_dct_coefficients`. Measured on 64×64 textured + sparse intra
+  frames at qi ∈ {16, 32, 48, 63}: total coded size fell from 7924 B to
+  5099 B (−35.6%) at identical reconstruction (the coefficient stream
+  is unchanged, only its spelling).
 - **Independent DC / AC §7.7.3 Huffman selector optimization (round
   384)** — the §7.7.3 decoder reads a *fresh* `htiL` / `htiC` pair at
   `ti = 1`, so the pair written at `ti = 0` only ever addresses Huffman

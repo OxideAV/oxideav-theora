@@ -6523,11 +6523,24 @@ fn plan_single_coefficient(v: i16) -> Option<PlannedToken> {
 /// never span blocks and the frame-level interleave stays a simple
 /// per-block cursor.
 ///
-/// Strategy: walk zig-zag positions 0..=`last_nz`. Pure zero gaps are
-/// skipped with token 8 (6-bit `RLEN`, run 1..=64); each non-zero
-/// coefficient is a single-coefficient token (9..=22). After the last
-/// non-zero coefficient an EOB token closes the block (zero-filling the
-/// tail). An all-zero block is closed by a single EOB token at ti = 0.
+/// Strategy: walk zig-zag positions 0..=`last_nz`. A zero gap and the
+/// non-zero coefficient that ends it are folded into one §7.7.2
+/// combined run+value token whenever one covers the pair — tokens
+/// 23..=29 for a trailing `±1` after a run of 1..=17 zeros (fixed runs
+/// 1..=5, then 2-bit / 3-bit run fields), tokens 30..=31 for a trailing
+/// `±2` / `±3` after a run of 1 / 2..=3 — replacing a zero-run code
+/// *plus* a single-coefficient code with one Huffman code. Gaps no
+/// combined token covers are skipped with a pure zero-run token: token
+/// 7 (3-bit `RLEN`, run 1..=8) for short gaps, token 8 (6-bit `RLEN`,
+/// run 1..=64) for longer ones. Any other non-zero coefficient is a
+/// single-coefficient token (9..=22). After the last non-zero
+/// coefficient an EOB token closes the block (zero-filling the tail).
+/// An all-zero block is closed by a single EOB token at ti = 0.
+///
+/// The folding is structural (the choice depends only on the run
+/// length and coefficient magnitude, not on the Huffman tables): one
+/// code plus its short payload replaces two codes plus a 3- or 6-bit
+/// run payload, which is what the combined tokens exist for.
 ///
 /// Returns `None` if any coefficient magnitude exceeds the
 /// single-coefficient token range (`|v| > 580`); callers clamp before
@@ -6549,18 +6562,80 @@ fn plan_block_tokens(coeffs_zz: &[i16; 64]) -> Option<Vec<PlannedToken>> {
         if coeffs_zz[ti] != 0 {
             plan.push(plan_single_coefficient(coeffs_zz[ti])?);
             ti += 1;
-        } else {
-            // Count the zero run up to the next non-zero (bounded by
-            // last_nz, which is non-zero).
-            let mut run = 0usize;
-            while coeffs_zz[ti] == 0 {
-                run += 1;
-                ti += 1;
-            }
-            // token 8: 6-bit RLEN = run - 1, range 1..=64.
-            let rlen = (run - 1) as u32;
-            plan.push(PlannedToken::with_extra(8, run as u8, &[(rlen, 6)]));
+            continue;
         }
+
+        // Measure the zero gap. It always ends at a non-zero
+        // coefficient: ti <= last_nz and coeffs_zz[last_nz] != 0.
+        let mut run = 0usize;
+        while coeffs_zz[ti + run] == 0 {
+            run += 1;
+        }
+        let v = coeffs_zz[ti + run];
+        let mag = v.unsigned_abs();
+        let sign: u32 = if v < 0 { 1 } else { 0 };
+
+        // §7.7.2 combined run+value tokens. Extra-bits field order
+        // matches the decoder exactly: SIGN, then the token's RLEN /
+        // MAG fields.
+        if mag == 1 && run <= 17 {
+            let pt = match run {
+                // Tokens 23..=27: fixed runs 1..=5, SIGN only.
+                1..=5 => PlannedToken::with_extra(22 + run as u8, (run + 1) as u8, &[(sign, 1)]),
+                // Token 28: SIGN + 2-bit RLEN, run 6..=9.
+                6..=9 => PlannedToken::with_extra(
+                    28,
+                    (run + 1) as u8,
+                    &[(sign, 1), ((run - 6) as u32, 2)],
+                ),
+                // Token 29: SIGN + 3-bit RLEN, run 10..=17.
+                _ => PlannedToken::with_extra(
+                    29,
+                    (run + 1) as u8,
+                    &[(sign, 1), ((run - 10) as u32, 3)],
+                ),
+            };
+            plan.push(pt);
+            ti += run + 1;
+            continue;
+        }
+        if (2..=3).contains(&mag) && run == 1 {
+            // Token 30: fixed run 1, SIGN + 1-bit MAG (2..=3).
+            plan.push(PlannedToken::with_extra(
+                30,
+                2,
+                &[(sign, 1), (u32::from(mag) - 2, 1)],
+            ));
+            ti += 2;
+            continue;
+        }
+        if (2..=3).contains(&mag) && (2..=3).contains(&run) {
+            // Token 31: SIGN + 1-bit MAG (2..=3) + 1-bit RLEN (2..=3).
+            plan.push(PlannedToken::with_extra(
+                31,
+                (run + 1) as u8,
+                &[(sign, 1), (u32::from(mag) - 2, 1), ((run - 2) as u32, 1)],
+            ));
+            ti += run + 1;
+            continue;
+        }
+
+        // Pure zero run: token 7 (3-bit RLEN, run 1..=8) halves the
+        // payload of token 8 (6-bit RLEN, run 1..=64) for short gaps.
+        if run <= 8 {
+            plan.push(PlannedToken::with_extra(
+                7,
+                run as u8,
+                &[((run - 1) as u32, 3)],
+            ));
+        } else {
+            plan.push(PlannedToken::with_extra(
+                8,
+                run as u8,
+                &[((run - 1) as u32, 6)],
+            ));
+        }
+        ti += run;
     }
 
     // Close the block: EOB token 0 zero-fills [ti..64], TIS := 64.
@@ -21918,6 +21993,119 @@ mod tests {
         // Total advance covers all 64 positions.
         let total: u16 = plan.iter().map(|p| p.advance as u16).sum();
         assert_eq!(total, 64);
+    }
+
+    /// The planner folds a zero gap plus its terminating coefficient
+    /// into the correct §7.7.2 combined run+value token (23..=31), uses
+    /// the 3-bit zero-run token 7 for short uncombinable gaps, and only
+    /// falls back to the 6-bit token 8 for long ones.
+    #[test]
+    fn plan_block_tokens_combined_run_value_tokens() {
+        // (gap length, trailing value, expected token). One combined
+        // token covers the pair, so the plan is exactly [combined, EOB].
+        let cases: &[(usize, i16, u8)] = &[
+            (1, 1, 23),
+            (2, -1, 24),
+            (3, 1, 25),
+            (4, -1, 26),
+            (5, 1, 27),
+            (6, 1, 28),
+            (9, -1, 28),
+            (10, 1, 29),
+            (17, -1, 29),
+            (1, 2, 30),
+            (1, -3, 30),
+            (2, 2, 31),
+            (3, -3, 31),
+        ];
+        for &(gap, v, want) in cases {
+            let mut c = [0i16; 64];
+            c[gap] = v;
+            let plan = plan_block_tokens(&c).unwrap();
+            assert_eq!(plan.len(), 2, "gap={gap} v={v}: combined + EOB only");
+            assert_eq!(plan[0].token, want, "gap={gap} v={v}");
+            assert_eq!(plan[0].advance as usize, gap + 1, "gap={gap} v={v}");
+            assert_eq!(plan[1].token, 0);
+            let total: u16 = plan.iter().map(|p| p.advance as u16).sum();
+            assert_eq!(total, 64, "gap={gap} v={v}");
+        }
+
+        // No combined token covers (run 4, |v| = 4): short gap → token
+        // 7 (3-bit RLEN), then the ±4 single-coefficient token.
+        let mut c = [0i16; 64];
+        c[4] = 4;
+        let plan = plan_block_tokens(&c).unwrap();
+        assert_eq!(plan[0].token, 7);
+        assert_eq!(plan[0].advance, 4);
+        assert_eq!(plan[1].token, 14);
+
+        // Run 18 with a trailing ±1 exceeds token 29's reach → token 8
+        // (6-bit RLEN) then the single coefficient.
+        let mut c = [0i16; 64];
+        c[18] = 1;
+        let plan = plan_block_tokens(&c).unwrap();
+        assert_eq!(plan[0].token, 8);
+        assert_eq!(plan[0].advance, 18);
+        assert_eq!(plan[1].token, 9);
+
+        // Run 9 with a trailing ±2 (tokens 30/31 reach only runs
+        // 1..=3) → longer-than-8 gap uses token 8.
+        let mut c = [0i16; 64];
+        c[9] = 2;
+        let plan = plan_block_tokens(&c).unwrap();
+        assert_eq!(plan[0].token, 8);
+        assert_eq!(plan[1].token, 11);
+    }
+
+    /// Every combined run+value token (23..=31) and the short zero-run
+    /// token 7 survive a full frame encode → §7.7.3 decode round trip
+    /// bit-exactly.
+    #[test]
+    fn encode_dct_coefficients_combined_tokens_round_trip() {
+        let setup = SetupHeaderTables::vp3_defaults();
+        let hts = &setup.huffman_tables[..];
+
+        // One block per combined-token case, plus the token-7 and
+        // token-8 fallback shapes, across luma and chroma.
+        let patterns: &[(usize, i16)] = &[
+            (1, 1),
+            (2, -1),
+            (3, 1),
+            (4, -1),
+            (5, 1),
+            (6, 1),
+            (9, -1),
+            (10, 1),
+            (17, -1),
+            (1, 2),
+            (1, -3),
+            (2, 2),
+            (3, -3),
+            (4, 4),  // token 7 + single.
+            (18, 1), // token 8 + single.
+            (9, 2),  // token 8 + single.
+        ];
+        let nbs = patterns.len() as u32;
+        let nmbs = 2u32; // nlbs = 8: first 8 blocks luma, rest chroma.
+        let bcoded = vec![1u8; nbs as usize];
+        let mut coeffs = vec![[0i16; 64]; nbs as usize];
+        for (bi, &(gap, v)) in patterns.iter().enumerate() {
+            coeffs[bi][gap] = v;
+            // A trailing coefficient too, so the combined token is
+            // mid-block for half the cases (exercises TIS advance).
+            if bi % 2 == 0 {
+                coeffs[bi][40] = -2;
+            }
+        }
+
+        let mut w = super::BitWriter::new();
+        encode_dct_coefficients_inner(&mut w, nbs, nmbs, &bcoded, &coeffs, hts).unwrap();
+        let bytes = w.into_bytes();
+
+        let (decoded, _n) = decode_dct_coefficients(&bytes, nbs, nmbs, &bcoded, hts).unwrap();
+        for bi in 0..nbs as usize {
+            assert_eq!(decoded[bi], coeffs[bi], "block {bi} coefficients differ");
+        }
     }
 
     /// A coefficient beyond the single-coefficient token range is

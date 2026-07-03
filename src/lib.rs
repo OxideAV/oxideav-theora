@@ -14988,6 +14988,13 @@ pub struct TheoraEncoder {
     /// `None` disables scene-cut detection (keyframes are purely
     /// interval-driven).
     scene_cut_threshold: Option<f64>,
+    /// Optional adaptive-quantization `qis` list for keyframes. When
+    /// `Some`, every intra frame is emitted through
+    /// [`FrameEncoder::encode_intra_frame_adaptive`] with this §7.1
+    /// `QIS` list (1..=3 entries), each block's AC quantizer chosen by
+    /// the per-block rate-distortion decision; `None` keeps the
+    /// single-`qi` intra path. Inter frames are unaffected.
+    adaptive_qis: Option<Vec<u8>>,
 }
 
 /// A target-bitrate rate-control loop that adapts the frame-level
@@ -15291,6 +15298,7 @@ impl TheoraEncoder {
             inter_mode: InterModeStrategy::default(),
             rate_control: None,
             scene_cut_threshold: None,
+            adaptive_qis: None,
         })
     }
 
@@ -15405,6 +15413,27 @@ impl TheoraEncoder {
         self
     }
 
+    /// Enable adaptive block-level quantization on keyframes. Returns
+    /// `self` for builder chaining.
+    ///
+    /// `qis` is the §7.1 frame-header quantization-index list every
+    /// intra frame will carry (1..=3 entries, each `0..=63`; `qis[0]`
+    /// drives the DC quantizers and the loop-filter limit). Each intra
+    /// frame is emitted through
+    /// [`FrameEncoder::encode_intra_frame_adaptive`], which picks each
+    /// block's AC quantizer from the list by the per-block `D + λ·R`
+    /// decision — spending bits where fidelity is cheap and saving them
+    /// where it is not. Inter (P) frames keep the single frame-level
+    /// `qi`. The list's shape is validated when the first keyframe is
+    /// encoded (`EncodeQisCountOutOfRange` / `QuantIndexOutOfRange`
+    /// surface from `send_frame`). When target-bitrate rate control is
+    /// also enabled it keeps steering the single-`qi` inter frames; the
+    /// adaptive list governs keyframes as configured.
+    pub fn with_adaptive_quant(mut self, qis: Vec<u8>) -> Self {
+        self.adaptive_qis = Some(qis);
+        self
+    }
+
     /// Enable a target-bitrate rate-control loop. Returns `self` for
     /// builder chaining.
     ///
@@ -15497,7 +15526,10 @@ impl TheoraEncoder {
         }
 
         let bytes = if want_keyframe {
-            self.frame_encoder.encode_intra_frame(frame)?
+            match &self.adaptive_qis {
+                Some(qis) => self.frame_encoder.encode_intra_frame_adaptive(frame, qis)?,
+                None => self.frame_encoder.encode_intra_frame(frame)?,
+            }
         } else {
             // Predict from the mirror decoder's reconstructed reference.
             let mirror = self
@@ -32003,6 +32035,106 @@ mod tests {
                     "frame {i} plane {pli}: tuned stream must reconstruct identically"
                 );
             }
+        }
+    }
+
+    /// MILESTONE: adaptive block-level quantization wired through the
+    /// framework `Encoder` trait. `with_adaptive_quant([16, 63])` makes
+    /// every keyframe a §7.1 multi-`qi` frame with an RD-chosen §7.6
+    /// per-block selector split; the I,P,I stream round-trips through
+    /// `TheoraDecoder`, the keyframes carry the two-entry `QIS` list on
+    /// the wire, and the P frame stays single-`qi`.
+    #[test]
+    fn encoder_trait_adaptive_quant_keyframes_round_trip() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let mut enc = TheoraEncoder::with_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            setup.clone(),
+            16,
+            2,
+        )
+        .unwrap()
+        .with_adaptive_quant(vec![16, 63]);
+
+        // Mixed content: flat top half, busy noise bottom half (top-down
+        // rows), so the RD chooser actually splits the selectors.
+        let g = build_frame_geometry(&ident).unwrap();
+        let mk_mixed = |phase: u32| -> oxideav_core::VideoFrame {
+            use oxideav_core::frame::VideoPlane;
+            let (w, h) = (g.dims_y.width, g.dims_y.height);
+            let mut y = vec![128u8; (w * h) as usize];
+            for row in h / 2..h {
+                for col in 0..w {
+                    y[(row * w + col) as usize] =
+                        (30 + ((col * 37 + row * 51 + phase * 11) % 200)) as u8;
+                }
+            }
+            let (cw, ch) = (g.dims_c.width, g.dims_c.height);
+            oxideav_core::VideoFrame {
+                pts: None,
+                planes: vec![
+                    VideoPlane {
+                        stride: w as usize,
+                        data: y,
+                    },
+                    VideoPlane {
+                        stride: cw as usize,
+                        data: vec![128u8; (cw * ch) as usize],
+                    },
+                    VideoPlane {
+                        stride: cw as usize,
+                        data: vec![128u8; (cw * ch) as usize],
+                    },
+                ],
+            }
+        };
+        for phase in 0..3 {
+            enc.send_frame(&oxideav_core::Frame::Video(mk_mixed(phase)))
+                .unwrap();
+        }
+
+        let mut headers = Vec::new();
+        let mut data = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if p.flags.header {
+                        headers.push(p);
+                    } else {
+                        data.push(p);
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error {e}"),
+            }
+        }
+        assert_eq!(data.len(), 3);
+        assert!(data[0].flags.keyframe && !data[1].flags.keyframe && data[2].flags.keyframe);
+
+        // The keyframes carry the adaptive two-entry QIS list on the
+        // wire; the P frame stays single-qi.
+        let mut fdec = FrameDecoder::new(ident, setup).unwrap();
+        let qis0 = fdec.decode_frame(&data[0].data).unwrap().qis;
+        let qis1 = fdec.decode_frame(&data[1].data).unwrap().qis;
+        let qis2 = fdec.decode_frame(&data[2].data).unwrap().qis;
+        assert_eq!(qis0, vec![16, 63]);
+        assert_eq!(qis1.len(), 1, "P frame stays single-qi (got {qis1:?})");
+        assert_eq!(qis2, vec![16, 63]);
+
+        // End-to-end through the framework decoder.
+        let mut dec = TheoraDecoder::new(codec_id);
+        for p in &headers {
+            dec.send_packet(p).unwrap();
+        }
+        for p in &data {
+            dec.send_packet(p).unwrap();
+            let oxideav_core::Frame::Video(_) = dec.receive_frame().unwrap() else {
+                panic!("expected video frame");
+            };
         }
     }
 

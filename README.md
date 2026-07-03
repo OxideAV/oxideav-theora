@@ -113,6 +113,56 @@ zero-initialized reference store.
   shrinks a further 19–23% versus the VP3-default tables at
   bit-identical reconstruction.
 
+* **Round 387 — inter-side encoder quality.** Four additions drive the
+  P-frame rate curves at equal reconstruction:
+
+  * **Inter token statistics + mixed I/P GOP tuning** —
+    `FrameEncoder::inter_token_statistics` tallies the §7.7 tokens an
+    RD inter encode would write (EOB runs and combined tokens
+    included) without producing a packet, and
+    `SetupHeaderTables::with_gop_tuned_huffman_tables` tunes **four**
+    codebooks per Huffman group (intra/inter × luma/chroma), each
+    replacing the selector slot scoring worst on its own statistics
+    column. `TheoraEncoder::with_gop_tuned_setup_keyframe_interval`
+    runs the first pass as the exact I/P GOP the stream will be
+    (inter frames planned by RD against a mirror decoder's
+    references). Measured on a 6-frame textured motion sequence at
+    interval 3: 2248 B (VP3 defaults) → 2141 B (intra-only tuning) →
+    2072 B GOP-tuned, all three reconstructing bit-identically.
+  * **Measured token rate everywhere** — `TokenBitCosts` prices every
+    RD candidate's exact token plan against the stream's own codebooks
+    (group-minimum code length + exact extra bits), replacing the flat
+    bits-per-coefficient proxies in both the inter mode decision and
+    the intra adaptive-quant chooser. The §7.4 mode writer likewise
+    picks the cheapest **mode-coding scheme** per frame (direct
+    scheme 7, the six fixed Table 7.19 alphabets, or a
+    frequency-sorted scheme-0 custom alphabet — a golden-dominated
+    31-MB mode section spells in 8 B vs 12 B direct).
+  * **INTRA in the P-frame candidate set** — the RD decision weighs
+    all **eight** §7.5.2 coding modes: an INTRA macro block codes from
+    scratch (flat-128 predictor, qti = 0 matrices per §7.9.4 step
+    2(d)ii) when neither reference predicts it. On a
+    checkerboard→gradient quadrant switch: 26 B / luma SSD 224 vs the
+    intra-less motion path's 149 B / SSD 4052.
+  * **Inter adaptive quantization** —
+    `FrameEncoder::encode_inter_frame_rd_adaptive` emits the §7.1
+    `MOREQIS` chain + §7.6 block-level qi stream on P-frames, each
+    coded block's AC quantizer chosen by `D + λ·R` on delivered SSD +
+    measured rate (`TheoraEncoder::with_adaptive_quant` now covers
+    both frame types). Measured corners at equal reference state:
+    all-qi0 178 B / SSD 157576, all-qi63 586 B / SSD 2336, adaptive
+    `[0, 63]` 565 B / SSD 9767 — strictly inside the single-`qi`
+    curve.
+  * **Measured-rate keyframe policy (golden-frame refresh)** —
+    `TheoraEncoder::with_keyframe_rate_policy(r)` converts a P-frame
+    to a true keyframe when its references have decayed (size ratio
+    past `r ×` the last keyframe, or a majority-INTRA mode plan) *and*
+    the intra spelling wins a Lagrangian comparison on SSD measured
+    through a throwaway mirror-decoder clone — re-seeding both
+    references (only intra frames refresh the golden frame). A
+    content-family switch at interval 30 measures 3 keyframes / 646 B
+    / SSD 47553 vs 1 keyframe / 651 B / the same SSD without it.
+
 * **Inter (P-frame) encoder** — `FrameEncoder::encode_inter_frame`
   (zero-MV baseline) and `encode_inter_frame_motion` (with motion
   estimation) emit a §7 *inter* video-data packet that round-trips
@@ -330,12 +380,6 @@ chroma blocks that earlier diverged is now sample-exact.
   header and a quantizer to emit a complete self-describing stream; a
   caller may still supply pre-decoded tables via `TheoraEncoder::new` /
   `extradata` when matching an existing setup.
-* **Inter-frame adaptive quantization / token statistics** — the §7.1
-  multi-`qi` header + §7.6 stream emission and the two-pass
-  `TokenStatistics` collection are wired for **intra** frames; inter
-  (P) frames are still coded at a single frame-level `qi` and do not
-  yet feed the Huffman-tuning tally (their tokens still *benefit* from
-  tuned tables at encode time via the per-frame selector optimization).
 * **Reference-captured golden / four-MV corpus fixture** — the
   golden-reference and four-MV inter modes are exercised
   top-to-bottom through this crate's own encoder→decoder round trip

@@ -6,6 +6,24 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Measured-rate keyframe policy — golden-frame refresh on reference
+  decay (round 387)** — `TheoraEncoder::with_keyframe_rate_policy(r)`
+  watches two decay signals on every RD P-frame: coded size exceeding
+  `r ×` the last keyframe's, or the mode decision coding a majority of
+  transmitted macro blocks INTRA (a de-facto intra frame paying §7.3 /
+  §7.4 inter syntax while refreshing nothing — this also catches new
+  content inherently cheaper than the old keyframe, invisible to any
+  size ratio). On either signal the frame is also encoded intra, both
+  candidates' delivered SSD is measured by decoding each in a
+  throwaway clone of the mirror decoder (`FrameDecoder` is now
+  `Clone`; loop filter included), and the lower-Lagrangian-cost
+  spelling is emitted — ties to intra, which re-seeds both references
+  (only an intra frame ever refreshes the golden frame). Measured on a
+  6-frame content-family-switch sequence at interval 30: 1 keyframe /
+  651 B / SSD 47553 without the policy vs 3 keyframes / 646 B / the
+  identical SSD 47553 with it — fewer bytes, fresh references, equal
+  reconstruction error.
+
 - **Adaptive quantization on framework-encoder P-frames (round 387)**
   — `TheoraEncoder::with_adaptive_quant(qis)` now drives every
   rate-distortion P-frame through

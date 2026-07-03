@@ -12509,7 +12509,7 @@ pub fn crop_frame_to_picture_region(
 /// planes that §7.11 steps 7–8 update after every frame. Feed it the
 /// stream's video-data packets in order via
 /// [`FrameDecoder::decode_frame`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FrameDecoder {
     ident: TheoraIdentHeader,
     setup: SetupHeaderTables,
@@ -15686,6 +15686,20 @@ pub struct TheoraEncoder {
     /// `None` disables scene-cut detection (keyframes are purely
     /// interval-driven).
     scene_cut_threshold: Option<f64>,
+    /// Optional measured-rate keyframe policy (the golden-frame
+    /// refresh policy). When `Some(ratio)`, a frame that would be coded
+    /// inter but whose coded size exceeds `ratio ×` the last keyframe's
+    /// coded size is *also* encoded intra, and the intra spelling is
+    /// emitted whenever it is strictly smaller — an inter frame
+    /// approaching keyframe cost means the previous/golden references
+    /// have decayed, and a same-or-cheaper intra frame re-seeds both
+    /// (golden included), so every following P-frame predicts from
+    /// fresh references. `None` disables the policy (keyframes are
+    /// interval- and scene-cut-driven only).
+    keyframe_rate_ratio: Option<f64>,
+    /// Coded size of the most recent keyframe, the yardstick for
+    /// [`Self::keyframe_rate_ratio`]. `None` until the first keyframe.
+    last_keyframe_bytes: Option<usize>,
     /// Optional adaptive-quantization `qis` list. When `Some`, every
     /// intra frame is emitted through
     /// [`FrameEncoder::encode_intra_frame_adaptive`] and every
@@ -15999,6 +16013,8 @@ impl TheoraEncoder {
             inter_mode: InterModeStrategy::default(),
             rate_control: None,
             scene_cut_threshold: None,
+            keyframe_rate_ratio: None,
+            last_keyframe_bytes: None,
             adaptive_qis: None,
         })
     }
@@ -16195,6 +16211,40 @@ impl TheoraEncoder {
         self
     }
 
+    /// Enable the measured-rate keyframe policy (the golden-frame
+    /// refresh policy). Returns `self` for builder chaining.
+    ///
+    /// Two signals mark a P-frame's references as decayed: its coded
+    /// size exceeding `ratio ×` the last keyframe's coded size (the
+    /// residuals cost nearly as much as coding from scratch), or the
+    /// rate-distortion mode decision coding a **majority of its
+    /// transmitted macro blocks INTRA** (a de-facto intra frame paying
+    /// inter-frame syntax overhead while refreshing nothing — this
+    /// second trigger also catches the case where the *new* content is
+    /// inherently cheaper than the old keyframe, which no size ratio
+    /// can see). On either signal the encoder *also* encodes the frame
+    /// intra, measures both candidates' delivered SSD by decoding each
+    /// in a throwaway copy of its mirror decoder (loop filter
+    /// included), and emits the spelling with the lower Lagrangian
+    /// cost `SSD + λ·bits` — ties to intra, which additionally
+    /// re-seeds **both** references (§7.9.4 — including the golden
+    /// frame, which only an intra frame ever refreshes), so every
+    /// following P-frame predicts from fresh references. The
+    /// keyframe-interval counter restarts from the inserted keyframe.
+    ///
+    /// Unlike [`Self::with_scene_cut_threshold`] (a source-side
+    /// luma-difference heuristic that fires on hard cuts), this policy
+    /// measures *coded rate*, so it also catches gradual drift —
+    /// content that slowly morphs away from the references without any
+    /// single frame jumping past a pixel-difference threshold. A
+    /// typical `ratio` is 0.6–1.0: lower values refresh more eagerly.
+    /// Both paths emit conformant §7 bitstreams; the policy only
+    /// decides which frames are intra.
+    pub fn with_keyframe_rate_policy(mut self, ratio: f64) -> Self {
+        self.keyframe_rate_ratio = Some(ratio.max(0.0));
+        self
+    }
+
     /// Enable adaptive block-level quantization. Returns `self` for
     /// builder chaining.
     ///
@@ -16310,7 +16360,14 @@ impl TheoraEncoder {
             self.frame_encoder.set_qi(rc.qi_for_next_frame())?;
         }
 
-        let bytes = if want_keyframe {
+        // Set by the RD inter branch below: did the mode decision code a
+        // majority of this P-frame's transmitted macro blocks INTRA? A
+        // de-facto intra frame is the direct reference-decay signal the
+        // measured-rate keyframe policy watches for (a size-ratio
+        // trigger alone misses the case where the *new* content is
+        // inherently cheaper than the old keyframe's).
+        let mut de_facto_intra = false;
+        let mut bytes = if want_keyframe {
             match &self.adaptive_qis {
                 Some(qis) => self.frame_encoder.encode_intra_frame_adaptive(frame, qis)?,
                 None => self.frame_encoder.encode_intra_frame(frame)?,
@@ -16323,12 +16380,34 @@ impl TheoraEncoder {
                 .expect("mirror is Some on the inter branch");
             let refs = mirror.reference_store().as_reference_plane_set()?;
             match self.inter_mode {
-                InterModeStrategy::RateDistortion => match &self.adaptive_qis {
-                    Some(qis) => self
-                        .frame_encoder
-                        .encode_inter_frame_rd_adaptive(frame, &refs, qis)?,
-                    None => self.frame_encoder.encode_inter_frame_rd(frame, &refs)?,
-                },
+                InterModeStrategy::RateDistortion => {
+                    let single_qi = [self.frame_encoder.qi()];
+                    let qis: &[u8] = match &self.adaptive_qis {
+                        Some(q) => q,
+                        None => &single_qi,
+                    };
+                    let ifp = self.frame_encoder.plan_inter_frame_with_qis(
+                        frame,
+                        &refs,
+                        MotionPlan::RateDistortion,
+                        qis,
+                    )?;
+                    // Tally the transmitted (coded-luma, §7.4 step
+                    // 2(d)i) macro blocks and their INTRA share.
+                    let g = self.frame_encoder.geometry();
+                    let mut transmitted = 0usize;
+                    let mut intra_mbs = 0usize;
+                    for (mbi, luma) in g.macro_block_to_luma_blocks.iter().enumerate() {
+                        if luma.iter().any(|&bi| ifp.bcoded[bi as usize] == 1) {
+                            transmitted += 1;
+                            if ifp.mbmodes[mbi] == MacroBlockMode::Intra {
+                                intra_mbs += 1;
+                            }
+                        }
+                    }
+                    de_facto_intra = transmitted > 0 && 2 * intra_mbs >= transmitted;
+                    self.frame_encoder.write_inter_packet(&ifp)?
+                }
                 InterModeStrategy::PreviousMotion => {
                     self.frame_encoder.encode_inter_frame_motion(frame, &refs)?
                 }
@@ -16340,6 +16419,67 @@ impl TheoraEncoder {
                     .encode_inter_frame_four_mv(frame, &refs)?,
             }
         };
+
+        // Measured-rate keyframe policy: an inter frame whose coded
+        // size approaches the last keyframe's says the references have
+        // decayed. Encode the same frame intra as well, measure each
+        // candidate's *delivered* fidelity by decoding it in a
+        // throwaway copy of the mirror decoder (loop filter included),
+        // and emit the spelling with the lower Lagrangian cost
+        // `SSD + λ·bits`. Ties go to intra: at equal cost it also
+        // re-seeds both references (only an intra frame ever refreshes
+        // the golden frame), so every following P-frame predicts from
+        // fresh references.
+        if !want_keyframe {
+            if let (Some(ratio), Some(kb)) = (self.keyframe_rate_ratio, self.last_keyframe_bytes) {
+                if de_facto_intra || bytes.len() as f64 > ratio * kb as f64 {
+                    let intra_bytes = match &self.adaptive_qis {
+                        Some(qis) => self.frame_encoder.encode_intra_frame_adaptive(frame, qis)?,
+                        None => self.frame_encoder.encode_intra_frame(frame)?,
+                    };
+                    let mirror = self
+                        .mirror
+                        .as_ref()
+                        .expect("mirror is Some on the inter branch");
+                    let ssd_of = |pkt: &[u8]| -> Result<u64, Error> {
+                        let mut probe = (**mirror).clone();
+                        let out = probe.decode_frame(pkt)?;
+                        let mut ssd = 0u64;
+                        for (got, want) in [
+                            (&out.frame.samples_y, &frame.samples_y),
+                            (&out.frame.samples_cb, &frame.samples_cb),
+                            (&out.frame.samples_cr, &frame.samples_cr),
+                        ] {
+                            ssd += got
+                                .iter()
+                                .zip(want.iter())
+                                .map(|(&a, &b)| {
+                                    let d = a as i64 - b as i64;
+                                    (d * d) as u64
+                                })
+                                .sum::<u64>();
+                        }
+                        Ok(ssd)
+                    };
+                    let qi0 = self
+                        .adaptive_qis
+                        .as_ref()
+                        .map_or(self.frame_encoder.qi(), |qis| qis[0]);
+                    let lambda = inter_rd_lambda(qi0);
+                    let inter_cost = ssd_of(&bytes)?
+                        .saturating_add(lambda.saturating_mul(8 * bytes.len() as u64));
+                    let intra_cost = ssd_of(&intra_bytes)?
+                        .saturating_add(lambda.saturating_mul(8 * intra_bytes.len() as u64));
+                    if intra_cost <= inter_cost {
+                        bytes = intra_bytes;
+                        want_keyframe = true;
+                    }
+                }
+            }
+        }
+        if want_keyframe {
+            self.last_keyframe_bytes = Some(bytes.len());
+        }
 
         // Mirror the emitted packet so the reference store stays in
         // lock-step with what a downstream decoder would reconstruct.
@@ -33266,6 +33406,156 @@ mod tests {
                 panic!("expected video frame");
             };
         }
+    }
+
+    /// MILESTONE (round 387, golden-frame policy): the measured-rate
+    /// keyframe policy converts a P-frame that has degenerated into a
+    /// de-facto keyframe into a real one. Frame 3 switches to a
+    /// completely new content family, so the RD mode decision codes it
+    /// almost entirely INTRA — at which point the frame pays keyframe
+    /// coding cost *plus* the inter-frame syntax overhead (§7.3 flags,
+    /// §7.4 modes) while refreshing nothing. The policy re-encodes it
+    /// intra, measures both candidates' delivered SSD by decoding them
+    /// in a throwaway mirror copy, and emits the cheaper Lagrangian
+    /// spelling — a true keyframe that also re-seeds **both**
+    /// references (only an intra frame ever refreshes the golden
+    /// frame). Measured against the interval-only encoder on the same
+    /// 6-frame sequence: an extra keyframe, strictly fewer total
+    /// bytes, and no worse total reconstruction error.
+    #[test]
+    fn encoder_trait_keyframe_rate_policy_refreshes_decayed_references() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = SetupHeaderTables::vp3_defaults();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let g = build_frame_geometry(&ident).unwrap();
+        let nframes = 6usize;
+
+        // Frames 0..=2: a busy checkerboard family drifting one pixel a
+        // frame (cheap inter prediction). Frames 3..=5: an unrelated
+        // smooth-gradient family, also drifting — frame 3's P-frame
+        // residual is hopeless against either reference, so the RD
+        // decision codes it almost entirely INTRA.
+        let mk_morph = |i: u32| -> oxideav_core::VideoFrame {
+            use oxideav_core::frame::VideoPlane;
+            let (w, h) = (g.dims_y.width, g.dims_y.height);
+            let mut y = vec![0u8; (w * h) as usize];
+            for row in 0..h {
+                for col in 0..w {
+                    let v = if i < 3 {
+                        let (x, yy) = (col + i, row + i);
+                        if (x / 2 + yy / 2) % 2 == 0 {
+                            230
+                        } else {
+                            25
+                        }
+                    } else {
+                        60 + ((3 * (col + i) + 2 * row) % 160)
+                    };
+                    y[(row * w + col) as usize] = v as u8;
+                }
+            }
+            let (cw, ch) = (g.dims_c.width, g.dims_c.height);
+            oxideav_core::VideoFrame {
+                pts: None,
+                planes: vec![
+                    VideoPlane {
+                        stride: w as usize,
+                        data: y,
+                    },
+                    VideoPlane {
+                        stride: cw as usize,
+                        data: vec![120u8; (cw * ch) as usize],
+                    },
+                    VideoPlane {
+                        stride: cw as usize,
+                        data: vec![130u8; (cw * ch) as usize],
+                    },
+                ],
+            }
+        };
+
+        let run = |policy: Option<f64>| -> (usize, usize, u64) {
+            let mut enc = TheoraEncoder::with_keyframe_interval(
+                codec_id.clone(),
+                ident.clone(),
+                setup.clone(),
+                40,
+                30,
+            )
+            .unwrap();
+            if let Some(r) = policy {
+                enc = enc.with_keyframe_rate_policy(r);
+            }
+            for i in 0..nframes {
+                enc.send_frame(&oxideav_core::Frame::Video(mk_morph(i as u32)))
+                    .unwrap();
+            }
+            let mut headers = Vec::new();
+            let mut data = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => {
+                        if p.flags.header {
+                            headers.push(p);
+                        } else {
+                            data.push(p);
+                        }
+                    }
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("encoder error {e}"),
+                }
+            }
+            assert_eq!(data.len(), nframes);
+            let keyframes = data.iter().filter(|p| p.flags.keyframe).count();
+            let total: usize = data.iter().map(|p| p.data.len()).sum();
+
+            // Decode the whole stream and sum the luma SSD against the
+            // sources.
+            let mut dec = TheoraDecoder::new(codec_id.clone());
+            for p in &headers {
+                dec.send_packet(p).unwrap();
+            }
+            let mut ssd_total = 0u64;
+            for (i, p) in data.iter().enumerate() {
+                dec.send_packet(p).unwrap();
+                let oxideav_core::Frame::Video(vf) = dec.receive_frame().unwrap() else {
+                    panic!("expected video frame");
+                };
+                let src = mk_morph(i as u32);
+                ssd_total += vf.planes[0]
+                    .data
+                    .iter()
+                    .zip(src.planes[0].data.iter())
+                    .map(|(&a, &b)| {
+                        let d = a as i64 - b as i64;
+                        (d * d) as u64
+                    })
+                    .sum::<u64>();
+            }
+            (keyframes, total, ssd_total)
+        };
+
+        let (kf_off, bytes_off, ssd_off) = run(None);
+        let (kf_on, bytes_on, ssd_on) = run(Some(0.8));
+        eprintln!(
+            "keyframe-rate policy: off {kf_off} keyframes / {bytes_off} B / SSD {ssd_off}; \
+             on {kf_on} keyframes / {bytes_on} B / SSD {ssd_on}"
+        );
+        assert_eq!(kf_off, 1, "interval-30 alone keeps a single keyframe");
+        assert!(
+            kf_on >= 2,
+            "the rate policy must convert (at least) the de-facto keyframe at the family \
+             switch (got {kf_on})"
+        );
+        assert!(
+            bytes_on < bytes_off,
+            "policy stream {bytes_on} B must beat interval-only {bytes_off} B"
+        );
+        assert!(
+            ssd_on <= ssd_off,
+            "policy stream SSD {ssd_on} must not exceed interval-only {ssd_off}"
+        );
     }
 
     // ------- target-bitrate rate control (round 371) -------

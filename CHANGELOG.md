@@ -6,6 +6,23 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Mixed I/P GOP two-pass Huffman tuning (round 387)** —
+  `SetupHeaderTables::with_gop_tuned_huffman_tables` tunes **four**
+  §6.4.4 codebooks per Huffman group (intra/inter × luma/chroma), each
+  replacing the selector slot scoring worst on its own statistics
+  column (all-zero columns skipped), so keyframes and P-frames each
+  get tables specialized to their very different token mixes and the
+  §7.7.3 per-frame selector optimization routes every frame to the
+  cheapest.
+  `TheoraEncoder::with_gop_tuned_setup_keyframe_interval` wraps the
+  full two-pass flow: the first pass encodes the sample sequence as
+  the exact I/P GOP the second pass will emit (RD-planned inter frames
+  against a mirror decoder's reconstructed references), tallying intra
+  and inter tokens separately. Measured on a 6-frame textured motion
+  sequence at interval 3: 2248 B (VP3 defaults) → 2141 B (intra-only
+  tuning) → 2072 B GOP-tuned (−7.8% / −3.2%), with all three streams
+  reconstructing bit-identically.
+
 - **Inter-frame token statistics (round 387)** —
   `FrameEncoder::inter_token_statistics` tallies the §7.7 tokens an
   inter (P-frame) encode would write — combined run+value tokens and

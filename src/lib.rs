@@ -2881,6 +2881,97 @@ impl SetupHeaderTables {
         }
         Ok(out)
     }
+
+    /// Derive a setup-table set with **separate** intra- and
+    /// inter-tuned §6.4.4 Huffman codebooks.
+    ///
+    /// Intra keyframes and inter (P) frames have very different token
+    /// mixes — a keyframe spends most of its bits on dense per-block
+    /// coefficient tokens while a P-frame's stream is dominated by
+    /// cross-block EOB runs and small residual values — so one merged
+    /// codebook per plane (what feeding a combined tally to
+    /// [`Self::with_tuned_huffman_tables`] would produce) is a
+    /// compromise that can lose to an intra-specialized table on
+    /// keyframe-heavy streams. This method instead sacrifices up to
+    /// **four** selector slots per Huffman group — intra-luma,
+    /// intra-chroma, inter-luma, inter-chroma, in that order — each
+    /// replaced (across all five groups) by the minimum-redundancy
+    /// codebook for its own statistics column. The §7.7.3 frame writer's
+    /// per-frame selector optimization then routes every frame to
+    /// whichever table is cheapest for *it*: keyframes pick the
+    /// intra-tuned slots, P-frames the inter-tuned ones, and content
+    /// resembling neither still has the 12 surviving fallbacks
+    /// (each replaced slot is the one scoring **worst** on its own
+    /// statistics, so nothing the sample would have picked is lost).
+    ///
+    /// A statistics column with no tokens at all (e.g. the inter tally
+    /// of an all-keyframe sample, or a pure-copy P-frame run) is
+    /// skipped and its slot left untouched. Like
+    /// [`Self::with_tuned_huffman_tables`], only the spelling of the
+    /// quantized coefficients changes — never what a decoder
+    /// reconstructs — and the result serializes through
+    /// [`encode_setup_header`] into a fully self-describing stream.
+    pub fn with_gop_tuned_huffman_tables(
+        &self,
+        intra: &TokenStatistics,
+        inter: &TokenStatistics,
+    ) -> Result<Self, Error> {
+        // Joint cost of selector slot `s` over one plane-column of
+        // counts (a slot serves every group, so the score sums across
+        // groups; a missing token leaf makes the slot unusable for
+        // this content — score it maximal).
+        let slot_cost = |counts: &[[u64; 32]; 5], s: usize| -> u128 {
+            let mut cost: u128 = 0;
+            for (hg, tokens) in counts.iter().enumerate() {
+                let table = &self.huffman_tables[16 * hg + s];
+                for (token, &c) in tokens.iter().enumerate() {
+                    if c == 0 {
+                        continue;
+                    }
+                    match huffman_code_for_token(table, token as u8) {
+                        Some((_, len)) => cost += u128::from(c) * u128::from(len),
+                        None => return u128::MAX,
+                    }
+                }
+            }
+            cost
+        };
+
+        // The four tuned columns, in replacement order.
+        let columns: [&[[u64; 32]; 5]; 4] = [
+            &intra.counts[0],
+            &intra.counts[1],
+            &inter.counts[0],
+            &inter.counts[1],
+        ];
+        let mut taken = [false; 16];
+        let mut out = self.clone();
+        for col in columns {
+            let total: u64 = col.iter().flat_map(|g| g.iter()).sum();
+            if total == 0 {
+                // Nothing sampled for this column: leave its slot as a
+                // fallback rather than burning it on an unused table.
+                continue;
+            }
+            // The worst not-yet-taken slot on this column.
+            let mut worst = usize::MAX;
+            for (s, &is_taken) in taken.iter().enumerate() {
+                if is_taken {
+                    continue;
+                }
+                if worst == usize::MAX || slot_cost(col, s) >= slot_cost(col, worst) {
+                    worst = s;
+                }
+            }
+            debug_assert!(worst < 16, "at most 4 of 16 slots are ever taken");
+            taken[worst] = true;
+            for (hg, tokens) in col.iter().enumerate() {
+                out.huffman_tables[16 * hg + worst] =
+                    HuffmanTable::from_token_counts(16 * hg + worst, tokens)?;
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Accumulated §7.7 DCT-token emission statistics, the input to
@@ -15476,6 +15567,87 @@ impl TheoraEncoder {
         Self::with_keyframe_interval(codec_id, ident, tuned, qi, keyframe_interval)
     }
 
+    /// Build an encoder whose §6.4.4 Huffman codebooks are tuned to a
+    /// sample **sequence coded as a mixed I/P GOP** — the two-pass
+    /// tuning flow extended to inter frames.
+    ///
+    /// [`Self::with_tuned_setup_keyframe_interval`] tunes on intra
+    /// token statistics alone, which skews the codebooks toward the
+    /// keyframes even though most frames of an interval-`n` stream are
+    /// inter frames with a very different token mix (EOB-run heavy,
+    /// small-value dominated residuals). This constructor's first pass
+    /// instead simulates the exact GOP structure the second pass will
+    /// emit: `samples` is encoded frame by frame with the same
+    /// keyframe-interval policy (`samples[0]` intra, then inter until
+    /// the interval elapses), each inter frame planned by the
+    /// rate-distortion mode decision against the reconstructed
+    /// references of a mirror decoder. The intra and inter token
+    /// tallies are kept **separate** and folded into the tables by
+    /// [`SetupHeaderTables::with_gop_tuned_huffman_tables`], which
+    /// tunes four codebooks per Huffman group (intra/inter ×
+    /// luma/chroma) so keyframes and P-frames each get tables
+    /// specialized to their own token mix — the per-frame selector
+    /// optimization routes every frame to whichever is cheapest.
+    /// Because the §7.7 token plan depends only on the quantized
+    /// coefficients (never on the codebooks that spell them), the
+    /// first-pass tally taken with `base_setup`'s tables transfers
+    /// exactly to the tuned second pass, and the tuned stream
+    /// reconstructs bit-identically to the base-table stream.
+    ///
+    /// The tuned tables ride in the §6.4 setup header the encoder
+    /// queues (and advertises in `extradata`), so the stream stays
+    /// fully self-describing.
+    pub fn with_gop_tuned_setup_keyframe_interval(
+        codec_id: oxideav_core::CodecId,
+        ident: TheoraIdentHeader,
+        base_setup: SetupHeaderTables,
+        qi: u8,
+        keyframe_interval: u32,
+        samples: &[SourceFrame],
+    ) -> Result<Self, Error> {
+        let sampler = FrameEncoder::new(ident.clone(), base_setup.clone(), qi)?;
+        let g = sampler.geometry().clone();
+        let interval = keyframe_interval.max(1);
+        let mut intra_stats = TokenStatistics::new();
+        let mut inter_stats = TokenStatistics::new();
+        let mut mirror: Option<FrameDecoder> = None;
+        let mut since_key = 0u32;
+        for frame in samples {
+            let is_key = mirror.is_none() || since_key >= interval;
+            if is_key {
+                // Keyframe: tally the intra token plan and feed the
+                // packet through the mirror so the following inter
+                // frames predict from real reconstructed references.
+                sampler.intra_token_statistics(frame, &mut intra_stats)?;
+                let pkt = sampler.encode_intra_frame(frame)?;
+                let dec = match mirror.as_mut() {
+                    Some(d) => d,
+                    None => {
+                        mirror = Some(FrameDecoder::new(ident.clone(), base_setup.clone())?);
+                        mirror.as_mut().expect("just inserted")
+                    }
+                };
+                dec.decode_frame(&pkt)?;
+                since_key = 1;
+            } else {
+                let dec = mirror.as_mut().expect("mirror exists after a keyframe");
+                // Plan once; tally and serialize from the same plan (the
+                // packet is only needed to advance the mirror).
+                let pkt = {
+                    let refs = dec.reference_store().as_reference_plane_set()?;
+                    let ifp = sampler.plan_inter_frame(frame, &refs, MotionPlan::RateDistortion)?;
+                    let token_plan = plan_frame_tokens(g.nbs, g.nmbs, &ifp.bcoded, &ifp.coeffs)?;
+                    inter_stats.accumulate(&token_plan.tally);
+                    sampler.write_inter_packet(&ifp)?
+                };
+                dec.decode_frame(&pkt)?;
+                since_key += 1;
+            }
+        }
+        let tuned = base_setup.with_gop_tuned_huffman_tables(&intra_stats, &inter_stats)?;
+        Self::with_keyframe_interval(codec_id, ident, tuned, qi, keyframe_interval)
+    }
+
     /// Set the P-frame inter mode-decision strategy (see
     /// [`InterModeStrategy`]). Returns `self` for builder chaining. The
     /// default is [`InterModeStrategy::RateDistortion`].
@@ -23209,6 +23381,54 @@ mod tests {
         let packet = encode_setup_header(&tuned).unwrap();
         let back = decode_setup_header(&packet).unwrap();
         assert_eq!(back, tuned, "tuned setup must survive the §6.4 round trip");
+    }
+
+    /// The four-column GOP tuner replaces one distinct slot per
+    /// non-empty statistics column (intra-luma, intra-chroma,
+    /// inter-luma, inter-chroma), skips all-zero columns without
+    /// burning their slot, and the result survives the §6.4 setup
+    /// round trip.
+    #[test]
+    fn gop_tuned_huffman_tables_replace_four_distinct_slots() {
+        let base = SetupHeaderTables::vp3_defaults();
+        let mut intra = TokenStatistics::new();
+        intra.counts[0][0][0] = 500;
+        intra.counts[0][2][15] = 220;
+        intra.counts[1][1][10] = 130;
+        let mut inter = TokenStatistics::new();
+        inter.counts[0][0][6] = 400;
+        inter.counts[0][3][23] = 90;
+        inter.counts[1][4][8] = 60;
+
+        let tuned = base.with_gop_tuned_huffman_tables(&intra, &inter).unwrap();
+        let changed: Vec<usize> = (0..16)
+            .filter(|&s| tuned.huffman_tables[s] != base.huffman_tables[s])
+            .collect();
+        assert_eq!(
+            changed.len(),
+            4,
+            "four non-empty columns → four distinct slots replaced (got {changed:?})"
+        );
+        assert_eq!(tuned.quantization_parameters, base.quantization_parameters);
+
+        // An empty inter tally leaves its two slots untouched.
+        let empty = TokenStatistics::new();
+        let intra_only = base.with_gop_tuned_huffman_tables(&intra, &empty).unwrap();
+        let changed2: Vec<usize> = (0..16)
+            .filter(|&s| intra_only.huffman_tables[s] != base.huffman_tables[s])
+            .collect();
+        assert_eq!(
+            changed2.len(),
+            2,
+            "empty inter columns must be skipped (got {changed2:?})"
+        );
+
+        let packet = encode_setup_header(&tuned).unwrap();
+        let back = decode_setup_header(&packet).unwrap();
+        assert_eq!(
+            back, tuned,
+            "GOP-tuned setup must survive the §6.4 round trip"
+        );
     }
 
     /// Two-pass Huffman tuning end-to-end: statistics collected from a
@@ -32129,6 +32349,147 @@ mod tests {
                     df.planes[pli].data, tf.planes[pli].data,
                     "frame {i} plane {pli}: tuned stream must reconstruct identically"
                 );
+            }
+        }
+    }
+
+    /// MILESTONE (round 387): mixed I/P GOP two-pass Huffman tuning.
+    /// `with_gop_tuned_setup_keyframe_interval` samples the sequence
+    /// *as the GOP it will be coded as* (I,P,P,I,P,P here) so the tally
+    /// weights intra and inter tokens exactly as the stream spends
+    /// them, where the intra-only tuner over-weights keyframe
+    /// statistics. Measured on a 6-frame textured motion sequence: the
+    /// GOP-tuned stream must beat both the default-table stream and the
+    /// intra-only-tuned stream strictly on total data bytes (measured
+    /// 2248 → 2141 → 2072 B when authored), while reconstructing
+    /// bit-identically to both (tuning re-spells the same coefficients;
+    /// it never changes what a decoder reconstructs).
+    #[test]
+    fn encoder_trait_gop_tuned_huffman_beats_intra_only_tuning() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let base = SetupHeaderTables::vp3_defaults();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let qi = 48u8;
+        let nframes = 6usize;
+        let interval = 3u32;
+
+        // The sample sequence as lower-left `SourceFrame`s.
+        let g = build_frame_geometry(&ident).unwrap();
+        let flip = |p: &oxideav_core::frame::VideoPlane, w: u32, h: u32| -> Vec<u8> {
+            let mut out = Vec::with_capacity((w * h) as usize);
+            for row in (0..h as usize).rev() {
+                out.extend_from_slice(&p.data[row * p.stride..row * p.stride + w as usize]);
+            }
+            out
+        };
+        let to_source = |vf: &oxideav_core::VideoFrame| -> SourceFrame {
+            SourceFrame {
+                samples_y: flip(&vf.planes[0], g.dims_y.width, g.dims_y.height),
+                samples_cb: flip(&vf.planes[1], g.dims_c.width, g.dims_c.height),
+                samples_cr: flip(&vf.planes[2], g.dims_c.width, g.dims_c.height),
+            }
+        };
+        let sources: Vec<SourceFrame> = (0..nframes)
+            .map(|i| to_source(&textured_video_frame(&ident, i as i32)))
+            .collect();
+
+        let mut enc_default = TheoraEncoder::with_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            base.clone(),
+            qi,
+            interval,
+        )
+        .unwrap();
+        let mut enc_intra_tuned = TheoraEncoder::with_tuned_setup_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            base.clone(),
+            qi,
+            interval,
+            std::slice::from_ref(&sources[0]),
+        )
+        .unwrap();
+        let mut enc_gop_tuned = TheoraEncoder::with_gop_tuned_setup_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            base,
+            qi,
+            interval,
+            &sources,
+        )
+        .unwrap();
+
+        let mut totals = Vec::new();
+        let mut streams = Vec::new();
+        for enc in [&mut enc_default, &mut enc_intra_tuned, &mut enc_gop_tuned] {
+            for phase in 0..nframes {
+                let vf = textured_video_frame(&ident, phase as i32);
+                enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+            }
+            let mut headers = Vec::new();
+            let mut data = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => {
+                        if p.flags.header {
+                            headers.push(p);
+                        } else {
+                            data.push(p);
+                        }
+                    }
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("encoder error {e}"),
+                }
+            }
+            assert_eq!(data.len(), nframes);
+            totals.push(data.iter().map(|p| p.data.len()).sum::<usize>());
+            streams.push((headers, data));
+        }
+        let (default_b, intra_b, gop_b) = (totals[0], totals[1], totals[2]);
+        eprintln!(
+            "gop-tuning rate: default {default_b} B, intra-tuned {intra_b} B, gop-tuned {gop_b} B"
+        );
+        assert!(
+            gop_b < default_b,
+            "GOP-tuned stream {gop_b} B must beat default tables {default_b} B"
+        );
+        assert!(
+            gop_b < intra_b,
+            "GOP-tuned stream {gop_b} B must beat intra-only tuning {intra_b} B"
+        );
+
+        // All three streams reconstruct bit-identically: the tuning only
+        // re-spells the same quantized coefficients.
+        let mut decoded: Vec<Vec<oxideav_core::VideoFrame>> = Vec::new();
+        for (headers, data) in &streams {
+            let mut dec = TheoraDecoder::new(codec_id.clone());
+            for p in headers {
+                dec.send_packet(p).unwrap();
+            }
+            let mut frames = Vec::new();
+            for p in data {
+                dec.send_packet(p).unwrap();
+                let oxideav_core::Frame::Video(vf) = dec.receive_frame().unwrap() else {
+                    panic!("expected video frame");
+                };
+                frames.push(vf);
+            }
+            decoded.push(frames);
+        }
+        for stream_idx in 1..3 {
+            for (i, (df, tf)) in decoded[0]
+                .iter()
+                .zip(decoded[stream_idx].iter())
+                .enumerate()
+            {
+                for pli in 0..3 {
+                    assert_eq!(
+                        df.planes[pli].data, tf.planes[pli].data,
+                        "stream {stream_idx} frame {i} plane {pli} must reconstruct identically"
+                    );
+                }
             }
         }
     }

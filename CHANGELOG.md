@@ -6,6 +6,16 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Adaptive quantization on framework-encoder P-frames (round 387)**
+  — `TheoraEncoder::with_adaptive_quant(qis)` now drives every
+  rate-distortion P-frame through
+  `FrameEncoder::encode_inter_frame_rd_adaptive` in addition to the
+  keyframes (non-RD inter strategies keep the single frame-level
+  `qi`), so an I,P,I stream carries the §7.1 multi-`qi` header and the
+  §7.6 per-block selector stream on all three frames; the trait-path
+  test re-parses each frame's wire `QIS` list and round-trips the
+  stream through `TheoraDecoder`.
+
 - **Adaptive block-level quantization on the inter encoder (round
   387)** — `FrameEncoder::encode_inter_frame_rd_adaptive` is the first
   P-frame path to emit the §7.1 `MOREQIS` / `QIS` chain and the §7.6

@@ -15686,12 +15686,15 @@ pub struct TheoraEncoder {
     /// `None` disables scene-cut detection (keyframes are purely
     /// interval-driven).
     scene_cut_threshold: Option<f64>,
-    /// Optional adaptive-quantization `qis` list for keyframes. When
-    /// `Some`, every intra frame is emitted through
-    /// [`FrameEncoder::encode_intra_frame_adaptive`] with this §7.1
-    /// `QIS` list (1..=3 entries), each block's AC quantizer chosen by
-    /// the per-block rate-distortion decision; `None` keeps the
-    /// single-`qi` intra path. Inter frames are unaffected.
+    /// Optional adaptive-quantization `qis` list. When `Some`, every
+    /// intra frame is emitted through
+    /// [`FrameEncoder::encode_intra_frame_adaptive`] and every
+    /// rate-distortion P-frame through
+    /// [`FrameEncoder::encode_inter_frame_rd_adaptive`] with this §7.1
+    /// `QIS` list (1..=3 entries), each coded block's AC quantizer
+    /// chosen by the per-block rate-distortion decision; `None` keeps
+    /// the single-`qi` paths. Non-RD inter strategies are unaffected
+    /// (they have no adaptive variant).
     adaptive_qis: Option<Vec<u8>>,
 }
 
@@ -16192,22 +16195,25 @@ impl TheoraEncoder {
         self
     }
 
-    /// Enable adaptive block-level quantization on keyframes. Returns
-    /// `self` for builder chaining.
+    /// Enable adaptive block-level quantization. Returns `self` for
+    /// builder chaining.
     ///
     /// `qis` is the §7.1 frame-header quantization-index list every
-    /// intra frame will carry (1..=3 entries, each `0..=63`; `qis[0]`
-    /// drives the DC quantizers and the loop-filter limit). Each intra
-    /// frame is emitted through
-    /// [`FrameEncoder::encode_intra_frame_adaptive`], which picks each
-    /// block's AC quantizer from the list by the per-block `D + λ·R`
-    /// decision — spending bits where fidelity is cheap and saving them
-    /// where it is not. Inter (P) frames keep the single frame-level
-    /// `qi`. The list's shape is validated when the first keyframe is
+    /// adaptive frame will carry (1..=3 entries, each `0..=63`;
+    /// `qis[0]` drives the DC quantizers and the loop-filter limit).
+    /// Each intra frame is emitted through
+    /// [`FrameEncoder::encode_intra_frame_adaptive`] and — under the
+    /// default [`InterModeStrategy::RateDistortion`] — each inter (P)
+    /// frame through [`FrameEncoder::encode_inter_frame_rd_adaptive`],
+    /// which pick each coded block's AC quantizer from the list by the
+    /// per-block `D + λ·R` decision — spending bits where fidelity is
+    /// cheap and saving them where it is not. Non-RD inter strategies
+    /// keep the single frame-level `qi` (they have no adaptive
+    /// variant). The list's shape is validated when the first frame is
     /// encoded (`EncodeQisCountOutOfRange` / `QuantIndexOutOfRange`
     /// surface from `send_frame`). When target-bitrate rate control is
-    /// also enabled it keeps steering the single-`qi` inter frames; the
-    /// adaptive list governs keyframes as configured.
+    /// also enabled, the adaptive list governs the adaptive frames as
+    /// configured (the rate-control quantizer is bypassed on them).
     pub fn with_adaptive_quant(mut self, qis: Vec<u8>) -> Self {
         self.adaptive_qis = Some(qis);
         self
@@ -16317,9 +16323,12 @@ impl TheoraEncoder {
                 .expect("mirror is Some on the inter branch");
             let refs = mirror.reference_store().as_reference_plane_set()?;
             match self.inter_mode {
-                InterModeStrategy::RateDistortion => {
-                    self.frame_encoder.encode_inter_frame_rd(frame, &refs)?
-                }
+                InterModeStrategy::RateDistortion => match &self.adaptive_qis {
+                    Some(qis) => self
+                        .frame_encoder
+                        .encode_inter_frame_rd_adaptive(frame, &refs, qis)?,
+                    None => self.frame_encoder.encode_inter_frame_rd(frame, &refs)?,
+                },
                 InterModeStrategy::PreviousMotion => {
                     self.frame_encoder.encode_inter_frame_motion(frame, &refs)?
                 }
@@ -33158,14 +33167,15 @@ mod tests {
         }
     }
 
-    /// MILESTONE: adaptive block-level quantization wired through the
-    /// framework `Encoder` trait. `with_adaptive_quant([16, 63])` makes
-    /// every keyframe a §7.1 multi-`qi` frame with an RD-chosen §7.6
-    /// per-block selector split; the I,P,I stream round-trips through
-    /// `TheoraDecoder`, the keyframes carry the two-entry `QIS` list on
-    /// the wire, and the P frame stays single-`qi`.
+    /// MILESTONE (round 384, extended round 387): adaptive block-level
+    /// quantization wired through the framework `Encoder` trait for
+    /// **both frame types**. `with_adaptive_quant([16, 63])` makes
+    /// every keyframe a §7.1 multi-`qi` frame *and* — under the default
+    /// rate-distortion inter strategy — every P-frame too; the I,P,I
+    /// stream round-trips through `TheoraDecoder` and all three frames
+    /// carry the two-entry `QIS` list on the wire.
     #[test]
-    fn encoder_trait_adaptive_quant_keyframes_round_trip() {
+    fn encoder_trait_adaptive_quant_all_frames_round_trip() {
         use oxideav_core::{Decoder, Encoder};
         let ident = decode_identification_header(&TINY_HEADER).unwrap();
         let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
@@ -33235,14 +33245,14 @@ mod tests {
         assert_eq!(data.len(), 3);
         assert!(data[0].flags.keyframe && !data[1].flags.keyframe && data[2].flags.keyframe);
 
-        // The keyframes carry the adaptive two-entry QIS list on the
-        // wire; the P frame stays single-qi.
+        // Every frame — keyframes and the RD P-frame alike — carries
+        // the adaptive two-entry QIS list on the wire.
         let mut fdec = FrameDecoder::new(ident, setup).unwrap();
         let qis0 = fdec.decode_frame(&data[0].data).unwrap().qis;
         let qis1 = fdec.decode_frame(&data[1].data).unwrap().qis;
         let qis2 = fdec.decode_frame(&data[2].data).unwrap().qis;
         assert_eq!(qis0, vec![16, 63]);
-        assert_eq!(qis1.len(), 1, "P frame stays single-qi (got {qis1:?})");
+        assert_eq!(qis1, vec![16, 63], "the RD P-frame is adaptive too");
         assert_eq!(qis2, vec![16, 63]);
 
         // End-to-end through the framework decoder.

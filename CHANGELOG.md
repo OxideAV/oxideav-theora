@@ -6,6 +6,20 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Changed
 
+- **Independent DC / AC §7.7.3 Huffman selector optimization (round
+  384)** — the §7.7.3 decoder reads a *fresh* `htiL` / `htiC` pair at
+  `ti = 1`, so the pair written at `ti = 0` only ever addresses Huffman
+  group 0 (the DC group) and the `ti = 1` pair only groups 1..=4 (the
+  AC groups). The frame token writer previously emitted one jointly
+  optimized pair twice; it now optimizes the two pairs independently
+  per plane (`best_huffman_selector` gains a group-range argument) and
+  emits the DC-optimized pair at `ti = 0` and the AC-optimized pair at
+  `ti = 1`. The split search space contains every joint choice, so this
+  is never worse than the round-379 joint selector — a pure bit-rate
+  win at zero distortion, with no new bitstream syntax (the same two
+  §7.7.3 selector fields, now decoupled). A new round-trip test drives
+  a frame whose DC tokens prefer a different table than its AC tokens
+  and pins the coded size to the split-selector cost model exactly.
 - **§7.7.3 Huffman codebook selection (round 379)** — the frame token
   writer no longer hard-codes the `0` table within each Huffman group.
   It now tallies, per Huffman group and token value, the luma and chroma

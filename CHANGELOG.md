@@ -6,6 +6,24 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Adaptive block-level quantization on the inter encoder (round
+  387)** — `FrameEncoder::encode_inter_frame_rd_adaptive` is the first
+  P-frame path to emit the §7.1 `MOREQIS` / `QIS` chain and the §7.6
+  block-level qi stream: `qis[0]` drives every DC quantizer and the RD
+  mode decision, while each coded block's AC quantizer is chosen from
+  the list by a per-block `D + λ·R` decision (delivered SSD against
+  the block's own mode-selected predictor — motion-compensated
+  reference, or flat-128 for intra-coded blocks with their qti = 0
+  matrices — plus the measured §7.7 token rate). The §7.6 promotion
+  writer is factored into `encode_block_level_qi_stream`, shared with
+  the intra path, and the λ ramp is unified as `inter_rd_lambda(qi0)`
+  across all three RD choosers. `NQIS = 1` is byte-identical to the
+  single-`qi` RD packet. Measured on a mixed flat/noise P-frame at
+  equal reference state: all-qi0 178 B / SSD 157576, all-qi63 586 B /
+  SSD 2336, adaptive `[0, 63]` 565 B / SSD 9767 — strictly inside the
+  single-`qi` curve on both corners, with the wire `QIS` / `QIIS`
+  re-parsed exactly by the production §7.11 step-1 driver.
+
 - **INTRA as the eighth RD mode in P-frames (round 387)** — the joint
   rate-distortion mode decision now evaluates `INTRA` alongside the
   seven inter modes: `mb_intra_mode_cost` scores each macro block on

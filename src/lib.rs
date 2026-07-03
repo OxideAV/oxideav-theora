@@ -12877,6 +12877,56 @@ enum MotionPlan {
 /// two-pass Huffman-tuning flow tally a frame's token statistics
 /// (which depend only on the plan, never on the codebooks that will
 /// spell it) without a packet write.
+/// Encode the §7.6 block-level qi stream onto `w`: `nqis − 1` §7.2.1
+/// long-run promotion passes over the **coded** blocks, the exact
+/// inverse of `decode_block_level_qi`. Pass number `qii` visits, in
+/// coded block order, the coded blocks still sitting at selector `qii`
+/// and writes one bit each — `0` keeps the block, `1` promotes it to
+/// `qii + 1` (placing it in the next pass's group). Writes nothing
+/// when `nqis == 1`. Uncoded blocks never appear in any pass; their
+/// `qiis` entries are ignored.
+fn encode_block_level_qi_stream(w: &mut BitWriter, bcoded: &[u8], nqis: usize, qiis: &[u8]) {
+    debug_assert_eq!(bcoded.len(), qiis.len());
+    let mut cur = vec![0u8; bcoded.len()];
+    for qii in 0..nqis.saturating_sub(1) {
+        let mut bits: Vec<u8> = Vec::new();
+        for (bi, &coded) in bcoded.iter().enumerate() {
+            if coded != 0 && cur[bi] as usize == qii {
+                let promote = qiis[bi] as usize > qii;
+                bits.push(promote as u8);
+                if promote {
+                    cur[bi] += 1;
+                }
+            }
+        }
+        encode_long_run_bit_string(w, &bits);
+    }
+    debug_assert!(
+        bcoded
+            .iter()
+            .zip(cur.iter().zip(qiis.iter()))
+            .all(|(&b, (&c, &q))| b == 0 || c == q),
+        "the §7.6 promotion passes must land every coded block"
+    );
+}
+
+/// The Lagrange multiplier λ trading distortion (SSD) for measured
+/// rate (bits) in the encoder's rate-distortion decisions (the
+/// [`MotionPlan::RateDistortion`] mode decision and the per-block
+/// adaptive-quantization choosers).
+///
+/// A monotone function of the frame's primary quantizer index `qi0`: a
+/// weaker quantizer (higher `qi`) preserves more residual energy, so a
+/// bit spent on an alternative buys less distortion reduction — raising
+/// λ there makes the decision favour the cheaper spelling. The shape (a
+/// quadratic ramp in `qi`, matching the squared-error distortion units)
+/// is an encoder tuning choice with no normative status; it only steers
+/// selection and never changes the bitstream syntax.
+fn inter_rd_lambda(qi0: u8) -> u64 {
+    let qi = qi0 as u64;
+    4 + qi * qi / 16
+}
+
 struct InterFramePlan {
     /// Per-macro-block §7.5.2 coding mode, post LAST1/LAST2 recode.
     mbmodes: Vec<MacroBlockMode>,
@@ -12888,6 +12938,13 @@ struct InterFramePlan {
     /// Per-block quantized coefficients in zig-zag order with the DC
     /// slot already converted to a §7.8 prediction residual.
     coeffs: Vec<[i16; 64]>,
+    /// The frame's §7.1 quantization-index list (`QIS`, 1..=3 entries).
+    /// `qis[0]` drives every DC quantizer and the mode decision; each
+    /// block's AC quantizer is `qis[qiis[bi]]`.
+    qis: Vec<u8>,
+    /// Per-block §7.6 selector into `qis` (length `nbs`; only coded
+    /// blocks' entries reach the wire). All zeros when `qis.len() == 1`.
+    qiis: Vec<u8>,
 }
 
 impl FrameEncoder {
@@ -13244,26 +13301,10 @@ impl FrameEncoder {
         w.write_bits(0, 3);
 
         // §7.3 / §7.4 / §7.5 read no bits on an intra all-coded frame.
-        // §7.6 (encoder side): NQIS − 1 §7.2.1 long-run passes. Pass
-        // `qii` visits, in coded order, the coded blocks still sitting
-        // at selector `qii` and writes one bit each: 0 keeps the block,
-        // 1 promotes it to `qii + 1` (putting it in the next pass's
-        // group) — the exact inverse of `decode_block_level_qi`.
-        let mut cur = vec![0u8; nbs];
-        for qii in 0..nqis - 1 {
-            let mut bits: Vec<u8> = Vec::new();
-            for bi in 0..nbs {
-                if bcoded[bi] != 0 && cur[bi] as usize == qii {
-                    let promote = qiis[bi] as usize > qii;
-                    bits.push(promote as u8);
-                    if promote {
-                        cur[bi] += 1;
-                    }
-                }
-            }
-            encode_long_run_bit_string(&mut w, &bits);
-        }
-        debug_assert_eq!(cur, qiis, "the §7.6 promotion passes must land every block");
+        // §7.6 (encoder side): NQIS − 1 §7.2.1 long-run promotion
+        // passes over the coded blocks, via the writer shared with the
+        // inter path.
+        encode_block_level_qi_stream(&mut w, &bcoded, nqis, qiis);
 
         encode_dct_coefficients_inner(
             &mut w,
@@ -13309,9 +13350,8 @@ impl FrameEncoder {
             }
         }
 
-        // λ from qis[0], matching `inter_rd_lambda`'s quadratic ramp.
-        let qi0 = qis[0] as u64;
-        let lambda = 4 + qi0 * qi0 / 16;
+        // λ from qis[0] — the shared quadratic ramp.
+        let lambda = inter_rd_lambda(qis[0]);
 
         // Per-plane DC matrices at qis[0], AC matrices per candidate.
         let qmats_dc: [QuantizationMatrix; 3] = [
@@ -13547,23 +13587,31 @@ impl FrameEncoder {
         self.encode_inter_frame_with_motion(frame, refs, MotionPlan::RateDistortion)
     }
 
-    /// The Lagrange multiplier λ trading distortion (SSD) for estimated
-    /// rate (bits) in the [`MotionPlan::RateDistortion`] mode decision.
+    /// Encode one inter frame with the joint rate-distortion mode
+    /// decision **and adaptive block-level quantization**, returning
+    /// the §7 video-data packet bytes — the first inter path to emit a
+    /// §7.1 multi-`qi` frame header (the `MOREQIS` / `QIS` chain) and
+    /// the §7.6 block-level qi stream on a P-frame.
     ///
-    /// A monotone function of the frame quantizer index: a weaker
-    /// quantizer (higher `qi`) preserves more residual energy, so a bit
-    /// spent on an alternative mode buys less distortion reduction —
-    /// raising λ there makes the decision favour the cheaper-header mode.
-    /// The shape (a small affine ramp in `qi`) is an encoder tuning
-    /// choice with no normative status; it only steers mode selection and
-    /// never changes the bitstream syntax a chosen mode emits.
-    fn inter_rd_lambda(&self) -> u64 {
-        // qi ∈ 0..=63; λ ramps from a small floor at the strongest
-        // quantizer to a larger value at the weakest. The squared form
-        // matches the SSD distortion metric's units (rate is linear in
-        // bits, distortion is quadratic in error).
-        let qi = self.qi as u64;
-        4 + qi * qi / 16
+    /// `qis` is the frame's §7.1 quantization-index list (1..=3
+    /// entries, each `0..=63`): `qis[0]` drives every DC quantizer,
+    /// the loop-filter limit, and the macro-block mode decision, while
+    /// each coded block's AC quantizer is chosen from the list by a
+    /// per-block `D + λ·R` decision — the delivered SSD against the
+    /// block's own mode-selected predictor (motion-compensated
+    /// reference or the §7.9.1.1 intra predictor) plus the measured
+    /// §7.7 token rate. Spending fewer bits on blocks that cannot
+    /// repay them is a pure encoder decision: the packet is a
+    /// conformant §7 inter frame either way, and `qis.len() == 1`
+    /// degrades to exactly [`Self::encode_inter_frame_rd`]'s bitstream.
+    pub fn encode_inter_frame_rd_adaptive(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        qis: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let ifp = self.plan_inter_frame_with_qis(frame, refs, MotionPlan::RateDistortion, qis)?;
+        self.write_inter_packet(&ifp)
     }
 
     /// Shared inter-frame encode body. `plan` selects the per-macro-
@@ -13615,7 +13663,8 @@ impl FrameEncoder {
         Ok(())
     }
 
-    /// Run the complete inter-frame planning pipeline for one frame:
+    /// Run the complete inter-frame planning pipeline for one frame at
+    /// the encoder's single frame-level `qi`:
     /// per-macro-block mode decision / motion search per `plan`, the
     /// forward residual transform + quantization against the
     /// mode-selected reference, the forward §7.8 DC prediction, and the
@@ -13628,9 +13677,40 @@ impl FrameEncoder {
         refs: &ReferencePlaneSet<'_>,
         plan: MotionPlan,
     ) -> Result<InterFramePlan, Error> {
+        self.plan_inter_frame_with_qis(frame, refs, plan, std::slice::from_ref(&self.qi))
+    }
+
+    /// As [`Self::plan_inter_frame`], but with an explicit §7.1 `qis`
+    /// list (1..=3 entries) enabling **adaptive block-level
+    /// quantization on the inter frame**: `qis[0]` drives every DC
+    /// quantizer, the loop-filter limit, and the macro-block mode
+    /// decision, while each *coded* block's AC quantizer is chosen
+    /// from the list per block by a `D + λ·R` decision (delivered SSD
+    /// against the block's own mode-selected predictor + the measured
+    /// §7.7 token rate) and recorded in the plan's `qiis` for the §7.6
+    /// stream. With `qis.len() == 1` the chooser is bypassed and the
+    /// plan is exactly [`Self::plan_inter_frame`]'s.
+    fn plan_inter_frame_with_qis(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        plan: MotionPlan,
+        qis: &[u8],
+    ) -> Result<InterFramePlan, Error> {
         let g = &self.geometry;
         let nbs = g.nbs as usize;
         let nmbs = g.nmbs as usize;
+
+        // Validate the qis list shape (as the intra multi-qi path does).
+        let nqis = qis.len();
+        if !(1..=3).contains(&nqis) {
+            return Err(Error::EncodeQisCountOutOfRange { got: nqis });
+        }
+        for &q in qis {
+            if q > 63 {
+                return Err(Error::QuantIndexOutOfRange { qi: q as usize });
+            }
+        }
 
         // Validate plane lengths against the coded geometry.
         let len_y = (g.dims_y.width as usize) * (g.dims_y.height as usize);
@@ -13657,7 +13737,7 @@ impl FrameEncoder {
             });
         }
 
-        let qi = self.qi as usize;
+        let qi = qis[0] as usize;
         // Per-plane inter (qti = 1) quantization matrix. NQIS = 1 so DC
         // and AC share one matrix per plane.
         let qmats: [QuantizationMatrix; 3] = [
@@ -13675,6 +13755,32 @@ impl FrameEncoder {
             compute_quantization_matrix(&self.setup.quantization_parameters, 0, 1, qi)?,
             compute_quantization_matrix(&self.setup.quantization_parameters, 0, 2, qi)?,
         ];
+        // Per-candidate AC matrices (per qti and plane) for the §7.6
+        // per-block quantizer chooser. Entry 0 is the qis[0] set the
+        // single-qi path uses; only built beyond that when the frame
+        // actually carries more than one qi.
+        let mut qmats_ac_inter: Vec<[QuantizationMatrix; 3]> = Vec::with_capacity(nqis);
+        let mut qmats_ac_intra: Vec<[QuantizationMatrix; 3]> = Vec::with_capacity(nqis);
+        for &cand in qis {
+            let c = cand as usize;
+            qmats_ac_inter.push([
+                compute_quantization_matrix(&self.setup.quantization_parameters, 1, 0, c)?,
+                compute_quantization_matrix(&self.setup.quantization_parameters, 1, 1, c)?,
+                compute_quantization_matrix(&self.setup.quantization_parameters, 1, 2, c)?,
+            ]);
+            qmats_ac_intra.push([
+                compute_quantization_matrix(&self.setup.quantization_parameters, 0, 0, c)?,
+                compute_quantization_matrix(&self.setup.quantization_parameters, 0, 1, c)?,
+                compute_quantization_matrix(&self.setup.quantization_parameters, 0, 2, c)?,
+            ]);
+        }
+
+        // Measured per-token §7.7 code lengths over the actual codebooks
+        // this stream will carry (tuned tables included) and the
+        // quantizer-derived Lagrange multiplier, shared by the
+        // rate-distortion mode decision and the per-block qi chooser.
+        let token_costs = TokenBitCosts::from_tables(&self.setup.huffman_tables[..]);
+        let lambda = inter_rd_lambda(qis[0]);
 
         // Per-macro-block motion vector + mode. The mode determines
         // both the on-wire §7.5.2 mode code and the reference frame the
@@ -13759,14 +13865,6 @@ impl FrameEncoder {
                 }
             }
             MotionPlan::RateDistortion => {
-                // Lagrange multiplier trading distortion (SSD) for rate
-                // (estimated token + header bits). A weaker quantizer
-                // (higher `qi`) keeps more residual energy, so the same
-                // bit buys less distortion reduction — scale λ with the
-                // quantizer index so the rate term carries more weight at
-                // low bitrates. The exact constant is an encoder tuning
-                // choice, not a normative quantity.
-                let lambda = self.inter_rd_lambda();
                 // Running §7.5.2 LAST1 / LAST2 motion-vector predictor
                 // state, advanced exactly as the post-decision recode pass
                 // (and the decoder) advance it. An `INTER_MV` candidate
@@ -13780,11 +13878,6 @@ impl FrameEncoder {
                 // charge would have lost to `INTER_NOMV`.
                 let mut last1 = MotionVector::ZERO;
                 let mut last2 = MotionVector::ZERO;
-                // Measured per-token §7.7 code lengths over the actual
-                // codebooks this stream will carry (tuned tables
-                // included), so every candidate's rate term is priced
-                // against real spellings rather than a flat proxy.
-                let token_costs = TokenBitCosts::from_tables(&self.setup.huffman_tables[..]);
                 for mbi in 0..nmbs {
                     let (prev_mv, _) =
                         self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Previous);
@@ -13927,6 +14020,7 @@ impl FrameEncoder {
         // Per-block working state.
         let mut coeffs = vec![[0i16; 64]; nbs];
         let mut bcoded = vec![0u8; nbs];
+        let mut qiis = vec![0u8; nbs];
 
         // Per-block motion vectors. For uniform modes every block shares
         // `mb_mv[mbi]`; for INTER_MV_FOUR each luma block carries its own
@@ -13988,25 +14082,30 @@ impl FrameEncoder {
             let mv = block_mv[bi];
 
             let src = Self::extract_block(plane, pw, ph, bx, by)?;
-            let q = if mode == MacroBlockMode::Intra {
-                // INTRA macro block inside the inter frame: the
-                // §7.9.1.1 flat-128 predictor and the qti = 0 intra
-                // quantization matrices (§7.9.4 step 2(d)ii resolves
-                // qti from the block's coding mode, not the frame
-                // type). No reference frame is read.
+            // Predictor tile + forward-DCT residual + quantization
+            // matrices, per the macro block's mode. INTRA blocks use
+            // the §7.9.1.1 flat-128 predictor and the qti = 0 intra
+            // matrices (§7.9.4 step 2(d)ii resolves qti from the
+            // block's coding mode, not the frame type — no reference
+            // frame is read); every other mode reads its
+            // motion-compensated reference (§7.9.4 Table 7.75: Golden
+            // for the GOLDEN modes, Previous otherwise) and the
+            // qti = 1 inter matrices.
+            let (pred, dqc, dc_mat, ac_mats) = if mode == MacroBlockMode::Intra {
+                let pred = [[128u8; 8]; 8];
                 let mut residual = [[0i16; 8]; 8];
                 for r in 0..8 {
                     for c in 0..8 {
                         residual[r][c] = src[r][c] - 128;
                     }
                 }
-                let dqc = forward_dct_2d(&residual);
-                quantize_block(&dqc, &qmats_intra[pli], &qmats_intra[pli])
+                (
+                    pred,
+                    forward_dct_2d(&residual),
+                    &qmats_intra[pli],
+                    &qmats_ac_intra[..],
+                )
             } else {
-                // Motion-compensated predictor for this block, read
-                // from the reference frame the macro block's mode
-                // selects (§7.9.4 Table 7.75: Golden for the GOLDEN
-                // modes, Previous otherwise).
                 let refframe = reference_frame_for_mb_mode(mode);
                 let refp = refs.pick(refframe, pli)?;
                 let pred = inter_block_predictor(&refp, bx, by, mv)?;
@@ -14018,19 +14117,65 @@ impl FrameEncoder {
                         residual[r][c] = src[r][c] - pred[r][c] as i16;
                     }
                 }
-                let dqc = forward_dct_2d(&residual);
-                quantize_block(&dqc, &qmats[pli], &qmats[pli])
+                (
+                    pred,
+                    forward_dct_2d(&residual),
+                    &qmats[pli],
+                    &qmats_ac_inter[..],
+                )
             };
+
+            // Quantize. A single-qi frame takes one pass at qis[0]; a
+            // multi-qi frame scores every candidate AC quantizer by
+            // delivered distortion + λ × measured token rate and
+            // records the winner's §7.6 selector. The DC quantizer is
+            // always qis[0] (the §7.6 preamble's rule, so §7.8 DC
+            // prediction is untouched by the per-block choice).
+            let (q, qii) = if nqis == 1 {
+                (quantize_block(&dqc, dc_mat, &ac_mats[0][pli]), 0u8)
+            } else {
+                let mut best_q = [0i16; 64];
+                let mut best_qii = 0u8;
+                let mut best_cost = u64::MAX;
+                for (cand, ac) in ac_mats.iter().enumerate() {
+                    let qc = quantize_block(&dqc, dc_mat, &ac[pli]);
+                    // Reconstruct exactly as the decoder will and take
+                    // the delivered SSD against the source block.
+                    let dqc_rec = dequantize_block(&qc, dc_mat, &ac[pli]);
+                    let rec = inverse_dct_2d(&dqc_rec);
+                    let mut ssd = 0u64;
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
+                            let d = src[r][c] as i32 - pv;
+                            ssd += (d * d) as u64;
+                        }
+                    }
+                    let bits = token_costs
+                        .block_bits(&qc)
+                        .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
+                    let cost = ssd + lambda.saturating_mul(u64::from(bits));
+                    if cost < best_cost {
+                        best_cost = cost;
+                        best_q = qc;
+                        best_qii = cand as u8;
+                    }
+                }
+                (best_q, best_qii)
+            };
+
             // A block is coded iff any quantized coefficient is non-zero
             // OR the macro block's mode forces it coded (any non-zero-MV
-            // INTER_MV / INTER_GOLDEN_* macro block — see
+            // INTER_MV / INTER_GOLDEN_* / INTRA macro block — see
             // `force_coded_for`). An all-zero coded block reconstructs
             // as the exact predictor (zero residual), so forcing it
-            // coded is still bit-faithful.
+            // coded is still bit-faithful. Uncoded blocks keep the
+            // default selector 0 (they never reach the §7.6 stream).
             let any_nonzero = q.iter().any(|&v| v != 0);
             if any_nonzero || force_coded {
                 bcoded[bi] = 1;
                 coeffs[bi] = q;
+                qiis[bi] = qii;
             }
         }
 
@@ -14124,6 +14269,8 @@ impl FrameEncoder {
             block_mv,
             bcoded,
             coeffs,
+            qis: qis.to_vec(),
+            qiis,
         })
     }
 
@@ -14133,15 +14280,26 @@ impl FrameEncoder {
     /// DCT-token stream, in bit-stream order on one shared writer.
     fn write_inter_packet(&self, ifp: &InterFramePlan) -> Result<Vec<u8>, Error> {
         let g = &self.geometry;
+        let nqis = ifp.qis.len();
         let mut w = BitWriter::new();
         // §7.1 step 1: packet-type bit 0 (data packet).
         w.write_bits(0, 1);
         // §7.1 step 2: FTYPE = 1 (inter).
         w.write_bits(1, 1);
-        // §7.1 step 3: QIS[0] (6 bits).
-        w.write_bits(self.qi as u32, 6);
-        // §7.1 step 4: MOREQIS = 0 (NQIS = 1).
-        w.write_bits(0, 1);
+        // §7.1 step 3: QIS[0]; steps 4–6: the MOREQIS chain.
+        w.write_bits(ifp.qis[0] as u32, 6);
+        if nqis >= 2 {
+            w.write_bits(1, 1); // MOREQIS[0]
+            w.write_bits(ifp.qis[1] as u32, 6);
+            if nqis == 3 {
+                w.write_bits(1, 1); // MOREQIS[1]
+                w.write_bits(ifp.qis[2] as u32, 6);
+            } else {
+                w.write_bits(0, 1);
+            }
+        } else {
+            w.write_bits(0, 1);
+        }
         // §7.1 step 7: inter frames read NO reserved bits.
 
         // §7.3 coded block flags.
@@ -14164,7 +14322,9 @@ impl FrameEncoder {
             &g.macro_block_to_luma_blocks,
         );
 
-        // §7.6 block-level qi: NQIS = 1 → no bits.
+        // §7.6 block-level qi: NQIS − 1 §7.2.1 long-run promotion
+        // passes over the coded blocks (no bits when NQIS = 1).
+        encode_block_level_qi_stream(&mut w, &ifp.bcoded, nqis, &ifp.qiis);
 
         // §7.7 DCT coefficient token stream.
         encode_dct_coefficients_inner(
@@ -35802,11 +35962,9 @@ mod tests {
     /// on (a weaker quantizer weights rate more heavily).
     #[test]
     fn inter_rd_lambda_is_monotone_in_qi() {
-        let (ident, setup) = ki30_ident_setup();
         let mut prev = 0u64;
         for qi in 0u8..=63 {
-            let enc = FrameEncoder::new(ident.clone(), setup.clone(), qi).unwrap();
-            let l = enc.inter_rd_lambda();
+            let l = inter_rd_lambda(qi);
             assert!(
                 l >= prev,
                 "λ must be monotone in qi: λ({qi}) = {l} < λ({}) = {prev}",
@@ -36317,6 +36475,157 @@ mod tests {
         assert!(
             rd_ssd < motion_ssd || rd_pkt.len() < motion_pkt.len(),
             "INTRA candidate must strictly win on at least one axis"
+        );
+    }
+
+    /// MILESTONE (round 387): adaptive block-level quantization on the
+    /// inter encoder — the first P-frame path to emit the §7.1
+    /// `MOREQIS` / `QIS` chain and the §7.6 block-level qi stream. A
+    /// P-frame whose changes mix flat and busy regions carries a mixed
+    /// wire `QIIS` split chosen by the per-block `D + λ·R` decision,
+    /// re-parsed exactly by the production §7.11 step-1 driver, and
+    /// decodes through `FrameDecoder`. The `NQIS = 1` case is
+    /// byte-identical to the single-`qi` RD packet.
+    #[test]
+    fn encode_inter_frame_rd_adaptive_multi_qi_round_trips() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let (w, h) = (g.dims_y.width as usize, g.dims_y.height as usize);
+
+        let f0 = gradient_source(&g, 0, 0);
+        // Frame 1: a gentle brightness lift on the left half (flat
+        // residual, cheap at any qi) and hard noise on the right half
+        // (fidelity costs real bits).
+        let mut f1 = f0.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                if x < w / 2 {
+                    f1.samples_y[idx] = f1.samples_y[idx].saturating_add(12);
+                } else {
+                    f1.samples_y[idx] = (25 + ((x * 41 + y * 59) % 205)) as u8;
+                }
+            }
+        }
+
+        let mut dec = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+        dec.decode_frame(&enc.encode_intra_frame(&f0).unwrap())
+            .unwrap();
+
+        let qis = [0u8, 63u8];
+        let pkt = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd_adaptive(&f1, &refs, &qis)
+                .unwrap()
+        };
+        // Wire QIS + QIIS via the production §7.11 step-1 driver.
+        let (wire_qis, wire_qiis) = decode_packet_qis_and_qiis(&enc, false, &pkt);
+        assert_eq!(
+            wire_qis,
+            qis.to_vec(),
+            "the MOREQIS chain must carry the list"
+        );
+        assert!(
+            wire_qiis.contains(&0) && wire_qiis.contains(&1),
+            "the per-block chooser must split the P-frame (got {wire_qiis:?})"
+        );
+        let out = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(out.ftype, FrameType::Inter);
+        assert_eq!(out.qis, qis.to_vec());
+
+        // NQIS = 1 degrades byte-identically to the single-qi packet.
+        let mut dec_a = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+        dec_a
+            .decode_frame(&enc.encode_intra_frame(&f0).unwrap())
+            .unwrap();
+        let mut dec_b = FrameDecoder::new(ident, setup).unwrap();
+        dec_b
+            .decode_frame(&enc.encode_intra_frame(&f0).unwrap())
+            .unwrap();
+        let single = {
+            let refs = dec_a.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd(&f1, &refs).unwrap()
+        };
+        let adaptive_one = {
+            let refs = dec_b.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd_adaptive(&f1, &refs, &[40])
+                .unwrap()
+        };
+        assert_eq!(
+            single, adaptive_one,
+            "a one-entry qis list must reproduce the single-qi bitstream byte-for-byte"
+        );
+    }
+
+    /// MILESTONE (round 387, measured rate curve): the adaptive
+    /// multi-`qi` P-frame sits strictly inside the single-`qi` rate /
+    /// distortion trade-off. Against the same reference state and
+    /// content, `qis = [0, 63]` (λ = 4, where fidelity is worth its
+    /// bits) delivers strictly lower luma SSD than the all-0 (strong
+    /// quantizer) P-frame *and* a strictly smaller packet than the
+    /// all-63 (weak quantizer) P-frame — bits flow to the busy blocks
+    /// that repay them and away from the flat ones that do not. (At a
+    /// high-λ operating point the chooser correctly collapses to the
+    /// strong quantizer instead — rate dominates the Lagrangian there.)
+    #[test]
+    fn encode_inter_frame_rd_adaptive_beats_single_qi_rate_distortion_corners() {
+        let (ident, setup) = ki30_ident_setup();
+        let g = build_frame_geometry(&ident).unwrap();
+        let (w, h) = (g.dims_y.width as usize, g.dims_y.height as usize);
+
+        let f0 = gradient_source(&g, 0, 0);
+        let mut f1 = f0.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                if x < w / 2 {
+                    f1.samples_y[idx] = f1.samples_y[idx].saturating_add(12);
+                } else {
+                    f1.samples_y[idx] = (25 + ((x * 41 + y * 59) % 205)) as u8;
+                }
+            }
+        }
+        let luma_ssd = |got: &[u8], want: &[u8]| -> u64 {
+            got.iter()
+                .zip(want.iter())
+                .map(|(&a, &b)| {
+                    let d = a as i64 - b as i64;
+                    (d * d) as u64
+                })
+                .sum()
+        };
+
+        // Each variant starts from an identical reference state (the
+        // keyframe is encoded by a shared qi-40 encoder).
+        let key_enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let run = |qis: &[u8]| -> (usize, u64) {
+            let mut dec = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+            dec.decode_frame(&key_enc.encode_intra_frame(&f0).unwrap())
+                .unwrap();
+            let enc = FrameEncoder::new(ident.clone(), setup.clone(), qis[0]).unwrap();
+            let pkt = {
+                let refs = dec.reference_store().as_reference_plane_set().unwrap();
+                enc.encode_inter_frame_rd_adaptive(&f1, &refs, qis).unwrap()
+            };
+            let out = dec.decode_frame(&pkt).unwrap();
+            (pkt.len(), luma_ssd(&out.frame.samples_y, &f1.samples_y))
+        };
+
+        let (strong_b, strong_ssd) = run(&[0]);
+        let (weak_b, weak_ssd) = run(&[63]);
+        let (adap_b, adap_ssd) = run(&[0, 63]);
+        eprintln!(
+            "inter adaptive-quant curve: qi0 {strong_b} B / SSD {strong_ssd}; \
+             qi63 {weak_b} B / SSD {weak_ssd}; adaptive[0,63] {adap_b} B / SSD {adap_ssd}"
+        );
+        assert!(
+            adap_ssd < strong_ssd,
+            "adaptive SSD {adap_ssd} must beat the all-strong frame's {strong_ssd}"
+        );
+        assert!(
+            adap_b < weak_b,
+            "adaptive size {adap_b} B must beat the all-weak frame's {weak_b} B"
         );
     }
 

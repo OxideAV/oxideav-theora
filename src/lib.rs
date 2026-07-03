@@ -13665,6 +13665,16 @@ impl FrameEncoder {
             compute_quantization_matrix(&self.setup.quantization_parameters, 1, 1, qi)?,
             compute_quantization_matrix(&self.setup.quantization_parameters, 1, 2, qi)?,
         ];
+        // Per-plane intra (qti = 0) quantization matrix, for the blocks
+        // of macro blocks the mode decision codes INTRA (§7.9.4 step
+        // 2(d)ii: qti is a property of the block's *coding mode*, not
+        // the frame type, so an INTRA macro block inside an inter frame
+        // quantizes and dequantizes with the intra matrices).
+        let qmats_intra: [QuantizationMatrix; 3] = [
+            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 0, qi)?,
+            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 1, qi)?,
+            compute_quantization_matrix(&self.setup.quantization_parameters, 0, 2, qi)?,
+        ];
 
         // Per-macro-block motion vector + mode. The mode determines
         // both the on-wire §7.5.2 mode code and the reference frame the
@@ -13838,6 +13848,24 @@ impl FrameEncoder {
                         }
                     }
 
+                    // INTRA candidate: the eighth §7.5.2 coding mode.
+                    // New or occluded content can be cheaper to code
+                    // from scratch (the §7.9.1.1 flat-128 predictor and
+                    // the qti = 0 intra matrices) than as a residual
+                    // against either reference. Its blocks are always
+                    // coded (an uncoded block would copy the zero-MV
+                    // previous reference — the wrong predictor), it
+                    // transmits no MV bits, and per §7.5.2 it neither
+                    // recodes to a LAST mode nor perturbs the running
+                    // LAST1 / LAST2 history.
+                    let intra_cost =
+                        self.mb_intra_mode_cost(frame, &qmats_intra, &token_costs, mbi, lambda)?;
+                    if intra_cost < best_cost {
+                        best_cost = intra_cost;
+                        best_mode = MacroBlockMode::Intra;
+                        best_mv = MotionVector::ZERO;
+                    }
+
                     // Four-MV candidate: an independent vector per luma
                     // block. Only worth coding when its delivered
                     // distortion beats every uniform mode by enough to
@@ -13959,24 +13987,40 @@ impl FrameEncoder {
             }
             let mv = block_mv[bi];
 
-            // Motion-compensated predictor for this block, read from the
-            // reference frame the macro block's mode selects (§7.9.4
-            // Table 7.75: Golden for the GOLDEN modes, Previous
-            // otherwise).
-            let refframe = reference_frame_for_mb_mode(mode);
-            let refp = refs.pick(refframe, pli)?;
-            let pred = inter_block_predictor(&refp, bx, by, mv)?;
-
-            // Residual = source - predictor.
             let src = Self::extract_block(plane, pw, ph, bx, by)?;
-            let mut residual = [[0i16; 8]; 8];
-            for r in 0..8 {
-                for c in 0..8 {
-                    residual[r][c] = src[r][c] - pred[r][c] as i16;
+            let q = if mode == MacroBlockMode::Intra {
+                // INTRA macro block inside the inter frame: the
+                // §7.9.1.1 flat-128 predictor and the qti = 0 intra
+                // quantization matrices (§7.9.4 step 2(d)ii resolves
+                // qti from the block's coding mode, not the frame
+                // type). No reference frame is read.
+                let mut residual = [[0i16; 8]; 8];
+                for r in 0..8 {
+                    for c in 0..8 {
+                        residual[r][c] = src[r][c] - 128;
+                    }
                 }
-            }
-            let dqc = forward_dct_2d(&residual);
-            let q = quantize_block(&dqc, &qmats[pli], &qmats[pli]);
+                let dqc = forward_dct_2d(&residual);
+                quantize_block(&dqc, &qmats_intra[pli], &qmats_intra[pli])
+            } else {
+                // Motion-compensated predictor for this block, read
+                // from the reference frame the macro block's mode
+                // selects (§7.9.4 Table 7.75: Golden for the GOLDEN
+                // modes, Previous otherwise).
+                let refframe = reference_frame_for_mb_mode(mode);
+                let refp = refs.pick(refframe, pli)?;
+                let pred = inter_block_predictor(&refp, bx, by, mv)?;
+
+                // Residual = source - predictor.
+                let mut residual = [[0i16; 8]; 8];
+                for r in 0..8 {
+                    for c in 0..8 {
+                        residual[r][c] = src[r][c] - pred[r][c] as i16;
+                    }
+                }
+                let dqc = forward_dct_2d(&residual);
+                quantize_block(&dqc, &qmats[pli], &qmats[pli])
+            };
             // A block is coded iff any quantized coefficient is non-zero
             // OR the macro block's mode forces it coded (any non-zero-MV
             // INTER_MV / INTER_GOLDEN_* macro block — see
@@ -14477,6 +14521,89 @@ impl FrameEncoder {
         // (MVMODE = 1: 6 bits per component) otherwise.
         rate += 3 + mv_bits;
 
+        Ok(distortion + lambda.saturating_mul(rate as u64))
+    }
+
+    /// Rate-distortion cost of coding one block INTRA inside an inter
+    /// frame: the §7.9.1.1 flat-128 predictor, the qti = 0 intra
+    /// quantization matrices, and the decoder's own reconstruction
+    /// (dequantize → inverse DCT → clamp against 128) — the same
+    /// delivered-fidelity scoring [`FrameEncoder::block_rd_cost`] gives
+    /// the inter candidates. Intra blocks are always coded.
+    fn block_rd_cost_intra(
+        &self,
+        frame: &SourceFrame,
+        qmats_intra: &[QuantizationMatrix; 3],
+        costs: &TokenBitCosts,
+        bi: usize,
+    ) -> Result<BlockRdCost, Error> {
+        let g = &self.geometry;
+        let pli = g.pli_of_block[bi] as usize;
+        let (plane, pw, ph) = match pli {
+            0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+            1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+            _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+        };
+        let src = Self::extract_block(plane, pw, ph, g.bx_of_block[bi], g.by_of_block[bi])?;
+
+        let mut residual = [[0i16; 8]; 8];
+        for r in 0..8 {
+            for c in 0..8 {
+                residual[r][c] = src[r][c] - 128;
+            }
+        }
+        let dqc_fwd = forward_dct_2d(&residual);
+        let q = quantize_block(&dqc_fwd, &qmats_intra[pli], &qmats_intra[pli]);
+
+        let dqc_rec = dequantize_block(&q, &qmats_intra[pli], &qmats_intra[pli]);
+        let recon_res = inverse_dct_2d(&dqc_rec);
+        let mut ssd = 0u64;
+        for r in 0..8 {
+            for c in 0..8 {
+                let p = (128 + recon_res[r][c] as i32).clamp(0, 255);
+                let d = src[r][c] as i32 - p;
+                ssd += (d * d) as u64;
+            }
+        }
+        let token_bits = costs.block_bits(&q).unwrap_or(TokenBitCosts::OVERFLOW_BITS);
+        Ok(BlockRdCost {
+            distortion: ssd,
+            token_bits,
+        })
+    }
+
+    /// Evaluate the rate-distortion cost of coding one macro block
+    /// INTRA inside an inter frame: every luma + chroma block scored by
+    /// [`FrameEncoder::block_rd_cost_intra`], plus the §7.4 mode code
+    /// (no §7.5 MV bits — INTRA reads none). The Lagrangian cost is
+    /// `D + λ·R`, directly comparable with
+    /// [`FrameEncoder::mb_uniform_mode_cost`] /
+    /// [`FrameEncoder::mb_four_mv_cost`].
+    fn mb_intra_mode_cost(
+        &self,
+        frame: &SourceFrame,
+        qmats_intra: &[QuantizationMatrix; 3],
+        costs: &TokenBitCosts,
+        mbi: usize,
+        lambda: u64,
+    ) -> Result<u64, Error> {
+        let g = &self.geometry;
+        let mut distortion = 0u64;
+        let mut rate = 0u32;
+        for &bi in g.macro_block_to_luma_blocks[mbi].iter() {
+            let c = self.block_rd_cost_intra(frame, qmats_intra, costs, bi as usize)?;
+            distortion += c.distortion;
+            rate += c.token_bits;
+        }
+        for plane_map in [&g.chroma_cb[mbi], &g.chroma_cr[mbi]] {
+            for &bi in plane_map.iter() {
+                let c = self.block_rd_cost_intra(frame, qmats_intra, costs, bi as usize)?;
+                distortion += c.distortion;
+                rate += c.token_bits;
+            }
+        }
+        // Header rate: the §7.4 mode code only.
+        rate += 3;
         Ok(distortion + lambda.saturating_mul(rate as u64))
     }
 
@@ -36085,6 +36212,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// MILESTONE (round 387): INTRA is the eighth mode in the joint
+    /// rate-distortion candidate set. Frame 0's quadrant is a
+    /// high-contrast checkerboard; frame 1 replaces it with a smooth
+    /// gradient (new content uncorrelated with both references), so an
+    /// inter residual there carries the checkerboard's full energy
+    /// while coding from scratch (flat-128 predictor, qti = 0
+    /// matrices) is far cheaper. The RD decision must code INTRA macro
+    /// blocks in that quadrant, the packet must round-trip through
+    /// this crate's own decoder (exercising §7.9.4 qti-per-mode and
+    /// the §7.8 mixed-reference-frame DC prediction from a real
+    /// bitstream), and it must beat the intra-less previous-reference
+    /// motion path on **both** delivered luma SSD and packet size.
+    #[test]
+    fn encode_inter_frame_rd_codes_intra_for_new_content() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let (w, h) = (g.dims_y.width as usize, g.dims_y.height as usize);
+
+        // Frame 0: flat 128 with a hard 16x16 checkerboard quadrant.
+        let mut f0 = SourceFrame {
+            samples_y: vec![128u8; w * h],
+            samples_cb: vec![128u8; (g.dims_c.width * g.dims_c.height) as usize],
+            samples_cr: vec![128u8; (g.dims_c.width * g.dims_c.height) as usize],
+        };
+        for y in 0..h / 2 {
+            for x in 0..w / 2 {
+                f0.samples_y[y * w + x] = if (x + y) % 2 == 0 { 235 } else { 20 };
+            }
+        }
+        // Frame 1: the quadrant becomes a smooth gradient.
+        let mut f1 = f0.clone();
+        for y in 0..h / 2 {
+            for x in 0..w / 2 {
+                f1.samples_y[y * w + x] = (60 + 4 * x + 4 * y) as u8;
+            }
+        }
+
+        let luma_ssd = |got: &[u8], want: &[u8]| -> u64 {
+            got.iter()
+                .zip(want.iter())
+                .map(|(&a, &b)| {
+                    let d = a as i64 - b as i64;
+                    (d * d) as u64
+                })
+                .sum()
+        };
+
+        // The RD plan must choose INTRA for (at least) some quadrant
+        // macro blocks.
+        let mut dec = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+        dec.decode_frame(&enc.encode_intra_frame(&f0).unwrap())
+            .unwrap();
+        let (rd_pkt, n_intra) = {
+            let refs = dec.reference_store().as_reference_plane_set().unwrap();
+            let ifp = enc
+                .plan_inter_frame(&f1, &refs, MotionPlan::RateDistortion)
+                .unwrap();
+            let n_intra = ifp
+                .mbmodes
+                .iter()
+                .filter(|&&m| m == MacroBlockMode::Intra)
+                .count();
+            (enc.write_inter_packet(&ifp).unwrap(), n_intra)
+        };
+        assert!(
+            n_intra > 0,
+            "new-content quadrant must drive INTRA macro blocks"
+        );
+        let rd_out = dec.decode_frame(&rd_pkt).unwrap();
+        let rd_ssd = luma_ssd(&rd_out.frame.samples_y, &f1.samples_y);
+        assert!(
+            plane_max_err(&rd_out.frame.samples_y, &f1.samples_y) <= 48,
+            "intra-in-inter luma max error {} exceeds tolerance",
+            plane_max_err(&rd_out.frame.samples_y, &f1.samples_y)
+        );
+
+        // Same content through the intra-less previous-reference
+        // motion path, from an identical reference state.
+        let mut dec2 = FrameDecoder::new(ident, setup).unwrap();
+        dec2.decode_frame(&enc.encode_intra_frame(&f0).unwrap())
+            .unwrap();
+        let motion_pkt = {
+            let refs = dec2.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_motion(&f1, &refs).unwrap()
+        };
+        let motion_out = dec2.decode_frame(&motion_pkt).unwrap();
+        let motion_ssd = luma_ssd(&motion_out.frame.samples_y, &f1.samples_y);
+
+        eprintln!(
+            "intra-in-inter: RD {} B / SSD {rd_ssd} ({n_intra} INTRA MBs) vs motion {} B / SSD {motion_ssd}",
+            rd_pkt.len(),
+            motion_pkt.len()
+        );
+        assert!(
+            rd_ssd <= motion_ssd && rd_pkt.len() <= motion_pkt.len(),
+            "INTRA candidate must not lose on either axis: RD {} B / SSD {rd_ssd} vs motion {} B / SSD {motion_ssd}",
+            rd_pkt.len(),
+            motion_pkt.len()
+        );
+        assert!(
+            rd_ssd < motion_ssd || rd_pkt.len() < motion_pkt.len(),
+            "INTRA candidate must strictly win on at least one axis"
+        );
     }
 
     /// The refactored plan/write split is transparent: the §7 packet an

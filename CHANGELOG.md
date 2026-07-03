@@ -6,6 +6,23 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **INTRA as the eighth RD mode in P-frames (round 387)** — the joint
+  rate-distortion mode decision now evaluates `INTRA` alongside the
+  seven inter modes: `mb_intra_mode_cost` scores each macro block on
+  the delivered fidelity of coding it from scratch (the §7.9.1.1
+  flat-128 predictor and the qti = 0 intra matrices — §7.9.4 step
+  2(d)ii resolves qti from the block's coding *mode*, not the frame
+  type) plus its measured token rate, and the planning loop emits
+  intra-coded blocks inside the inter frame (always coded, no MV bits,
+  excluded from the §7.5.2 LAST history per spec). New-content macro
+  blocks no longer pay for a reference that cannot predict them:
+  on a checkerboard-quadrant → gradient scene the RD path codes the
+  quadrant INTRA and measures 26 B / luma SSD 224 against the
+  intra-less motion path's 149 B / SSD 4052 — a strict win on both
+  axes, round-tripped through this crate's own decoder (exercising the
+  per-mode qti reconstruction and mixed-reference-frame §7.8 DC
+  prediction from a real bitstream).
+
 - **Measured §7.7 token rate in the encoder RD decisions (round
   387)** — `TokenBitCosts` precomputes, per Huffman group and token,
   the minimum §6.4.4 code length over the stream's own 16 selector

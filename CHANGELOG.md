@@ -4,6 +4,24 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Inter-frame token statistics (round 387)** —
+  `FrameEncoder::inter_token_statistics` tallies the §7.7 tokens an
+  inter (P-frame) encode would write — combined run+value tokens and
+  coalesced cross-block EOB runs included — without producing a
+  packet: the inter counterpart to `intra_token_statistics` and the
+  previously missing half of the two-pass Huffman-tuning flow for
+  mixed I/P streams. The mode decision, motion search, and forward
+  quantization run exactly as `encode_inter_frame_rd` runs them; the
+  shared inter encode body is refactored into a planning stage
+  (`plan_inter_frame` → `InterFramePlan`: modes, per-block MVs, coded
+  flags, quantized coefficients) and a serialization stage
+  (`write_inter_packet`), so the tally and the packet writer read the
+  identical per-block state. Tests pin that a pure-copy P-frame
+  tallies zero tokens, that the tally is deterministic, and that it
+  equals the token plan of the packet actually written.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-theora/compare/v0.0.10...v0.0.11) - 2026-07-03
 
 ### Other

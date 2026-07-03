@@ -12655,6 +12655,31 @@ enum MotionPlan {
     RateDistortion,
 }
 
+/// The fully-resolved per-block state of one planned inter frame,
+/// produced by [`FrameEncoder::plan_inter_frame`] and consumed by
+/// [`FrameEncoder::write_inter_packet`].
+///
+/// Everything a §7 inter video-data packet carries is derivable from
+/// these four arrays plus the encoder's frame-level `qi`: the §7.3
+/// coded-block flags from `bcoded`, the §7.4 modes from `mbmodes`, the
+/// §7.5 motion vectors from `block_mv`, and the §7.7 token stream from
+/// `coeffs`. Splitting the planning from the serialization lets the
+/// two-pass Huffman-tuning flow tally a frame's token statistics
+/// (which depend only on the plan, never on the codebooks that will
+/// spell it) without a packet write.
+struct InterFramePlan {
+    /// Per-macro-block §7.5.2 coding mode, post LAST1/LAST2 recode.
+    mbmodes: Vec<MacroBlockMode>,
+    /// Per-block motion-vector table (length `nbs`), exactly the table
+    /// the decoder's §7.5.2 walk reconstructs.
+    block_mv: Vec<MotionVector>,
+    /// Per-block coded flags (length `nbs`), the §7.3 input.
+    bcoded: Vec<u8>,
+    /// Per-block quantized coefficients in zig-zag order with the DC
+    /// slot already converted to a §7.8 prediction residual.
+    coeffs: Vec<[i16; 64]>,
+}
+
 impl FrameEncoder {
     /// Build an intra encoder from the identification header, decoded
     /// setup tables, and a frame-level quantization index `qi`
@@ -13336,14 +13361,66 @@ impl FrameEncoder {
 
     /// Shared inter-frame encode body. `plan` selects the per-macro-
     /// block motion strategy (see [`MotionPlan`]): zero-vector only,
-    /// previous-reference search, previous-or-golden search, or
-    /// per-luma-block (four-MV) search.
+    /// previous-reference search, previous-or-golden search,
+    /// per-luma-block (four-MV) search, or the joint rate-distortion
+    /// decision. The heavy lifting happens in
+    /// [`Self::plan_inter_frame`] (mode decision, motion search,
+    /// forward transform + quantization, DC prediction, and the §7.5.2
+    /// LAST recode); this wrapper serializes the resulting
+    /// [`InterFramePlan`] with [`Self::write_inter_packet`].
     fn encode_inter_frame_with_motion(
         &self,
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
         plan: MotionPlan,
     ) -> Result<Vec<u8>, Error> {
+        let ifp = self.plan_inter_frame(frame, refs, plan)?;
+        self.write_inter_packet(&ifp)
+    }
+
+    /// Tally the §7.7 tokens an inter (P-frame) encode of `frame`
+    /// against `refs` would write into `stats`, without producing a
+    /// packet.
+    ///
+    /// The inter counterpart to [`Self::intra_token_statistics`] — the
+    /// previously missing half of the two-pass Huffman-tuning flow for
+    /// mixed I/P streams. The macro-block mode decision, motion search,
+    /// and forward quantization run exactly as
+    /// [`Self::encode_inter_frame_rd`] (the `TheoraEncoder` P-frame
+    /// default) would run them, and the §7.7 token plan for the
+    /// resulting coefficients — combined run+value tokens and coalesced
+    /// cross-block EOB runs included — is tallied per plane and Huffman
+    /// group, exactly as the frame writer's own selector optimization
+    /// scores it. Because the token plan depends only on the quantized
+    /// coefficients (never on the codebooks that will spell them), a
+    /// first-pass tally taken with base tables transfers exactly to a
+    /// second pass encoded with tuned tables.
+    pub fn inter_token_statistics(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        stats: &mut TokenStatistics,
+    ) -> Result<(), Error> {
+        let g = &self.geometry;
+        let ifp = self.plan_inter_frame(frame, refs, MotionPlan::RateDistortion)?;
+        let token_plan = plan_frame_tokens(g.nbs, g.nmbs, &ifp.bcoded, &ifp.coeffs)?;
+        stats.accumulate(&token_plan.tally);
+        Ok(())
+    }
+
+    /// Run the complete inter-frame planning pipeline for one frame:
+    /// per-macro-block mode decision / motion search per `plan`, the
+    /// forward residual transform + quantization against the
+    /// mode-selected reference, the forward §7.8 DC prediction, and the
+    /// §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode pass. Returns
+    /// the [`InterFramePlan`] holding the packet-ready per-block state;
+    /// [`Self::write_inter_packet`] turns it into §7 bytes.
+    fn plan_inter_frame(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        plan: MotionPlan,
+    ) -> Result<InterFramePlan, Error> {
         let g = &self.geometry;
         let nbs = g.nbs as usize;
         let nmbs = g.nmbs as usize;
@@ -13778,7 +13855,20 @@ impl FrameEncoder {
             }
         }
 
-        // ---- Write the inter video-data packet. ----
+        Ok(InterFramePlan {
+            mbmodes,
+            block_mv,
+            bcoded,
+            coeffs,
+        })
+    }
+
+    /// Serialize a planned inter frame ([`InterFramePlan`]) into its §7
+    /// video-data packet bytes: the §7.1 frame header, §7.3 coded-block
+    /// flags, §7.4 macro-block modes, §7.5 motion vectors, and the §7.7
+    /// DCT-token stream, in bit-stream order on one shared writer.
+    fn write_inter_packet(&self, ifp: &InterFramePlan) -> Result<Vec<u8>, Error> {
+        let g = &self.geometry;
         let mut w = BitWriter::new();
         // §7.1 step 1: packet-type bit 0 (data packet).
         w.write_bits(0, 1);
@@ -13791,17 +13881,22 @@ impl FrameEncoder {
         // §7.1 step 7: inter frames read NO reserved bits.
 
         // §7.3 coded block flags.
-        encode_coded_block_flags(&mut w, &bcoded, g.nsbs, &g.block_to_super_block);
+        encode_coded_block_flags(&mut w, &ifp.bcoded, g.nsbs, &g.block_to_super_block);
 
         // §7.4 macro-block modes.
-        encode_macroblock_modes(&mut w, &mbmodes, &bcoded, &g.macro_block_to_luma_blocks);
+        encode_macroblock_modes(
+            &mut w,
+            &ifp.mbmodes,
+            &ifp.bcoded,
+            &g.macro_block_to_luma_blocks,
+        );
 
         // §7.5 motion vectors.
         encode_macroblock_motion_vectors(
             &mut w,
-            &mbmodes,
-            &bcoded,
-            &block_mv,
+            &ifp.mbmodes,
+            &ifp.bcoded,
+            &ifp.block_mv,
             &g.macro_block_to_luma_blocks,
         );
 
@@ -13812,8 +13907,8 @@ impl FrameEncoder {
             &mut w,
             g.nbs,
             g.nmbs,
-            &bcoded,
-            &coeffs,
+            &ifp.bcoded,
+            &ifp.coeffs,
             &self.setup.huffman_tables[..],
         )?;
 
@@ -35123,6 +35218,123 @@ mod tests {
             "RD global-motion inter luma max error {} exceeds tolerance",
             plane_max_err(&f1.frame.samples_y, &source.samples_y)
         );
+    }
+
+    /// MILESTONE (round 387): `inter_token_statistics` — the inter half
+    /// of the two-pass Huffman-tuning tally. A changed P-frame yields a
+    /// non-empty per-plane/group token tally that is deterministic
+    /// (running it twice exactly doubles every count), while a P-frame
+    /// identical to the reconstructed reference plans an all-uncoded
+    /// `INTER_NOMV` pure copy and tallies **zero** tokens (no coded
+    /// blocks → no §7.7 visits at all).
+    #[test]
+    fn inter_token_statistics_tallies_changed_frame_and_skips_pure_copy() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 50).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        let mut frame1 = frame0.clone();
+        let w_y = g.dims_y.width as usize;
+        for y in 0..(g.dims_y.height as usize / 2) {
+            for x in 0..(w_y / 2) {
+                let idx = y * w_y + x;
+                frame1.samples_y[idx] = frame1.samples_y[idx].saturating_add(35);
+            }
+        }
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        let f0 = dec.decode_frame(&key).unwrap();
+
+        // A source identical to the reconstructed reference plans a
+        // pure copy: zero tokens tallied.
+        let copy_source = SourceFrame {
+            samples_y: f0.frame.samples_y.clone(),
+            samples_cb: f0.frame.samples_cb.clone(),
+            samples_cr: f0.frame.samples_cr.clone(),
+        };
+        let refs_store = dec.reference_store();
+        let refs = refs_store.as_reference_plane_set().unwrap();
+        let mut stats = TokenStatistics::new();
+        enc.inter_token_statistics(&copy_source, &refs, &mut stats)
+            .unwrap();
+        let total: u64 = stats
+            .counts
+            .iter()
+            .flat_map(|p| p.iter())
+            .flat_map(|g| g.iter())
+            .sum();
+        assert_eq!(total, 0, "pure-copy P-frame must tally zero tokens");
+
+        // A changed frame tallies a non-empty plan; a second pass over
+        // the same frame doubles every count exactly.
+        let mut stats1 = TokenStatistics::new();
+        enc.inter_token_statistics(&frame1, &refs, &mut stats1)
+            .unwrap();
+        let total1: u64 = stats1
+            .counts
+            .iter()
+            .flat_map(|p| p.iter())
+            .flat_map(|g| g.iter())
+            .sum();
+        assert!(total1 > 0, "changed P-frame must tally tokens");
+
+        let mut stats2 = stats1.clone();
+        enc.inter_token_statistics(&frame1, &refs, &mut stats2)
+            .unwrap();
+        for plane in 0..2 {
+            for hg in 0..5 {
+                for token in 0..32 {
+                    assert_eq!(
+                        stats2.counts[plane][hg][token],
+                        2 * stats1.counts[plane][hg][token],
+                        "tally must be deterministic (plane {plane} hg {hg} token {token})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The refactored plan/write split is transparent: the §7 packet an
+    /// RD inter encode emits is byte-identical to what the pre-split
+    /// writer produced (pinned indirectly — the plan drives the exact
+    /// same §7.3/§7.4/§7.5/§7.7 writers), and the tally
+    /// `inter_token_statistics` records for a frame matches the token
+    /// plan of the packet actually written (same coefficients → same
+    /// §7.7 spelling decisions).
+    #[test]
+    fn inter_token_statistics_matches_encoded_packet_plan() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 45).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        let frame1 = gradient_source(&g, 2, 1);
+
+        let mut dec = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        dec.decode_frame(&key).unwrap();
+
+        let refs_store = dec.reference_store();
+        let refs = refs_store.as_reference_plane_set().unwrap();
+        let mut stats = TokenStatistics::new();
+        enc.inter_token_statistics(&frame1, &refs, &mut stats)
+            .unwrap();
+        // Re-derive the tally from the plan the encode path uses.
+        let ifp = enc
+            .plan_inter_frame(&frame1, &refs, MotionPlan::RateDistortion)
+            .unwrap();
+        let token_plan = plan_frame_tokens(g.nbs, g.nmbs, &ifp.bcoded, &ifp.coeffs).unwrap();
+        let mut expect = TokenStatistics::new();
+        expect.accumulate(&token_plan.tally);
+        assert_eq!(
+            stats, expect,
+            "statistics must equal the encode plan's tally"
+        );
+
+        // And the packet built from the same plan still round-trips.
+        let pkt = enc.encode_inter_frame_rd(&frame1, &refs).unwrap();
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
     }
 
     /// End-to-end §7.11 on the `q-high` fixture (64×64, `-q:v 10` →

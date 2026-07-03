@@ -13358,6 +13358,10 @@ impl FrameEncoder {
             ]);
         }
 
+        // Measured per-token §7.7 code lengths over the stream's actual
+        // codebooks, shared by every block's candidate scoring.
+        let token_costs = TokenBitCosts::from_tables(&self.setup.huffman_tables[..]);
+
         let mut qiis = vec![0u8; nbs];
         for (bi, qii_out) in qiis.iter_mut().enumerate() {
             let pli = g.pli_of_block[bi] as usize;
@@ -13391,20 +13395,13 @@ impl FrameEncoder {
                         ssd += (d * d) as u64;
                     }
                 }
-                // Rate estimate from the block's token plan: a nominal
-                // 5-bit Huffman code per token plus its extra bits.
-                let Some(plan) = plan_block_tokens(&q) else {
+                // Measured rate: the block's token plan priced against
+                // the stream's own codebooks (group-minimum code length
+                // per token plus the exact extra-bits payload).
+                let Some(bits) = token_costs.block_bits(&q) else {
                     continue;
                 };
-                let bits: u64 = plan
-                    .iter()
-                    .map(|pt| {
-                        5 + (0..pt.n_extra as usize)
-                            .map(|k| u64::from(pt.extra[k].1))
-                            .sum::<u64>()
-                    })
-                    .sum();
-                let cost = ssd + lambda * bits;
+                let cost = ssd + lambda * u64::from(bits);
                 if best.map_or(true, |(b, _)| cost < b) {
                     best = Some((cost, cand as u8));
                 }
@@ -13773,6 +13770,11 @@ impl FrameEncoder {
                 // charge would have lost to `INTER_NOMV`.
                 let mut last1 = MotionVector::ZERO;
                 let mut last2 = MotionVector::ZERO;
+                // Measured per-token §7.7 code lengths over the actual
+                // codebooks this stream will carry (tuned tables
+                // included), so every candidate's rate term is priced
+                // against real spellings rather than a flat proxy.
+                let token_costs = TokenBitCosts::from_tables(&self.setup.huffman_tables[..]);
                 for mbi in 0..nmbs {
                     let (prev_mv, _) =
                         self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Previous);
@@ -13816,7 +13818,15 @@ impl FrameEncoder {
                             _ => 0,
                         };
                         let cost = self.mb_uniform_mode_cost(
-                            frame, refs, &qmats, mbi, mode, mv, lambda, mv_bits,
+                            frame,
+                            refs,
+                            &qmats,
+                            &token_costs,
+                            mbi,
+                            mode,
+                            mv,
+                            lambda,
+                            mv_bits,
                         )?;
                         // Strict improvement keeps the earlier (cheaper-
                         // header) candidate on ties, biasing toward
@@ -13839,7 +13849,7 @@ impl FrameEncoder {
                     // never win the strict comparison and falls back to
                     // the uniform winner.
                     let (four_cost, four_luma) =
-                        self.mb_four_mv_cost(frame, refs, &qmats, mbi, lambda)?;
+                        self.mb_four_mv_cost(frame, refs, &qmats, &token_costs, mbi, lambda)?;
                     let chosen_mode;
                     if four_cost < best_cost {
                         chosen_mode = MacroBlockMode::InterMvFour;
@@ -14301,9 +14311,11 @@ impl FrameEncoder {
     /// source block and that reconstructed block, so a candidate mode is
     /// scored on the distortion it *delivers*, not on a pre-quantization
     /// SAD proxy. It also reports whether the block ends up coded (any
-    /// non-zero quantized coefficient) and a coarse estimate of the
-    /// token bits the §7.7 stream would spend on it, so the caller can
-    /// fold a rate term into the decision.
+    /// non-zero quantized coefficient) and the **measured** token bits
+    /// the block's §7.7 token plan would spend (each token priced by
+    /// `costs` at the cheapest available code in its Huffman group plus
+    /// its exact extra-bits payload), so the caller can fold a rate
+    /// term into the decision.
     ///
     /// `force_coded` forces the block coded even when its quantized
     /// residual is all-zero (required for any non-zero-MV / golden macro
@@ -14317,6 +14329,7 @@ impl FrameEncoder {
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
         qmats: &[QuantizationMatrix; 3],
+        costs: &TokenBitCosts,
         bi: usize,
         refframe: ReferenceFrame,
         mv: MotionVector,
@@ -14369,17 +14382,19 @@ impl FrameEncoder {
             }
         }
 
-        // Coarse token-bit estimate: a self-terminating EOB costs a few
-        // bits, and each non-zero quantized coefficient costs a token
-        // plus its magnitude bits. This is a rate *proxy* for the mode
-        // decision, not an exact §7.7 bit count — the actual stream is
-        // emitted unchanged by the shared token writer.
+        // Measured token-bit rate: the block's actual §7.7 token plan,
+        // each token priced at the cheapest available code in its
+        // Huffman group plus the exact extra-bits payload. Coefficients
+        // beyond the token alphabet make the candidate effectively
+        // unaffordable rather than an error, steering the decision
+        // toward an encodable mode. An all-zero forced-coded block
+        // still spends its terminal EOB. The count is a per-block
+        // decomposition (cross-block EOB coalescing and the frame-level
+        // single-selector constraint are not modelled), so it remains a
+        // decision-side estimate — the actual stream is emitted
+        // unchanged by the shared token writer.
         let token_bits = if coded {
-            let nz = q.iter().filter(|&&v| v != 0).count() as u32;
-            // ~6 bits per non-zero coefficient (token + magnitude) plus
-            // a small EOB tail; an all-zero forced-coded block still
-            // spends its EOB.
-            nz.saturating_mul(6).saturating_add(3)
+            costs.block_bits(&q).unwrap_or(TokenBitCosts::OVERFLOW_BITS)
         } else {
             0
         };
@@ -14404,6 +14419,7 @@ impl FrameEncoder {
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
         qmats: &[QuantizationMatrix; 3],
+        costs: &TokenBitCosts,
         mbi: usize,
         mode: MacroBlockMode,
         mv: MotionVector,
@@ -14419,8 +14435,16 @@ impl FrameEncoder {
 
         // Luma blocks.
         for &bi in g.macro_block_to_luma_blocks[mbi].iter() {
-            let c =
-                self.block_rd_cost(frame, refs, qmats, bi as usize, refframe, mv, force_coded)?;
+            let c = self.block_rd_cost(
+                frame,
+                refs,
+                qmats,
+                costs,
+                bi as usize,
+                refframe,
+                mv,
+                force_coded,
+            )?;
             distortion += c.distortion;
             rate += c.token_bits;
         }
@@ -14429,8 +14453,16 @@ impl FrameEncoder {
         // §7.5.2 decode assigns it.
         for plane_map in [&g.chroma_cb[mbi], &g.chroma_cr[mbi]] {
             for &bi in plane_map.iter() {
-                let c =
-                    self.block_rd_cost(frame, refs, qmats, bi as usize, refframe, mv, force_coded)?;
+                let c = self.block_rd_cost(
+                    frame,
+                    refs,
+                    qmats,
+                    costs,
+                    bi as usize,
+                    refframe,
+                    mv,
+                    force_coded,
+                )?;
                 distortion += c.distortion;
                 rate += c.token_bits;
             }
@@ -14473,6 +14505,7 @@ impl FrameEncoder {
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
         qmats: &[QuantizationMatrix; 3],
+        costs: &TokenBitCosts,
         mbi: usize,
         lambda: u64,
     ) -> Result<(u64, [MotionVector; 4]), Error> {
@@ -14497,6 +14530,7 @@ impl FrameEncoder {
                 frame,
                 refs,
                 qmats,
+                costs,
                 bi as usize,
                 ReferenceFrame::Previous,
                 luma[raster],
@@ -14516,6 +14550,7 @@ impl FrameEncoder {
                     frame,
                     refs,
                     qmats,
+                    costs,
                     bi as usize,
                     ReferenceFrame::Previous,
                     mv,
@@ -14541,9 +14576,80 @@ struct BlockRdCost {
     /// Sum of squared errors between the source block and the block the
     /// decoder will reconstruct from this candidate.
     distortion: u64,
-    /// Coarse estimate of the §7.7 token bits this block would spend.
-    /// Zero for an uncoded block (no residual transmitted).
+    /// Measured §7.7 token bits this block's token plan would spend
+    /// (per [`TokenBitCosts::block_bits`]). Zero for an uncoded block
+    /// (no residual transmitted).
     token_bits: u32,
+}
+
+/// Per-(Huffman group, token) minimum code lengths over a §6.4.4 table
+/// set, for measuring the §7.7 rate of a candidate block inside the
+/// rate-distortion mode decision.
+///
+/// The frame writer picks one selector per plane per range (DC / AC),
+/// so pricing every token at the cheapest of the 16 candidate tables in
+/// its group is an optimistic per-token decomposition of the real
+/// constraint — but it is *measured* against the actual codebooks the
+/// stream will use (tuned tables included), unlike a flat
+/// bits-per-coefficient proxy, and it is applied identically to every
+/// candidate mode so the comparison stays fair. Building the table is
+/// cheap (80 tables × 32 tokens) and done once per planned frame.
+struct TokenBitCosts {
+    /// `min_len[hg][token]` — the shortest §6.4.4 code length for
+    /// `token` among the 16 selector tables of group `hg`;
+    /// `u8::MAX` when no table in the group leafs the token.
+    min_len: [[u8; 32]; 5],
+}
+
+impl TokenBitCosts {
+    /// Rate charged to a candidate whose coefficients overflow the §7.7
+    /// token alphabet: large enough that any encodable candidate wins,
+    /// small enough that `distortion + λ·rate` cannot overflow `u64`.
+    const OVERFLOW_BITS: u32 = 1 << 24;
+
+    /// Scan the 80-table set (16 selector slots × 5 groups).
+    fn from_tables(hts: &[HuffmanTable]) -> Self {
+        let mut min_len = [[u8::MAX; 32]; 5];
+        for (hg, group_lens) in min_len.iter_mut().enumerate() {
+            for s in 0..16 {
+                let Some(table) = hts.get(16 * hg + s) else {
+                    continue;
+                };
+                for (token, slot) in group_lens.iter_mut().enumerate() {
+                    if let Some((_, len)) = huffman_code_for_token(table, token as u8) {
+                        *slot = (*slot).min(len);
+                    }
+                }
+            }
+        }
+        Self { min_len }
+    }
+
+    /// Measured §7.7 bit cost of one coded block: build the block's
+    /// token plan (`plan_block_tokens` — combined run+value folding and
+    /// the terminal EOB included), replay the `TIS` bookkeeping to
+    /// resolve each token's Huffman group, and sum the group-minimum
+    /// code length plus the exact extra-bits payload per token. Returns
+    /// `None` when a coefficient overflows the token alphabet or a
+    /// token has no leaf in its group.
+    fn block_bits(&self, coeffs_zz: &[i16; 64]) -> Option<u32> {
+        let plan = plan_block_tokens(coeffs_zz)?;
+        let mut ti: u8 = 0;
+        let mut bits = 0u32;
+        for pt in &plan {
+            let hg = huffman_table_group(ti) as usize;
+            let len = self.min_len[hg][pt.token as usize];
+            if len == u8::MAX {
+                return None;
+            }
+            bits += u32::from(len);
+            for k in 0..pt.n_extra as usize {
+                bits += pt.extra[k].1;
+            }
+            ti = ti.saturating_add(pt.advance).min(63);
+        }
+        Some(bits)
+    }
 }
 
 /// Build the §7.9.1 motion-compensated predictor tile for one block,
@@ -34993,10 +35099,13 @@ mod tests {
             samples_cr: vec![128; (g.dims_c.width * g.dims_c.height) as usize],
         };
 
-        // A decisive spread: qi 16 quantizes the noise half so hard the
-        // delivered SSD dwarfs λ·R for the qi-63 candidate, while the
-        // flat half is free at either (ties resolve to selector 0).
-        let qis = [16u8, 63u8];
+        // A decisive spread under the *measured* rate term: at
+        // `qis[0] = 0` the λ ramp bottoms out (λ = 4), so a busy
+        // block's delivered SSD at the strongest quantizer (thousands)
+        // dwarfs the qi-63 candidate's measured token bill
+        // (≈ 323 + 4·519 when authored), while the flat half is free
+        // at either candidate (ties resolve to selector 0).
+        let qis = [0u8, 63u8];
         let pkt = enc.encode_intra_frame_adaptive(&source, &qis).unwrap();
         let (wire_qis, wire_qiis) = decode_packet_qis_and_qiis(&enc, true, &pkt);
         assert_eq!(wire_qis, qis.to_vec());
@@ -35850,6 +35959,57 @@ mod tests {
             "RD global-motion inter luma max error {} exceeds tolerance",
             plane_max_err(&f1.frame.samples_y, &source.samples_y)
         );
+    }
+
+    /// `TokenBitCosts` prices every token at the cheapest §6.4.4 code
+    /// in its Huffman group: never longer than any single table's code,
+    /// an all-zero block costs exactly the group-0 minimum EOB code,
+    /// and a `DC=1`-only block routes its terminal EOB through group 1
+    /// (the `TIS` advance past the DC coefficient).
+    #[test]
+    fn token_bit_costs_group_minimum_pricing() {
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let costs = TokenBitCosts::from_tables(&setup.huffman_tables[..]);
+
+        // Group minimum <= every individual table's code length.
+        for hg in 0..5usize {
+            for token in 0..32usize {
+                for s in 0..16usize {
+                    if let Some((_, len)) =
+                        huffman_code_for_token(&setup.huffman_tables[16 * hg + s], token as u8)
+                    {
+                        assert!(
+                            costs.min_len[hg][token] <= len,
+                            "min_len[{hg}][{token}] must not exceed slot {s}'s length"
+                        );
+                    }
+                }
+            }
+        }
+
+        // All-zero block: a single terminal EOB read at ti = 0
+        // (group 0).
+        let zero = [0i16; 64];
+        assert_eq!(
+            costs.block_bits(&zero).unwrap(),
+            u32::from(costs.min_len[0][0]),
+            "an all-zero block costs exactly its group-0 EOB code"
+        );
+
+        // DC = 1 block: token 9 at ti = 0 (group 0), then the terminal
+        // EOB at ti = 1 (group 1).
+        let mut dc_one = [0i16; 64];
+        dc_one[0] = 1;
+        assert_eq!(
+            costs.block_bits(&dc_one).unwrap(),
+            u32::from(costs.min_len[0][9]) + u32::from(costs.min_len[1][0]),
+            "a DC-only block prices its EOB in group 1"
+        );
+
+        // A coefficient beyond the token alphabet is unencodable.
+        let mut huge = [0i16; 64];
+        huge[0] = 5000;
+        assert_eq!(costs.block_bits(&huge), None);
     }
 
     /// MILESTONE (round 387): `inter_token_statistics` — the inter half

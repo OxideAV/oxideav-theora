@@ -6,6 +6,22 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Measured §7.7 token rate in the encoder RD decisions (round
+  387)** — `TokenBitCosts` precomputes, per Huffman group and token,
+  the minimum §6.4.4 code length over the stream's own 16 selector
+  tables (tuned tables included), and `block_bits` prices a candidate
+  block by replaying its exact token plan (combined run+value folding,
+  `TIS` group routing, terminal EOB, exact extra-bits payloads). The
+  inter mode decision (`block_rd_cost` behind every `D + λ·R`
+  candidate) and the intra adaptive-quant chooser both replace their
+  flat bits-per-coefficient proxies (`6·nz + 3` / `5 + extras` per
+  token) with this measured rate; unencodable coefficients now make a
+  candidate effectively unaffordable instead of erroring later. Probe
+  measurements on the mixed flat/noise frame: the weak-quant candidate
+  really costs 519 bits where the old proxy guessed ~200, so the
+  adaptive split test moves to a spread that is decisive under
+  truthful rate (`qis = [0, 63]`).
+
 - **Frame-optimal §7.4 mode-coding scheme selection (round 387)** —
   the inter mode writer no longer hard-codes `MSCHEME = 7` (3 bits per
   mode): `choose_mode_scheme` tallies the modes a frame actually

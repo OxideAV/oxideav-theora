@@ -4,6 +4,63 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-theora/compare/v0.0.10...v0.0.11) - 2026-07-03
+
+### Other
+
+- README — round 384 entropy-writer depth (full §7.7 alphabet, EOB runs, tuned codebooks, adaptive quant)
+- wire adaptive quantization into TheoraEncoder keyframes
+- adaptive block-level quantization on the intra encoder (§7.1 MOREQIS + §7.6)
+- two-pass Huffman tuning through the framework Encoder
+- content-tuned §6.4.4 Huffman codebooks (two-pass encoding)
+- coalesce cross-block §7.7.1 EOB runs (tokens 1..=6)
+- fold zero runs into §7.7.2 combined run+value tokens 23..=31, use token 7 for short runs
+- optimize the ti=0 (DC) and ti=1 (AC) Huffman selector pairs independently
+- choose the §7.7.3 Huffman codebook to minimize frame size
+- make_encoder synthesizes setup when extradata omits it
+- synthesize VP3-default setup header from Appendix B data
+- scene-cut keyframe insertion
+- refresh stale encoder doc comments
+- keyframe-aware rate-control budgeting
+- fold §7.5.2 LAST-mode rate discount into the RD mode decision
+- expose GoldenMotion + FourMv P-frame InterModeStrategy variants
+- reject a zero-byte first packet instead of decoding from zeros
+- add a target-bitrate rate-control loop to TheoraEncoder
+- fold INTER_MV_FOUR into the unified rate-distortion candidate set
+- measured RD vs previous-only delta + README/CHANGELOG rollup
+- TheoraEncoder P-frames default to the rate-distortion decision
+- unified rate-distortion inter mode decision (D + λ·R)
+- round-trip four-MV chroma averaging across 4:2:0/4:2:2/4:4:4
+- README — golden + four-MV encode modes now emitted and round-tripped (round 364)
+- four-MV inter encoder — INTER_MV_FOUR emit + per-block decode round-trip
+- golden-reference inter encoder — INTER_GOLDEN_MV/NOMV emit + decode round-trip
+- per-plane/per-frame HD digest localisation
+- HD frame-1 §7.4 per-position macro-block trace pin (all 8160 MBs)
+- unit-cover split_motion_vector_per_axis per-axis divisors
+- §7.5.1 quarter-pixel chroma MC — HD 1080p fixture now pixel-SHA exact
+- document HD 1920x1088 fixture coverage + open pixel-fidelity item in README
+- HD 1920x1088 two-frame decode integration test (dimensions-1080p-very-short)
+- inter encoder picks INTER_MV_LAST / INTER_MV_LAST2 predicted modes
+- TheoraEncoder emits P-frames via keyframe interval + mirror decoder
+- inter (P-frame) encoder — §7.2/§7.3/§7.4/§7.5 encode + motion estimation
+- encoder chroma-format (420/422/444) + multi-frame coverage
+- oxideav_core::Encoder trait integration (TheoraEncoder + make_encoder)
+- §6 header-packet serialization (encode_{identification,comment,setup}_header)
+- scrub encoder-implementation naming from forward-DCT doc (round 338)
+- README — document the intra encoder (round 338)
+- intra encoder — encode→decode self-roundtrip (round 338 milestone)
+- forward DC prediction — inverse of §7.8.2 (round 338)
+- forward quantization — inverse of §7.9.2 (round 338)
+- §7.9.3.3 forward DCT (round 338, first encoder commit)
+- neutralize decorative reference-encoder naming in r334 fixture-gap prose
+- exercise golden + four-MV inter modes through the full §7.9.4 frame driver
+- pin keyframe-interval-1 fixture end-to-end — all-keyframe -g 1 run
+- pin monochrome-via-zero-chroma fixture end-to-end (round 325)
+- pin picture-region-non-mb-aligned fixture end-to-end (§2.2/§4.4.4 crop)
+- Wire oxideav_core::Decoder trait integration (round 317)
+- pin bitstream-version-3.2.1 fixture end-to-end (round 313)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **Adaptive quantization on the framework encoder (round 384)** —

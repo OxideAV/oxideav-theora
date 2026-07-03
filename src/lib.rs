@@ -5855,8 +5855,8 @@ fn encode_macroblock_modes(
     // (mi) of each mode, in mode order — the §7.4 decode's
     // `MALPHABET[mi] = MODE` loop reads them back in the same order.
     if mscheme == 0 {
-        for mode in 0..8 {
-            w.write_bits(rank_of_mode[mode] as u32, 3);
+        for &mi in rank_of_mode.iter() {
+            w.write_bits(mi as u32, 3);
         }
     }
     // Step 2(d): one mode per macro block whose luma is (at least
@@ -20280,7 +20280,7 @@ mod tests {
         let mut w = super::BitWriter::new();
         encode_macroblock_modes(&mut w, &v, &bcoded, &map);
         let chosen = w.into_bytes().len();
-        let direct = (3 + 3 * v.len() + 7) / 8; // MSCHEME + 3 bits/mode, byte-padded
+        let direct = (3 + 3 * v.len()).div_ceil(8); // MSCHEME + 3 bits/mode, byte-padded
         assert!(
             chosen < direct,
             "scheme selection must save bytes ({chosen} vs direct {direct})"

@@ -14439,7 +14439,12 @@ impl FrameEncoder {
                 }
             }
         }
-        (best_mv, best_sad)
+        // §7.5.1 half-pixel refinement around the integer winner: the
+        // whole-pixel loop only ever tried even components, so the
+        // decoder's two-tap half-pixel predictor was unreachable from
+        // the encoder. Probe the eight half-pixel neighbours and keep
+        // any strict SAD improvement.
+        refine_half_pixel_mv(best_mv, best_sad, sad_for)
     }
 
     /// Search the previous luma reference for the single best
@@ -14498,7 +14503,10 @@ impl FrameEncoder {
                 }
             }
         }
-        best_mv
+        // §7.5.1 half-pixel refinement around the integer winner (see
+        // `search_macro_block_mv_ref`): each of the four `INTER_MV_FOUR`
+        // luma vectors is refined independently to half-pixel accuracy.
+        refine_half_pixel_mv(best_mv, best_sad, sad_for).0
     }
 
     /// Rate-distortion cost of coding one block (luma or chroma) with a
@@ -14963,6 +14971,63 @@ fn inter_block_predictor(
         compute_half_pixel_predictor(refp, bx_origin, by_origin, mv1, mv2)
     };
     Ok(pred)
+}
+
+/// The eight half-pixel neighbours of a motion vector, in §7.5
+/// half-pixel units: ±1 in each axis (a single half-pixel step). The
+/// whole-pixel search visits only even components; probing these eight
+/// offsets recovers the odd (half-pixel) components the integer grid
+/// skips, which the decoder's §7.9.1.3 two-tap half-pixel predictor
+/// reconstructs exactly.
+const HALF_PIXEL_NEIGHBORS: [(i32, i32); 8] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+
+/// Refine a whole-pixel motion vector `best` (with even §7.5
+/// half-pixel-unit components, as the integer search produces) to
+/// half-pixel accuracy.
+///
+/// The integer search snaps every vector onto the whole-pixel grid, so
+/// it can never express the half-pixel alignments the decoder's
+/// §7.9.1.3 predictor can reconstruct. This pass evaluates the eight
+/// [`HALF_PIXEL_NEIGHBORS`] one half-pixel away from `best` and keeps any
+/// that strictly lowers the SAD (a tie holds `best`, so no extra
+/// motion-vector magnitude is spent without a fidelity gain). Candidates
+/// escaping the §7.5.1 `-31..=31` component range are skipped; the
+/// caller's `sad_for` prices out-of-reference offsets as `u32::MAX`, so
+/// they are rejected naturally too. The returned SAD lets a golden /
+/// previous chooser keep comparing on the refined value.
+fn refine_half_pixel_mv(
+    best: MotionVector,
+    best_sad: u32,
+    sad_for: impl Fn(MotionVector) -> u32,
+) -> (MotionVector, u32) {
+    let mut best_mv = best;
+    let mut best_sad = best_sad;
+    for &(ox, oy) in HALF_PIXEL_NEIGHBORS.iter() {
+        let x = best.x as i32 + ox;
+        let y = best.y as i32 + oy;
+        if !(-31..=31).contains(&x) || !(-31..=31).contains(&y) {
+            continue;
+        }
+        let mv = MotionVector {
+            x: x as i8,
+            y: y as i8,
+        };
+        let sad = sad_for(mv);
+        if sad < best_sad {
+            best_sad = sad;
+            best_mv = mv;
+        }
+    }
+    (best_mv, best_sad)
 }
 
 // =====================================================================
@@ -35357,6 +35422,133 @@ mod tests {
             "motion search must reduce luma SAD ({} → {})",
             sad(false),
             sad(true)
+        );
+    }
+
+    /// MILESTONE (round 398): the §7.5.1 half-pixel motion refinement
+    /// recovers a sub-pixel alignment the integer grid cannot express.
+    ///
+    /// A linear luma ramp is sampled at whole-pixel positions for the
+    /// reference (`frame0`) and half a pixel to the right for the source
+    /// (`frame1`). Because averaging two adjacent samples of a linear
+    /// ramp is exact, the decoder's §7.9.1.3 two-tap half-pixel
+    /// predictor at `MVX = 1` reproduces the source almost perfectly,
+    /// while any whole-pixel (even) vector is off by half a slope step
+    /// per pixel. We assert the refined search (a) codes an *odd*
+    /// (half-pixel) component for at least one macro block and (b)
+    /// strictly lowers the whole-plane luma SAD versus the best
+    /// integer-grid vector, and that the encoded frame still round-trips
+    /// through the decoder.
+    #[test]
+    fn half_pixel_refinement_beats_integer_grid_on_subpel_shift() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let w = g.dims_y.width as usize;
+        let h = g.dims_y.height as usize;
+        let slope = 3i32;
+
+        // frame0: whole-pixel-sampled horizontal ramp; frame1: the same
+        // ramp shifted right by exactly half a pixel.
+        let mut frame0 = gradient_source(&g, 0, 0);
+        let mut frame1 = frame0.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let base = 30 + x as i32 * slope;
+                frame0.samples_y[y * w + x] = base.clamp(0, 255) as u8;
+                // value at (x + 0.5): base + slope/2, rounded.
+                let half = 30 + (2 * x as i32 + 1) * slope / 2;
+                frame1.samples_y[y * w + x] = half.clamp(0, 255) as u8;
+            }
+        }
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        dec.decode_frame(&key).unwrap();
+
+        // Measure both SADs and the round-trip against the same
+        // reconstructed reference.
+        let refs = dec.reference_store().as_reference_plane_set().unwrap();
+        let refp = refs.pick(ReferenceFrame::Previous, 0).unwrap();
+
+        let block_sad = |mv: MotionVector, bx: u32, by: u32| -> u64 {
+            let pred = match inter_block_predictor(&refp, bx, by, mv) {
+                Ok(p) => p,
+                Err(_) => return u64::MAX,
+            };
+            let src = FrameEncoder::extract_block(
+                &frame1.samples_y,
+                g.dims_y.width,
+                g.dims_y.height,
+                bx,
+                by,
+            )
+            .unwrap();
+            let mut sad = 0u64;
+            for r in 0..8 {
+                for c in 0..8 {
+                    sad += (src[r][c] - pred[r][c] as i16).unsigned_abs() as u64;
+                }
+            }
+            sad
+        };
+
+        let mut integer_total = 0u64;
+        let mut refined_total = 0u64;
+        let mut odd_component_seen = false;
+        for mbi in 0..g.nmbs as usize {
+            let abcd = g.macro_block_to_luma_blocks[mbi];
+            // Best integer-grid (even-component) vector over the same
+            // ±3-pixel window the search uses.
+            let mut int_best = u64::MAX;
+            for dy in -3i32..=3 {
+                for dx in -3i32..=3 {
+                    let mv = MotionVector {
+                        x: (dx * 2) as i8,
+                        y: (dy * 2) as i8,
+                    };
+                    let mut s = 0u64;
+                    for &bi in abcd.iter() {
+                        let bx = g.bx_of_block[bi as usize];
+                        let by = g.by_of_block[bi as usize];
+                        s += block_sad(mv, bx, by);
+                    }
+                    int_best = int_best.min(s);
+                }
+            }
+            integer_total += int_best;
+
+            // The production search (integer window + half-pixel refine).
+            let mv = enc.search_macro_block_mv(&frame1, &refs, mbi);
+            if mv.x % 2 != 0 || mv.y % 2 != 0 {
+                odd_component_seen = true;
+            }
+            let mut s = 0u64;
+            for &bi in abcd.iter() {
+                let bx = g.bx_of_block[bi as usize];
+                let by = g.by_of_block[bi as usize];
+                s += block_sad(mv, bx, by);
+            }
+            refined_total += s;
+        }
+
+        assert!(
+            odd_component_seen,
+            "half-pixel refinement must code at least one odd MV component"
+        );
+        assert!(
+            refined_total < integer_total,
+            "half-pixel refinement must lower luma SAD (integer {integer_total} → refined {refined_total})"
+        );
+
+        // The refined encode still decodes faithfully.
+        let pkt = enc.encode_inter_frame_motion(&frame1, &refs).unwrap();
+        let f1 = dec.decode_frame(&pkt).unwrap();
+        assert_eq!(f1.ftype, FrameType::Inter);
+        assert!(
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 40,
+            "half-pixel inter luma max error {} exceeds tolerance",
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y)
         );
     }
 

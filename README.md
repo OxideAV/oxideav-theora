@@ -181,7 +181,14 @@ zero-initialized reference store.
   the decoder holds), so an unchanged second frame reconstructs
   bit-exactly as an all-uncoded `INTER_NOMV` pure copy; a changed
   frame stays within the quantizer bound. The motion path runs a small
-  whole-pixel SAD search per macro block, codes the winning vector with
+  whole-pixel SAD search per macro block **then refines the winner to
+  half-pixel accuracy** (§7.5.1): the integer grid only spells even
+  motion-vector components, so the eight half-pixel neighbours are
+  probed and any strict SAD improvement kept, making the decoder's
+  §7.9.1.3 two-tap half-pixel predictor reachable from the encoder (a
+  linear ramp sampled half a pixel off the reference grid drops the
+  whole-plane luma SAD from 1184 to 704, −40.5 %, at equal
+  reconstruction). It codes the winning vector with
   `INTER_MV`, and forces its blocks coded (an uncoded inter block always
   copies the zero-MV colocated reference, so a non-zero MV requires
   coded blocks). A forward §7.5.2 LAST1 / LAST2 pass then recodes a

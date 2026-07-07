@@ -6,6 +6,26 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **§7.5.1 half-pixel motion-vector refinement (round 398)** — the
+  motion search now refines its whole-pixel winner to half-pixel
+  accuracy. `search_macro_block_mv_ref` and `search_luma_block_mv`
+  each end with `refine_half_pixel_mv`, which evaluates the eight
+  `HALF_PIXEL_NEIGHBORS` one half-pixel away and keeps any strict SAD
+  improvement (a tie holds the integer winner, so no motion-vector
+  magnitude is spent without a fidelity gain; candidates escaping the
+  §7.5.1 `-31..=31` component range are dropped). The integer search
+  only ever emitted even components, so the decoder's §7.9.1.3 two-tap
+  half-pixel predictor was previously unreachable from the encoder;
+  odd (half-pixel) components are now produced and flow into the same
+  `encode_inter_frame_rd` candidate set (uniform `INTER_MV` /
+  `INTER_GOLDEN_MV` and each per-block `INTER_MV_FOUR` vector), where
+  the true `D + λ·R` decision prices their motion-vector bits. Measured
+  on a linear luma ramp sampled half a pixel off the reference grid:
+  whole-plane best integer-grid luma SAD 1184 vs half-pixel-refined
+  704 (−40.5 %); the refined encode still round-trips through
+  `FrameDecoder` within the quantizer bound. No bitstream-syntax change
+  — the same §7.5 writer serializes the (now possibly odd) components.
+
 - **Measured-rate keyframe policy — golden-frame refresh on reference
   decay (round 387)** — `TheoraEncoder::with_keyframe_rate_policy(r)`
   watches two decay signals on every RD P-frame: coded size exceeding

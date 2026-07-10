@@ -255,6 +255,19 @@ zero-initialized reference store.
   golden raw-SAD), or `FourMv` (per-luma-block four-MV search) — each
   reachable end-to-end through the framework `Encoder` trait.
 
+  A **per-block rate-distortion skip decision** completes the coded /
+  uncoded choice: in an `INTER_NOMV` macro block the decoder's uncoded
+  path is a bit-exact zero-MV previous copy — exactly the predictor
+  the encoder built — so a block whose quantized residual survives
+  quantization may still legally *skip*. Every inter path scores both
+  spellings by the frame's Lagrangian (skip: predictor SSD, zero bits;
+  code: delivered SSD + λ·measured token bits) and keeps the cheaper
+  one; `block_rd_cost` applies the same min inside the mode decision.
+  A noise-only P-frame (±3, residuals surviving the weakest quantizer)
+  drops from 140 B to 5 B and reconstructs as a bit-exact reference
+  copy, while a strongly changed block in the same conditions still
+  codes and tracks the source.
+
 * **Framework `Decoder` integration** — `TheoraDecoder` implements
   `oxideav_core::Decoder`, and `register` installs it into a
   `RuntimeContext` (reachable through the shared `CodecRegistry`). Packets

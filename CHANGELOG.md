@@ -6,6 +6,29 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Rate-distortion per-block skip on `INTER_NOMV` macro blocks
+  (round 406)** — the inter encode body previously coded every block
+  whose quantized residual had any non-zero coefficient; only an
+  exactly-zero residual stayed uncoded. The decoder's uncoded path
+  (§7.9.4 step 2(e)) reconstructs a block as the bare zero-MV
+  colocated previous copy — for an `INTER_NOMV` macro block that is
+  exactly the predictor the encoder built — so *skipping* a block with
+  a surviving residual is a legal alternative spelling. The per-block
+  loop now scores both by the frame's own Lagrangian — skip at
+  `SSD(src, pred)` and zero bits, code at
+  `SSD(src, clamp(pred + rec)) + λ·(measured §7.7 token bits)` — and
+  keeps the cheaper one (ties keep the coded spelling, preserving
+  prior loop-filter behaviour), in every inter path and at every
+  `NQIS`. `block_rd_cost` applies the same min inside the RD mode
+  decision so an `INTER_NOMV` candidate is priced on the plan the
+  encode body will actually emit. Measured on a P-frame differing from
+  its reference only by ±3 noise (residuals that *survive* the weakest
+  quantizer — the premise is pinned in-test): every block skips, the
+  packet drops from 140 B (the hand-built no-skip spelling of the same
+  frame) to 5 B while the frame reconstructs as a bit-exact previous
+  copy; a strongly changed block in a sea of noise still codes and
+  tracks the source (both directions regression-pinned).
+
 - **§2.2 picture-region (non-macro-block-aligned) encoding
   (round 406)** — the encoder now *produces* streams whose visible
   picture is not a multiple of sixteen, the encode-side counterpart of

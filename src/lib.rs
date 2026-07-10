@@ -14375,15 +14375,55 @@ impl FrameEncoder {
                 (best_q, best_qii)
             };
 
-            // A block is coded iff any quantized coefficient is non-zero
-            // OR the macro block's mode forces it coded (any non-zero-MV
-            // INTER_MV / INTER_GOLDEN_* / INTRA macro block — see
-            // `force_coded_for`). An all-zero coded block reconstructs
-            // as the exact predictor (zero residual), so forcing it
-            // coded is still bit-faithful. Uncoded blocks keep the
-            // default selector 0 (they never reach the §7.6 stream).
+            // A block whose quantized residual is all-zero is uncoded
+            // (unless the macro block's mode forces it coded — any
+            // non-zero-MV INTER_MV / INTER_GOLDEN_* / INTRA macro block,
+            // see `force_coded_for`; an all-zero forced-coded block
+            // reconstructs as the exact predictor, so forcing it is
+            // still bit-faithful). Uncoded blocks keep the default
+            // selector 0 (they never reach the §7.6 stream).
             let any_nonzero = q.iter().any(|&v| v != 0);
-            if any_nonzero || force_coded {
+            let mut coded = any_nonzero || force_coded;
+
+            // Rate-distortion skip decision. For an INTER_NOMV macro
+            // block the decoder's uncoded path (§7.9.4 step 2(e)) copies
+            // the zero-MV colocated previous reference — exactly `pred`
+            // here — so *skipping* a block with a non-zero quantized
+            // residual is a legal spelling whose delivered reconstruction
+            // is the bare predictor. Score both spellings by the same
+            // Lagrangian the mode decision uses — skip at
+            // `SSD(src, pred)` and zero token bits, code at
+            // `SSD(src, clamp(pred + rec)) + λ·bits` — and keep the
+            // cheaper one. A near-noise residual whose tokens buy almost
+            // no distortion reduction is dropped (a pure rate win); any
+            // residual that pays for itself is kept. Ties keep the coded
+            // spelling (equal cost, and the coded block's loop-filter
+            // edges then behave exactly as before this decision existed).
+            if coded && !force_coded && any_nonzero {
+                let dqc_rec = dequantize_block(&q, dc_mat, &ac_mats[qii as usize][pli]);
+                let rec = inverse_dct_2d(&dqc_rec);
+                let mut ssd_coded = 0u64;
+                let mut ssd_skip = 0u64;
+                for r in 0..8 {
+                    for c in 0..8 {
+                        let s = src[r][c] as i32;
+                        let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
+                        let dc = s - pv;
+                        ssd_coded += (dc * dc) as u64;
+                        let ds = s - pred[r][c] as i32;
+                        ssd_skip += (ds * ds) as u64;
+                    }
+                }
+                let bits = token_costs
+                    .block_bits(&q)
+                    .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
+                let cost_coded = ssd_coded.saturating_add(lambda.saturating_mul(u64::from(bits)));
+                if ssd_skip < cost_coded {
+                    coded = false;
+                }
+            }
+
+            if coded {
                 bcoded[bi] = 1;
                 coeffs[bi] = q;
                 qiis[bi] = qii;
@@ -14746,6 +14786,17 @@ impl FrameEncoder {
     /// `force_coded_for` in the encode body); the reconstruction is the
     /// same either way (an all-zero coded block reconstructs as the
     /// exact predictor), only the coded flag and rate change.
+    ///
+    /// When the block is *not* forced coded (an `INTER_NOMV`
+    /// candidate), the cost mirrors the encode body's per-block
+    /// rate-distortion **skip decision**: the block may legally stay
+    /// uncoded (§7.9.4 step 2(e) reconstructs it as the bare zero-MV
+    /// previous copy — exactly this candidate's predictor), so the
+    /// returned accounting is whichever spelling has the lower
+    /// Lagrangian cost `D + λ·R` — skipped (predictor SSD, zero token
+    /// bits) or coded (reconstructed SSD, measured token bits). This
+    /// keeps the mode decision priced on the plan the encode body will
+    /// actually emit.
     #[allow(clippy::too_many_arguments)]
     fn block_rd_cost(
         &self,
@@ -14757,6 +14808,7 @@ impl FrameEncoder {
         refframe: ReferenceFrame,
         mv: MotionVector,
         force_coded: bool,
+        lambda: u64,
     ) -> Result<BlockRdCost, Error> {
         let g = &self.geometry;
         let pli = g.pli_of_block[bi] as usize;
@@ -14794,14 +14846,20 @@ impl FrameEncoder {
             [[0i16; 8]; 8]
         };
 
-        // Distortion = SSD(source, clamp(PRED + RES)).
+        // Distortion of both spellings: SSD(source, clamp(PRED + RES))
+        // for the coded one, SSD(source, PRED) for the skipped one
+        // (identical when the block is uncoded anyway).
         let mut ssd = 0u64;
+        let mut ssd_skip = 0u64;
         for r in 0..8 {
             for c in 0..8 {
+                let s = src[r][c] as i32;
                 let p = pred[r][c] as i32 + recon_res[r][c] as i32;
                 let recon = p.clamp(0, 255);
-                let d = src[r][c] as i32 - recon;
+                let d = s - recon;
                 ssd += (d * d) as u64;
+                let dsk = s - pred[r][c] as i32;
+                ssd_skip += (dsk * dsk) as u64;
             }
         }
 
@@ -14821,6 +14879,19 @@ impl FrameEncoder {
         } else {
             0
         };
+
+        // Per-block skip decision (INTER_NOMV candidates only): report
+        // the cheaper spelling, mirroring the encode body. Ties keep
+        // the coded spelling, exactly as the encode body keeps it.
+        if !force_coded
+            && any_nonzero
+            && ssd_skip < ssd.saturating_add(lambda.saturating_mul(u64::from(token_bits)))
+        {
+            return Ok(BlockRdCost {
+                distortion: ssd_skip,
+                token_bits: 0,
+            });
+        }
 
         Ok(BlockRdCost {
             distortion: ssd,
@@ -14867,6 +14938,7 @@ impl FrameEncoder {
                 refframe,
                 mv,
                 force_coded,
+                lambda,
             )?;
             distortion += c.distortion;
             rate += c.token_bits;
@@ -14885,6 +14957,7 @@ impl FrameEncoder {
                     refframe,
                     mv,
                     force_coded,
+                    lambda,
                 )?;
                 distortion += c.distortion;
                 rate += c.token_bits;
@@ -15041,6 +15114,7 @@ impl FrameEncoder {
                 ReferenceFrame::Previous,
                 luma[raster],
                 true,
+                lambda,
             )?;
             distortion += c.distortion;
             rate += c.token_bits;
@@ -15061,6 +15135,7 @@ impl FrameEncoder {
                     ReferenceFrame::Previous,
                     mv,
                     true,
+                    lambda,
                 )?;
                 distortion += c.distortion;
                 rate += c.token_bits;
@@ -38405,5 +38480,255 @@ mod tests {
                 plane_max_err(&got, want_y)
             );
         }
+    }
+    // ----- round 406: rate-distortion per-block skip on INTER_NOMV -----
+
+    /// Build the *no-skip* spelling of a zero-MV inter frame — every
+    /// block coded with its quantized residual against the colocated
+    /// previous reference (exactly what the encode body emitted before
+    /// the per-block skip decision existed) — so a test can measure the
+    /// rate the skip decision saves on the same source frame.
+    fn all_coded_zero_mv_plan(
+        enc: &FrameEncoder,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        qi: u8,
+    ) -> InterFramePlan {
+        let g = enc.geometry();
+        let nbs = g.nbs as usize;
+        let nmbs = g.nmbs as usize;
+        let qmats: Vec<QuantizationMatrix> = (0..3)
+            .map(|pli| {
+                compute_quantization_matrix(&enc.setup.quantization_parameters, 1, pli, qi as usize)
+                    .unwrap()
+            })
+            .collect();
+        let mut coeffs = vec![[0i16; 64]; nbs];
+        let bcoded = vec![1u8; nbs];
+        for (bi, slot) in coeffs.iter_mut().enumerate() {
+            let pli = g.pli_of_block[bi] as usize;
+            let (plane, pw, ph) = match pli {
+                0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+                1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+                _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+            };
+            let bx = g.bx_of_block[bi];
+            let by = g.by_of_block[bi];
+            let src = FrameEncoder::extract_block(plane, pw, ph, bx, by).unwrap();
+            let refp = refs.pick(ReferenceFrame::Previous, pli).unwrap();
+            let pred = inter_block_predictor(&refp, bx, by, MotionVector::ZERO).unwrap();
+            let mut residual = [[0i16; 8]; 8];
+            for r in 0..8 {
+                for c in 0..8 {
+                    residual[r][c] = src[r][c] - pred[r][c] as i16;
+                }
+            }
+            *slot = quantize_block(&forward_dct_2d(&residual), &qmats[pli], &qmats[pli]);
+        }
+        let mbmodes = vec![MacroBlockMode::InterNoMv; nmbs];
+        let plane_orders: [&[u32]; 3] = [
+            &g.plane_raster_order[0],
+            &g.plane_raster_order[1],
+            &g.plane_raster_order[2],
+        ];
+        forward_dc_prediction(
+            &bcoded,
+            &mbmodes,
+            &g.mbi_of_block,
+            &g.neighbors,
+            &plane_orders,
+            &mut coeffs,
+        )
+        .unwrap();
+        InterFramePlan {
+            mbmodes,
+            block_mv: vec![MotionVector::ZERO; nbs],
+            bcoded,
+            coeffs,
+            qis: vec![qi],
+            qiis: vec![0u8; nbs],
+        }
+    }
+
+    /// MILESTONE: the per-block rate-distortion skip decision. A
+    /// P-frame differing from the previous reference only by
+    /// noise-level perturbation (±3) has quantized residuals that
+    /// *survive* the weakest quantizer — before the skip decision every
+    /// block was coded — yet no residual buys distortion worth its
+    /// token bits, so the plan leaves every block uncoded and the frame
+    /// reconstructs as a bit-exact previous copy. Against the
+    /// hand-built no-skip spelling of the same frame the packet shrinks
+    /// by more than an order of magnitude while the delivered
+    /// distortion stays at the (bounded) noise energy.
+    #[test]
+    fn inter_skip_drops_noise_residual_blocks() {
+        let (ident, setup) = ki30_ident_setup();
+        let qi = 63u8;
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), qi).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        let mut dec = FrameDecoder::new(ident, setup.clone()).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        let prev = dec.decode_frame(&key).unwrap().frame;
+
+        // Deterministic ±3/±1 perturbation of the reconstruction.
+        let perturb = |src: &[u8]| -> Vec<u8> {
+            src.iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let d = match i % 4 {
+                        0 => 3i16,
+                        1 => -3,
+                        2 => 1,
+                        _ => -1,
+                    };
+                    (v as i16 + d).clamp(0, 255) as u8
+                })
+                .collect()
+        };
+        let frame1 = SourceFrame {
+            samples_y: perturb(&prev.samples_y),
+            samples_cb: perturb(&prev.samples_cb),
+            samples_cr: perturb(&prev.samples_cr),
+        };
+
+        // Pin the premise: the noise residual on the first luma block
+        // survives quantization at qi 63, so the block would have been
+        // coded — the *skip decision* (not the quantizer) is what drops
+        // it below.
+        {
+            let qmat =
+                compute_quantization_matrix(&setup.quantization_parameters, 1, 0, qi as usize)
+                    .unwrap();
+            let src = FrameEncoder::extract_block(
+                &frame1.samples_y,
+                g.dims_y.width,
+                g.dims_y.height,
+                0,
+                0,
+            )
+            .unwrap();
+            let mut residual = [[0i16; 8]; 8];
+            for r in 0..8 {
+                for c in 0..8 {
+                    residual[r][c] =
+                        src[r][c] - prev.samples_y[r * g.dims_y.width as usize + c] as i16;
+                }
+            }
+            let q = quantize_block(&forward_dct_2d(&residual), &qmat, &qmat);
+            assert!(
+                q.iter().any(|&v| v != 0),
+                "premise: the noise residual must survive the weakest quantizer"
+            );
+        }
+
+        let refs = dec.reference_store().as_reference_plane_set().unwrap();
+        let ifp = enc
+            .plan_inter_frame(&frame1, &refs, MotionPlan::ZeroPrevious)
+            .unwrap();
+        assert!(
+            ifp.bcoded.iter().all(|&b| b == 0),
+            "every noise-residual block must skip ({} coded)",
+            ifp.bcoded.iter().filter(|&&b| b == 1).count()
+        );
+        let pkt_skip = enc.write_inter_packet(&ifp).unwrap();
+
+        // The no-skip spelling of the same frame, for the measured
+        // rate comparison.
+        let ifp_all = all_coded_zero_mv_plan(&enc, &frame1, &refs, qi);
+        let pkt_all = enc.write_inter_packet(&ifp_all).unwrap();
+        assert!(
+            pkt_skip.len() * 10 < pkt_all.len(),
+            "skip must cut the noise frame by >10x: {} vs {} bytes",
+            pkt_skip.len(),
+            pkt_all.len()
+        );
+
+        // Delivered reconstruction: an all-uncoded frame is a bit-exact
+        // copy of the previous reference (no residual, no loop filter
+        // around uncoded blocks), and its distortion against the source
+        // is exactly the injected noise energy — bounded by ±3.
+        let mut dec_all = dec.clone();
+        let f1 = dec.decode_frame(&pkt_skip).unwrap();
+        assert_eq!(f1.frame.samples_y, prev.samples_y);
+        assert_eq!(f1.frame.samples_cb, prev.samples_cb);
+        assert_eq!(f1.frame.samples_cr, prev.samples_cr);
+        assert!(plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 3);
+
+        // Sanity: the no-skip spelling decodes too (it is a legal
+        // stream, just an expensive one).
+        let f1_all = dec_all.decode_frame(&pkt_all).unwrap();
+        assert_eq!(f1_all.ftype, FrameType::Inter);
+    }
+
+    /// The skip decision is not an indiscriminate copy: a residual that
+    /// pays for its bits is still coded. On a frame mixing noise-level
+    /// perturbation with one strongly brightened macro block, the plan
+    /// skips the noise blocks but codes the changed ones, and the
+    /// reconstruction tracks the *source* (not the previous reference)
+    /// on the changed region.
+    #[test]
+    fn inter_skip_keeps_residuals_that_pay() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 63).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        let prev = dec.decode_frame(&key).unwrap().frame;
+
+        // Noise everywhere …
+        let mut samples_y: Vec<u8> = prev
+            .samples_y
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let d = if i % 2 == 0 { 2i16 } else { -2 };
+                (v as i16 + d).clamp(0, 255) as u8
+            })
+            .collect();
+        // … plus one strongly brightened 8×8 luma block (block origin
+        // (8, 8): inside the second macro block column/row).
+        let w = g.dims_y.width as usize;
+        for row in 8..16 {
+            for col in 8..16 {
+                samples_y[row * w + col] = samples_y[row * w + col].saturating_add(60);
+            }
+        }
+        let frame1 = SourceFrame {
+            samples_y,
+            samples_cb: prev.samples_cb.clone(),
+            samples_cr: prev.samples_cr.clone(),
+        };
+
+        let refs = dec.reference_store().as_reference_plane_set().unwrap();
+        let ifp = enc
+            .plan_inter_frame(&frame1, &refs, MotionPlan::ZeroPrevious)
+            .unwrap();
+        let coded = ifp.bcoded.iter().filter(|&&b| b == 1).count();
+        assert!(
+            (1..=4).contains(&coded),
+            "only the brightened block (and possibly its loop-filter \
+             neighbours) may code, got {coded}"
+        );
+        let pkt = enc.write_inter_packet(&ifp).unwrap();
+        let f1 = dec.decode_frame(&pkt).unwrap();
+
+        // The brightened region tracks the source …
+        let mut max_err_changed = 0i16;
+        for row in 8..16 {
+            for col in 8..16 {
+                let e = (f1.frame.samples_y[row * w + col] as i16
+                    - frame1.samples_y[row * w + col] as i16)
+                    .abs();
+                max_err_changed = max_err_changed.max(e);
+            }
+        }
+        assert!(
+            max_err_changed <= 12,
+            "changed block must be coded faithfully (max err {max_err_changed})"
+        );
+        // … while the whole plane stays within the noise bound.
+        assert!(plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 12);
     }
 }

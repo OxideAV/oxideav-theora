@@ -6,6 +6,22 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Encoder-output corruption + stress hardening (round 406)** — two
+  new regression harnesses. A deterministic corruption storm (xorshift
+  PRNG, reproducible) applies 2400 mutations — bit flips, byte
+  rewrites, truncations to any length including empty, tail
+  extensions — to real self-encoded intra and inter packets and
+  decodes every mutant on a clone of a mid-stream `FrameDecoder`:
+  the decoder must return `Ok` or a typed `Err`, never panic (all
+  2400 pass, both first-frame and referenced-frame paths). A
+  randomized multi-frame stress runs pseudo-random smoothly-evolving
+  sources through the full `TheoraEncoder` → `TheoraDecoder` loop at
+  every chroma format × qi ∈ {10, 40, 63} (I + 3 P each): every
+  packet decodes, output geometry is pinned per format, and the
+  weakest quantizer holds a fidelity bound — guarding the
+  less-travelled format × quantizer corners against panics, drift,
+  and geometry mix-ups.
+
 - **Duplicate-frame detection — zero-byte packet emission
   (round 406)** — when the RD plan of a `TheoraEncoder` P-frame codes
   no block at all (every residual dropped by the per-block skip

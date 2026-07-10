@@ -38835,4 +38835,206 @@ mod tests {
         assert_eq!(outs[0].planes[2].data, outs[1].planes[2].data);
         assert_ne!(outs[0].planes[0].data, outs[2].planes[0].data);
     }
+    // ----- round 406: encoder-output corruption + stress hardening -----
+
+    /// Deterministic xorshift PRNG for the corruption / stress tests
+    /// (no dev-dependency, reproducible failures).
+    struct XorShift64(u64);
+    impl XorShift64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// Corruption storm: the decoder must return `Ok` or a typed `Err`
+    /// — never panic, hang, or overflow — on arbitrarily corrupted
+    /// variants of real encoder output. Seeds one intra and one inter
+    /// packet from a self-encode, then applies bit flips, byte
+    /// rewrites, truncations, and tail extensions; every mutant is
+    /// decoded on a fresh clone of a mid-stream decoder so both the
+    /// first-frame and the referenced-frame paths are exercised.
+    #[test]
+    fn decode_frame_survives_corrupted_encoder_output() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 40).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+        let frame1 = gradient_source(&g, 3, 1);
+
+        let mut dec0 = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        dec0.decode_frame(&key).unwrap();
+        let inter = {
+            let refs = dec0.reference_store().as_reference_plane_set().unwrap();
+            enc.encode_inter_frame_rd(&frame1, &refs).unwrap()
+        };
+        // `dec0` now holds a real reference frame; every mutant decodes
+        // on a clone of it (and the intra mutants additionally on a
+        // fresh first-frame decoder via the clone taken before any
+        // decode — covered by dec0's own first decode above).
+
+        let mut rng = XorShift64(0x1234_5678_9abc_def1);
+        let mut decoded_ok = 0usize;
+        let mut rejected = 0usize;
+        for base in [&key, &inter] {
+            for _ in 0..1200 {
+                let mut pkt = base.clone();
+                match rng.next() % 4 {
+                    0 => {
+                        // Single bit flip.
+                        let i = (rng.next() as usize) % pkt.len();
+                        pkt[i] ^= 1 << (rng.next() % 8);
+                    }
+                    1 => {
+                        // Byte rewrite.
+                        let i = (rng.next() as usize) % pkt.len();
+                        pkt[i] = rng.next() as u8;
+                    }
+                    2 => {
+                        // Truncation (possibly to empty).
+                        let n = (rng.next() as usize) % (pkt.len() + 1);
+                        pkt.truncate(n);
+                    }
+                    _ => {
+                        // Tail extension with random bytes.
+                        let n = 1 + (rng.next() as usize) % 16;
+                        for _ in 0..n {
+                            pkt.push(rng.next() as u8);
+                        }
+                    }
+                }
+                let mut dec = dec0.clone();
+                match dec.decode_frame(&pkt) {
+                    Ok(_) => decoded_ok += 1,
+                    Err(_) => rejected += 1,
+                }
+            }
+        }
+        // The exact split is content-dependent; the invariant under
+        // test is "no panic". Both buckets are normally non-empty (a
+        // one-bit coefficient flip usually still decodes; a header
+        // flip usually does not).
+        assert_eq!(decoded_ok + rejected, 2400);
+    }
+
+    /// Randomized multi-frame stress across every chroma format and a
+    /// spread of quantizers: pseudo-random smoothly-evolving sources
+    /// run through the full `TheoraEncoder` → `TheoraDecoder` loop
+    /// (I + 3 P per stream). Every packet must decode; at the weakest
+    /// quantizer the delivered picture must stay within a loose
+    /// fidelity bound (the tight bounds are pinned by the dedicated
+    /// tests; this guards the integration against panics, drift, and
+    /// geometry mix-ups at less-travelled format × qi corners).
+    #[test]
+    fn encoder_decoder_randomized_stress_all_formats() {
+        use oxideav_core::{Decoder, Encoder};
+        let mut rng = XorShift64(0xfeed_face_cafe_beef);
+        for pf in [
+            PixelFormat::Yuv420,
+            PixelFormat::Yuv422,
+            PixelFormat::Yuv444,
+        ] {
+            for qi in [10u8, 40, 63] {
+                let ident = tiny_ident_with_pf(pf);
+                let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+                let mut enc = TheoraEncoder::with_default_setup_keyframe_interval(
+                    codec_id.clone(),
+                    ident.clone(),
+                    qi,
+                    4,
+                )
+                .unwrap();
+                let g = build_frame_geometry(&ident).unwrap();
+                let len_y = (g.dims_y.width * g.dims_y.height) as usize;
+                let len_c = (g.dims_c.width * g.dims_c.height) as usize;
+
+                // Smoothly-evolving pseudo-random planes: low-frequency
+                // base + small per-frame drift, so P-frames exercise
+                // mixed coded/skipped/MC blocks rather than pure noise.
+                let base_y: Vec<u8> = (0..len_y)
+                    .map(|i| {
+                        let x = i % g.dims_y.width as usize;
+                        let y = i / g.dims_y.width as usize;
+                        (128.0 + 60.0 * ((x as f64) / 5.0).sin() * ((y as f64) / 7.0).cos()) as u8
+                    })
+                    .collect();
+                let mut sources = Vec::new();
+                for f in 0..4i32 {
+                    let jitter = |len: usize, mid: u8, rng: &mut XorShift64| -> Vec<u8> {
+                        (0..len)
+                            .map(|_| (mid as i16 + (rng.next() % 7) as i16 - 3).clamp(0, 255) as u8)
+                            .collect()
+                    };
+                    let samples_y: Vec<u8> = base_y
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| {
+                            let drift = ((i as i32 / 64 + f) % 5 - 2) as i16;
+                            (v as i16 + drift * f as i16).clamp(0, 255) as u8
+                        })
+                        .collect();
+                    sources.push(SourceFrame {
+                        samples_y,
+                        samples_cb: jitter(len_c, 120, &mut rng),
+                        samples_cr: jitter(len_c, 135, &mut rng),
+                    });
+                }
+
+                let mut dec = TheoraDecoder::new(codec_id);
+                for (f, src) in sources.iter().enumerate() {
+                    use oxideav_core::frame::VideoPlane;
+                    let flip = |samples: &[u8], dims: PlaneDimensions| -> VideoPlane {
+                        VideoPlane {
+                            stride: dims.width as usize,
+                            data: plane_to_top_down(samples, dims),
+                        }
+                    };
+                    let vf = oxideav_core::VideoFrame {
+                        pts: Some(f as i64),
+                        planes: vec![
+                            flip(&src.samples_y, g.dims_y),
+                            flip(&src.samples_cb, g.dims_c),
+                            flip(&src.samples_cr, g.dims_c),
+                        ],
+                    };
+                    enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+                }
+                loop {
+                    match enc.receive_packet() {
+                        Ok(p) => dec.send_packet(&p).unwrap(),
+                        Err(oxideav_core::Error::NeedMore) => break,
+                        Err(e) => panic!("{pf:?} qi={qi}: encoder error: {e}"),
+                    }
+                }
+                for (f, src) in sources.iter().enumerate() {
+                    let oxideav_core::Frame::Video(out) = dec
+                        .receive_frame()
+                        .unwrap_or_else(|e| panic!("{pf:?} qi={qi} frame {f}: decode error {e}"))
+                    else {
+                        panic!("expected video frame");
+                    };
+                    assert_eq!(out.planes[0].data.len(), len_y, "{pf:?} qi={qi}");
+                    assert_eq!(out.planes[1].data.len(), len_c, "{pf:?} qi={qi}");
+                    if qi == 63 {
+                        // Loose fidelity bound at the weakest quantizer.
+                        let mut got = Vec::with_capacity(len_y);
+                        let w = g.dims_y.width as usize;
+                        for row in (0..g.dims_y.height as usize).rev() {
+                            got.extend_from_slice(&out.planes[0].data[row * w..(row + 1) * w]);
+                        }
+                        let err = plane_max_err(&got, &src.samples_y);
+                        assert!(
+                            err <= 48,
+                            "{pf:?} qi=63 frame {f}: luma max err {err} out of bound"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

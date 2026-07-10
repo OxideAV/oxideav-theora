@@ -6,6 +6,36 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **§2.2 picture-region (non-macro-block-aligned) encoding
+  (round 406)** — the encoder now *produces* streams whose visible
+  picture is not a multiple of sixteen, the encode-side counterpart of
+  the long-validated decode + display-crop path.
+  `TheoraIdentHeader::for_picture(picw, pich, pf, frn, frd)` builds a
+  §6.2 header around arbitrary picture dimensions (smallest containing
+  coded frame, region placed left- and top-aligned — `PICX = 0`,
+  `PICY = 16·FMBH − PICH` in the spec's lower-left coordinates,
+  matching the placement observed on the reference-captured fixtures),
+  and `TheoraIdentHeader::picture_plane_dims` exposes the §4.4.4
+  chroma round-up of the region per pixel format.
+  `SourceFrame::from_picture` pads picture-shaped planes to the coded
+  frame by **edge replication** (§2.2 leaves the outside-region samples
+  to the encoder; replication keeps the padding blocks' residual energy
+  near zero instead of cutting a hard synthetic edge into every border
+  block). `TheoraEncoder::send_frame` accepts `VideoFrame`s at either
+  the coded or the picture shape — the latter being exactly what
+  `TheoraDecoder` emits — and `output_params` now advertises the
+  picture dimensions (identical to the coded ones whenever the region
+  covers the whole frame, so MB-aligned callers see no change).
+  Validated end-to-end across all three chroma formats: a 26×18
+  picture (coded 32×32, the decode fixture's geometry) intra- and
+  inter(RD)-encodes, decodes through this crate's own `FrameDecoder`,
+  and crops back to picture planes faithful to the source (max error
+  ≤ 8 intra / ≤ 32 inter at `qi = 63`), including the §4.4.4 odd-edge
+  chroma windows (13×9 at 4:2:0); the framework-trait I+P loop
+  round-trips picture-shaped frames both ways. New error
+  `EncodePictureDimensionOutOfRange` covers axes outside
+  `1..=1048560`.
+
 - **§7.5.1 half-pixel motion-vector refinement (round 398)** — the
   motion search now refines its whole-pixel winner to half-pixel
   accuracy. `search_macro_block_mv_ref` and `search_luma_block_mv`

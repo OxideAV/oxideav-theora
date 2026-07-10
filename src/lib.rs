@@ -879,6 +879,17 @@ pub enum Error {
         /// The block's lower-left pixel row.
         by: u32,
     },
+    /// A picture dimension handed to
+    /// [`TheoraIdentHeader::for_picture`] was zero or too large for
+    /// the §6.2 header: the 20-bit `PICW` / `PICH` fields and the
+    /// 16-bit `FMBW` / `FMBH` macro-block counts jointly cap each
+    /// picture axis at `16 * 65535 = 1048560` pixels.
+    EncodePictureDimensionOutOfRange {
+        /// The offending axis.
+        which: MacroblockDimension,
+        /// The supplied picture dimension in pixels.
+        got: u32,
+    },
     /// An adaptive-quantization `qis` list had a length outside the
     /// §7.1 frame-header range (`NQIS` must be 1..=3).
     EncodeQisCountOutOfRange {
@@ -1773,6 +1784,16 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: encode block at ({bx},{by}) escapes its source plane"
             ),
+            Error::EncodePictureDimensionOutOfRange { which, got } => {
+                let axis = match which {
+                    MacroblockDimension::Width => "width",
+                    MacroblockDimension::Height => "height",
+                };
+                write!(
+                    f,
+                    "oxideav-theora: picture {axis} {got} outside the §6.2 range 1..=1048560"
+                )
+            }
             Error::EncodeQisCountOutOfRange { got } => write!(
                 f,
                 "oxideav-theora: encode qis list length {got} outside §7.1 NQIS range 1..=3"
@@ -2201,6 +2222,112 @@ impl TheoraIdentHeader {
             PixelFormat::Yuv422 => 8 * mb,
             PixelFormat::Yuv444 => 12 * mb,
         }
+    }
+
+    /// Build an identification header for a picture of arbitrary
+    /// (non-macro-block-aligned) dimensions.
+    ///
+    /// §2.2 requires the *coded* frame to be a multiple of sixteen on
+    /// each axis; content of any other size is carried as a §2.2
+    /// picture region inside the smallest coded frame that contains it
+    /// (`FMBW = ⌈picw/16⌉`, `FMBH = ⌈pich/16⌉`). The region is placed
+    /// left-aligned and **top-aligned**: `PICX = 0` and (§6.2 step 10
+    /// measures `PICY` from the lower-left corner) `PICY = 16·FMBH −
+    /// pich`, so a top-down consumer sees the picture at offset (0, 0)
+    /// with the padding rows below it. The slack per axis is at most 15
+    /// pixels, so both offsets always fit their 8-bit fields.
+    ///
+    /// `frn` / `frd` are the §6.2 frame-rate fraction (both must be
+    /// non-zero). The remaining informational fields are left neutral —
+    /// `PARN = PARD = 0` (aspect ratio not declared), `CS` undefined,
+    /// `NOMBR = 0`, `QUAL = 0`, `KFGSHIFT = 0` — and may be adjusted on
+    /// the returned header before use (they do not affect the frame
+    /// geometry).
+    ///
+    /// Returns [`Error::EncodePictureDimensionOutOfRange`] when an axis
+    /// is zero or exceeds `16 * 65535 = 1048560` (the largest picture
+    /// the 16-bit macro-block counts can cover; every such value also
+    /// fits the 20-bit `PICW` / `PICH` fields), and
+    /// [`Error::ZeroFrameRate`] when `frn` or `frd` is zero.
+    pub fn for_picture(
+        picw: u32,
+        pich: u32,
+        pf: PixelFormat,
+        frn: u32,
+        frd: u32,
+    ) -> Result<Self, Error> {
+        const MAX_AXIS: u32 = 16 * (u16::MAX as u32);
+        if picw == 0 || picw > MAX_AXIS {
+            return Err(Error::EncodePictureDimensionOutOfRange {
+                which: MacroblockDimension::Width,
+                got: picw,
+            });
+        }
+        if pich == 0 || pich > MAX_AXIS {
+            return Err(Error::EncodePictureDimensionOutOfRange {
+                which: MacroblockDimension::Height,
+                got: pich,
+            });
+        }
+        if frn == 0 {
+            return Err(Error::ZeroFrameRate {
+                which: FrameRateField::Numerator,
+            });
+        }
+        if frd == 0 {
+            return Err(Error::ZeroFrameRate {
+                which: FrameRateField::Denominator,
+            });
+        }
+        let fmbw = picw.div_ceil(16) as u16;
+        let fmbh = pich.div_ceil(16) as u16;
+        let coded_h = (fmbh as u32) * 16;
+        Ok(Self {
+            vmaj: 3,
+            vmin: 2,
+            vrev: 1,
+            fmbw,
+            fmbh,
+            picw,
+            pich,
+            picx: 0,
+            // Top-aligned in the §6.2 lower-left coordinate system.
+            picy: (coded_h - pich) as u8,
+            frn,
+            frd,
+            parn: 0,
+            pard: 0,
+            cs: ColorSpace::Undefined,
+            nombr: 0,
+            qual: 0,
+            kfgshift: 0,
+            pf,
+        })
+    }
+
+    /// The pixel dimensions of the §2.2 picture region's planes —
+    /// luma at `PICW × PICH`, chroma at the §4.4.4 round-up of the
+    /// picture region for the header's pixel format.
+    ///
+    /// These are exactly the plane dimensions
+    /// [`crop_frame_to_picture_region`] produces on decode, and the
+    /// dimensions [`SourceFrame::from_picture`] expects on encode, so
+    /// an encode → decode → crop round trip compares picture planes of
+    /// identical shape. Returns `(luma, chroma)`.
+    pub fn picture_plane_dims(&self) -> (PlaneDimensions, PlaneDimensions) {
+        let (sx, sy) = chroma_subsampling_factors(self.pf);
+        let (_, cw) = chroma_crop_axis(self.picx as u32, self.picw, sx);
+        let (_, ch) = chroma_crop_axis(self.picy as u32, self.pich, sy);
+        (
+            PlaneDimensions {
+                width: self.picw,
+                height: self.pich,
+            },
+            PlaneDimensions {
+                width: cw,
+                height: ch,
+            },
+        )
     }
 }
 
@@ -12776,6 +12903,90 @@ pub struct SourceFrame {
     pub samples_cr: Vec<u8>,
 }
 
+impl SourceFrame {
+    /// Build a coded-dimension source frame from planes at the §2.2
+    /// **picture** dimensions, padding the frame area outside the
+    /// picture region by edge replication.
+    ///
+    /// The encoder proper works on the full coded (macro-block-aligned)
+    /// frame; §2.2 lets the portions outside the picture region
+    /// "contain arbitrary image data" (the decoder crops them away
+    /// before display). This helper makes that choice for the caller:
+    /// the picture planes are placed at the header's (`PICX`, `PICY`)
+    /// offset — chroma at the §4.4.4 round-up of that window — and
+    /// every sample outside the window replicates the nearest picture
+    /// sample (clamped indexing). Replication extends the picture's
+    /// border rows/columns flat, which quantizes to near-zero residual
+    /// energy in the padding blocks instead of the strong edge a
+    /// constant fill would cut into every border block.
+    ///
+    /// Plane shapes: `y` at `PICW × PICH` and `cb` / `cr` at the chroma
+    /// dimensions from [`TheoraIdentHeader::picture_plane_dims`], all
+    /// lower-left row-major (matching [`CroppedFrame`]'s layout, so a
+    /// decoded-and-cropped frame can be fed straight back in). Returns
+    /// [`Error::EncodePlaneLenMismatch`] on any other length. When the
+    /// picture region covers the whole coded frame this is a plain
+    /// copy.
+    pub fn from_picture(
+        ident: &TheoraIdentHeader,
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+    ) -> Result<Self, Error> {
+        let (pic_y, pic_c) = ident.picture_plane_dims();
+        let rp = reference_plane_dimensions_from_ident(ident);
+        let (sx, sy) = chroma_subsampling_factors(ident.pf);
+        let (cx0, _) = chroma_crop_axis(ident.picx as u32, ident.picw, sx);
+        let (cy0, _) = chroma_crop_axis(ident.picy as u32, ident.pich, sy);
+
+        // Place `src` (pw × ph picture samples) inside a dw × dh coded
+        // plane with its lower-left corner at (ox, oy), replicating the
+        // nearest picture sample outside the window.
+        fn pad_plane(
+            plane_idx: u8,
+            src: &[u8],
+            (pw, ph): (u32, u32),
+            (ox, oy): (u32, u32),
+            (dw, dh): (u32, u32),
+        ) -> Result<Vec<u8>, Error> {
+            let want = (pw as usize) * (ph as usize);
+            if src.len() != want {
+                return Err(Error::EncodePlaneLenMismatch {
+                    plane: plane_idx,
+                    got: src.len(),
+                    want,
+                });
+            }
+            let (pw_i, ph_i) = (pw as i64, ph as i64);
+            let mut out = vec![0u8; (dw as usize) * (dh as usize)];
+            for row in 0..dh as i64 {
+                let sy = (row - oy as i64).clamp(0, ph_i - 1) as usize;
+                let src_row = &src[sy * pw as usize..(sy + 1) * pw as usize];
+                let dst_row = &mut out[(row as usize) * dw as usize..][..dw as usize];
+                for (col, slot) in dst_row.iter_mut().enumerate() {
+                    let sx = (col as i64 - ox as i64).clamp(0, pw_i - 1) as usize;
+                    *slot = src_row[sx];
+                }
+            }
+            Ok(out)
+        }
+
+        let pic_yd = (pic_y.width, pic_y.height);
+        let pic_cd = (pic_c.width, pic_c.height);
+        Ok(SourceFrame {
+            samples_y: pad_plane(
+                0,
+                y,
+                pic_yd,
+                (ident.picx as u32, ident.picy as u32),
+                (rp.rpyw, rp.rpyh),
+            )?,
+            samples_cb: pad_plane(1, cb, pic_cd, (cx0, cy0), (rp.rpcw, rp.rpch))?,
+            samples_cr: pad_plane(2, cr, pic_cd, (cx0, cy0), (rp.rpcw, rp.rpch))?,
+        })
+    }
+}
+
 /// A stateful Theora **intra-frame** encoder, the encoder-side
 /// counterpart to [`FrameDecoder`].
 ///
@@ -16048,11 +16259,14 @@ impl TheoraEncoder {
 
         let extradata = pack_extradata(&[&ident_pkt, &comment_pkt, &setup_pkt])?;
 
-        // Advertise the coded (macro-block-aligned) dimensions: that is
-        // what `send_frame` consumes and what the data packets carry.
+        // Advertise the §2.2 picture dimensions: that is the shape a
+        // downstream `TheoraDecoder` emits after the display crop (and
+        // one of the two shapes `send_frame` accepts — the coded
+        // macro-block-aligned one being the other). For a picture
+        // region covering the whole coded frame the two coincide.
         let mut params = oxideav_core::CodecParameters::video(codec_id.clone());
-        params.width = Some(ident.coded_width());
-        params.height = Some(ident.coded_height());
+        params.width = Some(ident.picw);
+        params.height = Some(ident.pich);
         params.pixel_format = Some(core_pixel_format(ident.pf));
         params.extradata = extradata;
 
@@ -16583,8 +16797,19 @@ impl TheoraEncoder {
         Ok(())
     }
 
-    /// Convert a top-down [`oxideav_core::VideoFrame`] at the coded
-    /// dimensions into a lower-left [`SourceFrame`].
+    /// Convert a top-down [`oxideav_core::VideoFrame`] into a
+    /// lower-left [`SourceFrame`] at the coded dimensions.
+    ///
+    /// Two input shapes are accepted. A frame at the coded
+    /// (macro-block-aligned) dimensions converts directly. A frame at
+    /// the §2.2 **picture** dimensions (luma `PICW × PICH`, chroma per
+    /// [`TheoraIdentHeader::picture_plane_dims`] — the shape
+    /// [`TheoraDecoder`] itself emits) is flipped at the picture shape
+    /// and then padded to the coded frame by
+    /// [`SourceFrame::from_picture`], so a caller with
+    /// non-macro-block-aligned content need not pad it manually. When
+    /// the picture region covers the whole coded frame the two shapes
+    /// coincide and the direct path is taken.
     fn video_frame_to_source(&self, vf: &oxideav_core::VideoFrame) -> Result<SourceFrame, Error> {
         let g = self.frame_encoder.geometry();
         if vf.planes.len() != 3 {
@@ -16594,17 +16819,44 @@ impl TheoraEncoder {
                 want: 3,
             });
         }
-        let samples_y =
-            top_down_plane_to_lower_left(&vf.planes[0], g.dims_y.width, g.dims_y.height)?;
-        let samples_cb =
-            top_down_plane_to_lower_left(&vf.planes[1], g.dims_c.width, g.dims_c.height)?;
-        let samples_cr =
-            top_down_plane_to_lower_left(&vf.planes[2], g.dims_c.width, g.dims_c.height)?;
-        Ok(SourceFrame {
-            samples_y,
-            samples_cb,
-            samples_cr,
-        })
+        let coded = (|| -> Result<SourceFrame, Error> {
+            Ok(SourceFrame {
+                samples_y: top_down_plane_to_lower_left(
+                    &vf.planes[0],
+                    g.dims_y.width,
+                    g.dims_y.height,
+                )?,
+                samples_cb: top_down_plane_to_lower_left(
+                    &vf.planes[1],
+                    g.dims_c.width,
+                    g.dims_c.height,
+                )?,
+                samples_cr: top_down_plane_to_lower_left(
+                    &vf.planes[2],
+                    g.dims_c.width,
+                    g.dims_c.height,
+                )?,
+            })
+        })();
+        match coded {
+            Ok(frame) => Ok(frame),
+            Err(coded_err) => {
+                // Not a coded-dimension frame; try the picture shape
+                // (only meaningful when it differs from the coded one).
+                let ident = self.frame_encoder.ident();
+                let (pic_y, pic_c) = ident.picture_plane_dims();
+                if pic_y.width == g.dims_y.width && pic_y.height == g.dims_y.height {
+                    return Err(coded_err);
+                }
+                let y = top_down_plane_to_lower_left(&vf.planes[0], pic_y.width, pic_y.height)
+                    .map_err(|_| coded_err)?;
+                let cb = top_down_plane_to_lower_left(&vf.planes[1], pic_c.width, pic_c.height)
+                    .map_err(|_| coded_err)?;
+                let cr = top_down_plane_to_lower_left(&vf.planes[2], pic_c.width, pic_c.height)
+                    .map_err(|_| coded_err)?;
+                SourceFrame::from_picture(ident, &y, &cb, &cr)
+            }
+        }
     }
 }
 
@@ -37811,5 +38063,347 @@ mod tests {
         assert!(out.planes[0].data.iter().all(|&b| b == 128));
         assert!(out.planes[1].data.iter().all(|&b| b == 128));
         assert!(out.planes[2].data.iter().all(|&b| b == 128));
+    }
+    // ----- round 406: §2.2 picture-region (non-MB-aligned) encoding -----
+
+    /// Build lower-left row-major picture-dimension planes carrying a
+    /// smooth gradient shifted by `(sx, sy)` — the picture-shaped
+    /// sibling of `gradient_source` (which fills coded-dimension
+    /// planes).
+    fn picture_gradient(
+        ident: &TheoraIdentHeader,
+        sx: i32,
+        sy: i32,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (pic_y, pic_c) = ident.picture_plane_dims();
+        let w_y = pic_y.width as i32;
+        let mut y = vec![0u8; (pic_y.width * pic_y.height) as usize];
+        for row in 0..pic_y.height as i32 {
+            for col in 0..w_y {
+                y[(row * w_y + col) as usize] =
+                    (16 + ((col + sx) * 5 + (row + sy) * 3).rem_euclid(220)) as u8;
+            }
+        }
+        let w_c = pic_c.width as i32;
+        let len_c = (pic_c.width * pic_c.height) as usize;
+        let mut cb = vec![0u8; len_c];
+        let mut cr = vec![0u8; len_c];
+        for row in 0..pic_c.height as i32 {
+            for col in 0..w_c {
+                cb[(row * w_c + col) as usize] = (110 + ((col + sx) * 2).rem_euclid(40)) as u8;
+                cr[(row * w_c + col) as usize] = (140 + ((row + sy) * 2).rem_euclid(40)) as u8;
+            }
+        }
+        (y, cb, cr)
+    }
+
+    /// `TheoraIdentHeader::for_picture` derives the smallest containing
+    /// coded frame and places the picture region top-aligned /
+    /// left-aligned, matching the placement observed on reference
+    /// streams (the 26×18 and 1920×1080 fixtures); the result
+    /// serializes and re-parses byte-faithfully.
+    #[test]
+    fn ident_for_picture_geometry_and_round_trip() {
+        // Non-MB-aligned on both axes: the 26×18 fixture geometry.
+        let h = TheoraIdentHeader::for_picture(26, 18, PixelFormat::Yuv420, 25, 1).unwrap();
+        assert_eq!((h.fmbw, h.fmbh), (2, 2));
+        assert_eq!((h.coded_width(), h.coded_height()), (32, 32));
+        assert_eq!((h.picw, h.pich), (26, 18));
+        assert_eq!((h.picx, h.picy), (0, 14), "top-aligned: 32 - 18 = 14");
+        let back = decode_identification_header(&encode_identification_header(&h).unwrap());
+        assert_eq!(back.unwrap(), h);
+
+        // HD: the 1080p fixture geometry.
+        let h =
+            TheoraIdentHeader::for_picture(1920, 1080, PixelFormat::Yuv420, 30000, 1001).unwrap();
+        assert_eq!((h.fmbw, h.fmbh), (120, 68));
+        assert_eq!((h.coded_width(), h.coded_height()), (1920, 1088));
+        assert_eq!((h.picx, h.picy), (0, 8), "top-aligned: 1088 - 1080 = 8");
+
+        // Already MB-aligned: the region covers the whole coded frame.
+        let h = TheoraIdentHeader::for_picture(32, 32, PixelFormat::Yuv444, 25, 1).unwrap();
+        assert_eq!((h.picx, h.picy), (0, 0));
+        assert_eq!((h.coded_width(), h.coded_height()), (32, 32));
+    }
+
+    /// `for_picture` rejects axes outside the representable range and
+    /// zero frame-rate components with typed errors.
+    #[test]
+    fn ident_for_picture_rejects_bad_arguments() {
+        assert_eq!(
+            TheoraIdentHeader::for_picture(0, 18, PixelFormat::Yuv420, 25, 1).unwrap_err(),
+            Error::EncodePictureDimensionOutOfRange {
+                which: MacroblockDimension::Width,
+                got: 0,
+            }
+        );
+        assert_eq!(
+            TheoraIdentHeader::for_picture(26, 16 * 65535 + 1, PixelFormat::Yuv420, 25, 1)
+                .unwrap_err(),
+            Error::EncodePictureDimensionOutOfRange {
+                which: MacroblockDimension::Height,
+                got: 16 * 65535 + 1,
+            }
+        );
+        // The largest representable axis is accepted.
+        assert!(TheoraIdentHeader::for_picture(16 * 65535, 16, PixelFormat::Yuv420, 25, 1).is_ok());
+        assert_eq!(
+            TheoraIdentHeader::for_picture(26, 18, PixelFormat::Yuv420, 0, 1).unwrap_err(),
+            Error::ZeroFrameRate {
+                which: FrameRateField::Numerator,
+            }
+        );
+        assert_eq!(
+            TheoraIdentHeader::for_picture(26, 18, PixelFormat::Yuv420, 25, 0).unwrap_err(),
+            Error::ZeroFrameRate {
+                which: FrameRateField::Denominator,
+            }
+        );
+    }
+
+    /// `picture_plane_dims` applies the §4.4.4 chroma round-up per
+    /// axis: with `PICY = 14`, `PICH = 18` on a 32-high coded frame the
+    /// 4:2:0 chroma window is rows 7..16 (9 rows, not `18/2 = 9` by
+    /// luck of the offset — the round-up covers the odd top edge), and
+    /// each unsubsampled axis carries the picture extent verbatim.
+    #[test]
+    fn picture_plane_dims_chroma_round_up() {
+        let cases = [
+            (PixelFormat::Yuv420, (13, 9)),
+            (PixelFormat::Yuv422, (13, 18)),
+            (PixelFormat::Yuv444, (26, 18)),
+        ];
+        for (pf, (cw, ch)) in cases {
+            let h = TheoraIdentHeader::for_picture(26, 18, pf, 25, 1).unwrap();
+            let (pic_y, pic_c) = h.picture_plane_dims();
+            assert_eq!((pic_y.width, pic_y.height), (26, 18), "{pf:?} luma");
+            assert_eq!((pic_c.width, pic_c.height), (cw, ch), "{pf:?} chroma");
+        }
+    }
+
+    /// `SourceFrame::from_picture` places the picture window at the
+    /// header's offsets and fills everything outside it by replicating
+    /// the nearest picture sample.
+    #[test]
+    fn source_from_picture_pads_by_edge_replication() {
+        let ident = TheoraIdentHeader::for_picture(26, 18, PixelFormat::Yuv420, 25, 1).unwrap();
+        let (y, cb, cr) = picture_gradient(&ident, 0, 0);
+        let src = SourceFrame::from_picture(&ident, &y, &cb, &cr).unwrap();
+
+        let (pic_y, pic_c) = ident.picture_plane_dims();
+        assert_eq!(src.samples_y.len(), 32 * 32);
+        assert_eq!(src.samples_cb.len(), 16 * 16);
+
+        // Interior: the picture window (columns 0..26, rows 14..32 in
+        // the lower-left coded plane) carries the picture verbatim.
+        let (pw, ph) = (pic_y.width as usize, pic_y.height as usize);
+        for row in 0..ph {
+            for col in 0..pw {
+                assert_eq!(
+                    src.samples_y[(row + 14) * 32 + col],
+                    y[row * pw + col],
+                    "luma interior ({col},{row})"
+                );
+            }
+        }
+        // Below the picture (rows 0..14): replicate picture row 0,
+        // column-clamped.
+        for row in 0..14 {
+            for col in 0..32 {
+                assert_eq!(
+                    src.samples_y[row * 32 + col],
+                    y[col.min(pw - 1)],
+                    "luma bottom padding ({col},{row})"
+                );
+            }
+        }
+        // Right of the picture: replicate the row's last picture column.
+        for row in 0..ph {
+            for col in pw..32 {
+                assert_eq!(
+                    src.samples_y[(row + 14) * 32 + col],
+                    y[row * pw + (pw - 1)],
+                    "luma right padding ({col},{row})"
+                );
+            }
+        }
+        // Chroma: the 13×9 window sits at (0, 7); below it every row
+        // replicates chroma picture row 0.
+        let (cw, chh) = (pic_c.width as usize, pic_c.height as usize);
+        for row in 0..chh {
+            for col in 0..cw {
+                assert_eq!(
+                    src.samples_cb[(row + 7) * 16 + col],
+                    cb[row * cw + col],
+                    "cb interior ({col},{row})"
+                );
+            }
+        }
+        for col in 0..16 {
+            assert_eq!(src.samples_cb[3 * 16 + col], cb[col.min(cw - 1)]);
+            assert_eq!(src.samples_cr[3 * 16 + col], cr[col.min(cw - 1)]);
+        }
+    }
+
+    /// `from_picture` validates every plane length against the picture
+    /// shape (not the coded shape).
+    #[test]
+    fn source_from_picture_rejects_wrong_plane_lengths() {
+        let ident = TheoraIdentHeader::for_picture(26, 18, PixelFormat::Yuv420, 25, 1).unwrap();
+        let (y, cb, cr) = picture_gradient(&ident, 0, 0);
+        match SourceFrame::from_picture(&ident, &y[1..], &cb, &cr) {
+            Err(Error::EncodePlaneLenMismatch { plane: 0, want, .. }) => {
+                assert_eq!(want, 26 * 18)
+            }
+            other => panic!("expected luma length mismatch, got {other:?}"),
+        }
+        match SourceFrame::from_picture(&ident, &y, &cb[1..], &cr) {
+            Err(Error::EncodePlaneLenMismatch { plane: 1, want, .. }) => {
+                assert_eq!(want, 13 * 9)
+            }
+            other => panic!("expected cb length mismatch, got {other:?}"),
+        }
+    }
+
+    /// MILESTONE: a non-macro-block-aligned picture encodes end-to-end
+    /// — pad to the coded frame, intra-encode, then a translated inter
+    /// (RD) frame — and this crate's own decoder + §2.2 display crop
+    /// recover picture planes faithful to the original picture source,
+    /// across all three chroma formats. This is the encode-side
+    /// counterpart of the `picture-region-non-mb-aligned` decode
+    /// fixture: the encoder now *produces* such streams.
+    #[test]
+    fn encode_picture_region_round_trips_all_formats() {
+        for pf in [
+            PixelFormat::Yuv420,
+            PixelFormat::Yuv422,
+            PixelFormat::Yuv444,
+        ] {
+            let ident = TheoraIdentHeader::for_picture(26, 18, pf, 25, 1).unwrap();
+            let setup = SetupHeaderTables::vp3_defaults();
+            let enc = FrameEncoder::new(ident.clone(), setup.clone(), 63).unwrap();
+            let mut dec = FrameDecoder::new(ident.clone(), setup).unwrap();
+
+            // Intra keyframe from picture-dimension planes.
+            let (y0, cb0, cr0) = picture_gradient(&ident, 0, 0);
+            let frame0 = SourceFrame::from_picture(&ident, &y0, &cb0, &cr0).unwrap();
+            let key = enc.encode_intra_frame(&frame0).unwrap();
+            let decoded0 = dec.decode_frame(&key).unwrap();
+            let shown0 = dec.crop_for_display(&decoded0).unwrap();
+            let (pic_y, pic_c) = ident.picture_plane_dims();
+            assert_eq!(shown0.dims_y.width, pic_y.width, "{pf:?}");
+            assert_eq!(shown0.dims_y.height, pic_y.height, "{pf:?}");
+            assert_eq!(shown0.dims_c.width, pic_c.width, "{pf:?}");
+            assert_eq!(shown0.dims_c.height, pic_c.height, "{pf:?}");
+            assert!(
+                plane_max_err(&shown0.samples_y, &y0) <= 8,
+                "{pf:?}: intra picture luma max error {}",
+                plane_max_err(&shown0.samples_y, &y0)
+            );
+            assert!(plane_max_err(&shown0.samples_cb, &cb0) <= 8, "{pf:?}");
+            assert!(plane_max_err(&shown0.samples_cr, &cr0) <= 8, "{pf:?}");
+
+            // Translated P-frame through the RD mode decision.
+            let (y1, cb1, cr1) = picture_gradient(&ident, 2, 0);
+            let frame1 = SourceFrame::from_picture(&ident, &y1, &cb1, &cr1).unwrap();
+            let pkt = {
+                let refs = dec.reference_store().as_reference_plane_set().unwrap();
+                enc.encode_inter_frame_rd(&frame1, &refs).unwrap()
+            };
+            let decoded1 = dec.decode_frame(&pkt).unwrap();
+            assert_eq!(decoded1.ftype, FrameType::Inter);
+            let shown1 = dec.crop_for_display(&decoded1).unwrap();
+            assert!(
+                plane_max_err(&shown1.samples_y, &y1) <= 32,
+                "{pf:?}: inter picture luma max error {}",
+                plane_max_err(&shown1.samples_y, &y1)
+            );
+            assert!(plane_max_err(&shown1.samples_cb, &cb1) <= 32, "{pf:?}");
+            assert!(plane_max_err(&shown1.samples_cr, &cr1) <= 32, "{pf:?}");
+        }
+    }
+
+    /// The framework `Encoder` path accepts `VideoFrame`s at the §2.2
+    /// picture dimensions (the exact shape `TheoraDecoder` emits): an
+    /// I + P sequence of 26×18 frames round-trips through
+    /// `TheoraEncoder` → `TheoraDecoder`, whose output planes are again
+    /// picture-shaped. `output_params` advertises the picture
+    /// dimensions.
+    #[test]
+    fn encoder_trait_picture_dimension_frames_round_trip() {
+        use oxideav_core::frame::VideoPlane;
+        use oxideav_core::{Decoder, Encoder};
+        let ident = TheoraIdentHeader::for_picture(26, 18, PixelFormat::Yuv420, 25, 1).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let mut enc = TheoraEncoder::with_default_setup_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            63,
+            2,
+        )
+        .unwrap();
+        assert_eq!(enc.output_params().width, Some(26));
+        assert_eq!(enc.output_params().height, Some(18));
+
+        // Top-down picture-dimension frames (flip the lower-left
+        // gradient planes row-wise).
+        let (pic_y, pic_c) = ident.picture_plane_dims();
+        let to_vf = |y: &[u8], cb: &[u8], cr: &[u8], pts: i64| -> oxideav_core::VideoFrame {
+            let flip = |src: &[u8], dims: PlaneDimensions| -> VideoPlane {
+                let w = dims.width as usize;
+                let mut data = Vec::with_capacity(src.len());
+                for row in (0..dims.height as usize).rev() {
+                    data.extend_from_slice(&src[row * w..(row + 1) * w]);
+                }
+                VideoPlane { stride: w, data }
+            };
+            oxideav_core::VideoFrame {
+                pts: Some(pts),
+                planes: vec![flip(y, pic_y), flip(cb, pic_c), flip(cr, pic_c)],
+            }
+        };
+        let (y0, cb0, cr0) = picture_gradient(&ident, 0, 0);
+        let (y1, cb1, cr1) = picture_gradient(&ident, 2, 0);
+        enc.send_frame(&oxideav_core::Frame::Video(to_vf(&y0, &cb0, &cr0, 0)))
+            .unwrap();
+        enc.send_frame(&oxideav_core::Frame::Video(to_vf(&y1, &cb1, &cr1, 1)))
+            .unwrap();
+
+        let mut dec = TheoraDecoder::new(codec_id);
+        let mut n_data = 0usize;
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if !p.flags.header {
+                        n_data += 1;
+                    }
+                    dec.send_packet(&p).unwrap();
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error: {e}"),
+            }
+        }
+        assert_eq!(n_data, 2, "one data packet per sent frame");
+
+        for want_y in [&y0, &y1] {
+            let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+                panic!("expected a video frame");
+            };
+            // Picture-shaped output: 26×18 luma, 13×9 chroma.
+            assert_eq!(out.planes[0].data.len(), 26 * 18);
+            assert_eq!(out.planes[1].data.len(), 13 * 9);
+            assert_eq!(out.planes[2].data.len(), 13 * 9);
+            // The decoder emits top-down planes; flip back to compare
+            // against the lower-left source.
+            let mut got = Vec::with_capacity(want_y.len());
+            for row in (0..18).rev() {
+                got.extend_from_slice(&out.planes[0].data[row * 26..(row + 1) * 26]);
+            }
+            assert!(
+                plane_max_err(&got, want_y) <= 32,
+                "picture luma max error {} through the trait path",
+                plane_max_err(&got, want_y)
+            );
+        }
     }
 }

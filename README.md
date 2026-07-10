@@ -290,8 +290,10 @@ zero-initialized reference store.
   optional, synthesized from the VP3 defaults when omitted). The encoder
   serializes the three §6 headers up front and emits them as the first
   three packets
-  (flagged `header`), then turns each top-down `VideoFrame` at the coded
-  dimensions into one §7 data packet. The keyframe interval (`-g`,
+  (flagged `header`), then turns each top-down `VideoFrame` — at the
+  coded dimensions or at the §2.2 picture dimensions (see the
+  picture-region bullet below) — into one §7 data packet. The keyframe
+  interval (`-g`,
   `TheoraEncoder::with_keyframe_interval`, default 1) decides intra vs
   inter: interval-boundary frames are intra keyframes, the frames
   between are inter (P) frames predicted from the reconstructed previous
@@ -303,13 +305,31 @@ zero-initialized reference store.
   resets the references; the keyframe-interval counter restarts from the
   inserted keyframe. The encoder mirrors its own output through an internal
   `FrameDecoder` so the reference it predicts from is byte-identical to
-  the downstream decoder's. `output_params` carries the coded
-  dimensions, the mapped pixel format, and a length-prefixed extradata
+  the downstream decoder's. `output_params` carries the picture
+  dimensions (equal to the coded ones for a full-frame picture region),
+  the mapped pixel format, and a length-prefixed extradata
   header chain, so a complete encode → decode loop round-trips through
   both `oxideav_core` traits and through the shared `CodecRegistry`
   (`first_encoder` → `first_decoder`): a flat frame is lossless, a
   gradient stays within the quantizer bound, and an I,P,P interval-3
   sequence reconstructs every frame within the quantizer bound.
+
+* **Picture-region (non-MB-aligned) encoding** — the encode-side
+  counterpart of the display crop. `TheoraIdentHeader::for_picture`
+  builds a §6.2 header around arbitrary picture dimensions (smallest
+  containing coded frame; region left- and top-aligned — `PICX = 0`,
+  `PICY = 16·FMBH − PICH` in the spec's lower-left coordinates — the
+  placement observed on the reference-captured fixtures), with
+  `picture_plane_dims` exposing the §4.4.4 chroma round-up per pixel
+  format. `SourceFrame::from_picture` pads picture-shaped planes to
+  the coded frame by edge replication (§2.2 leaves the outside-region
+  samples to the encoder; replication keeps the padding blocks'
+  residual energy near zero), and `TheoraEncoder::send_frame` accepts
+  picture-shaped `VideoFrame`s directly — exactly the shape
+  `TheoraDecoder` emits. A 26×18 picture (coded 32×32, the decode
+  fixture's geometry) intra- and inter(RD)-encodes and crops back to
+  picture planes faithful to the source across all three chroma
+  formats, including the odd-edge 13×9 chroma window at 4:2:0.
 
 * **Target-bitrate rate control** — `TheoraEncoder::with_target_bitrate`
   (and the `with_target_bitrate_bounded` variant for explicit `qi`

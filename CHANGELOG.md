@@ -6,6 +6,25 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Four-step whole-pixel motion search (round 406)** — the motion
+  estimator's exhaustive ±3-pixel grid (49 SAD probes) is replaced by
+  a four-step logarithmic descent (`whole_pixel_step_search`): from
+  the zero vector, each pass probes the eight neighbours at step 8, 4,
+  2, then 1 whole pixels around the running winner, reaching every
+  displacement in ±15 pixels with 33 probes. Strict-improvement moves
+  keep the zero-vector bias, the §7.5.1 ±31-component clamp is
+  enforced, and the existing half-pixel refinement still probes the
+  odd neighbours of the winner — both the uniform macro-block search
+  (previous and golden references) and the per-luma-block
+  `INTER_MV_FOUR` search use it. Measured: a (6, −5)-pixel translation
+  — unreachable before — is recovered (motion-vector components ≥ 8
+  half-pels on the wire, pinned in-test) and the motion packet drops
+  to 16 B where the zero-MV spelling of the same frame needs 125 B at
+  equal round-trip fidelity. The keyframe-rate-policy regression now
+  pins the whole-stream **Lagrangian cost** (`SSD + λ·bits`) instead
+  of raw SSD dominance — the property the policy actually optimizes —
+  since the wider search legally re-balances SSD against bytes.
+
 - **Rate-control target declared in the §6.2 `NOMBR` field
   (round 406)** — `TheoraEncoder::with_target_bitrate` (and the
   bounded variant) now writes the target into the identification

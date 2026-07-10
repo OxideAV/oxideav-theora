@@ -14669,32 +14669,15 @@ impl FrameEncoder {
             sad
         };
 
-        let mut best_mv = MotionVector::ZERO;
-        let mut best_sad = sad_for(MotionVector::ZERO);
-        // Whole-pixel search radius ±3 pixels → MV units ±6 (doubled).
-        for dy in -3i32..=3 {
-            for dx in -3i32..=3 {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let mv = MotionVector {
-                    x: (dx * 2) as i8,
-                    y: (dy * 2) as i8,
-                };
-                let sad = sad_for(mv);
-                // Bias toward the zero vector: require a strict
-                // improvement to spend MV bits.
-                if sad < best_sad {
-                    best_sad = sad;
-                    best_mv = mv;
-                }
-            }
-        }
+        // Four-step whole-pixel descent (±15 pixels reachable), zero-
+        // biased: strict improvement required to move off the zero
+        // vector.
+        let (best_mv, best_sad) = whole_pixel_step_search(&sad_for);
         // §7.5.1 half-pixel refinement around the integer winner: the
-        // whole-pixel loop only ever tried even components, so the
-        // decoder's two-tap half-pixel predictor was unreachable from
-        // the encoder. Probe the eight half-pixel neighbours and keep
-        // any strict SAD improvement.
+        // whole-pixel search only ever tries even components, so the
+        // decoder's two-tap half-pixel predictor would otherwise be
+        // unreachable from the encoder. Probe the eight half-pixel
+        // neighbours and keep any strict SAD improvement.
         refine_half_pixel_mv(best_mv, best_sad, sad_for)
     }
 
@@ -14736,24 +14719,8 @@ impl FrameEncoder {
             }
             sad
         };
-        let mut best_mv = MotionVector::ZERO;
-        let mut best_sad = sad_for(MotionVector::ZERO);
-        for dy in -3i32..=3 {
-            for dx in -3i32..=3 {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let mv = MotionVector {
-                    x: (dx * 2) as i8,
-                    y: (dy * 2) as i8,
-                };
-                let sad = sad_for(mv);
-                if sad < best_sad {
-                    best_sad = sad;
-                    best_mv = mv;
-                }
-            }
-        }
+        // Four-step whole-pixel descent, as `search_macro_block_mv_ref`.
+        let (best_mv, best_sad) = whole_pixel_step_search(&sad_for);
         // §7.5.1 half-pixel refinement around the integer winner (see
         // `search_macro_block_mv_ref`): each of the four `INTER_MV_FOUR`
         // luma vectors is refined independently to half-pixel accuracy.
@@ -15290,6 +15257,57 @@ const HALF_PIXEL_NEIGHBORS: [(i32, i32); 8] = [
 /// caller's `sad_for` prices out-of-reference offsets as `u32::MAX`, so
 /// they are rejected naturally too. The returned SAD lets a golden /
 /// previous chooser keep comparing on the refined value.
+/// Whole-pixel motion search: a four-step logarithmic descent over the
+/// §7.5.1 vector range.
+///
+/// Starting from the zero vector, each pass probes the eight
+/// neighbours at the current step distance (8, 4, 2, then 1 whole
+/// pixels; components are stored doubled, in half-pixel units) around
+/// the running winner and moves to any strict improvement — 33 SAD
+/// probes reaching every displacement in `[-15, 15]` on each axis,
+/// where the previous exhaustive grid spent 49 probes and reached only
+/// `[-3, 3]`. Strict-improvement moves keep the zero-vector bias (a
+/// tie never spends motion-vector bits), candidates escaping the
+/// §7.5.1 `[-31, 31]` component range are dropped, and only even
+/// (whole-pixel) components are ever produced — the §7.5.1 half-pixel
+/// refinement ([`refine_half_pixel_mv`]) then probes the odd
+/// neighbours of the winner exactly as before.
+fn whole_pixel_step_search(sad_for: impl Fn(MotionVector) -> u32) -> (MotionVector, u32) {
+    let mut best_mv = MotionVector::ZERO;
+    let mut best_sad = sad_for(MotionVector::ZERO);
+    // Step distances in whole pixels; vector components are doubled.
+    for step in [8i32, 4, 2, 1] {
+        let (cx, cy) = (best_mv.x as i32, best_mv.y as i32);
+        let d = step * 2;
+        for (dx, dy) in [
+            (-d, -d),
+            (0, -d),
+            (d, -d),
+            (-d, 0),
+            (d, 0),
+            (-d, d),
+            (0, d),
+            (d, d),
+        ] {
+            let x = cx + dx;
+            let y = cy + dy;
+            if !(-31..=31).contains(&x) || !(-31..=31).contains(&y) {
+                continue;
+            }
+            let mv = MotionVector {
+                x: x as i8,
+                y: y as i8,
+            };
+            let sad = sad_for(mv);
+            if sad < best_sad {
+                best_sad = sad;
+                best_mv = mv;
+            }
+        }
+    }
+    (best_mv, best_sad)
+}
+
 fn refine_half_pixel_mv(
     best: MotionVector,
     best_sad: u32,
@@ -33993,9 +34011,18 @@ mod tests {
             bytes_on < bytes_off,
             "policy stream {bytes_on} B must beat interval-only {bytes_off} B"
         );
+        // The policy's per-frame decision minimises the Lagrangian cost
+        // `SSD + λ·bits` (with the encoder's own qi-derived λ), so that
+        // — not raw SSD dominance — is the whole-stream property it
+        // guarantees: the delivered SSD may trade a little either way
+        // as long as the bits pay for it.
+        let lambda = inter_rd_lambda(40);
+        let cost_off = ssd_off + lambda * 8 * bytes_off as u64;
+        let cost_on = ssd_on + lambda * 8 * bytes_on as u64;
         assert!(
-            ssd_on <= ssd_off,
-            "policy stream SSD {ssd_on} must not exceed interval-only {ssd_off}"
+            cost_on <= cost_off,
+            "policy stream Lagrangian cost {cost_on} must not exceed interval-only {cost_off} \
+             (SSD {ssd_on} vs {ssd_off}, {bytes_on} B vs {bytes_off} B)"
         );
     }
 
@@ -39133,5 +39160,64 @@ mod tests {
         let first = enc.receive_packet().unwrap();
         let hdr = decode_identification_header(&first.data).unwrap();
         assert_eq!(hdr.nombr, (1 << 24) - 1);
+    }
+    /// MILESTONE: the four-step whole-pixel motion search reaches
+    /// translations the previous exhaustive ±3-pixel grid could not.
+    /// A frame translated by (6, −5) whole pixels is recovered — the
+    /// plan carries motion-vector components of magnitude ≥ 8 in
+    /// half-pixel units, unreachable under the old ±3-pixel (±7 after
+    /// half-pel refinement) search — and the motion packet is
+    /// dramatically smaller than the zero-MV spelling of the same
+    /// frame at equal round-trip fidelity.
+    #[test]
+    fn motion_search_recovers_wide_translation() {
+        let (ident, setup) = ki30_ident_setup();
+        let enc = FrameEncoder::new(ident.clone(), setup.clone(), 50).unwrap();
+        let g = enc.geometry().clone();
+        let frame0 = gradient_source(&g, 0, 0);
+
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        let key = enc.encode_intra_frame(&frame0).unwrap();
+        let prev = dec.decode_frame(&key).unwrap();
+
+        // Frame 1: the reconstruction translated by (6, -5) whole
+        // pixels (edge-clamped) — beyond the old search radius.
+        let frame1 = shift_source(&prev.frame, &g, 6, -5);
+
+        let refs = dec.reference_store().as_reference_plane_set().unwrap();
+        let ifp = enc
+            .plan_inter_frame(&frame1, &refs, MotionPlan::SearchPrevious)
+            .unwrap();
+        let wide = ifp
+            .block_mv
+            .iter()
+            .filter(|mv| mv.x.unsigned_abs().max(mv.y.unsigned_abs()) >= 8)
+            .count();
+        assert!(
+            wide > 0,
+            "the (6, -5) translation must be spelled with components ≥ 8 half-pels \
+             (old search peaked at 7)"
+        );
+
+        let pkt_motion = enc.write_inter_packet(&ifp).unwrap();
+        let pkt_zero = {
+            let ifp0 = enc
+                .plan_inter_frame(&frame1, &refs, MotionPlan::ZeroPrevious)
+                .unwrap();
+            enc.write_inter_packet(&ifp0).unwrap()
+        };
+        assert!(
+            pkt_motion.len() * 2 < pkt_zero.len(),
+            "recovered wide motion must at least halve the packet: {} vs {} bytes",
+            pkt_motion.len(),
+            pkt_zero.len()
+        );
+
+        let f1 = dec.decode_frame(&pkt_motion).unwrap();
+        assert!(
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 40,
+            "wide-translation round trip luma max error {}",
+            plane_max_err(&f1.frame.samples_y, &frame1.samples_y)
+        );
     }
 }

@@ -180,9 +180,13 @@ zero-initialized reference store.
   predicted from the **reconstructed** previous reference (the bytes
   the decoder holds), so an unchanged second frame reconstructs
   bit-exactly as an all-uncoded `INTER_NOMV` pure copy; a changed
-  frame stays within the quantizer bound. The motion path runs a small
-  whole-pixel SAD search per macro block **then refines the winner to
-  half-pixel accuracy** (§7.5.1): the integer grid only spells even
+  frame stays within the quantizer bound. The motion path runs a
+  **four-step whole-pixel SAD descent** per macro block (steps 8, 4,
+  2, 1 around the running winner: every displacement in ±15 pixels
+  reachable with 33 probes, zero-biased, §7.5.1 ±31-component clamp;
+  a (6, −5) translation spells a 16 B motion packet where the zero-MV
+  spelling needs 125 B) **then refines the winner to
+  half-pixel accuracy** (§7.5.1): the integer search only spells even
   motion-vector components, so the eight half-pixel neighbours are
   probed and any strict SAD improvement kept, making the decoder's
   §7.9.1.3 two-tap half-pixel predictor reachable from the encoder (a

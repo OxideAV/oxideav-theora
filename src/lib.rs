@@ -14672,7 +14672,7 @@ impl FrameEncoder {
         // Four-step whole-pixel descent (±15 pixels reachable), zero-
         // biased: strict improvement required to move off the zero
         // vector.
-        let (best_mv, best_sad) = whole_pixel_step_search(&sad_for);
+        let (best_mv, best_sad) = whole_pixel_step_search(sad_for);
         // §7.5.1 half-pixel refinement around the integer winner: the
         // whole-pixel search only ever tries even components, so the
         // decoder's two-tap half-pixel predictor would otherwise be
@@ -14720,7 +14720,7 @@ impl FrameEncoder {
             sad
         };
         // Four-step whole-pixel descent, as `search_macro_block_mv_ref`.
-        let (best_mv, best_sad) = whole_pixel_step_search(&sad_for);
+        let (best_mv, best_sad) = whole_pixel_step_search(sad_for);
         // §7.5.1 half-pixel refinement around the integer winner (see
         // `search_macro_block_mv_ref`): each of the four `INTER_MV_FOUR`
         // luma vectors is refined independently to half-pixel accuracy.

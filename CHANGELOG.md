@@ -6,6 +6,22 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Duplicate-frame detection — zero-byte packet emission
+  (round 406)** — when the RD plan of a `TheoraEncoder` P-frame codes
+  no block at all (every residual dropped by the per-block skip
+  decision, e.g. a repeated source frame), the encoder emits a §7.11
+  step-2 **zero-byte packet** instead of the ~5-byte header + all-zero
+  §7.3 flags spelling. The two spellings reconstruct identically — an
+  all-uncoded inter frame is a bit-exact zero-MV previous copy, the
+  loop filter only touches coded-block edges, and no inter frame
+  refreshes the golden reference — so this is a pure rate win with the
+  spec's own dedicated syntax for it. The branch is unreachable on the
+  stream's first frame (always an intra keyframe), so the decode-side
+  `FirstFrameEmptyPacket` guard never trips. Pinned end-to-end: an
+  I, dup, P sequence emits packet sizes (N, 0, M), the duplicate
+  decodes bit-exactly equal to the keyframe's output through
+  `TheoraDecoder`, and the changed third frame still codes normally.
+
 - **Rate-distortion per-block skip on `INTER_NOMV` macro blocks
   (round 406)** — the inter encode body previously coded every block
   whose quantized residual had any non-zero coefficient; only an

@@ -16760,7 +16760,24 @@ impl TheoraEncoder {
                         }
                     }
                     de_facto_intra = transmitted > 0 && 2 * intra_mbs >= transmitted;
-                    self.frame_encoder.write_inter_packet(&ifp)?
+                    if ifp.bcoded.iter().all(|&b| b == 0) {
+                        // Duplicate-frame detection: a plan with no coded
+                        // blocks reconstructs as a bit-exact copy of the
+                        // previous reference (every block is a §7.9.4
+                        // step 2(e) zero-MV colocated copy, the loop
+                        // filter only touches coded-block edges, and the
+                        // golden frame is untouched by any inter frame) —
+                        // exactly the semantics of a §7.11 step-2
+                        // **zero-byte packet**. Emit that instead of the
+                        // ~5-byte header + all-zero §7.3 flags spelling.
+                        // This branch is unreachable on the stream's
+                        // first frame (always an intra keyframe), so the
+                        // decoder-side `FirstFrameEmptyPacket` guard
+                        // never trips.
+                        Vec::new()
+                    } else {
+                        self.frame_encoder.write_inter_packet(&ifp)?
+                    }
                 }
                 InterModeStrategy::PreviousMotion => {
                     self.frame_encoder.encode_inter_frame_motion(frame, &refs)?
@@ -38730,5 +38747,92 @@ mod tests {
         );
         // … while the whole plane stays within the noise bound.
         assert!(plane_max_err(&f1.frame.samples_y, &frame1.samples_y) <= 12);
+    }
+    /// MILESTONE: duplicate-frame detection. When the RD plan codes no
+    /// block at all — here because the second source frame equals the
+    /// first, so every residual is quantizer-noise the per-block skip
+    /// decision drops — `TheoraEncoder` emits a §7.11 step-2
+    /// **zero-byte packet** instead of the ~5-byte header + all-zero
+    /// §7.3 flags spelling. The empty packet decodes as a bit-exact
+    /// duplicate of the previous frame through `TheoraDecoder`, and a
+    /// genuinely changed third frame still produces a normal inter
+    /// packet.
+    #[test]
+    fn encoder_emits_zero_byte_packet_for_duplicate_frame() {
+        use oxideav_core::{Decoder, Encoder};
+        let (ident, setup) = ki30_ident_setup();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let mut enc =
+            TheoraEncoder::with_keyframe_interval(codec_id.clone(), ident.clone(), setup, 63, 4)
+                .unwrap();
+        let g = build_frame_geometry(&ident).unwrap();
+
+        let to_vf = |src: &SourceFrame, pts: i64| -> oxideav_core::VideoFrame {
+            use oxideav_core::frame::VideoPlane;
+            let flip = |samples: &[u8], dims: PlaneDimensions| -> VideoPlane {
+                VideoPlane {
+                    stride: dims.width as usize,
+                    data: plane_to_top_down(samples, dims),
+                }
+            };
+            oxideav_core::VideoFrame {
+                pts: Some(pts),
+                planes: vec![
+                    flip(&src.samples_y, g.dims_y),
+                    flip(&src.samples_cb, g.dims_c),
+                    flip(&src.samples_cr, g.dims_c),
+                ],
+            }
+        };
+
+        let frame_a = gradient_source(&g, 0, 0);
+        let frame_c = gradient_source(&g, 2, 0);
+        enc.send_frame(&oxideav_core::Frame::Video(to_vf(&frame_a, 0)))
+            .unwrap();
+        // The exact same source again: a duplicate frame.
+        enc.send_frame(&oxideav_core::Frame::Video(to_vf(&frame_a, 1)))
+            .unwrap();
+        // A truly changed frame.
+        enc.send_frame(&oxideav_core::Frame::Video(to_vf(&frame_c, 2)))
+            .unwrap();
+
+        let mut data_sizes = Vec::new();
+        let mut dec = TheoraDecoder::new(codec_id);
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if !p.flags.header {
+                        data_sizes.push(p.data.len());
+                    }
+                    dec.send_packet(&p).unwrap();
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error: {e}"),
+            }
+        }
+        assert_eq!(data_sizes.len(), 3);
+        assert!(data_sizes[0] > 0, "keyframe is a normal data packet");
+        assert_eq!(
+            data_sizes[1], 0,
+            "the duplicate frame must be a zero-byte packet"
+        );
+        assert!(
+            data_sizes[2] > 0,
+            "a changed frame must still be a normal inter packet"
+        );
+
+        // The duplicate decodes bit-exactly equal to the keyframe's
+        // output; the changed frame does not.
+        let mut outs = Vec::new();
+        for _ in 0..3 {
+            let oxideav_core::Frame::Video(vf) = dec.receive_frame().unwrap() else {
+                panic!("expected video frame");
+            };
+            outs.push(vf);
+        }
+        assert_eq!(outs[0].planes[0].data, outs[1].planes[0].data);
+        assert_eq!(outs[0].planes[1].data, outs[1].planes[1].data);
+        assert_eq!(outs[0].planes[2].data, outs[1].planes[2].data);
+        assert_ne!(outs[0].planes[0].data, outs[2].planes[0].data);
     }
 }

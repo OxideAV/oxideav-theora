@@ -266,7 +266,10 @@ zero-initialized reference store.
   A noise-only P-frame (±3, residuals surviving the weakest quantizer)
   drops from 140 B to 5 B and reconstructs as a bit-exact reference
   copy, while a strongly changed block in the same conditions still
-  codes and tracks the source.
+  codes and tracks the source. When the skip decision empties a
+  `TheoraEncoder` P-frame entirely (a **duplicate frame**), the
+  encoder emits the spec's own syntax for that: a §7.11 step-2
+  zero-byte packet, decoding bit-exactly as a previous-frame copy.
 
 * **Framework `Decoder` integration** — `TheoraDecoder` implements
   `oxideav_core::Decoder`, and `register` installs it into a

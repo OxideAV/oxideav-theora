@@ -16665,6 +16665,38 @@ impl TheoraEncoder {
             qi_max,
             self.keyframe_interval,
         ));
+        // Declare the target in the §6.2 `NOMBR` nominal-bitrate field:
+        // the header is informational, but a stream produced under rate
+        // control *has* a nominal rate, and downstream tooling reads it
+        // from here. The field saturates at its 24-bit maximum, which
+        // §6.2 defines as "2^24 - 1 or greater". The already-queued
+        // identification header packet and the advertised extradata are
+        // re-serialized to match (this builder runs before any frame is
+        // sent, so the ident packet is still sitting at the head of the
+        // pending queue).
+        let nombr = target_bits_per_second.min((1 << 24) - 1) as u32;
+        if self.ident.nombr != nombr {
+            self.ident.nombr = nombr;
+            self.frame_encoder.ident.nombr = nombr;
+            if let Ok(ident_pkt) = encode_identification_header(&self.ident) {
+                if let Some(head) = self
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.flags.header && p.data.first() == Some(&0x80))
+                {
+                    head.data = ident_pkt;
+                }
+                let headers: Vec<&[u8]> = self
+                    .pending
+                    .iter()
+                    .filter(|p| p.flags.header)
+                    .map(|p| p.data.as_slice())
+                    .collect();
+                if let Ok(ed) = pack_extradata(&headers) {
+                    self.output_params.extradata = ed;
+                }
+            }
+        }
         self
     }
 
@@ -39036,5 +39068,70 @@ mod tests {
                 }
             }
         }
+    }
+    /// Enabling rate control declares the target in the §6.2 `NOMBR`
+    /// nominal-bitrate field: the already-queued identification header
+    /// packet and the advertised `extradata` are re-serialized so both
+    /// carriage paths agree, and the value saturates at the 24-bit
+    /// maximum (§6.2: "2^24 - 1 or greater"). The stream still decodes
+    /// end-to-end from the rewritten `output_params`.
+    #[test]
+    fn target_bitrate_declares_nombr_in_ident_header() {
+        use oxideav_core::Encoder;
+        let (ident, setup) = ki30_ident_setup();
+        assert_eq!(ident.nombr, 0, "fixture header declares no rate");
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+
+        let mut enc = TheoraEncoder::new(codec_id.clone(), ident.clone(), setup.clone(), 40)
+            .unwrap()
+            .with_target_bitrate(500_000);
+
+        // The queued ident header packet carries the declared rate.
+        let first = enc.receive_packet().unwrap();
+        assert!(first.flags.header);
+        let hdr = decode_identification_header(&first.data).unwrap();
+        assert_eq!(hdr.nombr, 500_000);
+
+        // The advertised extradata chain was rewritten to match, and a
+        // decoder built from it still decodes the stream.
+        let params = enc.output_params().clone();
+        let g = build_frame_geometry(&ident).unwrap();
+        let src = gradient_source(&g, 0, 0);
+        use oxideav_core::frame::VideoPlane;
+        let flip = |samples: &[u8], dims: PlaneDimensions| -> VideoPlane {
+            VideoPlane {
+                stride: dims.width as usize,
+                data: plane_to_top_down(samples, dims),
+            }
+        };
+        let vf = oxideav_core::VideoFrame {
+            pts: Some(0),
+            planes: vec![
+                flip(&src.samples_y, g.dims_y),
+                flip(&src.samples_cb, g.dims_c),
+                flip(&src.samples_cr, g.dims_c),
+            ],
+        };
+        enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+        let mut dec = make_decoder(&params).unwrap();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => dec.send_packet(&p).unwrap(),
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error: {e}"),
+            }
+        }
+        let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!("expected video frame");
+        };
+        assert_eq!(out.planes.len(), 3);
+
+        // Saturation at the 24-bit ceiling.
+        let mut enc = TheoraEncoder::new(codec_id, ident, setup, 40)
+            .unwrap()
+            .with_target_bitrate(20_000_000);
+        let first = enc.receive_packet().unwrap();
+        let hdr = decode_identification_header(&first.data).unwrap();
+        assert_eq!(hdr.nombr, (1 << 24) - 1);
     }
 }

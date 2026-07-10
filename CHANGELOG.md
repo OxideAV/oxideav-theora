@@ -6,6 +6,16 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Rate-control target declared in the §6.2 `NOMBR` field
+  (round 406)** — `TheoraEncoder::with_target_bitrate` (and the
+  bounded variant) now writes the target into the identification
+  header's nominal-bitrate field, saturating at the 24-bit maximum
+  (§6.2 defines `2^24 - 1` as "that value or greater"). The
+  already-queued ident header packet and the advertised
+  `output_params.extradata` chain are re-serialized so both header
+  carriage paths agree; a decoder built from the rewritten extradata
+  still decodes the stream (pinned in-test, saturation included).
+
 - **Encoder-output corruption + stress hardening (round 406)** — two
   new regression harnesses. A deterministic corruption storm (xorshift
   PRNG, reproducible) applies 2400 mutations — bit flips, byte

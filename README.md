@@ -371,7 +371,11 @@ zero-initialized reference store.
   encoder's keyframe interval). The loop is fully opt-in (disabled by
   default, a no-op), and over a multi-frame textured run a strict target
   produces a measurably smaller stream than a generous one while every
-  frame still decodes valid through `TheoraDecoder`.
+  frame still decodes valid through `TheoraDecoder`. Enabling the loop
+  also **declares the target in the §6.2 `NOMBR`** nominal-bitrate
+  header field (saturating at the 24-bit "`2^24 − 1` or greater"
+  ceiling), rewriting the queued ident packet and the advertised
+  extradata chain so both header carriage paths agree.
 
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation

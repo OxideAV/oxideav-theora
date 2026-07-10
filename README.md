@@ -5,8 +5,15 @@
 Pure-Rust Theora video codec — clean-room implementation, in progress.
 The crate works on Theora packets directly (it does not parse the Ogg
 container); callers de-frame the bitstream packets and hand them in. The
-decoder is sample-exact for its supported feature set; an intra-frame
-encoder now round-trips through the crate's own decoder faithfully.
+decoder is sample-exact for its supported feature set (validated up to
+HD against reference dumps). The encoder emits complete self-describing
+streams — §6 headers plus intra and inter (P) frames through a unified
+rate-distortion mode decision over all eight §7.5.2 coding modes, with
+motion estimation to half-pixel accuracy, per-block skip, adaptive
+quantization, content-tuned Huffman codebooks, non-macro-block-aligned
+picture regions, duplicate-frame packets, and optional target-bitrate
+rate control — every produced stream round-tripping through the
+crate's own decoder.
 
 ## What works
 
@@ -441,6 +448,13 @@ chroma blocks that earlier diverged is now sample-exact.
   bitstream). A *third-party*-captured `expected.yuv` fixture for these
   modes is still absent because the reference encoder's `testsrc`-class
   encodes never emit a golden or four-MV macroblock.
+* **Third-party decode validation of encoder output** — the encoder's
+  streams are validated through this crate's own ~sample-exact decoder
+  (plus a 2400-case corruption-storm harness on the packets
+  themselves). Feeding them to an external Theora decoder as a black
+  box requires Ogg encapsulation, which is the container crate's job —
+  a cross-crate encode→mux→external-decode check belongs in the
+  workspace-level test crate once the Ogg muxer can carry Theora.
 
 ## Usage
 

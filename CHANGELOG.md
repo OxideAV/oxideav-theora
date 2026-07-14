@@ -6,6 +6,36 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Fixed
 
+- **Rate-distortion λ derived from the actual quantizer step
+  (round 413)** — the Lagrange multiplier shared by every encoder RD
+  decision (inter mode decision, per-block skip, adaptive-quantization
+  choosers, keyframe-rate policy) was a quadratic ramp in the raw
+  quantizer *index*, which slopes the wrong way: in Theora a higher
+  `qi` is a *smaller* step (the high-fidelity regime where a saved bit
+  buys back little squared error), yet the ramp priced a bit there at
+  hundreds of SSD units, so P-frames skipped residuals the fine step
+  could have coded. Externally measured (encode → Ogg mux → black-box
+  reference decode → PSNR vs source, 16-frame I+P sweep at 320×240):
+  luma PSNR *fell* from 44.8 dB (qi 52) to 39.0 dB (qi 63) while rate
+  still rose — strictly dominated operating points. λ is now
+  `step² / 48` (§6.4.3 luma first-AC quantization value, ≈ (sample
+  step)²/3, divisor swept over {12, 24, 48, 96, 384} on the external
+  harness) and the same sweep is monotone on both axes: qi 63 moves to
+  51.4 dB at +4.5 % bytes, qi 40 gains +0.7 dB at +1 % bytes, and the
+  qi-0 rate floor drops ~33 % (heavier RD skipping where a bit buys
+  real distortion), which also lands the target-bitrate loop within
+  ±1 % of every externally-measured reachable target (a 400 kb/s
+  target previously overshot +17.6 %). Multi-`qi` frames take λ from
+  the **geometric mean** of the candidate steps (integer sqrt/cbrt,
+  bit-reproducible) instead of `qis[0]` alone, so a `QIS = [0, 63]`
+  spread no longer prices every block in the strongest candidate's
+  regime; intra frames use the intra (`qti = 0`) matrices. The
+  per-block skip regressions are re-pinned at qi 40 — at the weakest
+  quantizers coding ±3 noise now correctly *wins* the Lagrangian —
+  and the keyframe-rate-policy regression bounds its whole-stream
+  premium (a greedy per-frame policy never guaranteed global
+  dominance) instead of asserting it.
+
 - **`TheoraIdentHeader::for_picture` emits a container-carriable
   `KFGSHIFT` (round 413)** — the constructor wrote `KFGSHIFT = 0`,
   which makes the §A.2.3 granule mapping's offset-since-keyframe half

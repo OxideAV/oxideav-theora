@@ -4,6 +4,20 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`TheoraIdentHeader::for_picture` emits a container-carriable
+  `KFGSHIFT` (round 413)** — the constructor wrote `KFGSHIFT = 0`,
+  which makes the §A.2.3 granule mapping's offset-since-keyframe half
+  zero bits wide: a stream containing *any* inter frame cannot be
+  assigned granule positions at all, so encoder output built on a
+  `for_picture` header was unmuxable into Ogg (the first P frame has
+  no representable granule). The default is now 6 — offsets up to 63
+  cover a keyframe interval of 64 frames at the fewest granule bits —
+  and the field stays public for callers planning longer GOPs or
+  matching an existing stream. Surfaced by this round's external
+  container-carriage validation.
+
 ### Added
 
 - **Four-step whole-pixel motion search (round 406)** — the motion

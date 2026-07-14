@@ -2238,11 +2238,20 @@ impl TheoraIdentHeader {
     /// pixels, so both offsets always fit their 8-bit fields.
     ///
     /// `frn` / `frd` are the §6.2 frame-rate fraction (both must be
-    /// non-zero). The remaining informational fields are left neutral —
-    /// `PARN = PARD = 0` (aspect ratio not declared), `CS` undefined,
-    /// `NOMBR = 0`, `QUAL = 0`, `KFGSHIFT = 0` — and may be adjusted on
-    /// the returned header before use (they do not affect the frame
-    /// geometry).
+    /// non-zero). The informational fields are left neutral — `PARN =
+    /// PARD = 0` (aspect ratio not declared), `CS` undefined, `NOMBR =
+    /// 0`, `QUAL = 0` — and may be adjusted on the returned header
+    /// before use (they do not affect the frame geometry).
+    ///
+    /// `KFGSHIFT` is set to 6. A container maps each frame to a §A.2.3
+    /// granule position splitting at `KFGSHIFT` bits: the low half is
+    /// the frame's offset since its governing keyframe, so a shift of
+    /// zero can only mark keyframes — a stream with *any* inter frame
+    /// becomes uncarriable (its granule offsets are unrepresentable).
+    /// Six offset bits cover a keyframe interval up to 64 frames while
+    /// spending the fewest granule bits; a caller planning longer GOPs
+    /// (or matching an existing stream) can override the public field
+    /// before building the encoder.
     ///
     /// Returns [`Error::EncodePictureDimensionOutOfRange`] when an axis
     /// is zero or exceeds `16 * 65535 = 1048560` (the largest picture
@@ -2300,7 +2309,11 @@ impl TheoraIdentHeader {
             cs: ColorSpace::Undefined,
             nombr: 0,
             qual: 0,
-            kfgshift: 0,
+            // §A.2.3: the granule offset-since-keyframe half must be
+            // wide enough to mark inter frames; 0 would make any
+            // stream with a P frame uncarriable in Ogg. 6 covers
+            // keyframe intervals up to 64 frames.
+            kfgshift: 6,
             pf,
         })
     }
@@ -38261,6 +38274,9 @@ mod tests {
         assert_eq!((h.coded_width(), h.coded_height()), (32, 32));
         assert_eq!((h.picw, h.pich), (26, 18));
         assert_eq!((h.picx, h.picy), (0, 14), "top-aligned: 32 - 18 = 14");
+        // §A.2.3 carriage: the granule offset-since-keyframe half must
+        // be nonzero-width or inter frames cannot be marked at all.
+        assert_eq!(h.kfgshift, 6, "container-carriable KFGSHIFT default");
         let back = decode_identification_header(&encode_identification_header(&h).unwrap());
         assert_eq!(back.unwrap(), h);
 

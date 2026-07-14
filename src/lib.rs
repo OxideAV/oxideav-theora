@@ -16152,6 +16152,17 @@ pub struct TheoraEncoder {
     /// `None` disables scene-cut detection (keyframes are purely
     /// interval-driven).
     scene_cut_threshold: Option<f64>,
+    /// Running (exponential, α = ½) average of the per-frame mean
+    /// absolute luma difference measured by scene-cut detection within
+    /// the current GOP. `None` until the first inter frame after a
+    /// keyframe has seeded it; cleared whenever a keyframe is emitted.
+    /// Scene-cut fires only when a frame's difference is large both
+    /// absolutely (past the threshold) and *relatively* (more than
+    /// twice this average): steadily fast-moving content keeps a high
+    /// but flat difference against the previous reconstruction, and
+    /// converting every such frame to a keyframe storms the stream
+    /// with intra spellings that refresh nothing.
+    scene_cut_mad_avg: Option<f64>,
     /// Optional measured-rate keyframe policy (the golden-frame
     /// refresh policy). When `Some(ratio)`, a frame that would be coded
     /// inter but whose coded size exceeds `ratio ×` the last keyframe's
@@ -16482,6 +16493,7 @@ impl TheoraEncoder {
             inter_mode: InterModeStrategy::default(),
             rate_control: None,
             scene_cut_threshold: None,
+            scene_cut_mad_avg: None,
             keyframe_rate_ratio: None,
             last_keyframe_bytes: None,
             adaptive_qis: None,
@@ -16663,12 +16675,27 @@ impl TheoraEncoder {
     /// encoder measures the mean absolute luma difference (in 0..=255
     /// sample units) between the incoming source and the previous
     /// reconstructed reference. When that difference exceeds `threshold`
-    /// the frame is coded as a fresh keyframe instead — a scene change
-    /// makes inter prediction worthless (the residual would be nearly as
-    /// large as a fresh intra frame anyway), so an intra frame is both
-    /// smaller and resets the golden / previous references cleanly. The
-    /// keyframe-interval counter restarts from the inserted keyframe, so
-    /// the next forced keyframe is a full interval later.
+    /// **and** more than doubles the current GOP's running average
+    /// difference, the frame is coded as a fresh keyframe instead — a
+    /// scene change makes inter prediction worthless (the residual would
+    /// be nearly as large as a fresh intra frame anyway), so an intra
+    /// frame is both smaller and resets the golden / previous references
+    /// cleanly. The keyframe-interval counter restarts from the inserted
+    /// keyframe, so the next forced keyframe is a full interval later.
+    ///
+    /// The relative gate distinguishes a *cut* (one frame's difference
+    /// spiking above its neighbourhood) from steadily fast-moving
+    /// content, whose difference is high but flat frame over frame — an
+    /// absolute threshold alone converts every such frame to intra, and
+    /// an externally-measured moving-texture stream coded that way ran
+    /// 1.5× the bytes of the gated spelling at 1.4 dB *lower* luma
+    /// PSNR — the intra spellings tracked the source worse than the
+    /// inter frames they displaced. The
+    /// first inter frame after any keyframe only seeds the average (its
+    /// references are one frame old, so a large difference there is
+    /// indistinguishable from motion); gradual reference decay with no
+    /// single-frame spike is the measured-rate policy's job
+    /// ([`Self::with_keyframe_rate_policy`]).
     ///
     /// A typical threshold is in the 20–40 range (a fifth of the dynamic
     /// range); lower thresholds insert keyframes more eagerly. Scene-cut
@@ -16828,11 +16855,20 @@ impl TheoraEncoder {
 
         // Scene-cut detection: when enabled and this frame would otherwise
         // be an inter frame, compare the incoming source luma against the
-        // previous reconstructed reference. A mean absolute difference past
-        // the threshold signals a scene change — inter prediction against
-        // an unrelated reference would code a residual nearly as large as a
-        // fresh keyframe, so force a keyframe instead (smaller, and it
-        // resets the references cleanly).
+        // previous reconstructed reference. A mean absolute difference that
+        // is large both absolutely (past the threshold) and relatively
+        // (more than twice the GOP's running average difference) signals a
+        // scene change — inter prediction against an unrelated reference
+        // would code a residual nearly as large as a fresh intra frame, so
+        // force a keyframe instead (smaller, and it resets the references
+        // cleanly). The relative gate is what separates a *cut* from
+        // steadily fast-moving content: motion keeps the difference high
+        // but flat frame over frame, and an externally-measured stream that
+        // converted every such frame to intra ran 1.5× the bytes of the
+        // gated spelling at 1.4 dB lower luma PSNR. The first inter frame after a
+        // keyframe only seeds the average — its references are one frame
+        // old, so a "cut" against them is indistinguishable from motion,
+        // and the keyframe it would ask for was just emitted.
         if !want_keyframe {
             if let (Some(threshold), Some(mirror)) =
                 (self.scene_cut_threshold, self.mirror.as_ref())
@@ -16846,8 +16882,15 @@ impl TheoraEncoder {
                         .map(|(&s, &p)| (s as i16 - p as i16).unsigned_abs() as u64)
                         .sum();
                     let mad = total as f64 / frame.samples_y.len() as f64;
-                    if mad > threshold {
-                        want_keyframe = true;
+                    match self.scene_cut_mad_avg {
+                        None => self.scene_cut_mad_avg = Some(mad),
+                        Some(avg) => {
+                            if mad > threshold && mad > 2.0 * avg {
+                                want_keyframe = true;
+                            } else {
+                                self.scene_cut_mad_avg = Some(0.5 * avg + 0.5 * mad);
+                            }
+                        }
                     }
                 }
             }
@@ -17022,6 +17065,9 @@ impl TheoraEncoder {
 
         if want_keyframe {
             self.frames_since_keyframe = 1;
+            // A keyframe (from any policy) resets the references, so the
+            // GOP-local scene-cut difference statistics restart with it.
+            self.scene_cut_mad_avg = None;
         } else {
             self.frames_since_keyframe += 1;
         }
@@ -33604,6 +33650,88 @@ mod tests {
         assert!(
             !on[1] && !on[2] && !on[4] && !on[5],
             "steady frames must stay inter (got {on:?})"
+        );
+    }
+
+    /// The scene-cut relative gate: steadily fast-moving content —
+    /// every frame's mean absolute luma difference past the absolute
+    /// threshold, but flat frame over frame — stays inter, while a
+    /// genuine cut (a spike past twice the GOP's running average
+    /// difference) still fires. Under the absolute threshold alone
+    /// every motion frame here became a keyframe (externally measured
+    /// on a moving-texture stream: 1.5× the bytes at 1.4 dB lower luma
+    /// PSNR than the gated spelling).
+    #[test]
+    fn encoder_scene_cut_relative_gate_ignores_steady_motion() {
+        use oxideav_core::Encoder;
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let threshold = 8.0f64;
+
+        // Premise: consecutive motion frames differ by more than the
+        // absolute threshold at the source (the reconstruction the
+        // detector compares against tracks the source to within the
+        // quantizer, so the measured difference is in the same band —
+        // an ungated detector fires on every one of these frames).
+        let src_mad = |a: &oxideav_core::VideoFrame, b: &oxideav_core::VideoFrame| -> f64 {
+            let (pa, pb) = (&a.planes[0].data, &b.planes[0].data);
+            let total: u64 = pa
+                .iter()
+                .zip(pb.iter())
+                .map(|(&x, &y)| (x as i16 - y as i16).unsigned_abs() as u64)
+                .sum();
+            total as f64 / pa.len() as f64
+        };
+        for t in 0..5 {
+            let mad = src_mad(
+                &textured_video_frame(&ident, t),
+                &textured_video_frame(&ident, t + 1),
+            );
+            assert!(
+                mad > threshold,
+                "premise: motion frame {t}→{} MAD {mad:.1} must exceed the threshold",
+                t + 1
+            );
+        }
+
+        let mut enc =
+            TheoraEncoder::with_keyframe_interval(codec_id.clone(), ident.clone(), setup, 40, 100)
+                .unwrap()
+                .with_scene_cut_threshold(threshold);
+
+        // Six steadily-moving textured frames, then a hard cut to a
+        // flat bright frame (a difference spike far past 2× the
+        // running average).
+        for t in 0..6 {
+            enc.send_frame(&oxideav_core::Frame::Video(textured_video_frame(&ident, t)))
+                .unwrap();
+        }
+        let mut cut = flat_video_frame(&ident, 230, 128, 128, 0);
+        cut.pts = None;
+        enc.send_frame(&oxideav_core::Frame::Video(cut)).unwrap();
+
+        let mut flags: Vec<bool> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if !p.flags.header {
+                        flags.push(p.flags.keyframe);
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error {e}"),
+            }
+        }
+        assert_eq!(flags.len(), 7);
+        assert!(flags[0], "frame 0 is always a keyframe");
+        assert!(
+            flags[1..6].iter().all(|&k| !k),
+            "steady motion past the absolute threshold must stay inter (got {flags:?})"
+        );
+        assert!(
+            flags[6],
+            "the hard cut must still fire through the relative gate (got {flags:?})"
         );
     }
 

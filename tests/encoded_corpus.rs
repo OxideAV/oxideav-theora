@@ -329,8 +329,8 @@ fn encoded_corpus_digests_are_stable() {
         },
         Pin {
             name: "scenecut",
-            wire_sha256: "76781d2717018fbedc3771433d74a8911725181bcec45d58a1d8837864a1bda1",
-            recon_sha256: "42d02b500787046e6ed8a3c100c96d980cbfb8deba0551e3ae0e5f9ab3c361a9",
+            wire_sha256: "18707825163795b991ae19a9a8e66132fe246848a6e0421c42fac953a1a5f66e",
+            recon_sha256: "393c102e389d9345c9f4ac941744664b3eeee311761b1469709369024cb6da2a",
         },
         Pin {
             name: "goptuned",

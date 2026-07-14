@@ -36,6 +36,25 @@ All notable changes to `oxideav-theora` are recorded here.
   premium (a greedy per-frame policy never guaranteed global
   dominance) instead of asserting it.
 
+- **Scene-cut detection gated on a relative difference spike
+  (round 413)** — `with_scene_cut_threshold` fired on the absolute
+  mean-absolute-luma-difference test alone, so steadily fast-moving
+  content (difference high but flat frame over frame) converted
+  *every* frame to a keyframe once past the threshold: the external
+  moving-texture validation stream coded frames 7–13 all intra, at
+  1.5× the bytes and 1.4 dB lower luma PSNR than the gated spelling.
+  The detector now also requires the frame's difference to more than
+  double the GOP's running average (exponential, α = ½; seeded by the
+  first inter frame after any keyframe, which can no longer fire —
+  its references are one frame old, so a large difference there is
+  indistinguishable from motion). On the same external scenario the
+  gate cuts the stream 45.4 KB → 30.3 KB (−33 %) while luma PSNR
+  *rises* 37.7 → 39.1 dB, keyframes landing exactly at the interval
+  boundary and the true cut; hard cuts still fire (pinned in-test
+  alongside a new steady-motion regression). Gradual reference decay
+  with no single-frame spike remains `with_keyframe_rate_policy`'s
+  job.
+
 - **`TheoraIdentHeader::for_picture` emits a container-carriable
   `KFGSHIFT` (round 413)** — the constructor wrote `KFGSHIFT = 0`,
   which makes the §A.2.3 granule mapping's offset-since-keyframe half

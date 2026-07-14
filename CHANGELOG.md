@@ -50,6 +50,22 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **External (black-box) validation of the encoder + pinned
+  self-encoded corpus (round 413)** — the encoder's streams were
+  validated for the first time through an independent decoder: eleven
+  scenario families (all three pixel formats, non-MB-aligned picture
+  region, multi-`qi` adaptive quantization, rate control with `NOMBR`,
+  GOP-tuned custom Huffman setup headers, scene cuts, four-MV / golden
+  strategies, zero-byte duplicate frames) were muxed into `.ogv` via
+  the published `oxideav-ogg` crate in a throwaway helper (this crate
+  gains no container dependency), checked with `oggz-validate`, and
+  black-box-decoded — **11/11 pixel-exact** against this crate's own
+  reconstruction. The same scenario family is now pinned under
+  `tests/encoded_corpus.rs` (SHA-256 of the wire packet chain *and* of
+  the decoded output per scenario, self-generating, no staged
+  binaries) with the route + measured operating points documented in
+  `tests/encoded-corpus-notes.md`.
+
 - **Four-step whole-pixel motion search (round 406)** — the motion
   estimator's exhaustive ±3-pixel grid (49 SAD probes) is replaced by
   a four-step logarithmic descent (`whole_pixel_step_search`): from

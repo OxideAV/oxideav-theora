@@ -12,8 +12,11 @@ rate-distortion mode decision over all eight §7.5.2 coding modes, with
 motion estimation to half-pixel accuracy, per-block skip, adaptive
 quantization, content-tuned Huffman codebooks, non-macro-block-aligned
 picture regions, duplicate-frame packets, and optional target-bitrate
-rate control — every produced stream round-tripping through the
-crate's own decoder.
+rate control — and is **externally validated**: twelve scenario
+families (up to 1920×1080, all three pixel formats, every encoder
+feature above) were muxed into Ogg and black-box-decoded by an
+independent reference decoder **pixel-exactly** against this crate's
+own reconstruction, with the corpus pinned by SHA-256 under `tests/`.
 
 ## What works
 
@@ -158,10 +161,9 @@ zero-initialized reference store.
     `MOREQIS` chain + §7.6 block-level qi stream on P-frames, each
     coded block's AC quantizer chosen by `D + λ·R` on delivered SSD +
     measured rate (`TheoraEncoder::with_adaptive_quant` now covers
-    both frame types). Measured corners at equal reference state:
-    all-qi0 178 B / SSD 157576, all-qi63 586 B / SSD 2336, adaptive
-    `[0, 63]` 565 B / SSD 9767 — strictly inside the single-`qi`
-    curve.
+    both frame types); an adaptive `[0, 63]` spread lands strictly
+    inside the single-`qi` rate/distortion corners (pinned in-test at
+    equal reference state).
   * **Measured-rate keyframe policy (golden-frame refresh)** —
     `TheoraEncoder::with_keyframe_rate_policy(r)` converts a P-frame
     to a true keyframe when its references have decayed (size ratio
@@ -169,8 +171,10 @@ zero-initialized reference store.
     the intra spelling wins a Lagrangian comparison on SSD measured
     through a throwaway mirror-decoder clone — re-seeding both
     references (only intra frames refresh the golden frame). A
-    content-family switch at interval 30 measures 3 keyframes / 646 B
-    / SSD 47553 vs 1 keyframe / 651 B / the same SSD without it.
+    content-family switch at interval 30 converts the de-facto
+    keyframes while staying within a pinned whole-stream Lagrangian
+    bound of the interval-only spelling (a greedy per-frame policy
+    buys its refreshed references at a small, bounded premium).
 
 * **Inter (P-frame) encoder** — `FrameEncoder::encode_inter_frame`
   (zero-MV baseline) and `encode_inter_frame_motion` (with motion
@@ -237,8 +241,16 @@ zero-initialized reference store.
   quantize → dequantize → inverse-DCT → clamp (`block_rd_cost`), so a
   candidate is scored on *delivered* fidelity rather than a
   pre-quantization SAD proxy; the rate `R` folds in the §7.4 mode code
-  and §7.5 `MVMODE = 1` explicit-MV bits, weighted by a
-  quantizer-derived multiplier λ (`inter_rd_lambda`, monotone in `qi`).
+  and §7.5 `MVMODE = 1` explicit-MV bits, weighted by a multiplier λ
+  derived from the frame's **actual quantizer step** (λ ∝ step² on the
+  §6.4.3 luma first-AC quantization value; multi-`qi` frames take the
+  geometric mean of their candidate steps). External measurement —
+  encode → Ogg mux → black-box reference decode → PSNR — calibrated
+  the constant and caught the previous raw-`qi` ramp sloping the wrong
+  way (a higher `qi` is a *smaller* step in Theora): the I+P
+  rate/PSNR curve used to fold over above qi 52 (44.8 → 39.0 dB at
+  qi 63 with rate still rising) and is now monotone on both axes
+  (qi 63 at 51.4 dB for +4.5 % bytes).
   This subsumes the raw-SAD previous-vs-golden choice into one decision
   on reconstructed distortion; `INTER_MV` winners still flow through the
   §7.5.2 `INTER_MV_LAST` / `INTER_MV_LAST2` recode. The RD rate term is
@@ -274,10 +286,12 @@ zero-initialized reference store.
   spellings by the frame's Lagrangian (skip: predictor SSD, zero bits;
   code: delivered SSD + λ·measured token bits) and keeps the cheaper
   one; `block_rd_cost` applies the same min inside the mode decision.
-  A noise-only P-frame (±3, residuals surviving the weakest quantizer)
-  drops from 140 B to 5 B and reconstructs as a bit-exact reference
-  copy, while a strongly changed block in the same conditions still
-  codes and tracks the source. When the skip decision empties a
+  A noise-only P-frame (±3, residuals surviving a mid-strength qi-40
+  quantizer) drops from ~140 B to 5 B and reconstructs as a bit-exact
+  reference copy, while a strongly changed block in the same conditions
+  still codes and tracks the source (at the *weakest* quantizers the
+  step-derived λ correctly prefers coding the noise — bits are cheap
+  in that regime). When the skip decision empties a
   `TheoraEncoder` P-frame entirely (a **duplicate frame**), the
   encoder emits the spec's own syntax for that: a §7.11 step-2
   zero-byte packet, decoding bit-exactly as a previous-frame copy.
@@ -327,7 +341,12 @@ zero-initialized reference store.
   reference. Optional **scene-cut detection**
   (`with_scene_cut_threshold`) inserts a fresh keyframe mid-GOP when the
   mean absolute luma difference between the incoming source and the
-  previous reconstruction exceeds the threshold — a scene change makes
+  previous reconstruction exceeds the threshold **and** more than
+  doubles the GOP's running average difference — the relative gate
+  separates a cut (a one-frame spike) from steadily fast-moving
+  content, which an absolute threshold alone converted to a keyframe
+  storm (externally measured: the gated spelling of a moving-texture
+  stream is 33 % smaller *and* 1.4 dB better); a scene change makes
   inter prediction worthless, so an intra frame is both smaller and
   resets the references; the keyframe-interval counter restarts from the
   inserted keyframe. The encoder mirrors its own output through an internal
@@ -348,7 +367,9 @@ zero-initialized reference store.
   `PICY = 16·FMBH − PICH` in the spec's lower-left coordinates — the
   placement observed on the reference-captured fixtures), with
   `picture_plane_dims` exposing the §4.4.4 chroma round-up per pixel
-  format. `SourceFrame::from_picture` pads picture-shaped planes to
+  format, and a container-carriable `KFGSHIFT` default of 6 (a zero
+  shift leaves inter frames with no representable §A.2.3 granule
+  position — the field stays public for longer GOPs). `SourceFrame::from_picture` pads picture-shaped planes to
   the coded frame by edge replication (§2.2 leaves the outside-region
   samples to the encoder; replication keeps the padding blocks'
   residual energy near zero), and `TheoraEncoder::send_frame` accepts
@@ -380,9 +401,10 @@ zero-initialized reference store.
   average target is preserved exactly while a keyframe no longer perturbs
   the frames after it (the controller learns the GOP length from the
   encoder's keyframe interval). The loop is fully opt-in (disabled by
-  default, a no-op), and over a multi-frame textured run a strict target
-  produces a measurably smaller stream than a generous one while every
-  frame still decodes valid through `TheoraDecoder`. Enabling the loop
+  default, a no-op). **Externally measured** (5-second 320×240 runs
+  decoded black-box from the muxed `.ogv`): a 400 kb/s target lands
+  +0.5 % and an 800 kb/s target −0.9 %, while a target below the
+  content's `qi_min` rate floor saturates cleanly at the floor. Enabling the loop
   also **declares the target in the §6.2 `NOMBR`** nominal-bitrate
   header field (saturating at the 24-bit "`2^24 − 1` or greater"
   ceiling), rewriting the queued ident packet and the advertised
@@ -440,21 +462,37 @@ chroma blocks that earlier diverged is now sample-exact.
   header and a quantizer to emit a complete self-describing stream; a
   caller may still supply pre-decoded tables via `TheoraEncoder::new` /
   `extradata` when matching an existing setup.
-* **Reference-captured golden / four-MV corpus fixture** — the
+* **Reference-captured golden / four-MV decode fixture** — the
   golden-reference and four-MV inter modes are exercised
-  top-to-bottom through this crate's own encoder→decoder round trip
-  (the §7.5.2 four-MV decode + chroma averaging and §7.9.4 golden /
-  per-block reconstruction all run against a real, self-encoded
-  bitstream). A *third-party*-captured `expected.yuv` fixture for these
-  modes is still absent because the reference encoder's `testsrc`-class
-  encodes never emit a golden or four-MV macroblock.
-* **Third-party decode validation of encoder output** — the encoder's
-  streams are validated through this crate's own ~sample-exact decoder
-  (plus a 2400-case corruption-storm harness on the packets
-  themselves). Feeding them to an external Theora decoder as a black
-  box requires Ogg encapsulation, which is the container crate's job —
-  a cross-crate encode→mux→external-decode check belongs in the
-  workspace-level test crate once the Ogg muxer can carry Theora.
+  top-to-bottom through this crate's own encoder→decoder round trip,
+  and self-encoded golden / four-MV streams are now also decoded
+  **pixel-exactly by an external black-box decoder** (see below). A
+  *third-party-encoded* `expected.yuv` fixture for these modes is
+  still absent because the reference encoder's `testsrc`-class encodes
+  never emit a golden or four-MV macroblock.
+
+## External validation (round 413)
+
+The encoder's output is validated by an **independent reference
+decoder**, black-box, end-to-end: twelve scenario families — plain
+I/P GOPs at 320×240 and 1920×1080, 4:2:2 and 4:4:4, a non-MB-aligned
+130×98 picture region, multi-`qi` adaptive quantization, target-bitrate
+rate control (with the `NOMBR` declaration), GOP-tuned custom Huffman
+setup headers, scene cuts, the four-MV and golden inter strategies, and
+zero-byte duplicate-frame packets — were muxed into `.ogv` through the
+published `oxideav-ogg` crate (in a throwaway helper project; this
+crate itself takes no container dependency), passed `oggz-validate`,
+and decoded to raw video that matched this crate's own reconstruction
+**byte-for-byte in all twelve cases**. The same scenario family is
+pinned by SHA-256 (wire packets + decoded output) in
+`tests/encoded_corpus.rs`, with the route, verdicts, and measured
+operating points (externally-measured rate/PSNR curves and
+rate-control accuracy within ±1 % of reachable targets) documented in
+`tests/encoded-corpus-notes.md`. The external route surfaced and fixed
+three real defects this round: `for_picture`'s `KFGSHIFT = 0` (inter
+frames had no representable Ogg granule position), a wrong-slope RD λ
+(the rate/PSNR curve folded over above qi 52), and a scene-cut
+detector that converted steady motion into keyframe storms.
 
 ## Usage
 

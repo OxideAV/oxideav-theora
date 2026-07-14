@@ -400,7 +400,13 @@ zero-initialized reference store.
   repaid in equal shares across the GOP's inter frames, so the long-run
   average target is preserved exactly while a keyframe no longer perturbs
   the frames after it (the controller learns the GOP length from the
-  encoder's keyframe interval). The loop is fully opt-in (disabled by
+  encoder's keyframe interval). The fullness accumulator is **anti-windup
+  clamped** to the ±8 per-frame budgets the proportional step can act
+  on, so a stretch of content far under budget cannot bank unbounded
+  credit (externally measured at a reachable 400 kb/s target: a busy
+  stretch after 3 s of static content ran >2× the target for 3+
+  seconds unclamped, and is back inside regulation within one second
+  clamped). The loop is fully opt-in (disabled by
   default, a no-op). **Externally measured** (5-second 320×240 runs
   decoded black-box from the muxed `.ogv`): a 400 kb/s target lands
   +0.5 % and an 800 kb/s target −0.9 %, while a target below the

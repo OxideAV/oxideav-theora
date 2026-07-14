@@ -36,6 +36,20 @@ All notable changes to `oxideav-theora` are recorded here.
   premium (a greedy per-frame policy never guaranteed global
   dominance) instead of asserting it.
 
+- **Rate-control anti-windup (round 413)** — the leaky-bucket fullness
+  accumulator was unbounded, so a stretch of content far under budget
+  banked unlimited credit that the next busy stretch spent as a
+  sustained overshoot burst: externally measured at a reachable
+  400 kb/s target (320×240, 30 fps), 3 s of static content followed by
+  busy content ran **>2× the target for 3+ seconds** (814/560/693 kb/s
+  per second). The accumulator is now clamped to the ±8 per-frame
+  budgets the proportional step saturates at — beyond that window the
+  extra fullness commands no stronger correction, it only delays
+  recovery — and the same probe is back inside regulation within one
+  second (493/377/435 kb/s). Symmetric on the over-budget side. Pinned
+  by a controller-level regression; the corpus digests are unchanged
+  (the pinned rate-control stream never left the clamp window).
+
 - **Scene-cut detection gated on a relative difference spike
   (round 413)** — `with_scene_cut_threshold` fired on the absolute
   mean-absolute-luma-difference test alone, so steadily fast-moving

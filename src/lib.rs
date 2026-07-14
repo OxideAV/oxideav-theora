@@ -16361,6 +16361,18 @@ impl RateControl {
         // Leaky bucket: add what we spent, drain this frame's budget.
         self.fullness_bits += coded_bits - drained;
 
+        // Anti-windup: the proportional step below saturates at ±8
+        // per-frame budgets, so fullness beyond that reach cannot
+        // command any stronger correction — it only accumulates debt
+        // (or credit) that delays recovery once conditions change.
+        // Without the clamp, a stretch of content cheaper than the
+        // target banks unbounded credit, and the first busy second
+        // after it was measured at ~2.9× the target before the
+        // controller worked the credit off; clamped, the burst is
+        // bounded by the step saturation window.
+        let cap = 8.0 * self.bits_per_frame;
+        self.fullness_bits = self.fullness_bits.clamp(-cap, cap);
+
         // Proportional control: how many whole per-frame budgets are we
         // over (or under)? Each budget of imbalance shifts qi by one step
         // toward correcting it — *down* when over budget (lower qi =
@@ -34417,6 +34429,58 @@ mod tests {
              flat bucket ({}) — bonus fully repaid",
             a.fullness_bits,
             f.fullness_bits
+        );
+    }
+
+    /// Anti-windup: the fullness accumulator is clamped to the ±8
+    /// per-frame budgets the proportional step can actually act on.
+    /// Without the clamp a stretch of content far under budget banks
+    /// unbounded credit, and the first busy stretch after it spends
+    /// that credit as a sustained overshoot burst (externally measured
+    /// at a reachable 400 kb/s target: >2× the target for 3+ seconds
+    /// unclamped, back inside regulation within one second clamped).
+    #[test]
+    fn rate_control_anti_windup_bounds_banked_credit() {
+        // 300 kb/s at 30 fps → 10 000 bits (1 250 B) per-frame budget.
+        let mut rc = RateControl::new(300_000, 30, 1, 32, 0, 63, 1);
+        let cap = 8.0 * rc.bits_per_frame;
+
+        // 90 near-empty frames (≈ 3 s of static content). An unbounded
+        // bucket would bank ≈ −900 kbit; the clamp holds the credit at
+        // the step-saturation window.
+        for _ in 0..90 {
+            rc.observe_frame(4, false);
+        }
+        assert!(
+            rc.fullness_bits >= -cap - 1e-9,
+            "banked credit {} must be clamped to −{cap}",
+            rc.fullness_bits
+        );
+        // Under budget the controller correctly sits at the weakest
+        // quantizer, ready to spend headroom on fidelity.
+        assert_eq!(rc.qi_for_next_frame(), 63);
+
+        // Busy content returns at 4× budget. With the clamp the debt
+        // window is at most 8 budgets, so the controller is back to
+        // commanding *stronger* quantization (qi below the seed) within
+        // a handful of frames — not after seconds of credit repayment.
+        let mut frames_to_correct = 0;
+        while rc.qi_for_next_frame() > 32 && frames_to_correct < 100 {
+            rc.observe_frame(5_000, false);
+            frames_to_correct += 1;
+        }
+        assert!(
+            frames_to_correct <= 16,
+            "controller must re-engage within the step window, took {frames_to_correct} frames"
+        );
+        // The over-budget side is clamped symmetrically.
+        for _ in 0..90 {
+            rc.observe_frame(5_000, false);
+        }
+        assert!(
+            rc.fullness_bits <= cap + 1e-9,
+            "over-budget debt {} must be clamped to {cap}",
+            rc.fullness_bits
         );
     }
 

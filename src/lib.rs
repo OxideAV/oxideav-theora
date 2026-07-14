@@ -13954,10 +13954,13 @@ impl FrameEncoder {
     /// resulting coefficients — combined run+value tokens and coalesced
     /// cross-block EOB runs included — is tallied per plane and Huffman
     /// group, exactly as the frame writer's own selector optimization
-    /// scores it. Because the token plan depends only on the quantized
-    /// coefficients (never on the codebooks that will spell them), a
-    /// first-pass tally taken with base tables transfers exactly to a
-    /// second pass encoded with tuned tables.
+    /// scores it. The token plan for a *given* coefficient plan depends
+    /// only on those quantized coefficients — but the plan itself is
+    /// chosen by rate-distortion decisions that price bits against the
+    /// stream's own codebooks (the measured token costs), so a second pass
+    /// encoded with tuned tables may legally re-spell blocks whose
+    /// Lagrangian trade flips under the cheaper codes. The tally is a
+    /// statistical profile for table tuning, not a byte-exact promise.
     pub fn inter_token_statistics(
         &self,
         frame: &SourceFrame,
@@ -16612,11 +16615,13 @@ impl TheoraEncoder {
     /// luma/chroma) so keyframes and P-frames each get tables
     /// specialized to their own token mix — the per-frame selector
     /// optimization routes every frame to whichever is cheapest.
-    /// Because the §7.7 token plan depends only on the quantized
-    /// coefficients (never on the codebooks that spell them), the
-    /// first-pass tally taken with `base_setup`'s tables transfers
-    /// exactly to the tuned second pass, and the tuned stream
-    /// reconstructs bit-identically to the base-table stream.
+    /// The first-pass tally is a statistical profile: the second
+    /// pass's rate-distortion decisions price bits against the *tuned*
+    /// codebooks (measured token costs), so cheaper codes may legally
+    /// flip individual Lagrangian trades and re-spell a block. In
+    /// practice the tuned stream reconstructs identically or nearly so
+    /// (the current regression content reconstructs bit-identically),
+    /// but that is measured behaviour, not a structural guarantee.
     ///
     /// The tuned tables ride in the §6.4 setup header the encoder
     /// queues (and advertises in `extradata`), so the stream stays

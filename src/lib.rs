@@ -2636,6 +2636,8 @@ pub fn parse_comment_header(packet: &[u8]) -> Result<TheoraCommentHeader, Error>
 /// from the spec — see the crate-level "Known spec gap" notice).
 ///
 /// Source: `Theora.pdf` Appendix B.2.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const LFLIMS_VP3: [u8; 64] = [
     30, 25, 20, 20, 15, 15, 14, 14, //
     13, 13, 12, 12, 11, 11, 10, 10, //
@@ -2657,6 +2659,8 @@ pub const LFLIMS_VP3: [u8; 64] = [
 /// directly; later streams override it via §6.4.2 steps 1–2.
 ///
 /// Source: `Theora.pdf` Appendix B.3.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const ACSCALE_VP3: [u16; 64] = [
     500, 450, 400, 370, 340, 310, 285, 265, //
     245, 225, 210, 195, 185, 180, 170, 160, //
@@ -2674,6 +2678,8 @@ pub const ACSCALE_VP3: [u16; 64] = [
 /// [`ACSCALE_VP3`]; later streams override via §6.4.2 steps 3–4.
 ///
 /// Source: `Theora.pdf` Appendix B.3.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const DCSCALE_VP3: [u16; 64] = [
     220, 200, 190, 180, 170, 170, 160, 160, //
     150, 150, 140, 140, 130, 130, 120, 120, //
@@ -3267,6 +3273,8 @@ pub fn decode_setup_header(packet: &[u8]) -> Result<SetupHeaderTables, Error> {
 /// let lflims: [u8; 64] = decode_loop_filter_limit_table(payload)?;
 /// # Ok::<(), oxideav_theora::Error>(())
 /// ```
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_loop_filter_limit_table(bits: &[u8]) -> Result<[u8; 64], Error> {
     let mut r = BitReader::new(bits);
     decode_lflims_inner(&mut r)
@@ -3344,6 +3352,8 @@ fn ilog(a: i64) -> u32 {
 ///
 /// The procedure transcribes the numbered steps of §6.4.2 of the
 /// Xiph Theora I Specification directly.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_quantization_parameters(bits: &[u8]) -> Result<QuantizationParameters, Error> {
     let mut r = BitReader::new(bits);
     decode_quant_params_inner(&mut r)
@@ -3511,6 +3521,8 @@ fn qmin_table(qti: usize, ci: usize) -> u32 {
 /// `max(QMIN, min(..., 4096))`, and the per-coefficient `QMIN` (Table
 /// 6.18) is always `>= 8`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct QuantizationMatrix {
     /// The 64 quantizer values, indexed by natural-order coefficient
     /// index `ci` (`0` = DC). Each is in `1..=4096`.
@@ -3556,6 +3568,8 @@ pub struct QuantizationMatrix {
 /// * [`Error::QuantTypeIndexOutOfRange`] if `qti > 1`.
 /// * [`Error::QuantPlaneIndexOutOfRange`] if `pli > 2`.
 /// * [`Error::QuantIndexOutOfRange`] if `qi > 63`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn compute_quantization_matrix(
     params: &QuantizationParameters,
     qti: usize,
@@ -4044,6 +4058,8 @@ pub(crate) enum ReadTokenErr {
 ///
 /// The procedure transcribes the numbered steps of §6.4.4 of the Xiph
 /// Theora I Specification directly.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_dct_token_huffman_tables(
     bits: &[u8],
 ) -> Result<Box<[HuffmanTable; NUM_HUFFMAN_TABLES]>, Error> {
@@ -4170,6 +4186,8 @@ pub enum FrameType {
 /// Maximum number of `qi` values a single frame header may carry, per
 /// §7.1's MOREQIS termination logic (steps 4–6 unroll to at most three
 /// indices).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MAX_FRAME_QIS: usize = 3;
 
 /// Parsed Theora frame header, per §7.1 of the Xiph Theora I
@@ -4226,6 +4244,8 @@ impl TheoraFrameHeader {
 ///   an intra frame (§7.1 step 7) is non-zero.
 /// * [`Error::TruncatedHeader`] if the packet runs out of bits before
 ///   the header is complete.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_frame_header(packet: &[u8], first_frame: bool) -> Result<TheoraFrameHeader, Error> {
     let mut r = BitReader::new(packet);
     decode_frame_header_inner(&mut r, first_frame)
@@ -4382,6 +4402,8 @@ struct LongRunEntry {
 /// (Table 7.7 last row: `RSTART + (1 << RBITS) - 1 = 34 + 4095 = 4129`).
 /// In a Theora I-compliant stream this is also the threshold above
 /// which the bit value is re-read instead of toggled (§7.2.1 step 12).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const LONG_RUN_MAX: u16 = 4129;
 
 /// Table 7.11 entry for the §7.2.2 Short-Run-length Huffman code.
@@ -4457,6 +4479,8 @@ struct ShortRunEntry {
 
 /// Maximum run length encodable by the §7.2.2 short-run Huffman codes
 /// (Table 7.11 last row: `RSTART + (1 << RBITS) - 1 = 15 + 15 = 30`).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const SHORT_RUN_MAX: u16 = 30;
 
 /// Decode a §7.2.1 Long-Run-length-coded bit string from `bits`.
@@ -4487,6 +4511,8 @@ pub const SHORT_RUN_MAX: u16 = 30;
 /// * [`Error::RunLengthOverrun`] if a decoded run length advances `LEN`
 ///   past `nbits` (a malformed stream — the §7.2.1 step 10 invariant
 ///   says "LEN MUST be less than or equal to NBITS").
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_long_run_bit_string(bits: &[u8], nbits: u64) -> Result<Vec<u8>, Error> {
     let mut r = BitReader::new(bits);
     decode_long_run_bit_string_inner(&mut r, nbits)
@@ -4591,6 +4617,8 @@ fn recognise_long_run_code(r: &mut BitReader<'_>) -> Result<LongRunEntry, Error>
 ///   the bit string is complete.
 /// * [`Error::RunLengthOverrun`] if a decoded run length advances `LEN`
 ///   past `nbits` (a malformed stream — the §7.2.2 step 10 invariant).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_short_run_bit_string(bits: &[u8], nbits: u64) -> Result<Vec<u8>, Error> {
     let mut r = BitReader::new(bits);
     decode_short_run_bit_string_inner(&mut r, nbits)
@@ -4711,6 +4739,8 @@ fn recognise_short_run_code(r: &mut BitReader<'_>) -> Result<ShortRunEntry, Erro
 ///   `block_to_super_block` is `>= nsbs`.
 /// * [`Error::TruncatedHeader`] / [`Error::RunLengthOverrun`] when the
 ///   underlying §7.2 long- or short-run decode rejects.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_coded_block_flags(
     packet: &[u8],
     ftype: FrameType,
@@ -5192,6 +5222,8 @@ fn read_table_7_19_mi(r: &mut BitReader<'_>) -> Result<u8, Error> {
 ///   index is `>= nbs`.
 /// * [`Error::TruncatedHeader`] when the underlying bit reader is
 ///   exhausted before a field is fully read.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_macroblock_modes(
     packet: &[u8],
     ftype: FrameType,
@@ -5431,6 +5463,8 @@ fn recognise_mv_huffman(r: &mut BitReader<'_>) -> Result<i8, Error> {
 /// For `mvmode == 1` the spec mandates the sign bit be read even when
 /// magnitude is zero ("for compatibility with VP3, a sign bit is read
 /// even if the magnitude read is zero") — the implementation matches.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_single_motion_vector(bits: &[u8], mvmode: u8) -> Result<MotionVector, Error> {
     let mut r = BitReader::new(bits);
     decode_single_motion_vector_inner(&mut r, mvmode)
@@ -5485,6 +5519,8 @@ pub(crate) fn decode_single_motion_vector_inner(
 /// cr_map.len() == nmbs`. Per-MB inner slices have length 1, 2, or 4
 /// depending on `pf`.
 #[derive(Debug, Clone, Copy)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct ChromaBlockLayout<'a> {
     /// Cb-plane per-macroblock block indices.
     pub cb: &'a [&'a [u32]],
@@ -5584,6 +5620,8 @@ fn four_mv_chroma_average(luma: [MotionVector; 4], pf: PixelFormat) -> Vec<Motio
 /// * [`Error::TruncatedHeader`] when the underlying bit reader is
 ///   exhausted before a field is fully read.
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_macroblock_motion_vectors(
     packet: &[u8],
     ftype: FrameType,
@@ -6133,6 +6171,8 @@ fn encode_macroblock_motion_vectors(
 /// * [`Error::BlockLevelQiNqisOutOfRange`] if `nqis` is not in `1..=3`.
 /// * [`Error::TruncatedHeader`] / [`Error::RunLengthOverrun`] when the
 ///   underlying §7.2.1 long-run decode rejects.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_block_level_qi(
     packet: &[u8],
     nbs: u32,
@@ -6271,6 +6311,8 @@ pub(crate) fn decode_block_level_qi_inner(
 /// * [`Error::TruncatedHeader`] when the underlying bit reader is
 ///   exhausted before TOKEN 3..=6's extra-bits payload is fully read.
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_eob_token(
     packet: &[u8],
     token: u8,
@@ -6483,6 +6525,8 @@ pub enum CoefficientTokenKind {
 /// * [`Error::TruncatedHeader`] when the underlying bit reader is
 ///   exhausted before the token's extra-bits payload is fully read.
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_coefficient_token(
     packet: &[u8],
     token: u8,
@@ -6855,6 +6899,8 @@ fn huffman_table_group(ti: u8) -> u8 {
 ///   * [`Error::TruncatedHeader`] if the bit reader runs dry.
 ///   * Any §7.7.1 or §7.7.2 error variant that the sub-procedures may
 ///     emit (token-out-of-range, would-overflow-block, etc.).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_dct_coefficients(
     packet: &[u8],
     nbs: u32,
@@ -7611,6 +7657,8 @@ fn encode_dct_coefficients_inner(
 /// intra frame), they are still treated as distinct reference frames
 /// for the purposes of DC prediction — exactly what the per-mode
 /// mapping in Table 7.46 captures.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn reference_frame_for_mb_mode(mode: MacroBlockMode) -> ReferenceFrame {
     match mode {
         MacroBlockMode::InterNoMv => ReferenceFrame::Previous,
@@ -7686,6 +7734,8 @@ pub struct DcPredictorNeighbors {
 /// [`ReferenceFrame::index`]. Carried across blocks in raster order by
 /// the §7.8.2 driver; §7.8.1 itself only reads from it (step 11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct DcLastDc {
     /// `LASTDC[0]` — Intra. Initialised to zero per §7.8.2 step 1(c).
     pub intra: i32,
@@ -7821,6 +7871,8 @@ const TABLE_7_47: [DcPredictorWeights; 15] = [
 /// Available DC Predictors). Packed exactly as the spec presents it:
 /// four signed weights followed by a positive divisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct DcPredictorWeights {
     /// `[W[0], W[1], W[2], W[3]]`, one weight per neighbour slot.
     pub w: [i32; 4],
@@ -7833,6 +7885,8 @@ pub struct DcPredictorWeights {
 /// (`p0 | (p1 << 1) | (p2 << 2) | (p3 << 3)`), matching the order in
 /// which §7.8.1 fills `P[]`. Returns `None` for `mask == 0` so the
 /// all-zero §7.8.1 step 11 fallback path stays out of band.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn dc_predictor_weights(mask: u8) -> Option<DcPredictorWeights> {
     if mask == 0 || mask > 15 {
         return None;
@@ -7883,6 +7937,8 @@ pub fn dc_predictor_weights(mask: u8) -> Option<DcPredictorWeights> {
 ///   `block_to_macro_block[*]` is `>= mbmodes.len()`.
 /// * [`Error::DcPredictorNeighborIndexOutOfRange`] if any populated
 ///   neighbour slot points outside `nbs`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn compute_dc_predictor(
     bi: u32,
     bcoded: &[u8],
@@ -8065,6 +8121,8 @@ pub fn compute_dc_predictor(
 /// * [`Error::DcInversionDuplicateBlockIndex`] if a coded-order index
 ///   appears in more than one plane's raster ordering.
 /// * Any error returned by [`compute_dc_predictor`] propagates.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn invert_dc_prediction(
     bcoded: &[u8],
     mbmodes: &[MacroBlockMode],
@@ -8216,6 +8274,8 @@ pub fn invert_dc_prediction(
 /// `mbmodes`, `block_to_macro_block`, `neighbors`,
 /// `plane_raster_order`, in-place `coeffs`). The same error variants
 /// are returned for malformed geometry.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn forward_dc_prediction(
     bcoded: &[u8],
     mbmodes: &[MacroBlockMode],
@@ -8334,6 +8394,8 @@ pub fn forward_dc_prediction(
 /// The mapping is its own self-consistency check: it is a permutation
 /// of `0..=63`, with `ZIGZAG_NATURAL_TO_ZIGZAG[0] == 0` (the DC term
 /// is at zig-zag index 0).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const ZIGZAG_NATURAL_TO_ZIGZAG: [u8; 64] = [
     // Row 0 (ci = 0..=7).
     0, 1, 5, 6, 14, 15, 27, 28, // Row 1 (ci = 8..=15).
@@ -8396,6 +8458,8 @@ pub const ZIGZAG_NATURAL_TO_ZIGZAG: [u8; 64] = [
 /// This function does not return errors: it takes fixed-size inputs
 /// and produces a fixed-size output. Mis-wiring is prevented by the
 /// type system rather than runtime checks.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn dequantize_block(
     coeffs_zz: &[i16; 64],
     qmat_dc: &QuantizationMatrix,
@@ -8443,6 +8507,8 @@ pub fn dequantize_block(
 ///
 /// Returns any error propagated by [`compute_quantization_matrix`]
 /// (`qti > 1`, `pli > 2`, or `qi > 63`).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn dequantize_block_from_params(
     coeffs_zz: &[i16; 64],
     params: &QuantizationParameters,
@@ -8487,6 +8553,8 @@ pub fn dequantize_block_from_params(
 /// pre-compute the at-most-six per-plane matrices once and reuse them
 /// across blocks (the §7.9.2 efficiency note applies symmetrically to
 /// the encoder).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn quantize_block(
     dqc: &[i16; 64],
     qmat_dc: &QuantizationMatrix,
@@ -8527,6 +8595,8 @@ pub fn quantize_block(
 ///
 /// Returns any error propagated by [`compute_quantization_matrix`]
 /// (`qti > 1`, `pli > 2`, or `qi > 63`).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn quantize_block_from_params(
     dqc: &[i16; 64],
     params: &QuantizationParameters,
@@ -8637,6 +8707,8 @@ impl<'a> ReferencePlane<'a> {
 /// 64-element dequantized residual `DQC` (output of the §7.9.3
 /// inverse DCT) to this constant grid to recover the reconstructed
 /// intra block.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn compute_intra_predictor() -> [[u8; 8]; 8] {
     // Step 1: `for by in 0..=7 { for bx in 0..=7 { PRED[by][bx] = 128 } }`.
     // The literal-128 fill is the entire procedure — no branching,
@@ -8684,6 +8756,8 @@ pub fn compute_intra_predictor() -> [[u8; 8]; 8] {
 /// edge with negative MVs. The widening is bounds-safe because the
 /// largest legal `BX` from a 1920×1088 (or even the §6.2 ceiling)
 /// frame, plus a `+31` MV and a `+7` block index, fits in 21 bits.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn compute_whole_pixel_predictor(
     refp: &ReferencePlane<'_>,
     bx_origin: u32,
@@ -8765,6 +8839,8 @@ pub fn compute_whole_pixel_predictor(
 ///   from zero).
 ///
 /// Returns the 8×8 predictor tile `PRED[by][bx]` as `[[u8; 8]; 8]`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn compute_half_pixel_predictor(
     refp: &ReferencePlane<'_>,
     bx_origin: u32,
@@ -8842,6 +8918,8 @@ pub fn compute_half_pixel_predictor(
 /// Returns `None` if either doubled component is outside the range
 /// representable as an `i8 * 2` (i.e. would overflow `i8` after the
 /// truncation).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn split_half_pixel_motion_vector(
     double_mvx: i32,
     double_mvy: i32,
@@ -8902,6 +8980,8 @@ pub fn split_half_pixel_motion_vector(
 ///
 /// Returns `None` if any whole-pixel offset escapes the `i8` range the
 /// [`MotionVector`] wrapper stores.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn split_motion_vector_per_axis(
     mvx: i32,
     mvy: i32,
@@ -8998,6 +9078,8 @@ const IDCT_S7: i32 = 64277; // = C1
 /// Returns an 8-element `[i16; 8]` containing the 1D inverse DCT
 /// output. The function is total: every input combination produces
 /// a defined output (wrapping arithmetic for the truncations).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn inverse_dct_1d(y: &[i16; 8]) -> [i16; 8] {
     // Widen the inputs to i32 so the per-step arithmetic can run
     // without per-multiply re-narrowing. The narrowing back to i16
@@ -9114,6 +9196,8 @@ pub fn inverse_dct_1d(y: &[i16; 8]) -> [i16; 8] {
 /// once the +8 bias is applied: `(n + 8) >> 4` rounds `n / 16`
 /// toward `+∞` when the fractional part is `0.5` (a tie), and toward
 /// the nearer integer otherwise.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn inverse_dct_2d(dqc: &[i16; 64]) -> [[i16; 8]; 8] {
     // Pass 1: row-by-row 1D inverse DCT. Intermediate stored in
     // `res` as i16, matching the §7.9.3.2 "RES" output type
@@ -9205,6 +9289,8 @@ fn fdct_div_2p16(x: i32) -> i32 {
 /// avoid overflow as long as the input is in `−6270..=6270`; this
 /// implementation keeps the intermediates in `i32` for clarity. The
 /// `//2^16` floor-division-toward-zero steps use [`fdct_div_2p16`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn forward_dct_1d(x: &[i16; 8]) -> [i16; 8] {
     let x0 = x[0] as i32;
     let x1 = x[1] as i32;
@@ -9302,6 +9388,8 @@ pub fn forward_dct_1d(x: &[i16; 8]) -> [i16; 8] {
 /// Inputs are `i16` spatial samples (typically a residual in the range
 /// `−255..=255` for intra blocks, where the §7.9.1.1 predictor is the
 /// constant 128). Outputs are `i16` natural-order coefficients.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn forward_dct_2d(input: &[[i16; 8]; 8]) -> [i16; 64] {
     // Pass 1: row-by-row 1D forward DCT.
     let mut res = [[0i16; 8]; 8];
@@ -9633,6 +9721,8 @@ impl<'a> ReferencePlaneSet<'a> {
 /// body in a separate round from the frame-tiling driver so each is
 /// auditable against its own section of the spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct ReconstructedBlock {
     /// The 64 reconstructed pixel values for this 8×8 block, in
     /// `[by][bx]` row-major order, already clamped to `0..=255`
@@ -9659,6 +9749,8 @@ pub struct ReconstructedBlock {
 /// * `ncoeffs` ← `NCOEFFS[bi]`
 /// * `qii` ← `QIIS[bi]`
 #[derive(Debug, Clone, Copy)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct ReconstructBlockInputs {
     /// `BCODED[bi]` — true if this block is coded (step 2(d)),
     /// false if uncoded (step 2(e), copy from previous reference).
@@ -9763,6 +9855,8 @@ pub struct ReconstructBlockInputs {
 /// * Any error propagated from [`compute_quantization_matrix`] when
 ///   building the DC- or AC-quant matrices (e.g. `qti > 1`,
 ///   `pli > 2`, `qi > 63`).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn reconstruct_block(
     inputs: &ReconstructBlockInputs,
     pli: usize,
@@ -10055,6 +10149,8 @@ pub struct ReconstructedFrame {
 ///   `qis`, a `qii` past `qis.len()`, or a quant-matrix derivation
 ///   reject).
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn reconstruct_frame(
     bcoded: &[bool],
     mb_modes: &[MacroBlockMode],
@@ -10316,6 +10412,8 @@ const MB_IN_SB_HILBERT: [(u8, u8); 4] = [
 /// (`fmbw = fmbh = 0xFFFF`) yields block counts beyond `u16` but within
 /// `u32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct PlaneBlockDims {
     /// Plane width in macroblocks.
     pub mb_w: u32,
@@ -10402,6 +10500,8 @@ impl PlaneBlockDims {
 /// belongs to, its position inside that super block, and its plane-local
 /// raster coordinates (lower-left origin, in 8×8 blocks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct CodedBlockPosition {
     /// Plane-local super-block index (raster order, lower-left origin).
     /// In the range `0..sb_w * sb_h`.
@@ -10437,6 +10537,8 @@ pub struct CodedBlockPosition {
 /// extent are filtered out on the fly, so the total emitted item count
 /// is exactly the plane's [`PlaneBlockDims::block_count`].
 #[derive(Debug, Clone)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct PlaneBlockCodedOrder {
     sb_w: u32,
     sb_h: u32,
@@ -10592,6 +10694,8 @@ fn sb_slot_to_plane_xy(sb_index: u32, slot: u8, sb_w: u32) -> (u32, u32) {
 /// any partial macro blocks (§2.4 last sentence), so this walker emits
 /// exactly `nmbs = fmbw * fmbh` items for any luma plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct CodedMacroBlockPosition {
     /// Luma-plane super-block index (raster order, lower-left origin).
     pub sb_index: u32,
@@ -10612,6 +10716,8 @@ pub struct CodedMacroBlockPosition {
 /// happen on the top or right edge of an over-padded super block) are
 /// skipped on the fly.
 #[derive(Debug, Clone)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct PlaneMacroBlockCodedOrder {
     sb_w: u32,
     sb_h: u32,
@@ -10693,6 +10799,8 @@ impl Iterator for PlaneMacroBlockCodedOrder {
 /// Reference: Theora I Specification §7.10 (the piecewise function
 /// preceding §7.10.1 in the published PDF, page 127), restated in
 /// `docs/video/theora/Theora.pdf`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn lflim(r: i32, l: u8) -> i32 {
     let l = l as i32;
     let two_l = 2 * l;
@@ -10733,6 +10841,8 @@ pub fn lflim(r: i32, l: u8) -> i32 {
 /// middle pixels are written.
 ///
 /// Reference: Theora I Specification §7.10.1, page 128.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn horizontal_loop_filter_edge(
     recp: &mut [u8],
     plane_w: u32,
@@ -10798,6 +10908,8 @@ pub fn horizontal_loop_filter_edge(
 /// reference rows are unchanged; only the two middle rows are written.
 ///
 /// Reference: Theora I Specification §7.10.2, pages 129–130.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn vertical_loop_filter_edge(
     recp: &mut [u8],
     plane_w: u32,
@@ -10900,6 +11012,8 @@ fn check_plane_buffer_len(got: usize, plane_w: u32, plane_h: u32) -> Result<(), 
 /// Plane buffers (`recp`) are indexed `[y * plane_w + x]` in the same
 /// lower-left row-major layout the rest of the crate uses.
 #[derive(Debug, Clone)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct LoopFilterPlaneInput<'a> {
     /// Plane width in **block** units (`plane_w / 8`).
     pub block_w: u32,
@@ -10914,6 +11028,8 @@ pub struct LoopFilterPlaneInput<'a> {
 /// to [`loop_filter_frame`] as `RECY` / `RECCB` / `RECCR` with their
 /// matching `RPYW` / `RPYH` / `RPCW` / `RPCH` widths and heights.
 #[derive(Debug)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct LoopFilterPlanes<'a> {
     /// Y plane buffer (length `rpyw * rpyh`).
     pub recy: &'a mut [u8],
@@ -11000,6 +11116,8 @@ pub struct LoopFilterPlanes<'a> {
 /// the destructive edge writes therefore happen on each shared edge
 /// exactly once per §7.10.3.
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn loop_filter_frame(
     lflims: &[u8; 64],
     qis: &[u8],
@@ -11281,6 +11399,8 @@ pub fn reference_plane_dimensions_from_ident(
 /// call site, and lets callers test the classifier in isolation
 /// before the full driver lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum FrameDecodePacket<'a> {
     /// Step 2 path: a zero-byte packet, treated exactly like an
     /// inter frame with no coded blocks. The driver synthesises
@@ -11321,6 +11441,8 @@ impl<'a> FrameDecodePacket<'a> {
 /// to either the [`decode_data_packet_header_and_blocks`] step 1
 /// chain or the [`synthesize_empty_packet_frame_state`] step 2
 /// synthesis before running steps 3–8.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn classify_frame_decode_packet(packet: &[u8]) -> FrameDecodePacket<'_> {
     if packet.is_empty() {
         FrameDecodePacket::Empty
@@ -11338,6 +11460,8 @@ pub fn classify_frame_decode_packet(packet: &[u8]) -> FrameDecodePacket<'_> {
 /// helper is the §7.11 dispatcher's typed-bit decoder, returning
 /// [`Error::FrameTypeOutOfRange`] for any value other than 0 / 1
 /// rather than panicking on a hand-built fixture.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn frame_type_from_ftype(ftype: u8) -> Result<FrameType, Error> {
     match ftype {
         0 => Ok(FrameType::Intra),
@@ -11348,6 +11472,8 @@ pub fn frame_type_from_ftype(ftype: u8) -> Result<FrameType, Error> {
 
 /// The raw 1-bit `FTYPE` value (`0` for intra, `1` for inter) a
 /// `FrameType` corresponds to. Inverse of [`frame_type_from_ftype`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn frame_type_as_ftype(ft: FrameType) -> u8 {
     match ft {
         FrameType::Intra => 0,
@@ -11386,6 +11512,8 @@ pub fn frame_type_as_ftype(ft: FrameType) -> u8 {
 /// shared references — keeping the synthesised state owned matches
 /// the lifecycle of the step 1 chain's outputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct EmptyPacketFrameState {
     /// `FTYPE` synthesised by §7.11 step 2(a). Always
     /// [`FrameType::Inter`] (the spec hard-codes `1`).
@@ -11464,6 +11592,8 @@ impl From<&EmptyPacketFrameState> for TheoraFrameHeader {
 /// branch and pairs it with the §7.4 / §7.5.2 / §7.6 / §7.7.3
 /// per-block defaults (`INTER_NOMV` modes, zero vectors, zero
 /// coefficients) that the §7.9.4 uncoded-block path never reads.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFrameState, Error> {
     if nbs == 0 {
         return Err(Error::EmptyPacketFrameStateZeroNbs);
@@ -11522,6 +11652,8 @@ pub fn synthesize_empty_packet_frame_state(nbs: usize) -> Result<EmptyPacketFram
 /// (step 1(f)), with the DC slot of every coded block already carrying
 /// the reconstructed (prediction-inverted) value per step 1(g).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct DataPacketHeaderAndBlocks {
     /// §7.11 step 1(a) output — the §7.1 frame header (`FTYPE` +
     /// `QIS`). `FrameType::Intra` corresponds to `FTYPE = 0`.
@@ -11606,6 +11738,8 @@ impl DataPacketHeaderAndBlocks {
 /// exact contracts of the corresponding [`invert_dc_prediction`]
 /// parameters.
 #[derive(Debug, Clone, Copy)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct DcPredictionGeometry<'a> {
     /// `NBS`-element `bi → mbi` lookup (every block, luma and chroma,
     /// to its macro block). §7.8.1 reads it to compare reference
@@ -11736,6 +11870,8 @@ pub struct DcPredictionGeometry<'a> {
 /// 5 / step 6 dispatch into [`reconstruct_frame`] /
 /// [`loop_filter_frame`].
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_data_packet_header_and_blocks(
     packet: &[u8],
     first_frame: bool,

@@ -4,6 +4,14 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- Marked 68 clearly-internal public items (`#[doc(hidden)]`) — low-level
+  bitstream/DCT/loop-filter/geometry primitives exposed only for
+  tests and fuzzing — so cargo-semver-checks no longer tracks them as
+  stable API; the decode, encode, and registry entry points remain
+  visible and unchanged.
+
 ### Fixed
 
 - **Rate-distortion λ derived from the actual quantizer step

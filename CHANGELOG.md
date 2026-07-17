@@ -4,6 +4,39 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-theora/compare/v0.0.11...v0.0.12) - 2026-07-17
+
+### Other
+
+- Mark internal primitives #[doc(hidden)] so semver-checks ignores them
+- tuning docs — the first-pass tally is a profile, not a byte-exact promise
+- rate-control anti-windup — clamp fullness to the step's +-8-budget reach
+- README — external validation, step-derived lambda, gated scene-cut
+- scene-cut fires on a relative difference spike, not sustained motion
+- pinned self-encoded corpus after 11/11 external decode validation
+- RD lambda from the actual quantizer step (was a wrong-slope qi ramp)
+- for_picture — container-carriable KFGSHIFT default (6, was 0)
+- README — modernize the encoder summary and validation notes
+- clippy — pass the Copy closure by value to the step search
+- four-step whole-pixel motion search (±15-pixel reach)
+- declare the rate-control target in the §6.2 NOMBR field
+- encoder-output corruption storm + randomized format/qi stress
+- duplicate-frame detection — zero-byte packet emission
+- rate-distortion per-block skip on INTER_NOMV macro blocks
+- §2.2 picture-region (non-MB-aligned) encoding end-to-end
+- §7.5.1 half-pixel motion-vector refinement in the encoder search
+- add CI / crates.io / docs.rs / MIT-license badges
+- README — round 387 inter-side encoder quality
+- measured-rate keyframe policy (golden-frame refresh on reference decay)
+- wire adaptive quantization into TheoraEncoder P-frames
+- adaptive block-level quantization on the inter encoder (§7.1 MOREQIS + §7.6 on P-frames)
+- INTRA joins the P-frame RD mode decision (8th coding mode)
+- measured §7.7 token rate in the RD mode + adaptive-quant decisions
+- fix clippy lints in the §7.4 scheme-selection commit
+- frame-optimal §7.4 mode-coding scheme selection
+- mixed I/P GOP two-pass Huffman tuning (four tuned codebooks)
+- inter-frame §7.7 token statistics (plan/write split)
+
 ### Changed
 
 - Marked 68 clearly-internal public items (`#[doc(hidden)]`) — low-level

@@ -4,7 +4,13 @@
 
 Pure-Rust Theora video codec — clean-room implementation, in progress.
 The crate works on Theora packets directly (it does not parse the Ogg
-container); callers de-frame the bitstream packets and hand them in. The
+page framing itself — that lives in the container crates), but ships
+the complete codec side of Ogg carriage: the registration declares the
+identification header's payload magic for registry-first stream
+identification, `classify_packet` routes header vs. data packets per
+§6.1, and the §A.2.3 granule-position mapping (forward, inverse, and a
+mux-side tracker) is public API pinned against every data page of the
+staged fixture corpus. The
 decoder is sample-exact for its supported feature set (validated up to
 HD against reference dumps). The encoder emits complete self-describing
 streams — §6 headers plus intra and inter (P) frames through a unified
@@ -28,6 +34,26 @@ against reference output.
   (`parse_comment_header`), and setup (`parse_setup_header` /
   `decode_setup_header`, including loop-filter limits, quantisation
   parameters, and the DCT-token Huffman tables).
+* **Ogg carriage (codec side)** — the registration declares the §6.2
+  identification header's leading bytes (`IDENTIFICATION_HEADER_MAGIC`)
+  as the codec's payload magic, so a resolver-driven demuxer identifies
+  a Theora logical stream from its first packet registry-first;
+  `classify_packet` / `TheoraPacketKind` route de-framed packets per
+  §6.1 (the three header types, reserved types `0x83`–`0xFF` to be
+  ignored, video data including zero-byte duplicates); and the §A.2.3
+  granule-position mapping is public API — `split_granule_position` /
+  `join_granule_position`, `granule_position_for_frame` and its
+  frame-index / seek-anchor / decodable-count inverses, pre-3.2.1
+  (`VREV < 1`) normalization, `TheoraIdentHeader` methods that apply
+  the stream's `VREV` and frame rate automatically
+  (`granule_position_seconds`), and a mux-side `GranulePositionTracker`
+  that turns keyframe flags into per-packet granule positions. The
+  mapping is pinned against the granule value of **every data page of
+  the eleven staged `input.ogv` fixtures** (including the `KFGSHIFT=7`
+  streams and zero-byte duplicate frames) and rehearsed end-to-end at
+  all three pixel formats: encoder packet stream → blind
+  classification → payload-magic resolution → granule tracking →
+  registry-built decode.
 * **Frame header & bitstream** — frame header decode, coded-block flags,
   macroblock modes, motion-vector decode (zero-MV and explicit per-block
   MV with the half-pixel / quarter-pixel split), block-level `qi`
@@ -449,8 +475,11 @@ chroma blocks that earlier diverged is now sample-exact.
 
 ## Not yet supported
 
-* **Ogg container parsing** — out of scope here; packets are supplied
-  pre-de-framed by the caller.
+* **Ogg page framing** — parsing/writing `OggS` pages stays out of
+  scope here (it lives in the container crates); this crate supplies
+  the codec side of the carriage contract — payload magic, §6.1
+  packet classification, and the §A.2.3 granule mapping — and works
+  on pre-de-framed packets.
 * **Encoder mode coverage is complete** — every §7.5.2 inter mode
   (`INTER_NOMV`, `INTER_MV`, `INTER_MV_LAST`, `INTER_MV_LAST2`,
   `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`, `INTER_MV_FOUR`) is reachable

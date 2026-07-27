@@ -6,6 +6,19 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Carriage rehearsal + quality sweep (round 431)** — an
+  end-to-end packet-level test drives the `TheoraEncoder` stream the
+  way a muxer would at all three pixel formats (4:2:0/4:2:2/4:4:4,
+  distinct `qi` and keyframe cadences, non-MB-aligned pictures):
+  headers classify in §A.2.1 order and carry the exported magics,
+  the first packet resolves the codec via the registry's
+  payload-magic path, data packets walk `GranulePositionTracker`
+  into strictly increasing §A.2.3 granule positions whose frame
+  index / seek anchor / count / duration all invert, and the stream
+  decodes back through a registry-built decoder. A five-point intra
+  `qi` sweep (0→63) pins the packet-level rate/fidelity ordering:
+  bytes non-decreasing, max reconstruction error non-increasing,
+  near-exact at `qi = 63`.
 - **Payload-magic registration (round 431)** — `register` /
   `register_codecs` now declare `IDENTIFICATION_HEADER_MAGIC`
   (`\x80` + `theora`, the §6.2 identification header's leading bytes)

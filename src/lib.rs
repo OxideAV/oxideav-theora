@@ -40941,4 +40941,240 @@ mod tests {
             &[(0, 128), (1, 129)],
         );
     }
+
+    // ----- round 431: carriage rehearsal + quality sweep breadth -----
+
+    /// Top-down picture-dimension planes carrying a gradient shifted
+    /// by `s` — a cheap moving source for multi-frame encodes at any
+    /// pixel format.
+    fn moving_picture_frame(ident: &TheoraIdentHeader, s: i32) -> oxideav_core::VideoFrame {
+        use oxideav_core::frame::VideoPlane;
+        let (pic_y, pic_c) = ident.picture_plane_dims();
+        let mk = |w: u32, h: u32, base: i32, scale: i32| -> VideoPlane {
+            let mut data = vec![0u8; (w * h) as usize];
+            for row in 0..h as i32 {
+                for col in 0..w as i32 {
+                    data[(row * w as i32 + col) as usize] =
+                        (base + ((col + s) * scale + (row + s / 2) * 3).rem_euclid(200)) as u8;
+                }
+            }
+            VideoPlane {
+                stride: w as usize,
+                data,
+            }
+        };
+        oxideav_core::VideoFrame {
+            pts: None,
+            planes: vec![
+                mk(pic_y.width, pic_y.height, 20, 5),
+                mk(pic_c.width, pic_c.height, 40, 2),
+                mk(pic_c.width, pic_c.height, 30, 4),
+            ],
+        }
+    }
+
+    /// End-to-end carriage rehearsal at every pixel format: the
+    /// `TheoraEncoder`'s packet stream drives [`classify_packet`],
+    /// the payload-magic resolver, and [`GranulePositionTracker`]
+    /// exactly the way a muxer would — headers classify in §A.2.1
+    /// order under zero granule, data packets track strictly
+    /// increasing §A.2.3 granule positions whose count and seek
+    /// anchor invert correctly — and the whole stream decodes back
+    /// through a registry-built decoder.
+    #[test]
+    fn carriage_rehearsal_across_pixel_formats() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        for (pf, qi, w, h, nframes, kf_int) in [
+            (PixelFormat::Yuv420, 32u8, 48u32, 34u32, 5usize, 3u32),
+            (PixelFormat::Yuv422, 8, 40, 40, 4, 2),
+            (PixelFormat::Yuv444, 55, 26, 18, 4, 4),
+        ] {
+            let label = format!("{pf:?}/qi{qi}");
+            let ident = TheoraIdentHeader::for_picture(w, h, pf, 30_000, 1_001).unwrap();
+            let mut enc = TheoraEncoder::with_default_setup_keyframe_interval(
+                CodecId::new(THEORA_CODEC_ID),
+                ident.clone(),
+                qi,
+                kf_int,
+            )
+            .unwrap();
+            use oxideav_core::Encoder as _;
+            for i in 0..nframes {
+                let vf = moving_picture_frame(&ident, i as i32 * 4);
+                enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+            }
+            let mut packets = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => packets.push(p),
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("{label}: encoder error: {e}"),
+                }
+            }
+
+            // §A.2.1 header sequence: identification, comment, setup —
+            // classified blind, magic-prefixed, and header-flagged.
+            assert_eq!(packets.len(), 3 + nframes, "{label}: packet count");
+            let kinds: Vec<_> = packets[..3]
+                .iter()
+                .map(|p| {
+                    assert!(p.flags.header, "{label}: header flag");
+                    classify_packet(&p.data).unwrap()
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    TheoraPacketKind::IdentificationHeader,
+                    TheoraPacketKind::CommentHeader,
+                    TheoraPacketKind::SetupHeader,
+                ],
+                "{label}: §A.2.1 header order"
+            );
+            // The stream's first packet resolves the codec by payload
+            // magic — the registry-first identification a demuxer does.
+            assert_eq!(
+                ctx.codecs
+                    .resolve_payload_magic_ref(&packets[0].data)
+                    .map(|c| c.as_str()),
+                Some(THEORA_CODEC_ID),
+                "{label}: payload magic resolves"
+            );
+
+            // Data packets: classify as video data, walk the granule
+            // tracker off the keyframe flags, invert every value.
+            let wire_ident = decode_identification_header(&packets[0].data).unwrap();
+            let mut tracker = GranulePositionTracker::for_ident(&wire_ident).unwrap();
+            let mut gps = Vec::new();
+            let mut last_kf = 0u64;
+            for (i, p) in packets[3..].iter().enumerate() {
+                assert!(!p.flags.header, "{label}: data packet {i}");
+                assert_eq!(
+                    classify_packet(&p.data).unwrap(),
+                    TheoraPacketKind::VideoData,
+                    "{label}: data packet {i} classifies"
+                );
+                assert_eq!(
+                    p.flags.keyframe,
+                    i == 0 || (i as u32).is_multiple_of(kf_int),
+                    "{label}: keyframe cadence at packet {i}"
+                );
+                if p.flags.keyframe {
+                    last_kf = i as u64;
+                }
+                let gp = tracker.push_frame(p.flags.keyframe).unwrap();
+                assert_eq!(
+                    wire_ident.frame_index_from_granule_position(gp).unwrap(),
+                    i as u64,
+                    "{label}: frame index inverts"
+                );
+                assert_eq!(
+                    wire_ident.keyframe_index_from_granule_position(gp).unwrap(),
+                    last_kf,
+                    "{label}: seek anchor inverts"
+                );
+                gps.push(gp);
+            }
+            assert!(
+                gps.windows(2).all(|w| w[0] < w[1]),
+                "{label}: granules strictly increase: {gps:?}"
+            );
+            let last_gp = *gps.last().unwrap();
+            assert_eq!(
+                wire_ident
+                    .frame_count_from_granule_position(last_gp)
+                    .unwrap(),
+                nframes as u64,
+                "{label}: decodable count"
+            );
+            let secs = wire_ident.granule_position_seconds(last_gp).unwrap();
+            let want = nframes as f64 * 1_001.0 / 30_000.0;
+            assert!(
+                (secs - want).abs() < 1e-9,
+                "{label}: stream duration {secs} vs {want}"
+            );
+
+            // The stream decodes back through a registry-built decoder
+            // (headers via extradata), one picture-dimension frame per
+            // data packet.
+            let mut dec = ctx.codecs.first_decoder(enc.output_params()).unwrap();
+            let (pic_y, _) = ident.picture_plane_dims();
+            for (i, p) in packets[3..].iter().enumerate() {
+                dec.send_packet(p).unwrap();
+                let oxideav_core::Frame::Video(out) = dec.receive_frame().unwrap() else {
+                    panic!("{label}: expected video frame {i}");
+                };
+                assert_eq!(
+                    out.planes[0].data.len(),
+                    (pic_y.width * pic_y.height) as usize,
+                    "{label}: frame {i} at picture dimensions"
+                );
+            }
+        }
+    }
+
+    /// Quality sweep on the packet level: the same picture encoded
+    /// at ascending `qi` spends more bits (Theora's `qi` orders
+    /// quantizers strong→weak, matching the q-low/q-high fixture
+    /// pair) and reconstructs at monotonically non-increasing max
+    /// error, ending near-exact at `qi = 63`.
+    #[test]
+    fn intra_quality_sweep_trades_bytes_for_error_monotonically() {
+        let ident = TheoraIdentHeader::for_picture(48, 34, PixelFormat::Yuv420, 25, 1).unwrap();
+        let setup = SetupHeaderTables::vp3_defaults();
+        let geometry = build_frame_geometry(&ident).unwrap();
+        let src = {
+            // Lower-left coded-dimension SourceFrame with smooth
+            // gradient content (compressible at every quantizer).
+            let g = &geometry;
+            let mk = |w: u32, h: u32, base: i32, scale: i32| -> Vec<u8> {
+                let mut v = vec![0u8; (w * h) as usize];
+                for row in 0..h as i32 {
+                    for col in 0..w as i32 {
+                        v[(row * w as i32 + col) as usize] =
+                            (base + (col * scale + row * 3).rem_euclid(190)) as u8;
+                    }
+                }
+                v
+            };
+            SourceFrame {
+                samples_y: mk(g.dims_y.width, g.dims_y.height, 25, 5),
+                samples_cb: mk(g.dims_c.width, g.dims_c.height, 60, 2),
+                samples_cr: mk(g.dims_c.width, g.dims_c.height, 90, 3),
+            }
+        };
+
+        let mut sizes = Vec::new();
+        let mut errors = Vec::new();
+        for qi in [0u8, 18, 32, 50, 63] {
+            let enc = FrameEncoder::new(ident.clone(), setup.clone(), qi).unwrap();
+            let pkt = enc.encode_intra_frame(&src).unwrap();
+            let mut dec = FrameDecoder::new(ident.clone(), setup.clone()).unwrap();
+            let out = dec.decode_frame(&pkt).unwrap();
+            let err = plane_max_err(&out.frame.samples_y, &src.samples_y);
+            sizes.push((qi, pkt.len()));
+            errors.push((qi, err));
+        }
+        for w in sizes.windows(2) {
+            assert!(
+                w[0].1 <= w[1].1,
+                "bytes must not shrink as qi weakens the quantizer: {sizes:?}"
+            );
+        }
+        for w in errors.windows(2) {
+            assert!(
+                w[0].1 >= w[1].1,
+                "max error must not grow as qi rises: {errors:?}"
+            );
+        }
+        assert!(
+            sizes[0].1 < sizes[sizes.len() - 1].1,
+            "the sweep must actually spend bits: {sizes:?}"
+        );
+        assert!(
+            errors[0].1 > errors[errors.len() - 1].1 && errors[errors.len() - 1].1 <= 8,
+            "qi 63 must reconstruct the gradient to within the finest quantizer step: {errors:?}"
+        );
+    }
 }

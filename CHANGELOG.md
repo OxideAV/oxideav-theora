@@ -40,7 +40,16 @@ All notable changes to `oxideav-theora` are recorded here.
   count × `FRD/FRN`, the §A.2.2 end-of-display-interval time). New
   typed errors cover the §A.2.3 uncarriable-offset hazard, `i64`
   (Ogg-field) overflow, header-page (`keyframe_count == 0`) values,
-  and inconsistent frame/keyframe indices.
+  and inconsistent frame/keyframe indices. The mapping is pinned
+  against the staged corpus: all 26 data packets of the eleven
+  `input.ogv` streams walk through `GranulePositionTracker`
+  with keyframe flags read from their own §7.1 frame headers, and
+  the tracker's output matches every data page's on-disk granule
+  value (extracted offline from the Ogg page headers) — including
+  the zero-byte duplicate frames of `keyframe-interval-30` and the
+  three streams that declare `KFGSHIFT = 7` instead of 6; the
+  inverse helpers recover frame index, seek anchor, and
+  decodable-frame count from each page value.
 
 ### Changed
 

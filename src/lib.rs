@@ -16345,9 +16345,10 @@ impl GranulePositionTracker {
     /// Tracker whose first pushed frame carries the zero-based index
     /// `first_frame_index`.
     ///
-    /// Some producers begin marking at a nonzero display index (three
-    /// streams of the staged fixture corpus open with `2|0` — an
-    /// initial index of 1); this constructor reproduces such streams.
+    /// Every stream of the staged fixture corpus starts at frame 0
+    /// (the §A.2.3 `1|0` opening), but a producer resuming or
+    /// splicing a stream may begin marking at a later display index;
+    /// this constructor reproduces such streams.
     pub fn starting_at(kfgshift: u8, first_frame_index: u64) -> Result<Self, Error> {
         check_kfgshift(kfgshift)?;
         Ok(Self {
@@ -40736,5 +40737,208 @@ mod tests {
                 "prefix {miss:02x?} must not resolve"
             );
         }
+    }
+
+    // ----- round 431: §A.2.3 granule mapping vs. the fixture corpus -----
+
+    /// Walk one fixture stream's real data packets through
+    /// [`GranulePositionTracker`], classifying each packet's keyframe
+    /// flag from its own §7.1 frame header (zero-byte duplicates are
+    /// inter frames), and check the tracker's output against the
+    /// granule positions the staged `input.ogv` actually carries.
+    ///
+    /// `page_ends` lists `(packet index, granule position)` for each
+    /// data page of the container, granule values extracted offline
+    /// from the page headers of
+    /// `docs/video/theora/fixtures/<name>/input.ogv` (§A.2.2: a page
+    /// is marked with the granule position of the last packet that
+    /// finishes on it). The inverse helpers must recover the frame
+    /// index and governing-keyframe index from each page value.
+    fn granule_walk_fixture(
+        name: &str,
+        ident_packet: &[u8],
+        packets: &[&[u8]],
+        kfgshift: u8,
+        page_ends: &[(usize, u64)],
+    ) {
+        let ident = decode_identification_header(ident_packet).unwrap();
+        assert_eq!(ident.kfgshift, kfgshift, "{name}: declared KFGSHIFT");
+        assert!(
+            !ident.uses_legacy_granule_position(),
+            "{name}: 3.2.1 streams"
+        );
+
+        let mut tracker = GranulePositionTracker::for_ident(&ident).unwrap();
+        let mut gps = Vec::new();
+        let mut keyframes = Vec::new(); // governing keyframe per packet
+        let mut last_kf = None;
+        for (i, pkt) in packets.iter().enumerate() {
+            let is_keyframe = !pkt.is_empty()
+                && decode_frame_header(pkt, i == 0).unwrap().ftype == FrameType::Intra;
+            let frame_index = tracker.next_frame_index();
+            if is_keyframe {
+                last_kf = Some(frame_index);
+            }
+            keyframes.push(last_kf.expect("first packet of every fixture is a keyframe"));
+            gps.push(tracker.push_frame(is_keyframe).unwrap());
+        }
+
+        // §A.2.3: monotonically increasing across the whole stream.
+        assert!(
+            gps.windows(2).all(|w| w[0] < w[1]),
+            "{name}: granule positions must increase strictly: {gps:?}"
+        );
+
+        for &(pkt_idx, page_gp) in page_ends {
+            assert_eq!(
+                gps[pkt_idx], page_gp,
+                "{name}: packet {pkt_idx} must map to the page's granule position"
+            );
+            let frame_index = pkt_idx as u64;
+            assert_eq!(
+                ident.frame_index_from_granule_position(page_gp).unwrap(),
+                frame_index,
+                "{name}: frame index recovered from page granule"
+            );
+            assert_eq!(
+                ident.keyframe_index_from_granule_position(page_gp).unwrap(),
+                keyframes[pkt_idx],
+                "{name}: §A.2.3 seek anchor recovered from page granule"
+            );
+            assert_eq!(
+                ident.frame_count_from_granule_position(page_gp).unwrap(),
+                frame_index + 1,
+                "{name}: decodable-frame count recovered from page granule"
+            );
+        }
+    }
+
+    /// The eight fixtures declaring `KFGSHIFT = 6`, all opening with
+    /// the §A.2.3 `1|0` marking: single-keyframe streams,
+    /// keyframe+inter streams, the all-keyframe `-g 1` stream, and
+    /// the duplicate-frame stream where zero-byte packets advance the
+    /// granule like any other frame.
+    #[test]
+    fn granule_mapping_matches_fixture_pages_at_kfgshift_6() {
+        granule_walk_fixture(
+            "tiny-i-only-16x16",
+            &TINY_HEADER,
+            &[&fixture_data::TINY_DATA_PACKET_0],
+            6,
+            &[(0, 64)], // 1|0
+        );
+        granule_walk_fixture(
+            "quant-table-custom",
+            &fixture_data::QTC_IDENT_PACKET,
+            &[&fixture_data::QTC_DATA_PACKET_0],
+            6,
+            &[(0, 64)],
+        );
+        granule_walk_fixture(
+            "bitstream-version-3.2.1",
+            &fixture_data::BV321_IDENT_PACKET,
+            &[&fixture_data::BV321_DATA_PACKET],
+            6,
+            &[(0, 64)],
+        );
+        granule_walk_fixture(
+            "picture-region-non-mb-aligned",
+            &fixture_data::PICREG_IDENT_PACKET,
+            &[&fixture_data::PICREG_DATA_PACKET],
+            6,
+            &[(0, 64)],
+        );
+        granule_walk_fixture(
+            "monochrome-via-zero-chroma",
+            &fixture_data::MONO_IDENT_PACKET,
+            &[
+                &fixture_data::MONO_IFRAME_PACKET,
+                &fixture_data::MONO_PFRAME_PACKET,
+            ],
+            6,
+            &[(0, 64), (1, 65)], // 1|0, 1|1
+        );
+        granule_walk_fixture(
+            "dimensions-1080p-very-short",
+            &fixture_data::HD1080_IDENT_PACKET,
+            &[
+                &fixture_data::HD1080_DATA_PACKET_0,
+                &fixture_data::HD1080_DATA_PACKET_1,
+            ],
+            6,
+            &[(0, 64), (1, 65)],
+        );
+        granule_walk_fixture(
+            "keyframe-interval-1",
+            &fixture_data::KI30_IDENT_PACKET, // byte-identical ident
+            &[
+                &fixture_data::KI1_DATA_PACKET_0,
+                &fixture_data::KI1_DATA_PACKET_1,
+                &fixture_data::KI1_DATA_PACKET_2,
+                &fixture_data::KI1_DATA_PACKET_3,
+            ],
+            6,
+            // Every frame is a keyframe: the low half stays zero and
+            // the high half counts up — 1|0, 2|0, 3|0, 4|0.
+            &[(0, 64), (1, 128), (2, 192), (3, 256)],
+        );
+        granule_walk_fixture(
+            "keyframe-interval-30",
+            &fixture_data::KI30_IDENT_PACKET,
+            &[
+                &fixture_data::KI30_DATA_PACKET_0,
+                &fixture_data::KI30_DATA_PACKET_1, // zero-byte duplicate
+                &fixture_data::KI30_DATA_PACKET_2, // zero-byte duplicate
+                &fixture_data::KI30_DATA_PACKET_3,
+                &fixture_data::KI30_DATA_PACKET_4,
+                &fixture_data::KI30_DATA_PACKET_5,
+                &fixture_data::KI30_DATA_PACKET_6,
+                &fixture_data::KI30_DATA_PACKET_7,
+            ],
+            6,
+            // Two data pages: the keyframe alone (1|0), then packets
+            // 1..=7 finishing on one page marked for frame 7 (1|7) —
+            // the zero-byte duplicates advanced the granule too.
+            &[(0, 64), (7, 71)],
+        );
+    }
+
+    /// The three fixtures declaring `KFGSHIFT = 7`: the same wire
+    /// values that read `2|0`, `2|1` under a shift of 6 are the
+    /// §A.2.3 opening `1|0`, `1|1` at the stream's own shift —
+    /// pinning that the mapping is meaningless without the §6.2
+    /// step 18 field and that the helpers consume it correctly.
+    #[test]
+    fn granule_mapping_matches_fixture_pages_at_kfgshift_7() {
+        granule_walk_fixture(
+            "i-frame-then-p-frame-64x64",
+            &fixture_data::IFP_IDENT_PACKET,
+            &[
+                &fixture_data::IFP_IFRAME_PACKET,
+                &fixture_data::IFP_PFRAME_PACKET,
+            ],
+            7,
+            &[(0, 128), (1, 129)], // 1|0, 1|1 at KFGSHIFT=7
+        );
+        granule_walk_fixture(
+            "q-low",
+            &fixture_data::QLOW_IDENT_PACKET,
+            &[
+                &fixture_data::QLOW_IFRAME_PACKET,
+                &fixture_data::QLOW_PFRAME_PACKET,
+            ],
+            7,
+            &[(0, 128), (1, 129)],
+        );
+        granule_walk_fixture(
+            "q-high",
+            &fixture_data::QHIGH_IDENT_PACKET,
+            &[
+                &fixture_data::QHIGH_IFRAME_PACKET,
+                &fixture_data::QHIGH_PFRAME_PACKET,
+            ],
+            7,
+            &[(0, 128), (1, 129)],
+        );
     }
 }

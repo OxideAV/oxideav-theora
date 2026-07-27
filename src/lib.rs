@@ -1374,6 +1374,61 @@ pub enum Error {
         /// Plane height.
         plane_h: u32,
     },
+    /// A `kfgshift` argument was outside the 5-bit `0..=31` range §6.2
+    /// step 18 declares for the `KFGSHIFT` field. Headers decoded from
+    /// the wire always satisfy this; the check guards hand-built values.
+    KfgshiftOutOfRange {
+        /// The offending shift value.
+        kfgshift: u8,
+    },
+    /// A frame's offset since its governing keyframe does not fit in
+    /// the `KFGSHIFT`-bit low half of the split §A.2.3 granule
+    /// position, so the frame cannot be marked in an Ogg page — the
+    /// stream is uncarriable with this `KFGSHIFT` (the hazard
+    /// [`TheoraIdentHeader::for_picture`] avoids by defaulting the
+    /// shift to 6).
+    GranuleOffsetUnrepresentable {
+        /// `frame_index - keyframe_index`, which must be strictly less
+        /// than `2^kfgshift`.
+        frames_since_keyframe: u64,
+        /// The `KFGSHIFT` in effect.
+        kfgshift: u8,
+    },
+    /// The high half of a split §A.2.3 granule position does not fit
+    /// in the `64 - KFGSHIFT` bits available above the shift, or the
+    /// joined value exceeds `i64::MAX` (the Ogg page field is a signed
+    /// 64-bit integer, with `-1` reserved for "no packet finishes on
+    /// this page").
+    GranulePositionOverflow {
+        /// The frame count in the high half (`keyframe_index + 1`).
+        keyframe_count: u64,
+        /// The `KFGSHIFT` in effect.
+        kfgshift: u8,
+    },
+    /// The high half of a split §A.2.3 granule position is zero, so it
+    /// marks no decodable frame. Header pages carry a granule position
+    /// of zero (§A.2.1); data-marking granule positions of a
+    /// version-3.2.1+ stream always have a nonzero high half (the first
+    /// keyframe is marked `1|0`). A pre-3.2.1 (`VREV < 1`) value must
+    /// be normalized via [`granule_position_from_legacy`] first.
+    GranulePositionNoFrames {
+        /// The offending granule position.
+        granule_position: u64,
+    },
+    /// A frame index handed to the §A.2.3 forward mapping was smaller
+    /// than the index of the keyframe said to govern it. A keyframe
+    /// governs only frames at or after itself.
+    FrameBeforeKeyframe {
+        /// Zero-based index of the frame being mapped.
+        frame_index: u64,
+        /// Zero-based index of the governing keyframe.
+        keyframe_index: u64,
+    },
+    /// The first frame pushed into a [`GranulePositionTracker`] was not
+    /// a keyframe. §A.2.3 has no representation for a frame with no
+    /// governing keyframe, matching §7.1's requirement that the first
+    /// coded frame of a stream is intra.
+    GranuleStreamFirstFrameNotKeyframe,
     /// The crate has not yet implemented this surface (planned for a
     /// later round).
     NotImplemented,
@@ -2029,6 +2084,44 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: §2.2 picture region [{x}+{w}, {y}+{h}) escapes plane {pli} of {plane_w}x{plane_h}"
             ),
+            Error::KfgshiftOutOfRange { kfgshift } => write!(
+                f,
+                "oxideav-theora: KFGSHIFT {kfgshift} outside the 5-bit range 0..=31 of §6.2 step 18"
+            ),
+            Error::GranuleOffsetUnrepresentable {
+                frames_since_keyframe,
+                kfgshift,
+            } => write!(
+                f,
+                "oxideav-theora: offset of {frames_since_keyframe} frames since the keyframe does \
+                 not fit the KFGSHIFT={kfgshift} low half of the §A.2.3 granule position"
+            ),
+            Error::GranulePositionOverflow {
+                keyframe_count,
+                kfgshift,
+            } => write!(
+                f,
+                "oxideav-theora: keyframe count {keyframe_count} overflows the §A.2.3 granule \
+                 position's high half at KFGSHIFT={kfgshift}"
+            ),
+            Error::GranulePositionNoFrames { granule_position } => write!(
+                f,
+                "oxideav-theora: granule position {granule_position} has a zero high half and \
+                 marks no decodable frame (§A.2.1 header page, or an unnormalized pre-3.2.1 value)"
+            ),
+            Error::FrameBeforeKeyframe {
+                frame_index,
+                keyframe_index,
+            } => write!(
+                f,
+                "oxideav-theora: frame {frame_index} precedes its claimed governing keyframe \
+                 {keyframe_index} (§A.2.3)"
+            ),
+            Error::GranuleStreamFirstFrameNotKeyframe => write!(
+                f,
+                "oxideav-theora: the first tracked frame must be a keyframe — §A.2.3 cannot mark \
+                 a frame with no governing keyframe (§7.1 requires an intra first frame)"
+            ),
             Error::NotImplemented => write!(
                 f,
                 "oxideav-theora: surface not implemented in current clean-room round"
@@ -2341,6 +2434,109 @@ impl TheoraIdentHeader {
                 height: ch,
             },
         )
+    }
+
+    /// True when this stream predates bitstream version 3.2.1, i.e.
+    /// `VREV < 1` with the major/minor fields at their only legal
+    /// values — such streams mark data packets with the legacy §A.2.3
+    /// granule form (keyframe *index* in the high half).
+    pub fn uses_legacy_granule_position(&self) -> bool {
+        self.vrev < 1
+    }
+
+    /// This stream's granule position for `granule_position`, in the
+    /// version-3.2.1+ interpretation: pre-3.2.1 streams
+    /// ([`Self::uses_legacy_granule_position`]) are normalized per
+    /// §A.2.3 by adding 1 to the high half; 3.2.1+ values pass
+    /// through unchanged.
+    fn normalized_granule_position(&self, granule_position: u64) -> Result<u64, Error> {
+        if self.uses_legacy_granule_position() {
+            granule_position_from_legacy(granule_position, self.kfgshift)
+        } else {
+            Ok(granule_position)
+        }
+    }
+
+    /// Split `granule_position` at this header's `KFGSHIFT` (§6.2
+    /// step 18). Raw field split — no version normalization.
+    pub fn split_granule_position(
+        &self,
+        granule_position: u64,
+    ) -> Result<SplitGranulePosition, Error> {
+        split_granule_position(granule_position, self.kfgshift)
+    }
+
+    /// Zero-based index of the frame `granule_position` marks
+    /// (§A.2.3), normalizing pre-3.2.1 values per the stream's `VREV`.
+    pub fn frame_index_from_granule_position(&self, granule_position: u64) -> Result<u64, Error> {
+        frame_index_from_granule_position(
+            self.normalized_granule_position(granule_position)?,
+            self.kfgshift,
+        )
+    }
+
+    /// Zero-based index of the governing keyframe `granule_position`
+    /// points back to — the §A.2.3 seek anchor — normalizing
+    /// pre-3.2.1 values per the stream's `VREV`.
+    pub fn keyframe_index_from_granule_position(
+        &self,
+        granule_position: u64,
+    ) -> Result<u64, Error> {
+        keyframe_index_from_granule_position(
+            self.normalized_granule_position(granule_position)?,
+            self.kfgshift,
+        )
+    }
+
+    /// Count of decodable frames `granule_position` declares
+    /// (§A.2.3), normalizing pre-3.2.1 values per the stream's
+    /// `VREV`. Note that on a legacy stream a raw zero is
+    /// indistinguishable from a header page's zero and normalizes to
+    /// a count of 1 (its first keyframe) — an ambiguity inherent to
+    /// the pre-3.2.1 convention.
+    pub fn frame_count_from_granule_position(&self, granule_position: u64) -> Result<u64, Error> {
+        frame_count_from_granule_position(
+            self.normalized_granule_position(granule_position)?,
+            self.kfgshift,
+        )
+    }
+
+    /// The wire granule position marking `frame_index` on this
+    /// stream, given its governing keyframe — the §A.2.3 forward
+    /// mapping in the stream's own vintage (3.2.1+ form, or the
+    /// legacy high-half-index form when
+    /// [`Self::uses_legacy_granule_position`]).
+    pub fn granule_position_for_frame(
+        &self,
+        frame_index: u64,
+        keyframe_index: u64,
+    ) -> Result<u64, Error> {
+        let modern = granule_position_for_frame(frame_index, keyframe_index, self.kfgshift)?;
+        if self.uses_legacy_granule_position() {
+            // Inverse of the §A.2.3 normalization: the legacy high
+            // half is the keyframe index, one less than the count.
+            Ok(modern - (1u64 << self.kfgshift))
+        } else {
+            Ok(modern)
+        }
+    }
+
+    /// End of the marked frame's display interval in seconds:
+    /// the §A.2.3 decodable-frame count times the §6.2 frame period
+    /// `FRD / FRN`.
+    pub fn granule_position_seconds(&self, granule_position: u64) -> Result<f64, Error> {
+        if self.frn == 0 {
+            return Err(Error::ZeroFrameRate {
+                which: FrameRateField::Numerator,
+            });
+        }
+        if self.frd == 0 {
+            return Err(Error::ZeroFrameRate {
+                which: FrameRateField::Denominator,
+            });
+        }
+        let count = self.frame_count_from_granule_position(granule_position)?;
+        Ok(count as f64 * self.frd as f64 / self.frn as f64)
     }
 }
 
@@ -15889,6 +16085,319 @@ fn encode_quant_params_inner(w: &mut BitWriter, qp: &QuantizationParameters) -> 
 // -----------------------------------------------------------------------------
 // oxideav_core::Decoder integration
 // -----------------------------------------------------------------------------
+
+// =====================================================================
+// Ogg carriage: the §A.2.3 granule-position mapping (§6.2 step 18).
+//
+// Theora packets carried in Ogg pages are timed through the page
+// `granulepos` field, split at `KFGSHIFT` bits (§6.2 step 18) into a
+// high half that locates the governing keyframe and a low half that
+// counts frames since it (§A.2.3). The helpers here implement both
+// directions of that mapping so a container layer needs no Theora
+// knowledge of its own; the codec crate itself still never parses Ogg
+// framing.
+// =====================================================================
+
+/// A §A.2.3 granule position split at `KFGSHIFT` bits.
+///
+/// §A.2.3 divides the field into two sections: "the more significant
+/// portion of the field gives the count of coded frames after the
+/// coding of the last keyframe in stream, and the less significant
+/// portion gives the count of frames since the last keyframe". A
+/// version-3.2.1+ stream (`VREV >= 1`) thus begins with a split of
+/// `1|0` for its first keyframe, followed by `1|1`, `1|2`, … — the
+/// high half of a data-marking value is never zero, and equals the
+/// governing keyframe's zero-based frame index plus one. All ten
+/// streams of the staged fixture corpus carry exactly this form.
+///
+/// Pre-3.2.1 streams (`VREV < 1`) instead stored the keyframe's frame
+/// *index* in the high half; §A.2.3 says such values "can be
+/// interpreted according to the description above by adding 1 to the
+/// more signification field" — see [`granule_position_from_legacy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitGranulePosition {
+    /// High half: count of coded frames up to and including the
+    /// governing keyframe — its zero-based frame index plus one.
+    /// Zero only on §A.2.1 header pages (whose granule position is
+    /// zero) or unnormalized pre-3.2.1 values.
+    pub keyframe_count: u64,
+    /// Low half (`KFGSHIFT` bits wide): count of frames since the
+    /// governing keyframe. Zero when the marked frame is the keyframe
+    /// itself.
+    pub frames_since_keyframe: u64,
+}
+
+/// Validate a `KFGSHIFT` value against the 5-bit range of §6.2 step 18.
+fn check_kfgshift(kfgshift: u8) -> Result<(), Error> {
+    if kfgshift > 0x1f {
+        return Err(Error::KfgshiftOutOfRange { kfgshift });
+    }
+    Ok(())
+}
+
+/// Split a granule position at `KFGSHIFT` bits (§6.2 step 18).
+///
+/// Pure field split — no version normalization is applied; a
+/// pre-3.2.1 value keeps its keyframe *index* in
+/// [`SplitGranulePosition::keyframe_count`] until passed through
+/// [`granule_position_from_legacy`]. Fails only on a `kfgshift`
+/// outside `0..=31`.
+pub fn split_granule_position(
+    granule_position: u64,
+    kfgshift: u8,
+) -> Result<SplitGranulePosition, Error> {
+    check_kfgshift(kfgshift)?;
+    Ok(SplitGranulePosition {
+        keyframe_count: granule_position >> kfgshift,
+        frames_since_keyframe: granule_position & ((1u64 << kfgshift) - 1),
+    })
+}
+
+/// Join a [`SplitGranulePosition`] back into the wire value.
+///
+/// Inverse of [`split_granule_position`]. Fails when the low half
+/// does not fit `KFGSHIFT` bits
+/// ([`Error::GranuleOffsetUnrepresentable`] — the §A.2.3 hazard of a
+/// keyframe interval outrunning the shift) or when the high half
+/// pushes the joined value past `i64::MAX`
+/// ([`Error::GranulePositionOverflow`]; the Ogg page field is a
+/// signed 64-bit integer whose `-1` is reserved for "no packet
+/// finishes on this page", so only non-negative values are
+/// carriable).
+pub fn join_granule_position(split: SplitGranulePosition, kfgshift: u8) -> Result<u64, Error> {
+    check_kfgshift(kfgshift)?;
+    if split.frames_since_keyframe >= (1u64 << kfgshift) {
+        return Err(Error::GranuleOffsetUnrepresentable {
+            frames_since_keyframe: split.frames_since_keyframe,
+            kfgshift,
+        });
+    }
+    if split.keyframe_count > (i64::MAX as u64) >> kfgshift {
+        return Err(Error::GranulePositionOverflow {
+            keyframe_count: split.keyframe_count,
+            kfgshift,
+        });
+    }
+    Ok((split.keyframe_count << kfgshift) | split.frames_since_keyframe)
+}
+
+/// The §A.2.3 granule position marking frame `frame_index` in a
+/// version-3.2.1+ stream, given the zero-based index of its governing
+/// keyframe.
+///
+/// `frame_index` and `keyframe_index` are zero-based display/coding
+/// indices (Theora has no frame reordering); for a keyframe the two
+/// are equal and the low half is zero. This is the value §A.2.2
+/// requires on a data page when this frame's packet is the last to
+/// finish on it.
+pub fn granule_position_for_frame(
+    frame_index: u64,
+    keyframe_index: u64,
+    kfgshift: u8,
+) -> Result<u64, Error> {
+    check_kfgshift(kfgshift)?;
+    if frame_index < keyframe_index {
+        return Err(Error::FrameBeforeKeyframe {
+            frame_index,
+            keyframe_index,
+        });
+    }
+    let keyframe_count = keyframe_index
+        .checked_add(1)
+        .ok_or(Error::GranulePositionOverflow {
+            keyframe_count: u64::MAX,
+            kfgshift,
+        })?;
+    join_granule_position(
+        SplitGranulePosition {
+            keyframe_count,
+            frames_since_keyframe: frame_index - keyframe_index,
+        },
+        kfgshift,
+    )
+}
+
+/// The zero-based index of the frame a version-3.2.1+ granule
+/// position marks: `keyframe_count + frames_since_keyframe - 1`.
+///
+/// Fails with [`Error::GranulePositionNoFrames`] when the high half
+/// is zero — a §A.2.1 header-page value (or an unnormalized
+/// pre-3.2.1 value; normalize via [`granule_position_from_legacy`]
+/// first).
+pub fn frame_index_from_granule_position(
+    granule_position: u64,
+    kfgshift: u8,
+) -> Result<u64, Error> {
+    let split = split_granule_position(granule_position, kfgshift)?;
+    if split.keyframe_count == 0 {
+        return Err(Error::GranulePositionNoFrames { granule_position });
+    }
+    // keyframe_count - 1 is the keyframe's index; the offset never
+    // overflows because both halves came out of one u64.
+    Ok(split.keyframe_count - 1 + split.frames_since_keyframe)
+}
+
+/// The zero-based index of the governing keyframe a version-3.2.1+
+/// granule position points back to: `keyframe_count - 1`. This is
+/// the §A.2.3 seek anchor — "information necessary to efficiently
+/// find the previous keyframe to continue decoding after a seek".
+///
+/// Fails with [`Error::GranulePositionNoFrames`] when the high half
+/// is zero (see [`frame_index_from_granule_position`]).
+pub fn keyframe_index_from_granule_position(
+    granule_position: u64,
+    kfgshift: u8,
+) -> Result<u64, Error> {
+    let split = split_granule_position(granule_position, kfgshift)?;
+    if split.keyframe_count == 0 {
+        return Err(Error::GranulePositionNoFrames { granule_position });
+    }
+    Ok(split.keyframe_count - 1)
+}
+
+/// The count of decodable frames a version-3.2.1+ granule position
+/// declares: `keyframe_count + frames_since_keyframe`. §A.2.3
+/// derives data-packet granule positions "from the count of decodable
+/// frames after that packet is processed", so this count times the
+/// frame period is the end of the marked frame's display interval
+/// (§A.2.2).
+///
+/// A granule position of zero returns zero (a §A.2.1 header page
+/// declares no decodable frames); a nonzero low half under a zero
+/// high half is not a valid 3.2.1+ marking and fails with
+/// [`Error::GranulePositionNoFrames`].
+pub fn frame_count_from_granule_position(
+    granule_position: u64,
+    kfgshift: u8,
+) -> Result<u64, Error> {
+    let split = split_granule_position(granule_position, kfgshift)?;
+    if split.keyframe_count == 0 && split.frames_since_keyframe != 0 {
+        return Err(Error::GranulePositionNoFrames { granule_position });
+    }
+    split
+        .keyframe_count
+        .checked_add(split.frames_since_keyframe)
+        .ok_or(Error::GranulePositionOverflow {
+            keyframe_count: split.keyframe_count,
+            kfgshift,
+        })
+}
+
+/// Normalize a pre-3.2.1 (`VREV < 1`) granule position to the
+/// version-3.2.1+ interpretation.
+///
+/// §A.2.3: before 3.2.1 "data packets were marked by a granulepos
+/// derived from the index of the frame being decoded, rather than the
+/// count … They can be interpreted according to the description above
+/// by adding 1 to the more signification field of the split granulepos
+/// when VREV is less than 1." The returned value feeds the other
+/// `*_from_granule_position` helpers unchanged.
+pub fn granule_position_from_legacy(granule_position: u64, kfgshift: u8) -> Result<u64, Error> {
+    let split = split_granule_position(granule_position, kfgshift)?;
+    let keyframe_count =
+        split
+            .keyframe_count
+            .checked_add(1)
+            .ok_or(Error::GranulePositionOverflow {
+                keyframe_count: split.keyframe_count,
+                kfgshift,
+            })?;
+    join_granule_position(
+        SplitGranulePosition {
+            keyframe_count,
+            frames_since_keyframe: split.frames_since_keyframe,
+        },
+        kfgshift,
+    )
+}
+
+/// Running §A.2.3 granule-position generator for a muxer.
+///
+/// Feed it every data packet's keyframe flag in coding order (Theora
+/// has no reordering) and it yields that packet's granule position —
+/// the value §A.2.2 requires on a page when the packet is the last to
+/// finish on it. Zero-byte duplicate-frame packets (§7.11 step 2) are
+/// frames like any other: push them as non-keyframes.
+///
+/// The tracker emits the version-3.2.1+ (`VREV >= 1`) form — the only
+/// form streams authored by this crate use. The first pushed frame
+/// must be a keyframe (§7.1 requires an intra first frame; §A.2.3 has
+/// no marking for a frame with no governing keyframe). State is
+/// committed only on success, so a
+/// [`Error::GranuleOffsetUnrepresentable`] rejection (keyframe
+/// interval outrunning `2^KFGSHIFT`) leaves the tracker where a
+/// caller can retry the same frame as a forced keyframe.
+#[derive(Debug, Clone)]
+pub struct GranulePositionTracker {
+    kfgshift: u8,
+    next_frame_index: u64,
+    last_keyframe_index: Option<u64>,
+}
+
+impl GranulePositionTracker {
+    /// Tracker for a stream whose first data packet is frame 0 — the
+    /// §A.2.3 opening ("a stream would begin with a split granulepos
+    /// of 1|0").
+    pub fn new(kfgshift: u8) -> Result<Self, Error> {
+        Self::starting_at(kfgshift, 0)
+    }
+
+    /// Tracker whose first pushed frame carries the zero-based index
+    /// `first_frame_index`.
+    ///
+    /// Some producers begin marking at a nonzero display index (three
+    /// streams of the staged fixture corpus open with `2|0` — an
+    /// initial index of 1); this constructor reproduces such streams.
+    pub fn starting_at(kfgshift: u8, first_frame_index: u64) -> Result<Self, Error> {
+        check_kfgshift(kfgshift)?;
+        Ok(Self {
+            kfgshift,
+            next_frame_index: first_frame_index,
+            last_keyframe_index: None,
+        })
+    }
+
+    /// Tracker using the `KFGSHIFT` an identification header declares.
+    pub fn for_ident(ident: &TheoraIdentHeader) -> Result<Self, Error> {
+        Self::new(ident.kfgshift)
+    }
+
+    /// Account one data packet (= one frame) and return its §A.2.3
+    /// granule position.
+    pub fn push_frame(&mut self, is_keyframe: bool) -> Result<u64, Error> {
+        let frame_index = self.next_frame_index;
+        let keyframe_index = if is_keyframe {
+            frame_index
+        } else {
+            self.last_keyframe_index
+                .ok_or(Error::GranuleStreamFirstFrameNotKeyframe)?
+        };
+        let gp = granule_position_for_frame(frame_index, keyframe_index, self.kfgshift)?;
+        let next = frame_index
+            .checked_add(1)
+            .ok_or(Error::GranulePositionOverflow {
+                keyframe_count: u64::MAX,
+                kfgshift: self.kfgshift,
+            })?;
+        // All fallible steps passed — commit.
+        self.next_frame_index = next;
+        if is_keyframe {
+            self.last_keyframe_index = Some(frame_index);
+        }
+        Ok(gp)
+    }
+
+    /// Zero-based index the next pushed frame will carry.
+    pub fn next_frame_index(&self) -> u64 {
+        self.next_frame_index
+    }
+
+    /// Zero-based index of the most recent keyframe, once one has
+    /// been pushed.
+    pub fn last_keyframe_index(&self) -> Option<u64> {
+        self.last_keyframe_index
+    }
+}
 
 /// Canonical codec id this decoder registers under.
 pub const THEORA_CODEC_ID: &str = "theora";
@@ -39679,5 +40188,242 @@ mod tests {
             "wide-translation round trip luma max error {}",
             plane_max_err(&f1.frame.samples_y, &frame1.samples_y)
         );
+    }
+
+    // ----- round 431: §A.2.3 granule-position mapping -----
+
+    /// §A.2.3 opening sequence at the `for_picture` default shift of
+    /// 6: "a stream would begin with a split granulepos of 1|0 (a
+    /// keyframe), followed by 1|1, 1|2, 1|3, etc."
+    #[test]
+    fn granule_forward_mapping_matches_the_spec_opening_sequence() {
+        assert_eq!(granule_position_for_frame(0, 0, 6).unwrap(), 64); // 1|0
+        assert_eq!(granule_position_for_frame(1, 0, 6).unwrap(), 65); // 1|1
+        assert_eq!(granule_position_for_frame(2, 0, 6).unwrap(), 66); // 1|2
+        assert_eq!(granule_position_for_frame(3, 0, 6).unwrap(), 67); // 1|3
+                                                                      // A mid-stream keyframe restarts the low half at zero with the
+                                                                      // high half at its own decodable-frame count (index + 1).
+        assert_eq!(
+            granule_position_for_frame(1270, 1270, 6).unwrap(),
+            1271 << 6 // 1271|0
+        );
+        // The value stays monotonically increasing across the keyframe
+        // even though the low half resets (§A.2.3's requirement).
+        let before = granule_position_for_frame(1269, 1233, 6).unwrap(); // 1234|36
+        assert_eq!(before, (1234 << 6) | 36);
+        assert!(before < 1271 << 6);
+    }
+
+    /// Split/join are exact inverses across the whole legal shift
+    /// range, and both directions reject a shift outside §6.2 step
+    /// 18's 5-bit field.
+    #[test]
+    fn granule_split_join_round_trip_and_shift_validation() {
+        for kfgshift in [0u8, 1, 6, 15, 31] {
+            for (kc, fsk) in [(1u64, 0u64), (1, 1), (77, 3), (1 << 20, 0)] {
+                // Keep the offset inside the shift's low half.
+                let fsk = fsk & ((1u64 << kfgshift) - 1);
+                let split = SplitGranulePosition {
+                    keyframe_count: kc,
+                    frames_since_keyframe: fsk,
+                };
+                let gp = join_granule_position(split, kfgshift).unwrap();
+                assert_eq!(split_granule_position(gp, kfgshift).unwrap(), split);
+            }
+        }
+        assert_eq!(
+            split_granule_position(64, 32).unwrap_err(),
+            Error::KfgshiftOutOfRange { kfgshift: 32 }
+        );
+        assert_eq!(
+            granule_position_for_frame(0, 0, 255).unwrap_err(),
+            Error::KfgshiftOutOfRange { kfgshift: 255 }
+        );
+    }
+
+    /// The inverse helpers recover frame index, keyframe index (the
+    /// §A.2.3 seek anchor), and decodable-frame count.
+    #[test]
+    fn granule_inverse_mapping_recovers_indices_and_count() {
+        // 1234|36 marks frame 1269 governed by keyframe 1233; 1270
+        // frames are decodable once it is processed.
+        let gp = (1234u64 << 6) | 36;
+        assert_eq!(frame_index_from_granule_position(gp, 6).unwrap(), 1269);
+        assert_eq!(keyframe_index_from_granule_position(gp, 6).unwrap(), 1233);
+        assert_eq!(frame_count_from_granule_position(gp, 6).unwrap(), 1270);
+        // Forward → inverse closes the loop for keyframes and inter
+        // frames alike.
+        for (fi, ki) in [(0u64, 0u64), (5, 0), (63, 0), (64, 64), (100, 64)] {
+            let gp = granule_position_for_frame(fi, ki, 6).unwrap();
+            assert_eq!(frame_index_from_granule_position(gp, 6).unwrap(), fi);
+            assert_eq!(keyframe_index_from_granule_position(gp, 6).unwrap(), ki);
+            assert_eq!(frame_count_from_granule_position(gp, 6).unwrap(), fi + 1);
+        }
+    }
+
+    /// A zero high half marks no frame: §A.2.1 header pages carry
+    /// granule position zero, and no 3.2.1+ data marking has
+    /// `keyframe_count == 0`.
+    #[test]
+    fn granule_zero_high_half_marks_no_frame() {
+        assert_eq!(
+            frame_index_from_granule_position(0, 6).unwrap_err(),
+            Error::GranulePositionNoFrames {
+                granule_position: 0
+            }
+        );
+        assert_eq!(
+            keyframe_index_from_granule_position(7, 6).unwrap_err(),
+            Error::GranulePositionNoFrames {
+                granule_position: 7
+            }
+        );
+        // The count of a header-page zero is zero decodable frames…
+        assert_eq!(frame_count_from_granule_position(0, 6).unwrap(), 0);
+        // …but a nonzero low half under a zero high half is malformed.
+        assert_eq!(
+            frame_count_from_granule_position(7, 6).unwrap_err(),
+            Error::GranulePositionNoFrames {
+                granule_position: 7
+            }
+        );
+    }
+
+    /// Offsets that outrun `2^KFGSHIFT` are uncarriable (§A.2.3), and
+    /// high halves that escape `i64` are rejected — the Ogg field is
+    /// signed with `-1` reserved.
+    #[test]
+    fn granule_rejects_unrepresentable_offsets_and_overflow() {
+        // KFGSHIFT = 0 can only mark keyframes.
+        assert_eq!(granule_position_for_frame(4, 4, 0).unwrap(), 5);
+        assert_eq!(
+            granule_position_for_frame(5, 4, 0).unwrap_err(),
+            Error::GranuleOffsetUnrepresentable {
+                frames_since_keyframe: 1,
+                kfgshift: 0,
+            }
+        );
+        // KFGSHIFT = 6 covers offsets 0..=63.
+        assert!(granule_position_for_frame(63, 0, 6).is_ok());
+        assert_eq!(
+            granule_position_for_frame(64, 0, 6).unwrap_err(),
+            Error::GranuleOffsetUnrepresentable {
+                frames_since_keyframe: 64,
+                kfgshift: 6,
+            }
+        );
+        // Largest carriable keyframe count at shift 6, then one past.
+        let max_kc = (i64::MAX as u64) >> 6;
+        assert!(granule_position_for_frame(max_kc - 1, max_kc - 1, 6).is_ok());
+        assert_eq!(
+            granule_position_for_frame(max_kc, max_kc, 6).unwrap_err(),
+            Error::GranulePositionOverflow {
+                keyframe_count: max_kc + 1,
+                kfgshift: 6,
+            }
+        );
+        assert_eq!(
+            granule_position_for_frame(0, 1, 6).unwrap_err(),
+            Error::FrameBeforeKeyframe {
+                frame_index: 0,
+                keyframe_index: 1,
+            }
+        );
+    }
+
+    /// §A.2.3's pre-3.2.1 rule: legacy values are normalized "by
+    /// adding 1 to the more signification field … when VREV is less
+    /// than 1", and the ident-header methods apply it from `VREV`
+    /// automatically.
+    #[test]
+    fn granule_legacy_normalization_follows_vrev() {
+        // Legacy first keyframe: high half holds the keyframe *index*
+        // (0), so the raw value is 0|0; normalization yields 1|0.
+        assert_eq!(granule_position_from_legacy(0, 6).unwrap(), 64);
+        assert_eq!(
+            granule_position_from_legacy((5 << 6) | 3, 6).unwrap(),
+            (6 << 6) | 3
+        );
+
+        let mut ident = TheoraIdentHeader::for_picture(64, 64, PixelFormat::Yuv420, 25, 1).unwrap();
+        assert!(
+            !ident.uses_legacy_granule_position(),
+            "for_picture emits 3.2.1"
+        );
+        assert_eq!(ident.frame_index_from_granule_position(65).unwrap(), 1);
+        assert_eq!(ident.keyframe_index_from_granule_position(65).unwrap(), 0);
+        assert_eq!(ident.granule_position_for_frame(1, 0).unwrap(), 65);
+
+        ident.vrev = 0;
+        assert!(ident.uses_legacy_granule_position());
+        // The same stream positions now ride the legacy form: 0|1
+        // marks frame 1 governed by keyframe 0.
+        assert_eq!(ident.frame_index_from_granule_position(1).unwrap(), 1);
+        assert_eq!(ident.keyframe_index_from_granule_position(1).unwrap(), 0);
+        assert_eq!(ident.granule_position_for_frame(1, 0).unwrap(), 1);
+        // Forward → inverse closes on the legacy vintage too.
+        for (fi, ki) in [(0u64, 0u64), (7, 0), (64, 64), (70, 64)] {
+            let gp = ident.granule_position_for_frame(fi, ki).unwrap();
+            assert_eq!(ident.frame_index_from_granule_position(gp).unwrap(), fi);
+            assert_eq!(ident.keyframe_index_from_granule_position(gp).unwrap(), ki);
+        }
+    }
+
+    /// Granule → seconds: the decodable-frame count times the §6.2
+    /// frame period `FRD / FRN` — the end of the marked frame's
+    /// display interval (§A.2.2).
+    #[test]
+    fn granule_position_seconds_uses_the_frame_period() {
+        let ident =
+            TheoraIdentHeader::for_picture(64, 64, PixelFormat::Yuv420, 30_000, 1_001).unwrap();
+        // Frame 29 (30 decodable frames) at 30000/1001 fps ends at
+        // exactly 30 * 1001 / 30000 = 1.001 s.
+        let gp = ident.granule_position_for_frame(29, 0).unwrap();
+        let secs = ident.granule_position_seconds(gp).unwrap();
+        assert!((secs - 1.001).abs() < 1e-12, "got {secs}");
+        // A header page's zero marks time zero.
+        assert_eq!(ident.granule_position_seconds(0).unwrap(), 0.0);
+    }
+
+    /// The mux-side tracker reproduces the §A.2.3 sequence from
+    /// keyframe flags alone, refuses an inter first frame, and leaves
+    /// state untouched when an offset outruns the shift so the caller
+    /// can retry with a forced keyframe.
+    #[test]
+    fn granule_tracker_walks_keyframe_flags() {
+        let mut t = GranulePositionTracker::new(6).unwrap();
+        assert_eq!(t.push_frame(true).unwrap(), 64); // 1|0
+        assert_eq!(t.push_frame(false).unwrap(), 65); // 1|1
+        assert_eq!(t.push_frame(false).unwrap(), 66); // 1|2
+        assert_eq!(t.push_frame(true).unwrap(), 4 << 6); // 4|0
+        assert_eq!(t.push_frame(false).unwrap(), (4 << 6) | 1); // 4|1
+        assert_eq!(t.next_frame_index(), 5);
+        assert_eq!(t.last_keyframe_index(), Some(3));
+
+        // First frame must be a keyframe.
+        let mut t = GranulePositionTracker::new(6).unwrap();
+        assert_eq!(
+            t.push_frame(false).unwrap_err(),
+            Error::GranuleStreamFirstFrameNotKeyframe
+        );
+        assert_eq!(
+            t.push_frame(true).unwrap(),
+            64,
+            "recoverable after the refusal"
+        );
+
+        // GOP outruns 2^KFGSHIFT: shift 1 marks offsets 0..=1 only.
+        let mut t = GranulePositionTracker::new(1).unwrap();
+        assert_eq!(t.push_frame(true).unwrap(), 2); // 1|0
+        assert_eq!(t.push_frame(false).unwrap(), 3); // 1|1
+        assert_eq!(
+            t.push_frame(false).unwrap_err(),
+            Error::GranuleOffsetUnrepresentable {
+                frames_since_keyframe: 2,
+                kfgshift: 1,
+            }
+        );
+        // State unchanged — the same frame goes through as a keyframe.
+        assert_eq!(t.push_frame(true).unwrap(), 3 << 1); // 3|0
     }
 }

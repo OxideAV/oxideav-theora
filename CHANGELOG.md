@@ -4,6 +4,25 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **§A.2.3 granule-position mapping (round 431)** — public helpers a
+  container layer can call without Theora knowledge of its own:
+  `split_granule_position` / `join_granule_position` (the §6.2 step 18
+  `KFGSHIFT` split), `granule_position_for_frame` and the inverse
+  `frame_index_from_granule_position` /
+  `keyframe_index_from_granule_position` (the §A.2.3 seek anchor) /
+  `frame_count_from_granule_position`, the pre-3.2.1 `VREV < 1`
+  normalization `granule_position_from_legacy` (§A.2.3's +1 high-half
+  rule), and a mux-side `GranulePositionTracker` that walks keyframe
+  flags into per-packet granule positions. `TheoraIdentHeader` grows
+  the same operations as methods that normalize automatically from the
+  stream's `VREV` plus `granule_position_seconds` (decodable-frame
+  count × `FRD/FRN`, the §A.2.2 end-of-display-interval time). New
+  typed errors cover the §A.2.3 uncarriable-offset hazard, `i64`
+  (Ogg-field) overflow, header-page (`keyframe_count == 0`) values,
+  and inconsistent frame/keyframe indices.
+
 ### Changed
 
 - Marked 68 clearly-internal public items (`#[doc(hidden)]`) — low-level

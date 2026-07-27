@@ -16107,7 +16107,7 @@ fn encode_quant_params_inner(w: &mut BitWriter, qp: &QuantizationParameters) -> 
 /// version-3.2.1+ stream (`VREV >= 1`) thus begins with a split of
 /// `1|0` for its first keyframe, followed by `1|1`, `1|2`, … — the
 /// high half of a data-marking value is never zero, and equals the
-/// governing keyframe's zero-based frame index plus one. All ten
+/// governing keyframe's zero-based frame index plus one. All eleven
 /// streams of the staged fixture corpus carry exactly this form.
 ///
 /// Pre-3.2.1 streams (`VREV < 1`) instead stored the keyframe's frame

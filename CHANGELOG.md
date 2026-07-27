@@ -6,6 +6,17 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **§6.1 packet classification (round 431)** — `classify_packet` /
+  `TheoraPacketKind` route a de-framed packet by its first byte
+  without consuming past the common header: the three header types
+  (identification `0x80`, comment `0x81`, setup `0x82`), reserved
+  header types `0x83`–`0xFF` (reported as `ReservedHeader`, which
+  §6.1 says MUST be ignored), and video data (most significant bit
+  unset, including the zero-byte §7.11 duplicate-frame marker), with
+  `Error::BadMagic` / `Error::TruncatedHeader` on a corrupt sync
+  pattern. The three header prefixes are exported as
+  `IDENTIFICATION_HEADER_MAGIC` / `COMMENT_HEADER_MAGIC` /
+  `SETUP_HEADER_MAGIC`.
 - **§A.2.3 granule-position mapping (round 431)** — public helpers a
   container layer can call without Theora knowledge of its own:
   `split_granule_position` / `join_granule_position` (the §6.2 step 18

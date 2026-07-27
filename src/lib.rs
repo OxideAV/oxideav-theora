@@ -16399,6 +16399,118 @@ impl GranulePositionTracker {
     }
 }
 
+// =====================================================================
+// Ogg carriage: §6.1 packet classification.
+// =====================================================================
+
+/// The leading bytes of every §6.2 identification header packet: the
+/// `0x80` header type followed by the six-byte §6.1 `theora` sync
+/// pattern.
+///
+/// This is the payload magic a Theora logical stream announces itself
+/// with — the identification header is the first packet of the stream
+/// (§A.2.1), so a container that captures a stream's opening payload
+/// bytes can resolve the codec from this prefix alone. The crate's
+/// [`register`] hook declares it via
+/// [`CodecInfo::payload_magic`](oxideav_core::CodecInfo::payload_magic)
+/// so resolver-driven demuxers match it through
+/// [`CodecRegistry::resolve_payload_magic_ref`](oxideav_core::CodecRegistry::resolve_payload_magic_ref).
+pub const IDENTIFICATION_HEADER_MAGIC: [u8; 7] = *b"\x80theora";
+
+/// The leading bytes of the §6.3 comment header packet (`0x81` +
+/// `theora`) — the second packet of a logical stream.
+pub const COMMENT_HEADER_MAGIC: [u8; 7] = *b"\x81theora";
+
+/// The leading bytes of the §6.4 setup header packet (`0x82` +
+/// `theora`) — the third packet of a logical stream.
+pub const SETUP_HEADER_MAGIC: [u8; 7] = *b"\x82theora";
+
+/// What kind of packet a §6.1 first-byte inspection says this is.
+///
+/// Returned by [`classify_packet`]. §6.1: "All header packets have the
+/// most significant bit of the type field — which is the initial bit
+/// in the packet — set. This distinguishes them from video data
+/// packets in which the first bit is unset."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TheoraPacketKind {
+    /// The §6.2 identification header (`HEADERTYPE = 0x80`) — first
+    /// packet of the stream, parsed by
+    /// [`decode_identification_header`].
+    IdentificationHeader,
+    /// The §6.3 comment header (`HEADERTYPE = 0x81`) — second packet,
+    /// parsed by [`parse_comment_header`].
+    CommentHeader,
+    /// The §6.4 setup header (`HEADERTYPE = 0x82`) — third packet,
+    /// parsed by [`parse_setup_header`] / [`decode_setup_header`].
+    SetupHeader,
+    /// A header packet with a reserved type. §6.1: "Packets with
+    /// other header types (`0x83`–`0xFF`) are reserved and MUST be
+    /// ignored." Carries the raw `HEADERTYPE` byte.
+    ReservedHeader(u8),
+    /// A §7 video-data packet (most significant bit of the first byte
+    /// unset), including the zero-byte duplicate-frame packet of
+    /// §7.11 step 2. Feed to [`FrameDecoder::decode_frame`] once the
+    /// headers are in.
+    VideoData,
+}
+
+impl TheoraPacketKind {
+    /// True for every header variant (the §6.1 most-significant-bit
+    /// set class), including reserved types.
+    pub fn is_header(&self) -> bool {
+        !matches!(self, TheoraPacketKind::VideoData)
+    }
+
+    /// The raw `HEADERTYPE` byte for header packets, `None` for video
+    /// data.
+    pub fn header_type(&self) -> Option<u8> {
+        match self {
+            TheoraPacketKind::IdentificationHeader => Some(0x80),
+            TheoraPacketKind::CommentHeader => Some(0x81),
+            TheoraPacketKind::SetupHeader => Some(0x82),
+            TheoraPacketKind::ReservedHeader(t) => Some(*t),
+            TheoraPacketKind::VideoData => None,
+        }
+    }
+}
+
+/// Classify a de-framed Theora packet per §6.1, so a demuxer can
+/// route header packets to the right parser without magic knowledge
+/// of its own.
+///
+/// Applies §6.1 steps 1–2 without consuming anything past the common
+/// header: a first byte with the most significant bit unset — or a
+/// zero-byte packet, the §7.11 step 2 duplicate-frame marker — is
+/// [`TheoraPacketKind::VideoData`]; otherwise the packet is a header
+/// and its six following bytes must spell `theora`
+/// ([`Error::BadMagic`] when they do not — "This stream is not
+/// decodable by this specification" — and
+/// [`Error::TruncatedHeader`] when the packet ends before them).
+/// Known header types map to their variants; `0x83`–`0xFF` return
+/// [`TheoraPacketKind::ReservedHeader`], which per §6.1 MUST be
+/// ignored rather than treated as an error.
+pub fn classify_packet(packet: &[u8]) -> Result<TheoraPacketKind, Error> {
+    let Some(&header_type) = packet.first() else {
+        // Zero-byte packets are §7.11 step 2 duplicate-frame markers.
+        return Ok(TheoraPacketKind::VideoData);
+    };
+    if header_type & 0x80 == 0 {
+        return Ok(TheoraPacketKind::VideoData);
+    }
+    let magic = packet
+        .get(1..7)
+        .ok_or(Error::TruncatedHeader { field: "magic" })?;
+    if magic != b"theora" {
+        return Err(Error::BadMagic);
+    }
+    Ok(match header_type {
+        0x80 => TheoraPacketKind::IdentificationHeader,
+        0x81 => TheoraPacketKind::CommentHeader,
+        0x82 => TheoraPacketKind::SetupHeader,
+        other => TheoraPacketKind::ReservedHeader(other),
+    })
+}
+
 /// Canonical codec id this decoder registers under.
 pub const THEORA_CODEC_ID: &str = "theora";
 
@@ -40425,5 +40537,105 @@ mod tests {
         );
         // State unchanged — the same frame goes through as a keyframe.
         assert_eq!(t.push_frame(true).unwrap(), 3 << 1); // 3|0
+    }
+
+    // ----- round 431: §6.1 packet classification -----
+
+    /// Every real header packet in the embedded fixture material —
+    /// identification headers across geometries, the shared setup
+    /// packet, and a comment header built by this crate's own §6.3
+    /// writer — classifies to its §6.1 type, and the exported magic
+    /// constants are exactly their leading bytes.
+    #[test]
+    fn classify_packet_recognizes_the_three_header_types() {
+        for ident in [
+            &TINY_HEADER[..],
+            &fixture_data::QTC_IDENT_PACKET[..],
+            &fixture_data::HD1080_IDENT_PACKET[..],
+            &fixture_data::MONO_IDENT_PACKET[..],
+        ] {
+            assert_eq!(
+                classify_packet(ident).unwrap(),
+                TheoraPacketKind::IdentificationHeader
+            );
+            assert!(ident.starts_with(&IDENTIFICATION_HEADER_MAGIC));
+        }
+        for setup in [
+            &fixture_data::FIXTURE_SETUP_PACKET[..],
+            &fixture_data::HD1080_SETUP_PACKET[..],
+        ] {
+            assert_eq!(
+                classify_packet(setup).unwrap(),
+                TheoraPacketKind::SetupHeader
+            );
+            assert!(setup.starts_with(&SETUP_HEADER_MAGIC));
+        }
+        let comment =
+            encode_comment_header("vendor", &[("A".to_string(), "B".to_string())]).unwrap();
+        assert_eq!(
+            classify_packet(&comment).unwrap(),
+            TheoraPacketKind::CommentHeader
+        );
+        assert!(comment.starts_with(&COMMENT_HEADER_MAGIC));
+        // The bare magics themselves classify — a demuxer may probe on
+        // exactly seven captured bytes.
+        assert_eq!(
+            classify_packet(&IDENTIFICATION_HEADER_MAGIC).unwrap(),
+            TheoraPacketKind::IdentificationHeader
+        );
+        assert_eq!(
+            classify_packet(&COMMENT_HEADER_MAGIC).unwrap(),
+            TheoraPacketKind::CommentHeader
+        );
+        assert_eq!(
+            classify_packet(&SETUP_HEADER_MAGIC).unwrap(),
+            TheoraPacketKind::SetupHeader
+        );
+    }
+
+    /// §6.1 video-data classification: the most significant bit of
+    /// the first byte is unset — including intra packets, inter
+    /// packets, and the zero-byte §7.11 step 2 duplicate marker.
+    #[test]
+    fn classify_packet_routes_video_data() {
+        for data in [
+            &fixture_data::TINY_DATA_PACKET_0[..],
+            &fixture_data::IFP_IFRAME_PACKET[..],
+            &fixture_data::IFP_PFRAME_PACKET[..],
+            &fixture_data::KI30_DATA_PACKET_1[..], // zero-byte duplicate
+        ] {
+            let kind = classify_packet(data).unwrap();
+            assert_eq!(kind, TheoraPacketKind::VideoData);
+            assert!(!kind.is_header());
+            assert_eq!(kind.header_type(), None);
+        }
+    }
+
+    /// §6.1's edge classes: reserved header types (`0x83`–`0xFF`,
+    /// MUST be ignored — reported, not errored), a wrong sync pattern
+    /// (stream not decodable), and a header cut short of its magic.
+    #[test]
+    fn classify_packet_reserved_types_and_errors() {
+        let mut reserved = *b"\x83theora";
+        assert_eq!(
+            classify_packet(&reserved).unwrap(),
+            TheoraPacketKind::ReservedHeader(0x83)
+        );
+        reserved[0] = 0xff;
+        let kind = classify_packet(&reserved).unwrap();
+        assert_eq!(kind, TheoraPacketKind::ReservedHeader(0xff));
+        assert!(kind.is_header());
+        assert_eq!(kind.header_type(), Some(0xff));
+
+        assert_eq!(classify_packet(b"\x80theorb").unwrap_err(), Error::BadMagic);
+        assert_eq!(classify_packet(b"\x81Theora").unwrap_err(), Error::BadMagic);
+        assert_eq!(
+            classify_packet(b"\x80theo").unwrap_err(),
+            Error::TruncatedHeader { field: "magic" }
+        );
+        assert_eq!(
+            classify_packet(&[0x80]).unwrap_err(),
+            Error::TruncatedHeader { field: "magic" }
+        );
     }
 }

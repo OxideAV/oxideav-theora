@@ -18029,7 +18029,12 @@ pub fn make_encoder(
 
 /// Register the Theora codec into `reg` under [`THEORA_CODEC_ID`], with
 /// the Matroska CodecID `V_THEORA` the codec is carried under in MKV /
-/// WebM. (Theora has no canonical AVI FourCC; the container-specific tag
+/// WebM and the [`IDENTIFICATION_HEADER_MAGIC`] payload magic Ogg
+/// logical streams announce it by (Ogg carries no codec tag — the
+/// codec is identified by the first packet's leading bytes, resolved
+/// registry-first via
+/// [`CodecRegistry::resolve_payload_magic_ref`](oxideav_core::CodecRegistry::resolve_payload_magic_ref)).
+/// (Theora has no canonical AVI FourCC; the container-specific tag
 /// resolution lives in the container crates against this registration.)
 pub fn register_codecs(reg: &mut oxideav_core::CodecRegistry) {
     use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
@@ -18039,7 +18044,13 @@ pub fn register_codecs(reg: &mut oxideav_core::CodecRegistry) {
             .capabilities(caps)
             .decoder(make_decoder)
             .encoder(make_encoder)
-            .tag(CodecTag::matroska("V_THEORA")),
+            .tag(CodecTag::matroska("V_THEORA"))
+            // §A.2.1: the identification header is the first packet
+            // of the logical stream, so its §6.1 leading bytes are
+            // the payload magic a resolver-driven container (an Ogg
+            // demuxer holding a stream's first packet) identifies
+            // the codec by.
+            .payload_magic(IDENTIFICATION_HEADER_MAGIC),
     );
 }
 
@@ -40637,5 +40648,93 @@ mod tests {
             classify_packet(&[0x80]).unwrap_err(),
             Error::TruncatedHeader { field: "magic" }
         );
+    }
+
+    // ----- round 431: payload-magic registration -----
+
+    /// The registration declares [`IDENTIFICATION_HEADER_MAGIC`] as
+    /// the stream's payload magic, so a resolver holding an Ogg
+    /// logical stream's first packet resolves `"theora"` from payload
+    /// bytes alone — the §A.2.1 identification path a demuxer takes
+    /// when no codec tag exists.
+    #[test]
+    fn registry_resolves_the_payload_magic_from_a_first_packet() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+
+        // The bare seven-byte magic resolves…
+        assert_eq!(
+            ctx.codecs
+                .resolve_payload_magic_ref(&IDENTIFICATION_HEADER_MAGIC)
+                .map(|c| c.as_str()),
+            Some(THEORA_CODEC_ID),
+        );
+        // …and so does every real identification packet the fixture
+        // corpus carries (prefix-keyed on the full first packet, the
+        // shape an Ogg demuxer hands over).
+        for ident in [
+            &TINY_HEADER[..],
+            &fixture_data::QTC_IDENT_PACKET[..],
+            &fixture_data::HD1080_IDENT_PACKET[..],
+            &fixture_data::MONO_IDENT_PACKET[..],
+        ] {
+            assert_eq!(
+                ctx.codecs
+                    .resolve_payload_magic_ref(ident)
+                    .map(|c| c.as_str()),
+                Some(THEORA_CODEC_ID),
+            );
+        }
+
+        // The registry-built encoder's own first output packet — the
+        // §6.2 identification header — resolves too, closing the
+        // loop: what this crate muxes, a resolver identifies.
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let extradata = pack_extradata(&[
+            &encode_identification_header(&ident).unwrap(),
+            &encode_comment_header("v", &[]).unwrap(),
+            &encode_setup_header(&setup).unwrap(),
+        ])
+        .unwrap();
+        let mut params = oxideav_core::CodecParameters::video(CodecId::new(THEORA_CODEC_ID));
+        params.extradata = extradata;
+        let mut enc = ctx.codecs.first_encoder(&params).unwrap();
+        let vf = flat_video_frame(&ident, 128, 128, 128, 0);
+        enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+        let first = enc.receive_packet().unwrap();
+        assert!(first.flags.header);
+        assert_eq!(
+            ctx.codecs
+                .resolve_payload_magic_ref(&first.data)
+                .map(|c| c.as_str()),
+            Some(THEORA_CODEC_ID),
+        );
+    }
+
+    /// Prefixes that are not the identification header stay
+    /// unresolved: the comment / setup header magics (legal packets,
+    /// but never the first of a stream), truncations of the magic,
+    /// video-data bytes, and a foreign sync pattern.
+    #[test]
+    fn registry_payload_magic_refuses_non_identification_prefixes() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        for miss in [
+            &COMMENT_HEADER_MAGIC[..],               // \x81theora
+            &SETUP_HEADER_MAGIC[..],                 // \x82theora
+            &fixture_data::FIXTURE_SETUP_PACKET[..], // full setup packet
+            &IDENTIFICATION_HEADER_MAGIC[..6],       // \x80theor — truncated
+            &IDENTIFICATION_HEADER_MAGIC[..1],       // \x80 alone
+            b"",                                     // empty capture
+            &fixture_data::TINY_DATA_PACKET_0[..],   // video data
+            b"\x80vorbis",                           // foreign pattern
+        ] {
+            assert_eq!(
+                ctx.codecs.resolve_payload_magic_ref(miss),
+                None,
+                "prefix {miss:02x?} must not resolve"
+            );
+        }
     }
 }

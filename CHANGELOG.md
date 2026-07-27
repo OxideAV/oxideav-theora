@@ -6,6 +6,14 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Payload-magic registration (round 431)** — `register` /
+  `register_codecs` now declare `IDENTIFICATION_HEADER_MAGIC`
+  (`\x80` + `theora`, the §6.2 identification header's leading bytes)
+  via `CodecInfo::payload_magic`, so resolver-driven containers (the
+  Ogg demuxer's registry-first identification path) resolve
+  `"theora"` from a logical stream's first packet without built-in
+  knowledge. Comment/setup prefixes, truncations, and video-data
+  bytes stay unresolved.
 - **§6.1 packet classification (round 431)** — `classify_packet` /
   `TheoraPacketKind` route a de-framed packet by its first byte
   without consuming past the common header: the three header types

@@ -19206,6 +19206,31 @@ mod tests {
         }
     }
 
+    /// §5.2.5: "Reading to the end of the packet, but not past the
+    /// end … and then reading a zero bit integer shall succeed,
+    /// returning 0, and not trigger an 'end-of-packet' condition."
+    /// This is load-bearing on the wire: an all-zero §6.4.1 LFLIMS
+    /// table serializes at `NBITS = 0`, so a setup header may
+    /// legally end (up to padding) with sixty-four zero-bit reads.
+    #[test]
+    fn bitreader_zero_bit_read_at_exact_end_succeeds() {
+        let mut r = BitReader::new(&[0xAB]);
+        assert_eq!(r.read_bits(8, "byte").unwrap(), 0xAB);
+        // Exactly at the end — not past it: zero-bit reads succeed
+        // and keep succeeding (they never advance the stream).
+        assert_eq!(r.read_bits(0, "zero-bit").unwrap(), 0);
+        assert_eq!(r.read_bits(0, "zero-bit again").unwrap(), 0);
+        // A one-bit read past the end still fails.
+        match r.read_bits(1, "overflow") {
+            Err(Error::TruncatedHeader { field: "overflow" }) => {}
+            other => panic!("expected TruncatedHeader, got {other:?}"),
+        }
+        // The §5.2.5 "after EOP, zero-bit reads fail" arm never
+        // arises inside this crate: every read returns a `Result`
+        // and the decode chains propagate the first `Err`, so no
+        // reader is consulted again after an end-of-packet error.
+    }
+
     #[test]
     fn bitreader_returns_truncated_mid_field() {
         // Buffer has 12 bits available; requesting 16 fails at the

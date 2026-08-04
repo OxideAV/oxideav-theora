@@ -40172,6 +40172,113 @@ mod tests {
         assert_eq!(decoded_ok + rejected, 2400);
     }
 
+    /// §5.2 end-of-packet discipline on *reference-encoded* packets:
+    /// every possible truncation of the staged fixture corpus's
+    /// i-then-p packets must decode to `Ok` or a typed `Err` — never
+    /// panic — and any accepted prefix must still survive the §2.2
+    /// display crop. This complements the corruption storm above
+    /// (which mutates *self-encoded* packets): the reference streams
+    /// spell their headers through libtheora-shaped Huffman tables and
+    /// multi-qi frame headers this crate's encoder never emits, so the
+    /// §7 read chain crosses different token boundaries when the
+    /// packet ends early. The intra prefixes run against a fresh
+    /// decoder (first-frame path), the inter prefixes against a
+    /// decoder holding the fixture's real reference frame.
+    #[test]
+    fn decode_frame_every_truncation_of_reference_fixture_packets_is_live() {
+        let ident = decode_identification_header(&fixture_data::IFP_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let pristine = FrameDecoder::new(ident, setup).unwrap();
+
+        // Seed the reference state with the full keyframe for the
+        // inter-prefix leg.
+        let mut after_key = pristine.clone();
+        after_key
+            .decode_frame(&fixture_data::IFP_IFRAME_PACKET)
+            .expect("full fixture keyframe decodes");
+
+        let mut accepted_intra = 0usize;
+        for len in 0..=fixture_data::IFP_IFRAME_PACKET.len() {
+            let mut dec = pristine.clone();
+            if let Ok(frame) = dec.decode_frame(&fixture_data::IFP_IFRAME_PACKET[..len]) {
+                dec.crop_for_display(&frame)
+                    .expect("accepted prefix must survive the display crop");
+                accepted_intra += 1;
+            }
+        }
+        // The full packet is always among the accepted spellings.
+        assert!(accepted_intra >= 1, "the untruncated keyframe decodes");
+
+        let mut accepted_inter = 0usize;
+        for len in 0..=fixture_data::IFP_PFRAME_PACKET.len() {
+            let mut dec = after_key.clone();
+            if let Ok(frame) = dec.decode_frame(&fixture_data::IFP_PFRAME_PACKET[..len]) {
+                dec.crop_for_display(&frame)
+                    .expect("accepted prefix must survive the display crop");
+                accepted_inter += 1;
+            }
+        }
+        // The zero-byte truncation is the §7.11 step-2 duplicate-frame
+        // marker — legal here because a reference exists — and the full
+        // packet decodes, so at least two prefixes are accepted.
+        assert!(
+            accepted_inter >= 2,
+            "empty-packet duplicate and the untruncated P-frame both decode"
+        );
+    }
+
+    /// Corruption storm on the *reference-encoded* fixture packets —
+    /// the same liveness contract as
+    /// [`decode_frame_survives_corrupted_encoder_output`], applied to
+    /// the staged corpus's libtheora-shaped spellings (multi-qi frame
+    /// headers, different codebooks) instead of this crate's own
+    /// output.
+    #[test]
+    fn decode_frame_survives_corrupted_reference_fixture_packets() {
+        let ident = decode_identification_header(&fixture_data::IFP_IDENT_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let mut dec0 = FrameDecoder::new(ident, setup).unwrap();
+        dec0.decode_frame(&fixture_data::IFP_IFRAME_PACKET)
+            .expect("full fixture keyframe decodes");
+
+        let key: Vec<u8> = fixture_data::IFP_IFRAME_PACKET.to_vec();
+        let inter: Vec<u8> = fixture_data::IFP_PFRAME_PACKET.to_vec();
+        let mut rng = XorShift64(0x0dec_0de5_0f37_1e0a);
+        let mut decoded_ok = 0usize;
+        let mut rejected = 0usize;
+        for base in [&key, &inter] {
+            for _ in 0..800 {
+                let mut pkt = base.clone();
+                match rng.next() % 4 {
+                    0 => {
+                        let i = (rng.next() as usize) % pkt.len();
+                        pkt[i] ^= 1 << (rng.next() % 8);
+                    }
+                    1 => {
+                        let i = (rng.next() as usize) % pkt.len();
+                        pkt[i] = rng.next() as u8;
+                    }
+                    2 => {
+                        let n = (rng.next() as usize) % (pkt.len() + 1);
+                        pkt.truncate(n);
+                    }
+                    _ => {
+                        let n = 1 + (rng.next() as usize) % 16;
+                        for _ in 0..n {
+                            pkt.push(rng.next() as u8);
+                        }
+                    }
+                }
+                let mut dec = dec0.clone();
+                match dec.decode_frame(&pkt) {
+                    Ok(_) => decoded_ok += 1,
+                    Err(_) => rejected += 1,
+                }
+            }
+        }
+        assert_eq!(decoded_ok + rejected, 1600);
+    }
+
     /// Randomized multi-frame stress across every chroma format and a
     /// spread of quantizers: pseudo-random smoothly-evolving sources
     /// run through the full `TheoraEncoder` → `TheoraDecoder` loop

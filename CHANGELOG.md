@@ -61,6 +61,16 @@ All notable changes to `oxideav-theora` are recorded here.
   were black-box decoded by the reference decoder **byte-for-byte
   identically** to this crate's own reconstruction (3/3
   pixel-exact); see `tests/encoded-corpus-notes.md`.
+- **§5.2 end-of-packet discipline on reference-encoded packets
+  (round 437)** — every possible truncation of the staged fixture
+  corpus's i-then-p packets (the intra prefixes on a fresh decoder,
+  the inter prefixes on a decoder holding the fixture's real
+  reference frame) must return `Ok` or a typed `Err`, with any
+  accepted prefix surviving the §2.2 display crop; plus a 1600-mutant
+  corruption storm over the same reference-encoded spellings
+  (libtheora-shaped codebooks and multi-qi frame headers this
+  crate's encoder never emits) mirroring the existing self-encoded
+  storm.
 
 - **Carriage rehearsal + quality sweep (round 431)** — an
   end-to-end packet-level test drives the `TheoraEncoder` stream the

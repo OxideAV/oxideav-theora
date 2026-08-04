@@ -44,6 +44,23 @@ All notable changes to `oxideav-theora` are recorded here.
   dimensions). Seeded with encoder-generated valid streams; the
   crashing input behind the §6.4.3 fix above is pinned as a corpus
   regression entry.
+- **Decode-corner corpus scenarios, externally validated (round
+  437)** — three new pinned self-encoded streams
+  (`encoded_corpus_decode_corner_digests_are_stable`) reach wire
+  states the staged fixture corpus never exercises on the decode
+  side: `lflims127` (every §6.4.1 loop-filter limit at the 7-bit
+  ceiling — `lflim()` at `L = 127` on every edge of an I+P GOP, the
+  serialized table asserted 7 bits wide), `lflims0` (the all-zero
+  table serializes at `NBITS = 0`, sixty-four §5.2.5 zero-bit reads
+  on the wire and the §7.10 filter skipped at every qi), and
+  `multiqrange` (three transmitted quant ranges per `(qti, pli)` set
+  with adaptive-quant candidate qis in different ranges, driving
+  §6.4.3 interpolation across interior boundaries of a non-VP3
+  layout on both frame types). All three were muxed to `.ogv`
+  through the published container crate, passed `oggz-validate`, and
+  were black-box decoded by the reference decoder **byte-for-byte
+  identically** to this crate's own reconstruction (3/3
+  pixel-exact); see `tests/encoded-corpus-notes.md`.
 
 - **Carriage rehearsal + quality sweep (round 431)** — an
   end-to-end packet-level test drives the `TheoraEncoder` stream the

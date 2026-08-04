@@ -1,4 +1,4 @@
-# Self-encoded corpus — generation + external-validation notes (round 413)
+# Self-encoded corpus — generation + external-validation notes (rounds 413 / 437)
 
 `encoded_corpus.rs` pins eleven deterministic encoder scenarios by
 SHA-256, at two levels per scenario:
@@ -60,6 +60,36 @@ byte-for-byte.
   measured, 800 kb/s → −0.9 %; a 200 kb/s target is below this
   content's qi-0 rate floor (~310 kb/s) and saturates cleanly at
   `qi_min`.
+
+## Round 437 — decode-corner scenarios
+
+Three further pins (`encoded_corpus_decode_corner_digests_are_stable`)
+target wire states the staged fixture corpus never reaches on the
+decode side. The self-encoded stream is the vehicle: the encoder is a
+validated stream source, so exotic setup-header configurations become
+real decodable streams.
+
+* **`lflims127`** — every §6.4.1 loop-filter limit forced to 127, so
+  the serialized table is 7 bits wide (asserted on the setup packet)
+  and `lflim()` runs at the ceiling `L = 127` on every edge of an
+  I+P GOP. The staged fixtures only exercise limits 0 and 15.
+* **`lflims0`** — the all-zero limit table serializes at `NBITS = 0`:
+  sixty-four §5.2.5 *zero-bit* integer reads on the wire (asserted),
+  and the §7.10 loop filter is skipped at every qi.
+* **`multiqrange`** — three transmitted quant ranges per `(qti, pli)`
+  set (21 + 21 + 21, alternating base matrices) plus adaptive
+  quantization with candidate qis 40 / 10 / 60, so §6.4.3
+  interpolation crosses interior boundaries of a non-VP3 range layout
+  on both frame types and on several qis per frame.
+
+External validation (2026-08-04): the exact pinned streams
+(176×144, 8 frames, interval 6) were muxed to `.ogv` through the
+published `oxideav-ogg` crate (Xiph-laced extradata, frame-index pts,
+keyframe unit boundaries, 4096-byte page target), passed
+`oggz-validate`, and were black-box decoded by `ffmpeg` 8.1
+(`-f rawvideo -pix_fmt yuv420p`); all three matched this crate's own
+reconstruction **byte-for-byte** (304128 bytes each). Verdict:
+3/3 pixel-exact.
 
 ## Rules
 

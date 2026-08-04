@@ -514,6 +514,136 @@ fn encoded_corpus_digests_are_stable() {
     check(&PINS[10], &id, &pkts);
 }
 
+// ----------------------------------------------------------------------
+// Round 437 — decode-corner scenarios. Same generator, same external
+// validation route (see tests/encoded-corpus-notes.md), aimed at wire
+// states the staged fixture corpus never reaches on the decode side.
+// ----------------------------------------------------------------------
+
+/// VP3-default tables with every §6.4.1 loop-filter limit forced to
+/// `limit`. The serializer picks the minimal `NBITS` for the table, so
+/// `limit = 127` puts a 7-bit-wide LFLIMS on the wire and `limit = 0`
+/// a zero-bit one (§5.2.5 zero-bit integer reads).
+fn lflims_setup(limit: u8) -> SetupHeaderTables {
+    let mut s = SetupHeaderTables::vp3_defaults();
+    s.loop_filter_limits = [limit; 64];
+    s
+}
+
+/// VP3-default tables rebuilt around **three quant ranges** per
+/// `(qti, pli)` set (sizes 21 + 21 + 21, alternating between the set's
+/// own VP3 base matrix and an extra flat matrix), so §6.4.3 must
+/// interpolate across interior range boundaries the single-range VP3
+/// assignment never has.
+fn multiqrange_setup() -> SetupHeaderTables {
+    let mut s = SetupHeaderTables::vp3_defaults();
+    let qp = &mut s.quantization_parameters;
+    qp.base_matrices.push([24u8; 64]);
+    qp.num_base_matrices = qp.base_matrices.len() as u16;
+    for qti in 0..2 {
+        for pli in 0..3 {
+            let orig = qp.quant_range_base_matrix_indices[qti][pli][0];
+            qp.num_quant_ranges[qti][pli] = 3;
+            qp.quant_range_sizes[qti][pli][..3].copy_from_slice(&[21, 21, 21]);
+            let b = &mut qp.quant_range_base_matrix_indices[qti][pli];
+            b[0] = orig;
+            b[1] = 3;
+            b[2] = orig;
+            b[3] = 3;
+        }
+    }
+    s
+}
+
+/// The §6.4.1 `NBITS` field of a serialized setup packet: the three
+/// bits immediately after the 7-byte common header.
+fn setup_lflims_nbits(setup_packet: &[u8]) -> u8 {
+    setup_packet[7] >> 5
+}
+
+/// Round-437 decode-corner pins. Externally validated through the
+/// round-413 route (Ogg mux → `oggz-validate` → black-box reference
+/// decode, byte-compared against this crate's own reconstruction) at
+/// these exact geometries; see tests/encoded-corpus-notes.md.
+#[test]
+fn encoded_corpus_decode_corner_digests_are_stable() {
+    let cid = || CodecId::new(THEORA_CODEC_ID);
+
+    const PINS: [Pin; 3] = [
+        Pin {
+            name: "lflims127",
+            wire_sha256: "08f9bf67d6e2ac5edc18998336a49c0b01750e64807beb3b1166066ac7e2ba78",
+            recon_sha256: "e81ec6272ddff5a67dfdbcac011e571d6003dd51a6dc167e749aa6c0278eff90",
+        },
+        Pin {
+            name: "lflims0",
+            wire_sha256: "b02f34f360d2a701915bf2923db3e865aeb7feddaae15f0b4034179f2f513382",
+            recon_sha256: "4c8392a4b6c39b776a0821182f7361bf66c9ed3e600626f7e9f5fc26f37b8b7e",
+        },
+        Pin {
+            name: "multiqrange",
+            wire_sha256: "9f9f8071cda25a4f3676a8374bf493191123f22fc370e7c6dd2df43a2865db03",
+            recon_sha256: "143d2f24861c8798ca9527039f4b19a5b3aceb76950cd1fa620852357d5724b6",
+        },
+    ];
+
+    // 12. LFLIMS at the 7-bit ceiling: `lflim()` runs with `L = 127`
+    // on every edge of an I+P GOP — the staged fixtures only exercise
+    // limits 0 and 15, so the wide half of the §7.10 response ramp
+    // never ran on a real stream before.
+    let id = ident(176, 144, PixelFormat::Yuv420);
+    let pkts = drive(
+        TheoraEncoder::with_keyframe_interval(cid(), id.clone(), lflims_setup(127), 40, 6).unwrap(),
+        &id,
+        8,
+        fam0,
+        false,
+    );
+    let setup_pkt = &pkts[2].data;
+    assert_eq!(
+        setup_lflims_nbits(setup_pkt),
+        7,
+        "lflims127: the serialized §6.4.1 table must be 7 bits wide"
+    );
+    check(&PINS[0], &id, &pkts);
+
+    // 13. LFLIMS all-zero: the serializer picks NBITS = 0, so the
+    // §6.4.1 table is sixty-four §5.2.5 zero-bit reads on the wire and
+    // the §7.10 loop filter is skipped at every qi (the staged corpus
+    // reaches the skip only through the libtheora table's qi-63 zero).
+    let id = ident(176, 144, PixelFormat::Yuv420);
+    let pkts = drive(
+        TheoraEncoder::with_keyframe_interval(cid(), id.clone(), lflims_setup(0), 40, 6).unwrap(),
+        &id,
+        8,
+        fam0,
+        false,
+    );
+    let setup_pkt = &pkts[2].data;
+    assert_eq!(
+        setup_lflims_nbits(setup_pkt),
+        0,
+        "lflims0: the serialized §6.4.1 table must be zero bits wide"
+    );
+    check(&PINS[1], &id, &pkts);
+
+    // 14. Three custom quant ranges per set + adaptive quantization
+    // whose candidate qis (40 / 10 / 60) land in different ranges, so
+    // the decoder's §6.4.3 interpolation crosses interior boundaries
+    // of a *transmitted* (non-VP3) range layout on both frame types.
+    let id = ident(176, 144, PixelFormat::Yuv420);
+    let pkts = drive(
+        TheoraEncoder::with_keyframe_interval(cid(), id.clone(), multiqrange_setup(), 40, 6)
+            .unwrap()
+            .with_adaptive_quant(vec![40, 10, 60]),
+        &id,
+        8,
+        fam0,
+        false,
+    );
+    check(&PINS[2], &id, &pkts);
+}
+
 /// The test-local SHA-256 must match FIPS 180-4 vectors (so the pins
 /// above mean what they claim).
 #[test]

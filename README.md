@@ -68,7 +68,13 @@ against reference output.
   driver, and reference-frame promotion.
 * **Loop filter** — the edge primitives, `lflim()` response, and the
   complete raster-order loop-filter driver (applied in place; collapses
-  to identity at a zero filter limit).
+  to identity at a zero filter limit). The full §6.4.1 limit range is
+  exercised on real streams: the staged fixtures run limits 0 and 15,
+  and two round-437 self-encoded streams — every limit at the 7-bit
+  ceiling (`NBITS = 7`, `lflim()` at `L = 127` on every edge) and the
+  all-zero table (`NBITS = 0`, sixty-four §5.2.5 zero-bit reads on the
+  wire, filter skipped at every qi) — are externally black-box-decoded
+  pixel-exactly against this crate's reconstruction.
 * **Display crop** — `crop_frame_to_picture_region` (and the
   `FrameDecoder::crop_for_display` wrapper) crops the macroblock-aligned
   reconstruction down to the picture region, with the spec's chroma-axis
@@ -506,6 +512,30 @@ chroma blocks that earlier diverged is now sample-exact.
   still absent because the reference encoder's `testsrc`-class encodes
   never emit a golden or four-MV macroblock.
 
+## Robustness and fuzzing (round 437)
+
+The decode surface is fuzzed by a `fuzz/` sub-crate with five
+libFuzzer targets: arbitrary bytes at the three §6 header decoders
+(with the crate's own serializers as self-inverse oracles — an
+accepted ident header re-encodes byte-exactly, accepted setup tables
+survive an encode → decode fixpoint), hostile §7 packet chains
+against a live `FrameDecoder` at all pixel formats and
+non-MB-aligned geometries, the `make_decoder` extradata walk plus
+inline-header routing through the `oxideav_core::Decoder` trait, the
+§A.2.3 granule-mapping algebra, and an encoder→decoder contract
+target on fuzz-derived streams. The first sessions (~27M runs)
+surfaced one real decode defect — §6.4.2 step 7(a)ivG transcribes
+the non-initial `QRBMIS` reads without step 7(a)ivC's `NBMS` range
+check, so a syntactically valid setup header could reference an
+undefined base matrix and panic §6.4.3 — now rejected with a typed
+error and regression-pinned at both the parameter and wire level.
+Deterministic sweeps complement the fuzzers: every possible
+truncation of the reference-encoded fixture packets (intra on a
+fresh decoder, inter on a decoder holding the fixture's real
+reference) and 4000 corruption-storm mutants across self- and
+reference-encoded spellings must return `Ok` or a typed `Err`,
+never panic.
+
 ## External validation (round 413)
 
 The encoder's output is validated by an **independent reference
@@ -523,7 +553,13 @@ pinned by SHA-256 (wire packets + decoded output) in
 `tests/encoded_corpus.rs`, with the route, verdicts, and measured
 operating points (externally-measured rate/PSNR curves and
 rate-control accuracy within ±1 % of reachable targets) documented in
-`tests/encoded-corpus-notes.md`. The external route surfaced and fixed
+`tests/encoded-corpus-notes.md`. Round 437 added three
+**decode-corner** scenarios through the same route — loop-filter
+limits at the 7-bit ceiling, the all-zero `NBITS = 0` limit table,
+and a three-quant-range transmitted layout with adaptive-quant qis
+spanning the ranges (§6.4.3 interpolation across interior boundaries
+of a non-VP3 layout) — all three black-box-decoded byte-identically
+to this crate's reconstruction (15/15 scenarios cumulative). The external route surfaced and fixed
 three real defects this round: `for_picture`'s `KFGSHIFT = 0` (inter
 frames had no representable Ogg granule position), a wrong-slope RD λ
 (the rate/PSNR curve folded over above qi 52), and a scene-cut

@@ -3652,7 +3652,10 @@ fn decode_quant_params_inner(r: &mut BitReader<'_>) -> Result<QuantizationParame
                     // F: qri += 1.
                     qri += 1;
 
-                    // G: QRBMIS[qri] (NOT range-checked here, per spec).
+                    // G: QRBMIS[qri] (NOT range-checked here, per the
+                    // spec's own step text — §6.4.3 rejects a value at
+                    // or past NBMS when the matrix is consumed; see
+                    // `compute_quantization_matrix`).
                     let bmi = r.read_bits(bmi_bits, "QRBMIS")?;
                     quant_range_base_matrix_indices[qti][pli][qri] = bmi as u16;
 
@@ -3764,6 +3767,12 @@ pub struct QuantizationMatrix {
 /// * [`Error::QuantTypeIndexOutOfRange`] if `qti > 1`.
 /// * [`Error::QuantPlaneIndexOutOfRange`] if `pli > 2`.
 /// * [`Error::QuantIndexOutOfRange`] if `qi > 63`.
+/// * [`Error::BaseMatrixIndexOutOfRange`] if the quant range
+///   bracketing `qi` references a base matrix at or past `NBMS` —
+///   reachable on the wire because §6.4.2 step 7(a)ivG transcribes
+///   the non-initial `QRBMIS` reads without step 7(a)ivC's range
+///   check, leaving §6.4.3 steps 4–5 to reject the undefined
+///   `BMS[bmi]` / `BMS[bmj]` reference here.
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub fn compute_quantization_matrix(
@@ -3807,8 +3816,30 @@ pub fn compute_quantization_matrix(
     }
 
     // Step 4 / 5: the base-matrix indices at the two range end-points.
+    //
+    // §6.4.2 step 7(a)ivC range-checks only the *first* QRBMIS of a
+    // set against NBMS; the step 7(a)ivG reads at the later range
+    // boundaries are transcribed unchecked, so a syntactically valid
+    // setup header can smuggle an index at or past NBMS this far.
+    // §6.4.3 steps 4–5 then reference `BMS[bmi]` / `BMS[bmj]`, which
+    // simply do not exist for such an index — the stream references
+    // an undefined base matrix and is undecodable, the same verdict
+    // step 7(a)ivC hands the checked read.
+    let nbms = params.base_matrices.len();
     let bmi = bmis[qri] as usize;
     let bmj = bmis[qri + 1] as usize;
+    if bmi >= nbms {
+        return Err(Error::BaseMatrixIndexOutOfRange {
+            bmi: bmi as u32,
+            nbms: nbms as u32,
+        });
+    }
+    if bmj >= nbms {
+        return Err(Error::BaseMatrixIndexOutOfRange {
+            bmi: bmj as u32,
+            nbms: nbms as u32,
+        });
+    }
     let bm_lo = &params.base_matrices[bmi];
     let bm_hi = &params.base_matrices[bmj];
 
@@ -19836,6 +19867,73 @@ mod tests {
             Err(Error::QuantIndexOutOfRange { qi: 64 }) => {}
             other => panic!("expected QuantIndexOutOfRange(64), got {other:?}"),
         }
+    }
+
+    /// A quant range whose upper end-point references a base matrix at
+    /// or past `NBMS` must be rejected by §6.4.3 (steps 4–5 would read
+    /// an undefined `BMS[bmj]`), not panic. Fuzz regression: the §6.4.2
+    /// step 7(a)ivG reads are transcribed without step 7(a)ivC's range
+    /// check, so this state is reachable from a syntactically valid
+    /// setup header.
+    #[test]
+    fn compute_qmat_rejects_boundary_bmi_past_nbms() {
+        // Two base matrices; the range's high end-point claims index 2.
+        let params = single_range_params(vec![[16u8; 64], [100u8; 64]], 0, 2, 100, 100);
+        match compute_quantization_matrix(&params, 0, 0, 0) {
+            Err(Error::BaseMatrixIndexOutOfRange { bmi: 2, nbms: 2 }) => {}
+            other => panic!("expected BaseMatrixIndexOutOfRange(2/2), got {other:?}"),
+        }
+        // Low end-point out of range too.
+        let params = single_range_params(vec![[16u8; 64], [100u8; 64]], 3, 1, 100, 100);
+        match compute_quantization_matrix(&params, 0, 0, 0) {
+            Err(Error::BaseMatrixIndexOutOfRange { bmi: 3, nbms: 2 }) => {}
+            other => panic!("expected BaseMatrixIndexOutOfRange(3/2), got {other:?}"),
+        }
+    }
+
+    /// Wire-level version of the same regression: a §6.4.2 payload
+    /// whose *second* `QRBMIS` read (step 7(a)ivG) encodes `NBMS`
+    /// itself. The parse must succeed — the spec's step G carries no
+    /// range check — and the §6.4.3 matrix computation must then
+    /// return [`Error::BaseMatrixIndexOutOfRange`] for every `qi` in
+    /// the poisoned range instead of indexing out of bounds.
+    #[test]
+    fn decoded_quant_params_with_oor_boundary_bmi_error_cleanly() {
+        let mut w = BitWriter::new();
+        encode_scales(&mut w, &[100u16; 64], &[100u16; 64]);
+        let nbms = 3u32;
+        w.put(nbms - 1, 9);
+        let bmi_bits = test_ilog(nbms as i64 - 1);
+        for _bmi in 0..nbms {
+            for _ci in 0..64 {
+                w.put(16, 8);
+            }
+        }
+        for qti in 0..2 {
+            for pli in 0..3 {
+                if qti > 0 || pli > 0 {
+                    w.put(1, 1);
+                }
+                w.put(0, bmi_bits);
+                w.put(62, test_ilog(62));
+                // (0,0) closes its single range on index 3 == NBMS —
+                // representable in the 2-bit field, undefined in BMS.
+                let hi = if qti == 0 && pli == 0 { 3 } else { 1 };
+                w.put(hi, bmi_bits);
+            }
+        }
+        let payload = w.finish();
+        let qp = decode_quantization_parameters(&payload)
+            .expect("step 7(a)ivG has no range check — the parse itself succeeds");
+        for qi in [0usize, 31, 63] {
+            match compute_quantization_matrix(&qp, 0, 0, qi) {
+                Err(Error::BaseMatrixIndexOutOfRange { bmi: 3, nbms: 3 }) => {}
+                other => panic!("qi={qi}: expected BaseMatrixIndexOutOfRange(3/3), got {other:?}"),
+            }
+        }
+        // The untainted sets still compute.
+        compute_quantization_matrix(&qp, 0, 1, 31).expect("valid (0,1) set");
+        compute_quantization_matrix(&qp, 1, 0, 31).expect("valid (1,0) set");
     }
 
     #[test]

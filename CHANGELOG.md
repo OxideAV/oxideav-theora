@@ -4,6 +4,24 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **§6.4.3 rejects quant ranges referencing undefined base matrices
+  (round 437, fuzz finding)** — §6.4.2 step 7(a)ivC range-checks only
+  the *first* `QRBMIS` of a new quant-range set against `NBMS`; the
+  step 7(a)ivG reads at the later range boundaries carry no such
+  check in the spec's own step text, so a syntactically valid setup
+  header can place an index at or past `NBMS` on a range end-point.
+  `compute_quantization_matrix` (§6.4.3 steps 4–5) previously
+  indexed the base-matrix array with it — an out-of-bounds panic on
+  a hostile stream, found within minutes by the new
+  `decoder_trait_stream` fuzz target. It now returns
+  `Error::BaseMatrixIndexOutOfRange` (the same verdict the checked
+  step 7(a)ivC read hands out), keeping the §6.4.2 parse itself
+  faithful to the spec text. Regression-pinned at both levels:
+  directly on constructed parameters and on a synthesized §6.4.2
+  wire payload whose second `QRBMIS` encodes `NBMS`.
+
 ### Added
 
 - **Carriage rehearsal + quality sweep (round 431)** — an

@@ -40203,7 +40203,7 @@ mod tests {
     /// panic — and any accepted prefix must still survive the §2.2
     /// display crop. This complements the corruption storm above
     /// (which mutates *self-encoded* packets): the reference streams
-    /// spell their headers through libtheora-shaped Huffman tables and
+    /// spell their headers through the reference corpus's Huffman-table spellings and
     /// multi-qi frame headers this crate's encoder never emits, so the
     /// §7 read chain crosses different token boundaries when the
     /// packet ends early. The intra prefixes run against a fresh
@@ -40255,7 +40255,7 @@ mod tests {
     /// Corruption storm on the *reference-encoded* fixture packets —
     /// the same liveness contract as
     /// [`decode_frame_survives_corrupted_encoder_output`], applied to
-    /// the staged corpus's libtheora-shaped spellings (multi-qi frame
+    /// the staged corpus's reference-corpus spellings (multi-qi frame
     /// headers, different codebooks) instead of this crate's own
     /// output.
     #[test]

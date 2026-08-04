@@ -610,7 +610,7 @@ fn encoded_corpus_decode_corner_digests_are_stable() {
     // 13. LFLIMS all-zero: the serializer picks NBITS = 0, so the
     // §6.4.1 table is sixty-four §5.2.5 zero-bit reads on the wire and
     // the §7.10 loop filter is skipped at every qi (the staged corpus
-    // reaches the skip only through the libtheora table's qi-63 zero).
+    // reaches the skip only through the reference table's qi-63 zero).
     let id = ident(176, 144, PixelFormat::Yuv420);
     let pkts = drive(
         TheoraEncoder::with_keyframe_interval(cid(), id.clone(), lflims_setup(0), 40, 6).unwrap(),

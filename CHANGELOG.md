@@ -68,7 +68,7 @@ All notable changes to `oxideav-theora` are recorded here.
   reference frame) must return `Ok` or a typed `Err`, with any
   accepted prefix surviving the §2.2 display crop; plus a 1600-mutant
   corruption storm over the same reference-encoded spellings
-  (libtheora-shaped codebooks and multi-qi frame headers this
+  (reference-corpus codebook spellings and multi-qi frame headers this
   crate's encoder never emits) mirroring the existing self-encoded
   storm.
 

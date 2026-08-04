@@ -24,6 +24,27 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Fuzz harness over the decode surface (round 437)** — a new
+  `fuzz/` sub-crate with five libFuzzer targets: `decode_headers`
+  (arbitrary bytes at `classify_packet` + the three §6 header
+  decoders, with the ident byte-exact re-encode and the setup
+  decode→encode→decode fixpoint as self-inverse oracles),
+  `decode_frame_chain` (hostile §7 packet chains against a live
+  `FrameDecoder` across all pixel formats and non-MB-aligned
+  geometries, every accepted frame surviving the §2.2 crop),
+  `decoder_trait_stream` (the `make_decoder` extradata walk +
+  inline-header/reserved-type/video routing through the
+  `oxideav_core::Decoder` trait, with a harness-side geometry cap so
+  valid-but-enormous ident headers stay a resource request rather
+  than a false OOM), `granule_mapping` (§A.2.3 split/join round-trip,
+  forward-mapping inverses, tracker monotonicity), and
+  `encode_decode_roundtrip` (fuzz-derived geometry/options/content
+  through `TheoraEncoder` → `make_decoder`, asserting every emitted
+  packet classifies and decodes to exactly one frame at the picture
+  dimensions). Seeded with encoder-generated valid streams; the
+  crashing input behind the §6.4.3 fix above is pinned as a corpus
+  regression entry.
+
 - **Carriage rehearsal + quality sweep (round 431)** — an
   end-to-end packet-level test drives the `TheoraEncoder` stream the
   way a muxer would at all three pixel formats (4:2:0/4:2:2/4:4:4,

@@ -1,0 +1,97 @@
+[package]
+name = "oxideav-theora-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Theora's decode surface is the part worth fuzzing hardest: three
+# bit-packed §6 header packets configure quantization matrices, an
+# 80-codebook Huffman forest, and a loop-filter limit table, after
+# which each §7 video-data packet drives run-length bit-strings,
+# macro-block mode alphabets, motion-vector decode, per-block qi
+# promotion passes, cross-block EOB runs, and the token-driven DCT
+# coefficient walk — all off one shared MSb-first bit reader. The
+# clean-room wall bars any reference codec source as an oracle, so
+# every target is self-contained: liveness on hostile bytes plus the
+# crate's own inverse pairs (encode_* is the exact inverse of
+# decode_*) as round-trip oracles.
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-theora]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# Header-packet targets: arbitrary bytes at `classify_packet` +
+# `decode_identification_header` + `parse_comment_header` +
+# `parse_setup_header` / `decode_setup_header`. When a decode
+# succeeds, the matching §6 serializer must reproduce it — the ident
+# re-encode is asserted byte-exact against the accepted prefix, and
+# accepted setup tables must survive an encode → decode fixpoint.
+[[bin]]
+name = "decode_headers"
+path = "fuzz_targets/decode_headers.rs"
+test = false
+doc = false
+
+# Video-data-packet target: a small fuzz-chosen geometry (picture
+# dimensions 1..=48 in each axis, all three pixel formats) with the
+# §B VP3 default setup tables, then a chain of fuzz-framed packets
+# through `FrameDecoder::decode_frame` + `crop_for_display`.
+# Exercises the whole §7 chain — frame header, coded-block flags,
+# modes, motion vectors, block-level qi, tokens, reconstruction,
+# loop filter, reference promotion — on hostile bytes, including
+# inter frames referencing earlier fuzz-decoded state.
+[[bin]]
+name = "decode_frame_chain"
+path = "fuzz_targets/decode_frame_chain.rs"
+test = false
+doc = false
+
+# Framework-trait target: fuzz bytes split into an extradata chain
+# (the length-prefixed §6 header pack `make_decoder` consumes) and a
+# packet stream driven through `oxideav_core::Decoder`. Covers the
+# factory's extradata walk, inline-header collection order, the
+# reserved-header ignore path, and the §2.2 display crop on every
+# emitted frame. Oversized declared geometries are skipped in the
+# harness (a valid-but-enormous ident header is a resource request,
+# not a decoder bug).
+[[bin]]
+name = "decoder_trait_stream"
+path = "fuzz_targets/decoder_trait_stream.rs"
+test = false
+doc = false
+
+# §A.2.3 granule-position mapping properties: split/join round-trip,
+# the frame-index / keyframe-index / decodable-count inverses against
+# `granule_position_for_frame`, and `GranulePositionTracker` emission
+# monotonicity over fuzz-derived keyframe-flag sequences.
+[[bin]]
+name = "granule_mapping"
+path = "fuzz_targets/granule_mapping.rs"
+test = false
+doc = false
+
+# Encoder→decoder contract target: fuzz-derived picture dimensions
+# (non-MB-aligned included), pixel format, quantizer, keyframe
+# interval, inter-mode strategy, and plane content drive
+# `TheoraEncoder` end-to-end through the `oxideav_core` traits; every
+# emitted packet chain must classify, decode, and crop back to the
+# picture dimensions without error. Asserts the encoder is a stream
+# source the decoder always accepts — the same contract the
+# externally validated corpus pins, on arbitrary content.
+[[bin]]
+name = "encode_decode_roundtrip"
+path = "fuzz_targets/encode_decode_roundtrip.rs"
+test = false
+doc = false

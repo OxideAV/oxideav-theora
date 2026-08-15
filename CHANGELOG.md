@@ -44,6 +44,21 @@ All notable changes to `oxideav-theora` are recorded here.
   `KFGSHIFT = 6` walk. Every data page of all **fourteen** staged
   `input.ogv` fixtures is now covered by the tracker/inverse pins.
 
+- **Fuzz corpus seeded with the third-party spellings + follow-up
+  session (round 444)** — six new tracked corpus entries:
+  `decoder_trait_stream` gains the full 4:2:2, 4:4:4, and
+  all-modes streams (real extradata chain + data packets in the
+  harness framing, so mutation explores around genuine golden /
+  four-MV / non-4:2:0 wire states), and `decode_headers` gains the
+  `KFGSHIFT = 8` / `PF = 2` identification headers and the
+  third-party §6.4 setup spelling. The shared setup packet is
+  deduplicated (all three fixtures carry byte-identical setup
+  headers, now one constant). A follow-up local session (~4.3M runs:
+  1.4M `decoder_trait_stream`, 766K `decode_frame_chain`, 2.1M
+  `decode_headers`, 36K `encode_decode_roundtrip`, all seeds
+  replayed first) found no new crashes; `decoder_trait_stream`
+  line coverage rose 2373 → 3384 with the new seeds in play.
+
 - **Hostile-stream sweeps over the third-party spellings (round
   444)** — every possible truncation of **every data packet** of the
   three new fixtures decodes against the exact reference state the

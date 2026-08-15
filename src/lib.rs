@@ -36418,7 +36418,7 @@ mod tests {
         assert_eq!(ident.qual, 44);
         assert_eq!(ident.kfgshift, 8);
         assert_eq!((ident.frn, ident.frd), (25, 1));
-        let setup = decode_setup_header(&fixture_data::AMM_SETUP_PACKET).unwrap();
+        let setup = decode_setup_header(&fixture_data::PF_SETUP_PACKET).unwrap();
         let mut dec = FrameDecoder::new(ident, setup).unwrap();
         // notes.md §6.2 geometry: NSBS = 6, NBS = 96, NMBS = 16.
         let g = dec.geometry().clone();
@@ -40678,7 +40678,7 @@ mod tests {
             ),
             (
                 &fixture_data::AMM_IDENT_PACKET,
-                &fixture_data::AMM_SETUP_PACKET,
+                &fixture_data::PF_SETUP_PACKET,
                 vec![
                     &fixture_data::AMM_DATA_PACKET_0,
                     &fixture_data::AMM_DATA_PACKET_1,

@@ -16138,8 +16138,9 @@ fn encode_quant_params_inner(w: &mut BitWriter, qp: &QuantizationParameters) -> 
 /// version-3.2.1+ stream (`VREV >= 1`) thus begins with a split of
 /// `1|0` for its first keyframe, followed by `1|1`, `1|2`, … — the
 /// high half of a data-marking value is never zero, and equals the
-/// governing keyframe's zero-based frame index plus one. All eleven
-/// streams of the staged fixture corpus carry exactly this form.
+/// governing keyframe's zero-based frame index plus one. All
+/// fourteen streams of the staged fixture corpus carry exactly this
+/// form.
 ///
 /// Pre-3.2.1 streams (`VREV < 1`) instead stored the keyframe's frame
 /// *index* in the high half; §A.2.3 says such values "can be
@@ -36211,6 +36212,288 @@ mod tests {
         );
     }
 
+    /// Run the §7.11 step-1 low-level driver (§7.1 header, §7.3 coded
+    /// blocks, §7.4 modes, §7.5 motion vectors, §7.6/§7.7 tokens)
+    /// against a live decoder's geometry without reconstructing
+    /// pixels — the same route the HD trace pin above takes inline.
+    /// Used to census §7.4 macro-block modes on multi-frame fixtures.
+    fn low_level_header_and_blocks(
+        dec: &FrameDecoder,
+        packet: &[u8],
+        first_frame: bool,
+    ) -> DataPacketHeaderAndBlocks {
+        let g = dec.geometry();
+        let huffman_tables = &dec.setup_tables().huffman_tables;
+        let cb_slices: Vec<&[u32]> = g.chroma_cb.iter().map(|v| v.as_slice()).collect();
+        let cr_slices: Vec<&[u32]> = g.chroma_cr.iter().map(|v| v.as_slice()).collect();
+        let plane_orders: [&[u32]; 3] = [
+            &g.plane_raster_order[0],
+            &g.plane_raster_order[1],
+            &g.plane_raster_order[2],
+        ];
+        decode_data_packet_header_and_blocks(
+            packet,
+            first_frame,
+            g.pf,
+            g.nsbs,
+            g.nbs,
+            g.nmbs,
+            &g.block_to_super_block,
+            &g.macro_block_to_luma_blocks,
+            ChromaBlockLayout {
+                cb: &cb_slices,
+                cr: &cr_slices,
+            },
+            &huffman_tables[..],
+            DcPredictionGeometry {
+                block_to_macro_block: &g.mbi_of_block,
+                neighbors: &g.neighbors,
+                plane_raster_order: &plane_orders,
+            },
+        )
+        .unwrap()
+    }
+
+    /// End-to-end §7.11 on the `pixel-format-422-64x64` fixture — the
+    /// corpus's first third-party-encoded `PF = 2` stream (every prior
+    /// 4:2:2 validation decoded this crate's *own* encoder output).
+    /// The §4.4 plane geometry is the point: at `PF = 2` the chroma
+    /// planes are horizontally subsampled only (32×64 next to 64×64
+    /// luma), changing the §2.3–§2.4 super-block/block counts and the
+    /// §4.4 block-to-plane mapping. All three frames are pinned
+    /// pixel-exactly: per-frame SHA-256s localise a break, and the
+    /// concatenated top-down stream reproduces the `expected.yuv`
+    /// digest recorded in the fixture's `notes.md` (`3f5fc542…`).
+    #[test]
+    fn decode_frame_pixel_format_422_fixture_is_pixel_exact() {
+        let ident = decode_identification_header(&fixture_data::P422_IDENT_PACKET).unwrap();
+        assert_eq!(ident.pf, PixelFormat::Yuv422, "§6.2 PF = 2");
+        assert_eq!(ident.version(), 0x03_02_01);
+        assert_eq!(ident.coded_width(), 64);
+        assert_eq!(ident.coded_height(), 64);
+        assert_eq!(
+            (ident.picw, ident.pich, ident.picx, ident.picy),
+            (64, 64, 0, 0)
+        );
+        assert_eq!(ident.qual, 37);
+        assert_eq!(ident.kfgshift, 6);
+        let setup = decode_setup_header(&fixture_data::PF_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        // §2.3–§2.4 at PF = 2: 16 macro blocks of 8 blocks each (4 luma
+        // + 2 Cb + 2 Cr), chroma super blocks spanning the 32×64 planes.
+        let g = dec.geometry().clone();
+        assert_eq!((g.nmbs, g.nsbs, g.nbs), (16, 8, 128));
+
+        let packets: [&[u8]; 3] = [
+            &fixture_data::P422_DATA_PACKET_0,
+            &fixture_data::P422_DATA_PACKET_1,
+            &fixture_data::P422_DATA_PACKET_2,
+        ];
+        let mut out = Vec::new();
+        for (i, pkt) in packets.iter().enumerate() {
+            let f = dec
+                .decode_frame(pkt)
+                .expect("4:2:2 fixture frame should decode");
+            assert_eq!(
+                f.ftype,
+                if i == 0 {
+                    FrameType::Intra
+                } else {
+                    FrameType::Inter
+                },
+                "frame {i} type"
+            );
+            assert_eq!((f.frame.dims_y.width, f.frame.dims_y.height), (64, 64));
+            assert_eq!((f.frame.dims_cb.width, f.frame.dims_cb.height), (32, 64));
+            assert_eq!((f.frame.dims_cr.width, f.frame.dims_cr.height), (32, 64));
+            let bytes = frame_top_down_yuv(&f.frame);
+            assert_eq!(bytes.len(), 64 * 64 * 2);
+            assert_eq!(
+                sha256_hex(&bytes),
+                fixture_data::P422_FRAME_DIGESTS[i],
+                "4:2:2 frame {i} must match the reference dump pixel-exactly"
+            );
+            out.extend(bytes);
+        }
+        assert_eq!(
+            sha256_hex(&out),
+            "3f5fc542f2a6a1c7870774fb06776099476b11cb13ed4cdb1cb916bb4350c674",
+            "4:2:2 three-frame output must match the recorded expected.yuv SHA-256"
+        );
+    }
+
+    /// End-to-end §7.11 on the `pixel-format-444-64x64` fixture — the
+    /// third-party-encoded `PF = 3` sibling (same source and encoder
+    /// settings as the 4:2:2 fixture, so the pair is a controlled A/B
+    /// on the `PF` field alone). At `PF = 3` chroma is not subsampled:
+    /// every macro block carries 12 blocks (4 per plane), `NBS = 192`
+    /// per the fixture's `notes.md`. All three frames pinned
+    /// pixel-exactly against the `expected.yuv` digest (`6309cd29…`).
+    #[test]
+    fn decode_frame_pixel_format_444_fixture_is_pixel_exact() {
+        let ident = decode_identification_header(&fixture_data::P444_IDENT_PACKET).unwrap();
+        assert_eq!(ident.pf, PixelFormat::Yuv444, "§6.2 PF = 3");
+        assert_eq!(ident.version(), 0x03_02_01);
+        assert_eq!(ident.coded_width(), 64);
+        assert_eq!(ident.coded_height(), 64);
+        assert_eq!(
+            (ident.picw, ident.pich, ident.picx, ident.picy),
+            (64, 64, 0, 0)
+        );
+        assert_eq!(ident.qual, 37);
+        assert_eq!(ident.kfgshift, 6);
+        let setup = decode_setup_header(&fixture_data::PF_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        // §2.3–§2.4 at PF = 3: full-resolution chroma — 12 blocks per
+        // macro block, 4 super blocks per plane.
+        let g = dec.geometry().clone();
+        assert_eq!((g.nmbs, g.nsbs, g.nbs), (16, 12, 192));
+
+        let packets: [&[u8]; 3] = [
+            &fixture_data::P444_DATA_PACKET_0,
+            &fixture_data::P444_DATA_PACKET_1,
+            &fixture_data::P444_DATA_PACKET_2,
+        ];
+        let mut out = Vec::new();
+        for (i, pkt) in packets.iter().enumerate() {
+            let f = dec
+                .decode_frame(pkt)
+                .expect("4:4:4 fixture frame should decode");
+            assert_eq!(
+                f.ftype,
+                if i == 0 {
+                    FrameType::Intra
+                } else {
+                    FrameType::Inter
+                },
+                "frame {i} type"
+            );
+            assert_eq!((f.frame.dims_y.width, f.frame.dims_y.height), (64, 64));
+            assert_eq!((f.frame.dims_cb.width, f.frame.dims_cb.height), (64, 64));
+            assert_eq!((f.frame.dims_cr.width, f.frame.dims_cr.height), (64, 64));
+            let bytes = frame_top_down_yuv(&f.frame);
+            assert_eq!(bytes.len(), 64 * 64 * 3);
+            assert_eq!(
+                sha256_hex(&bytes),
+                fixture_data::P444_FRAME_DIGESTS[i],
+                "4:4:4 frame {i} must match the reference dump pixel-exactly"
+            );
+            out.extend(bytes);
+        }
+        assert_eq!(
+            sha256_hex(&out),
+            "6309cd299e2f89a518061fc75e878797947d3890f20631680a86928a7fff27c2",
+            "4:4:4 three-frame output must match the recorded expected.yuv SHA-256"
+        );
+    }
+
+    /// End-to-end §7.11 on the `all-mb-modes-64x64` fixture: 24 frames
+    /// (1 keyframe + 23 inter) whose §7.4 mode census spans **all
+    /// eight** coding modes — the corpus's only third-party-encoded
+    /// occurrences of `INTER_GOLDEN_NOMV` (5), `INTER_GOLDEN_MV` (6)
+    /// and `INTER_MV_FOUR` (7), and its only long inter run with real
+    /// motion. What this pins that no other fixture can:
+    ///
+    /// * **Golden-reference selection** — the stream's single keyframe
+    ///   (`KFGSHIFT = 8`, interval 250) seeds the golden frame at
+    ///   frame 0 and never refreshes it, so a decoder aliasing golden
+    ///   onto "previous" drifts by up to 23 frames.
+    /// * **Four-MV decode** — §7.5.2 per-luma-block vectors with the
+    ///   chroma vector derived from their average, plus the LAST /
+    ///   LAST2 history updates four-MV blocks feed.
+    /// * **MV history across a long run** — modes 3/4 reuse previously
+    ///   decoded vectors for 23 consecutive inter frames.
+    ///
+    /// Every frame is pinned pixel-exactly (per-frame SHA-256s, then
+    /// the concatenated stream against the `notes.md` digest
+    /// `1dd7fbd6…`), and the census is asserted against the fixture's
+    /// mode table exactly.
+    #[test]
+    fn decode_frame_all_mb_modes_fixture_is_pixel_exact_with_full_mode_census() {
+        let ident = decode_identification_header(&fixture_data::AMM_IDENT_PACKET).unwrap();
+        assert_eq!(ident.pf, PixelFormat::Yuv420, "§6.2 PF = 0");
+        assert_eq!(ident.version(), 0x03_02_01);
+        assert_eq!(ident.coded_width(), 64);
+        assert_eq!(ident.coded_height(), 64);
+        assert_eq!(ident.qual, 44);
+        assert_eq!(ident.kfgshift, 8);
+        assert_eq!((ident.frn, ident.frd), (25, 1));
+        let setup = decode_setup_header(&fixture_data::AMM_SETUP_PACKET).unwrap();
+        let mut dec = FrameDecoder::new(ident, setup).unwrap();
+        // notes.md §6.2 geometry: NSBS = 6, NBS = 96, NMBS = 16.
+        let g = dec.geometry().clone();
+        assert_eq!((g.nmbs, g.nsbs, g.nbs), (16, 6, 96));
+
+        let packets: [&[u8]; 24] = [
+            &fixture_data::AMM_DATA_PACKET_0,
+            &fixture_data::AMM_DATA_PACKET_1,
+            &fixture_data::AMM_DATA_PACKET_2,
+            &fixture_data::AMM_DATA_PACKET_3,
+            &fixture_data::AMM_DATA_PACKET_4,
+            &fixture_data::AMM_DATA_PACKET_5,
+            &fixture_data::AMM_DATA_PACKET_6,
+            &fixture_data::AMM_DATA_PACKET_7,
+            &fixture_data::AMM_DATA_PACKET_8,
+            &fixture_data::AMM_DATA_PACKET_9,
+            &fixture_data::AMM_DATA_PACKET_10,
+            &fixture_data::AMM_DATA_PACKET_11,
+            &fixture_data::AMM_DATA_PACKET_12,
+            &fixture_data::AMM_DATA_PACKET_13,
+            &fixture_data::AMM_DATA_PACKET_14,
+            &fixture_data::AMM_DATA_PACKET_15,
+            &fixture_data::AMM_DATA_PACKET_16,
+            &fixture_data::AMM_DATA_PACKET_17,
+            &fixture_data::AMM_DATA_PACKET_18,
+            &fixture_data::AMM_DATA_PACKET_19,
+            &fixture_data::AMM_DATA_PACKET_20,
+            &fixture_data::AMM_DATA_PACKET_21,
+            &fixture_data::AMM_DATA_PACKET_22,
+            &fixture_data::AMM_DATA_PACKET_23,
+        ];
+        let mut census = [0u32; 8];
+        let mut out = Vec::new();
+        for (i, pkt) in packets.iter().enumerate() {
+            // §7.4 mode census off the low-level step-1 driver (intra
+            // frames contribute NMBS Intra entries per §7.4 step 1).
+            let ll = low_level_header_and_blocks(&dec, pkt, i == 0);
+            for &m in &ll.mbmodes {
+                census[m.to_index() as usize] += 1;
+            }
+            let f = dec
+                .decode_frame(pkt)
+                .expect("all-mb-modes fixture frame should decode");
+            assert_eq!(
+                f.ftype,
+                if i == 0 {
+                    FrameType::Intra
+                } else {
+                    FrameType::Inter
+                },
+                "frame {i} type (single keyframe at interval 250)"
+            );
+            let bytes = frame_top_down_yuv(&f.frame);
+            assert_eq!(bytes.len(), 64 * 64 * 3 / 2);
+            assert_eq!(
+                sha256_hex(&bytes),
+                fixture_data::AMM_FRAME_DIGESTS[i],
+                "all-mb-modes frame {i} must match the reference dump pixel-exactly"
+            );
+            out.extend(bytes);
+        }
+        // The fixture notes.md mode table, §7.4 numbering 0..=7 —
+        // modes 5, 6 and 7 appear nowhere else in the staged corpus.
+        assert_eq!(
+            census,
+            [173, 104, 45, 50, 5, 1, 1, 5],
+            "24-frame §7.4 macro-block mode census must match the fixture table"
+        );
+        assert_eq!(
+            sha256_hex(&out),
+            "1dd7fbd6a1160a0f7019f336d4f0e1525800eb874e00619129518d7b69145e12",
+            "all-mb-modes 24-frame output must match the recorded expected.yuv SHA-256"
+        );
+    }
+
     /// End-to-end §7.11 on the `i-frame-then-p-frame-64x64` fixture:
     /// decode the keyframe and then the following inter frame from the
     /// real packet bytes, exercising the §7.9.4 motion-compensated
@@ -39294,6 +39577,68 @@ mod tests {
         assert_eq!(vf.planes[2].stride, 16);
     }
 
+    /// Framework `Decoder`-trait decode of the third-party-encoded
+    /// 4:2:2 and 4:4:4 fixtures: the core-facing surface (top-down
+    /// plane flip, §2.2 crop, per-plane strides) was previously
+    /// exercised at these chroma formats only on self-encoded
+    /// streams. Each stream's three emitted `VideoFrame`s concatenate
+    /// to the fixture's `expected.yuv` digest exactly, and the chroma
+    /// strides pin the §4.4.4 plane geometry (32 at 4:2:2, 64 at
+    /// 4:4:4).
+    #[test]
+    fn decoder_trait_third_party_pixel_format_fixtures_are_pixel_exact() {
+        for (ident_pkt, chroma_stride, want) in [
+            (
+                &fixture_data::P422_IDENT_PACKET[..],
+                32usize,
+                "3f5fc542f2a6a1c7870774fb06776099476b11cb13ed4cdb1cb916bb4350c674",
+            ),
+            (
+                &fixture_data::P444_IDENT_PACKET[..],
+                64usize,
+                "6309cd299e2f89a518061fc75e878797947d3890f20631680a86928a7fff27c2",
+            ),
+        ] {
+            let mut dec = TheoraDecoder::with_headers(
+                CodecId::new(THEORA_CODEC_ID),
+                &[ident_pkt, &fixture_data::PF_SETUP_PACKET],
+            )
+            .expect("ident + setup parse");
+            let packets: [&[u8]; 3] = if chroma_stride == 32 {
+                [
+                    &fixture_data::P422_DATA_PACKET_0,
+                    &fixture_data::P422_DATA_PACKET_1,
+                    &fixture_data::P422_DATA_PACKET_2,
+                ]
+            } else {
+                [
+                    &fixture_data::P444_DATA_PACKET_0,
+                    &fixture_data::P444_DATA_PACKET_1,
+                    &fixture_data::P444_DATA_PACKET_2,
+                ]
+            };
+            let mut out = Vec::new();
+            for pkt in packets {
+                dec.send_packet(&data_packet(pkt)).unwrap();
+                let Frame::Video(vf) = dec.receive_frame().expect("frame") else {
+                    panic!("expected video frame");
+                };
+                assert_eq!(vf.planes.len(), 3);
+                assert_eq!(vf.planes[0].stride, 64);
+                assert_eq!(vf.planes[1].stride, chroma_stride);
+                assert_eq!(vf.planes[2].stride, chroma_stride);
+                out.extend_from_slice(&vf.planes[0].data);
+                out.extend_from_slice(&vf.planes[1].data);
+                out.extend_from_slice(&vf.planes[2].data);
+            }
+            assert_eq!(
+                sha256_hex(&out),
+                want,
+                "trait-path output must match the fixture expected.yuv digest"
+            );
+        }
+    }
+
     /// `with_headers` parses the ident + setup chain up front (the
     /// container-setup carriage path); the comment header is optional.
     #[test]
@@ -40304,6 +40649,148 @@ mod tests {
         assert_eq!(decoded_ok + rejected, 1600);
     }
 
+    /// The three round-444 third-party-encoded fixtures as
+    /// `(ident, setup, data packets)` triples — the wire spellings the
+    /// older sweeps never crossed: 4:2:2 and 4:4:4 block geometry
+    /// (§2.3–§2.4 counts, §4.4 plane mapping) and the golden / four-MV
+    /// §7.4–§7.5 mode syntax of `all-mb-modes-64x64`.
+    type FixtureStream = (&'static [u8], &'static [u8], Vec<&'static [u8]>);
+
+    fn third_party_fixture_streams() -> [FixtureStream; 3] {
+        [
+            (
+                &fixture_data::P422_IDENT_PACKET,
+                &fixture_data::PF_SETUP_PACKET,
+                vec![
+                    &fixture_data::P422_DATA_PACKET_0,
+                    &fixture_data::P422_DATA_PACKET_1,
+                    &fixture_data::P422_DATA_PACKET_2,
+                ],
+            ),
+            (
+                &fixture_data::P444_IDENT_PACKET,
+                &fixture_data::PF_SETUP_PACKET,
+                vec![
+                    &fixture_data::P444_DATA_PACKET_0,
+                    &fixture_data::P444_DATA_PACKET_1,
+                    &fixture_data::P444_DATA_PACKET_2,
+                ],
+            ),
+            (
+                &fixture_data::AMM_IDENT_PACKET,
+                &fixture_data::AMM_SETUP_PACKET,
+                vec![
+                    &fixture_data::AMM_DATA_PACKET_0,
+                    &fixture_data::AMM_DATA_PACKET_1,
+                    &fixture_data::AMM_DATA_PACKET_2,
+                    &fixture_data::AMM_DATA_PACKET_3,
+                    &fixture_data::AMM_DATA_PACKET_4,
+                    &fixture_data::AMM_DATA_PACKET_5,
+                    &fixture_data::AMM_DATA_PACKET_6,
+                    &fixture_data::AMM_DATA_PACKET_7,
+                    &fixture_data::AMM_DATA_PACKET_8,
+                    &fixture_data::AMM_DATA_PACKET_9,
+                    &fixture_data::AMM_DATA_PACKET_10,
+                    &fixture_data::AMM_DATA_PACKET_11,
+                    &fixture_data::AMM_DATA_PACKET_12,
+                    &fixture_data::AMM_DATA_PACKET_13,
+                    &fixture_data::AMM_DATA_PACKET_14,
+                    &fixture_data::AMM_DATA_PACKET_15,
+                    &fixture_data::AMM_DATA_PACKET_16,
+                    &fixture_data::AMM_DATA_PACKET_17,
+                    &fixture_data::AMM_DATA_PACKET_18,
+                    &fixture_data::AMM_DATA_PACKET_19,
+                    &fixture_data::AMM_DATA_PACKET_20,
+                    &fixture_data::AMM_DATA_PACKET_21,
+                    &fixture_data::AMM_DATA_PACKET_22,
+                    &fixture_data::AMM_DATA_PACKET_23,
+                ],
+            ),
+        ]
+    }
+
+    /// §5.2 end-of-packet discipline across the third-party-encoded
+    /// fixtures: **every possible truncation of every data packet of
+    /// all three streams** must return `Ok` or a typed `Err` — never
+    /// panic — with any accepted prefix surviving the §2.2 display
+    /// crop. Each packet's prefixes run against the decoder state the
+    /// full stream produced up to that packet (real golden/previous
+    /// references, real LAST/LAST2 vector history), so the sweep
+    /// crosses the 4:2:2 / 4:4:4 block geometry and the golden and
+    /// four-MV mode syntax at every possible packet-end boundary —
+    /// wire states the i-then-p sweep above cannot reach.
+    #[test]
+    fn decode_frame_every_truncation_of_third_party_fixture_packets_is_live() {
+        for (ident_pkt, setup_pkt, packets) in third_party_fixture_streams() {
+            let ident = decode_identification_header(ident_pkt).unwrap();
+            let setup = decode_setup_header(setup_pkt).unwrap();
+            let mut dec = FrameDecoder::new(ident, setup).unwrap();
+            for (i, pkt) in packets.iter().enumerate() {
+                for len in 0..=pkt.len() {
+                    let mut probe = dec.clone();
+                    if let Ok(frame) = probe.decode_frame(&pkt[..len]) {
+                        probe
+                            .crop_for_display(&frame)
+                            .expect("accepted prefix must survive the display crop");
+                    }
+                }
+                dec.decode_frame(pkt)
+                    .unwrap_or_else(|e| panic!("full packet {i} decodes: {e:?}"));
+            }
+        }
+    }
+
+    /// Corruption storm on the third-party-encoded fixture packets —
+    /// the same no-panic liveness contract as the storms above, aimed
+    /// at the keyframe (fresh-decoder path) and the final inter packet
+    /// (decoded on the state left by the whole preceding stream) of
+    /// each of the three streams: 400 mutants × 2 packets × 3 fixtures.
+    #[test]
+    fn decode_frame_survives_corrupted_third_party_fixture_packets() {
+        let mut rng = XorShift64(0x7413_0444_0aab_cd01);
+        let mut total = 0usize;
+        for (ident_pkt, setup_pkt, packets) in third_party_fixture_streams() {
+            let ident = decode_identification_header(ident_pkt).unwrap();
+            let setup = decode_setup_header(setup_pkt).unwrap();
+            let fresh = FrameDecoder::new(ident, setup).unwrap();
+            let mut warm = fresh.clone();
+            for pkt in &packets[..packets.len() - 1] {
+                warm.decode_frame(pkt).expect("stream prefix decodes");
+            }
+            let legs: [(&FrameDecoder, &[u8]); 2] =
+                [(&fresh, packets[0]), (&warm, packets[packets.len() - 1])];
+            for (state, base) in legs {
+                for _ in 0..400 {
+                    let mut pkt = base.to_vec();
+                    match rng.next() % 4 {
+                        0 => {
+                            let i = (rng.next() as usize) % pkt.len();
+                            pkt[i] ^= 1 << (rng.next() % 8);
+                        }
+                        1 => {
+                            let i = (rng.next() as usize) % pkt.len();
+                            pkt[i] = rng.next() as u8;
+                        }
+                        2 => {
+                            let n = (rng.next() as usize) % (pkt.len() + 1);
+                            pkt.truncate(n);
+                        }
+                        _ => {
+                            let n = 1 + (rng.next() as usize) % 16;
+                            for _ in 0..n {
+                                pkt.push(rng.next() as u8);
+                            }
+                        }
+                    }
+                    let mut dec = state.clone();
+                    let _ = dec.decode_frame(&pkt);
+                    total += 1;
+                }
+            }
+        }
+        assert_eq!(total, 2400);
+    }
+
     /// Randomized multi-frame stress across every chroma format and a
     /// spread of quantizers: pseudo-random smoothly-evolving sources
     /// run through the full `TheoraEncoder` → `TheoraDecoder` loop
@@ -41043,11 +41530,13 @@ mod tests {
         }
     }
 
-    /// The eight fixtures declaring `KFGSHIFT = 6`, all opening with
+    /// The ten fixtures declaring `KFGSHIFT = 6`, all opening with
     /// the §A.2.3 `1|0` marking: single-keyframe streams,
-    /// keyframe+inter streams, the all-keyframe `-g 1` stream, and
-    /// the duplicate-frame stream where zero-byte packets advance the
-    /// granule like any other frame.
+    /// keyframe+inter streams, the all-keyframe `-g 1` stream, the
+    /// duplicate-frame stream where zero-byte packets advance the
+    /// granule like any other frame, and the third-party-encoded
+    /// 4:2:2 / 4:4:4 streams (the granule mapping is chroma-format
+    /// independent).
     #[test]
     fn granule_mapping_matches_fixture_pages_at_kfgshift_6() {
         granule_walk_fixture(
@@ -41130,6 +41619,73 @@ mod tests {
             // 1..=7 finishing on one page marked for frame 7 (1|7) —
             // the zero-byte duplicates advanced the granule too.
             &[(0, 64), (7, 71)],
+        );
+        granule_walk_fixture(
+            "pixel-format-422-64x64",
+            &fixture_data::P422_IDENT_PACKET,
+            &[
+                &fixture_data::P422_DATA_PACKET_0,
+                &fixture_data::P422_DATA_PACKET_1,
+                &fixture_data::P422_DATA_PACKET_2,
+            ],
+            6,
+            // Keyframe page 1|0, then both inter frames finishing on
+            // one page marked for frame 2 (1|2).
+            &[(0, 64), (2, 66)],
+        );
+        granule_walk_fixture(
+            "pixel-format-444-64x64",
+            &fixture_data::P444_IDENT_PACKET,
+            &[
+                &fixture_data::P444_DATA_PACKET_0,
+                &fixture_data::P444_DATA_PACKET_1,
+                &fixture_data::P444_DATA_PACKET_2,
+            ],
+            6,
+            &[(0, 64), (2, 66)],
+        );
+    }
+
+    /// The `all-mb-modes-64x64` fixture declares `KFGSHIFT = 8` — a
+    /// third shift value the corpus never carried before (every other
+    /// stream is 6 or 7), so the §A.2.3 split is pinned at a third
+    /// operating point: the keyframe page reads `1|0` as `256` and the
+    /// final page — 23 inter frames later, all governed by the single
+    /// interval-250 keyframe — reads `1|23` as `279`.
+    #[test]
+    fn granule_mapping_matches_fixture_pages_at_kfgshift_8() {
+        granule_walk_fixture(
+            "all-mb-modes-64x64",
+            &fixture_data::AMM_IDENT_PACKET,
+            &[
+                &fixture_data::AMM_DATA_PACKET_0,
+                &fixture_data::AMM_DATA_PACKET_1,
+                &fixture_data::AMM_DATA_PACKET_2,
+                &fixture_data::AMM_DATA_PACKET_3,
+                &fixture_data::AMM_DATA_PACKET_4,
+                &fixture_data::AMM_DATA_PACKET_5,
+                &fixture_data::AMM_DATA_PACKET_6,
+                &fixture_data::AMM_DATA_PACKET_7,
+                &fixture_data::AMM_DATA_PACKET_8,
+                &fixture_data::AMM_DATA_PACKET_9,
+                &fixture_data::AMM_DATA_PACKET_10,
+                &fixture_data::AMM_DATA_PACKET_11,
+                &fixture_data::AMM_DATA_PACKET_12,
+                &fixture_data::AMM_DATA_PACKET_13,
+                &fixture_data::AMM_DATA_PACKET_14,
+                &fixture_data::AMM_DATA_PACKET_15,
+                &fixture_data::AMM_DATA_PACKET_16,
+                &fixture_data::AMM_DATA_PACKET_17,
+                &fixture_data::AMM_DATA_PACKET_18,
+                &fixture_data::AMM_DATA_PACKET_19,
+                &fixture_data::AMM_DATA_PACKET_20,
+                &fixture_data::AMM_DATA_PACKET_21,
+                &fixture_data::AMM_DATA_PACKET_22,
+                &fixture_data::AMM_DATA_PACKET_23,
+            ],
+            8,
+            // Keyframe page 1|0 = 256, final page 1|23 = 279.
+            &[(0, 256), (23, 279)],
         );
     }
 

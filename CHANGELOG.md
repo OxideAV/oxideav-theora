@@ -4,6 +4,57 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Third-party-encoded decode fixtures pixel-exact — all three pixel
+  formats and all eight coding modes (round 444)** — the three staged
+  corpus fixtures the crate had never consumed are now embedded (Ogg
+  framing stripped offline, per the established `fixture_data`
+  pattern) and decoded end-to-end:
+
+  * `pixel-format-422-64x64` (`PF = 2`) and `pixel-format-444-64x64`
+    (`PF = 3`) — the corpus's first third-party non-4:2:0 streams;
+    every earlier 4:2:2 / 4:4:4 validation decoded this crate's *own*
+    encoder output. Both decode **pixel-exactly**: per-frame SHA-256s
+    localise any break and the concatenated top-down output reproduces
+    each fixture's `expected.yuv` digest, with the §2.3–§2.4 geometry
+    (`NBS` 128 / 192, `NSBS` 8 / 12) and the §4.4.4 chroma plane
+    shapes (32×64 horizontally-subsampled vs 64×64 unsubsampled)
+    asserted, through both `FrameDecoder` and the framework `Decoder`
+    trait (plane strides included).
+  * `all-mb-modes-64x64` — 24 frames, one interval-250 keyframe, whose
+    §7.4 macro-block mode census is asserted **exactly** against the
+    fixture table (173 / 104 / 45 / 50 / 5 / 1 / 1 / 5 across modes
+    0–7): the corpus's only third-party-encoded `INTER_GOLDEN_NOMV`,
+    `INTER_GOLDEN_MV`, and `INTER_MV_FOUR` macro blocks, plus its only
+    long inter run with real motion. All 24 frames decode
+    pixel-exactly (per-frame digests + the whole-stream `expected.yuv`
+    digest), pinning golden-reference selection against a golden frame
+    up to 23 frames staler than "previous", per-luma-block four-MV
+    decode with §7.5.2 chroma averaging, and the LAST / LAST2 vector
+    history that four-MV blocks feed. This closes the README's
+    long-standing "third-party golden / four-MV `expected.yuv` fixture
+    absent" item.
+
+- **Granule mapping pinned at `KFGSHIFT = 8` (round 444)** — the
+  `all-mb-modes-64x64` stream declares a third shift value the corpus
+  never carried (every other stream is 6 or 7), so the §A.2.3 split is
+  now pinned at a third operating point (keyframe page `1|0 = 256`,
+  final page `1|23 = 279`); the 4:2:2 / 4:4:4 streams join the
+  `KFGSHIFT = 6` walk. Every data page of all **fourteen** staged
+  `input.ogv` fixtures is now covered by the tracker/inverse pins.
+
+- **Hostile-stream sweeps over the third-party spellings (round
+  444)** — every possible truncation of **every data packet** of the
+  three new fixtures decodes against the exact reference state the
+  full stream produced up to that packet (real golden/previous
+  references and LAST / LAST2 history), so the §5.2 end-of-packet
+  discipline crosses the 4:2:2 / 4:4:4 block geometry and the golden /
+  four-MV mode syntax at every packet-end boundary; plus a
+  2400-mutant corruption storm (keyframe on a fresh decoder, final
+  inter packet on the fully-warmed state, per fixture). All return
+  `Ok` or a typed `Err`; no panics were found.
+
 ### Fixed
 
 - **§6.4.3 rejects quant ranges referencing undefined base matrices

@@ -11,8 +11,10 @@ identification, `classify_packet` routes header vs. data packets per
 §6.1, and the §A.2.3 granule-position mapping (forward, inverse, and a
 mux-side tracker) is public API pinned against every data page of the
 staged fixture corpus. The
-decoder is sample-exact for its supported feature set (validated up to
-HD against reference dumps). The encoder emits complete self-describing
+decoder is sample-exact for its supported feature set — validated up to
+HD against reference dumps, at all three pixel formats and across all
+eight §7.4 macro-block coding modes against third-party-encoded
+streams. The encoder emits complete self-describing
 streams — §6 headers plus intra and inter (P) frames through a unified
 rate-distortion mode decision over all eight §7.5.2 coding modes, with
 motion estimation to half-pixel accuracy, per-block skip, adaptive
@@ -49,8 +51,8 @@ against reference output.
   (`granule_position_seconds`), and a mux-side `GranulePositionTracker`
   that turns keyframe flags into per-packet granule positions. The
   mapping is pinned against the granule value of **every data page of
-  the eleven staged `input.ogv` fixtures** (including the `KFGSHIFT=7`
-  streams and zero-byte duplicate frames) and rehearsed end-to-end at
+  the fourteen staged `input.ogv` fixtures** (spanning `KFGSHIFT` 6, 7
+  and 8, and zero-byte duplicate frames) and rehearsed end-to-end at
   all three pixel formats: encoder packet stream → blind
   classification → payload-magic resolution → granule tracking →
   registry-built decode.
@@ -460,6 +462,27 @@ grayscale-source `monochrome-via-zero-chroma` I+P stream whose chroma
 planes stay a flat `0x80` through both the coded-residual and pure-copy
 inter branches (asserted in addition to the sample-exact pixel match).
 
+Three third-party-encoded fixture families close the decode side's
+last staged-corpus gaps **pixel-exactly** (per-frame SHA-256s plus the
+whole-stream `expected.yuv` digest from each fixture's `notes.md`):
+
+* `pixel-format-422-64x64` / `pixel-format-444-64x64` — the corpus's
+  first third-party `PF = 2` and `PF = 3` streams (every earlier
+  non-4:2:0 validation decoded this crate's *own* encoder output).
+  They pin the §2.3–§2.4 super-block/block counts (`NBS` 128 / 192),
+  the §4.4 block-to-plane mapping, and the horizontally-only (32×64)
+  versus unsubsampled (64×64) chroma geometry, through both the direct
+  `FrameDecoder` path and the framework `Decoder` trait.
+* `all-mb-modes-64x64` — 24 frames (one interval-250 keyframe + 23
+  inter) whose §7.4 census spans **all eight coding modes**, asserted
+  exactly (173 / 104 / 45 / 50 / 5 / 1 / 1 / 5): the corpus's only
+  third-party-encoded `INTER_GOLDEN_NOMV`, `INTER_GOLDEN_MV`, and
+  `INTER_MV_FOUR` macro blocks, decoded against a golden frame that is
+  23 frames stale by the stream's end — pinning golden-reference
+  selection, per-luma-block four-MV decode with §7.5.2 chroma
+  averaging, and the LAST / LAST2 vector history across the corpus's
+  only long inter run with real motion.
+
 The `dimensions-1080p-very-short` fixture (coded 1920×1088, visible
 1920×1080, two frames I then P) is decoded end-to-end and validated
 against every invariant the staged instrumented trace records
@@ -503,14 +526,19 @@ chroma blocks that earlier diverged is now sample-exact.
   header and a quantizer to emit a complete self-describing stream; a
   caller may still supply pre-decoded tables via `TheoraEncoder::new` /
   `extradata` when matching an existing setup.
-* **Reference-captured golden / four-MV decode fixture** — the
-  golden-reference and four-MV inter modes are exercised
-  top-to-bottom through this crate's own encoder→decoder round trip,
-  and self-encoded golden / four-MV streams are now also decoded
-  **pixel-exactly by an external black-box decoder** (see below). A
-  *third-party-encoded* `expected.yuv` fixture for these modes is
-  still absent because the reference encoder's `testsrc`-class encodes
-  never emit a golden or four-MV macroblock.
+* **Pre-3.2.0 (legacy) bitstreams** — the §A.2.3 pre-3.2.1 granule
+  normalization is implemented, but no *decodable* `VREV < 1` fixture
+  exists: the staged catalogue
+  (`docs/video/theora/third-party-corpora.md` §3.1) records a live
+  `0x030100` stream whose pre-3.2.0 identification header uses a
+  different layout, and no `expected.yuv` can currently be derived
+  for it, so it remains a parser-fixture candidate only (a
+  documented corpus gap, not a crate gap). The external catalogue's
+  fetch-and-test families (§1–§3: large pictures with `PICX`/`PICY`
+  offsets up to 128/144, chained logical streams, variable frame
+  rate, non-square pixels) are likewise catalogued by URL + SHA-256
+  rather than staged, and container-level concerns among them
+  (chaining, page framing) belong to the container crates.
 
 ## Robustness and fuzzing (round 437)
 
@@ -532,9 +560,14 @@ error and regression-pinned at both the parameter and wire level.
 Deterministic sweeps complement the fuzzers: every possible
 truncation of the reference-encoded fixture packets (intra on a
 fresh decoder, inter on a decoder holding the fixture's real
-reference) and 4000 corruption-storm mutants across self- and
-reference-encoded spellings must return `Ok` or a typed `Err`,
-never panic.
+reference) and 6400 corruption-storm mutants across self-,
+reference- and third-party-encoded spellings must return `Ok` or a
+typed `Err`, never panic. Round 444 extended the truncation sweep to **every
+data packet of the three third-party-encoded fixtures** — each
+prefix decoded against the exact reference state the full stream
+produced up to that packet — so the §5.2 end-of-packet discipline
+now crosses the 4:2:2 / 4:4:4 block geometry and the golden /
+four-MV mode syntax at every possible packet-end boundary.
 
 ## External validation (round 413)
 

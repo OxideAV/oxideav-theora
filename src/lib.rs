@@ -17565,8 +17565,13 @@ impl TheoraEncoder {
     /// variant). The list's shape is validated when the first frame is
     /// encoded (`EncodeQisCountOutOfRange` / `QuantIndexOutOfRange`
     /// surface from `send_frame`). When target-bitrate rate control is
-    /// also enabled, the adaptive list governs the adaptive frames as
-    /// configured (the rate-control quantizer is bypassed on them).
+    /// also enabled the two **compose**: the rate-control loop owns
+    /// each frame's `qis[0]` (the frame-level quantizer that drives
+    /// the DC quantizers, the loop-filter limit, and the RD λ) and
+    /// this list's entries ride along as the per-block AC candidates
+    /// (duplicates of an earlier entry dropped, at most three total),
+    /// so the bucket steers the frame's base rate while the per-block
+    /// chooser still redistributes bits within the frame.
     pub fn with_adaptive_quant(mut self, qis: Vec<u8>) -> Self {
         self.adaptive_qis = Some(qis);
         self
@@ -17711,6 +17716,33 @@ impl TheoraEncoder {
             self.frame_encoder.set_qi(rc.qi_for_next_frame())?;
         }
 
+        // Effective §7.1 adaptive-quant candidate list for this frame.
+        // Under rate control the loop owns `qis[0]` — the frame-level
+        // quantizer that drives the DC quantizers, the loop-filter
+        // limit, and the RD λ — while the caller's candidates stay in
+        // the list as per-block AC alternatives (duplicates of an
+        // earlier entry dropped, `NQIS <= 3` kept by truncation), so
+        // the two features compose: the bucket steers the frame's
+        // base rate and the per-block `D + λ·R` chooser still
+        // redistributes bits within the frame. A caller list with an
+        // invalid shape (empty or more than 3 entries) is passed
+        // through untouched so the encode paths' own validation still
+        // rejects it. Without rate control the caller's list is used
+        // verbatim, as before.
+        let adaptive_qis: Option<Vec<u8>> = self.adaptive_qis.as_ref().map(|qis| {
+            if self.rate_control.is_some() && !qis.is_empty() && qis.len() <= 3 {
+                let mut eff = vec![self.frame_encoder.qi()];
+                for &q in qis {
+                    if eff.len() < 3 && !eff.contains(&q) {
+                        eff.push(q);
+                    }
+                }
+                eff
+            } else {
+                qis.clone()
+            }
+        });
+
         // Set by the RD inter branch below: did the mode decision code a
         // majority of this P-frame's transmitted macro blocks INTRA? A
         // de-facto intra frame is the direct reference-decay signal the
@@ -17719,7 +17751,7 @@ impl TheoraEncoder {
         // inherently cheaper than the old keyframe's).
         let mut de_facto_intra = false;
         let mut bytes = if want_keyframe {
-            match &self.adaptive_qis {
+            match &adaptive_qis {
                 Some(qis) => self.frame_encoder.encode_intra_frame_adaptive(frame, qis)?,
                 None => self.frame_encoder.encode_intra_frame(frame)?,
             }
@@ -17733,7 +17765,7 @@ impl TheoraEncoder {
             match self.inter_mode {
                 InterModeStrategy::RateDistortion => {
                     let single_qi = [self.frame_encoder.qi()];
-                    let qis: &[u8] = match &self.adaptive_qis {
+                    let qis: &[u8] = match &adaptive_qis {
                         Some(q) => q,
                         None => &single_qi,
                     };
@@ -17801,7 +17833,7 @@ impl TheoraEncoder {
         if !want_keyframe {
             if let (Some(ratio), Some(kb)) = (self.keyframe_rate_ratio, self.last_keyframe_bytes) {
                 if de_facto_intra || bytes.len() as f64 > ratio * kb as f64 {
-                    let intra_bytes = match &self.adaptive_qis {
+                    let intra_bytes = match &adaptive_qis {
                         Some(qis) => self.frame_encoder.encode_intra_frame_adaptive(frame, qis)?,
                         None => self.frame_encoder.encode_intra_frame(frame)?,
                     };
@@ -17829,8 +17861,7 @@ impl TheoraEncoder {
                         }
                         Ok(ssd)
                     };
-                    let qi0 = self
-                        .adaptive_qis
+                    let qi0 = adaptive_qis
                         .as_ref()
                         .map_or(self.frame_encoder.qi(), |qis| qis[0]);
                     let lambda = inter_rd_lambda(&self.setup.quantization_parameters, qi0)?;
@@ -35000,6 +35031,157 @@ mod tests {
                 panic!("expected video frame");
             };
         }
+    }
+
+    /// Rate control **composes** with adaptive quantization instead of
+    /// being bypassed by it (round 444): the leaky-bucket loop owns
+    /// each adaptive frame's `QIS[0]` — the frame-level quantizer that
+    /// drives the DC quantizers, the loop-filter limit, and the RD λ —
+    /// while the caller's `with_adaptive_quant` entries ride along as
+    /// per-block AC candidates. On the wire: the first frame's header
+    /// carries the seed `qi` at the head with the caller candidates
+    /// behind it, and a stream held far over budget walks `QIS[0]`
+    /// strictly downward frame over frame (a lower `qi` is *stronger*
+    /// quantization in Theora) while the candidate tail keeps riding.
+    /// Without rate control the caller's list is used verbatim, as
+    /// before. The whole stream decodes through `TheoraDecoder`.
+    #[test]
+    fn encoder_trait_rate_control_composes_with_adaptive_quant() {
+        use oxideav_core::{Decoder, Encoder};
+        let ident = decode_identification_header(&TINY_HEADER).unwrap();
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
+        let g = build_frame_geometry(&ident).unwrap();
+
+        // Busy noise planes: every frame codes far over the tiny byte
+        // budget below, so the bucket commands a strictly stronger
+        // quantizer each frame.
+        let mk_busy = |phase: u32| -> oxideav_core::VideoFrame {
+            use oxideav_core::frame::VideoPlane;
+            let (w, h) = (g.dims_y.width, g.dims_y.height);
+            let mut y = vec![0u8; (w * h) as usize];
+            for row in 0..h {
+                for col in 0..w {
+                    y[(row * w + col) as usize] =
+                        (17 + ((col * 41 + row * 59 + phase * 13) % 211)) as u8;
+                }
+            }
+            let (cw, ch) = (g.dims_c.width, g.dims_c.height);
+            oxideav_core::VideoFrame {
+                pts: None,
+                planes: vec![
+                    VideoPlane {
+                        stride: w as usize,
+                        data: y,
+                    },
+                    VideoPlane {
+                        stride: cw as usize,
+                        data: vec![128u8; (cw * ch) as usize],
+                    },
+                    VideoPlane {
+                        stride: cw as usize,
+                        data: vec![128u8; (cw * ch) as usize],
+                    },
+                ],
+            }
+        };
+
+        // 100 bytes per frame at the stream's own frame rate — far
+        // below what the busy 32×32 content costs at qi 40, so every
+        // observed frame overshoots. Interval 1 keeps the
+        // keyframe-bonus budget path inert (flat per-frame budget).
+        let fps = ident.frn as u64 / ident.frd as u64;
+        let target_bits_per_second = 800 * fps;
+        let mut enc = TheoraEncoder::with_keyframe_interval(
+            codec_id.clone(),
+            ident.clone(),
+            setup.clone(),
+            40,
+            1,
+        )
+        .unwrap()
+        .with_adaptive_quant(vec![37, 61])
+        .with_target_bitrate(target_bits_per_second);
+
+        let nframes = 4usize;
+        for phase in 0..nframes as u32 {
+            enc.send_frame(&oxideav_core::Frame::Video(mk_busy(phase)))
+                .unwrap();
+        }
+        let mut headers = Vec::new();
+        let mut data = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if p.flags.header {
+                        headers.push(p);
+                    } else {
+                        data.push(p);
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error {e}"),
+            }
+        }
+        assert_eq!(data.len(), nframes);
+
+        let mut heads = Vec::new();
+        for (i, p) in data.iter().enumerate() {
+            let hdr = decode_frame_header(&p.data, i == 0).unwrap();
+            let head = hdr.qis[0];
+            // The caller's candidates ride behind the rate-control
+            // head, in order, minus any entry equal to the head.
+            let want_tail: Vec<u8> = [37u8, 61].iter().copied().filter(|&q| q != head).collect();
+            assert_eq!(
+                &hdr.qis[1..],
+                &want_tail[..],
+                "frame {i}: caller AC candidates must ride behind the RC head"
+            );
+            heads.push(head);
+        }
+        // Frame 0 codes at the seed quantizer; every following frame
+        // overshoots the 100-byte budget, so the bucket walks the head
+        // strictly downward (stronger quantization).
+        assert_eq!(heads[0], 40, "frame 0 carries the seed qi at QIS[0]");
+        for w in heads.windows(2) {
+            assert!(
+                w[1] < w[0],
+                "sustained overshoot must strengthen the quantizer ({heads:?})"
+            );
+        }
+
+        // The composed stream decodes end-to-end.
+        let mut dec = TheoraDecoder::new(codec_id.clone());
+        for p in &headers {
+            dec.send_packet(p).unwrap();
+        }
+        for p in &data {
+            dec.send_packet(p).unwrap();
+            let oxideav_core::Frame::Video(_) = dec.receive_frame().unwrap() else {
+                panic!("expected video frame");
+            };
+        }
+
+        // Control: without rate control the caller's list is verbatim.
+        let mut plain =
+            TheoraEncoder::with_keyframe_interval(codec_id, ident.clone(), setup, 40, 1)
+                .unwrap()
+                .with_adaptive_quant(vec![37, 61]);
+        plain
+            .send_frame(&oxideav_core::Frame::Video(mk_busy(0)))
+            .unwrap();
+        let first_data = loop {
+            match plain.receive_packet() {
+                Ok(p) if !p.flags.header => break p,
+                Ok(_) => continue,
+                Err(e) => panic!("encoder error {e}"),
+            }
+        };
+        assert_eq!(
+            decode_frame_header(&first_data.data, true).unwrap().qis,
+            vec![37, 61],
+            "without rate control the adaptive list is used verbatim"
+        );
     }
 
     /// MILESTONE (round 387, golden-frame policy): the measured-rate

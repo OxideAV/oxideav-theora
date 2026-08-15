@@ -6,6 +6,27 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Rate control composes with adaptive quantization (round 444)** —
+  enabling both `with_target_bitrate` and `with_adaptive_quant`
+  previously left the rate-control loop inert: every frame under the
+  default rate-distortion strategy is adaptive, and adaptive frames
+  used the caller's `qis` list verbatim, so the bucket observed every
+  frame but steered none (a documented bypass — and with it, a
+  rate-controlled adaptive-quant stream was unreachable). The two now
+  compose: the loop owns each adaptive frame's `QIS[0]` — the
+  frame-level quantizer that drives the DC quantizers, the §6.4.1
+  loop-filter limit, and the RD λ — while the caller's entries ride
+  along as the per-block AC candidates (duplicates of an earlier
+  entry dropped, `NQIS <= 3` kept; a malformed caller list is passed
+  through untouched so the encode paths' validation still rejects
+  it). No new bitstream syntax — the composed stream spells ordinary
+  §7.1 multi-`qi` headers. Pinned at the wire level: the first frame
+  carries the seed `qi` at `QIS[0]` with the candidates behind it, a
+  stream held far over budget walks `QIS[0]` strictly downward while
+  the candidate tail keeps riding, the composed stream decodes
+  through `TheoraDecoder`, and a rate-control-free encoder still uses
+  the caller's list verbatim.
+
 - **Third-party-encoded decode fixtures pixel-exact — all three pixel
   formats and all eight coding modes (round 444)** — the three staged
   corpus fixtures the crate had never consumed are now embedded (Ogg

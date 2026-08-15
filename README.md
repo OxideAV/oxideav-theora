@@ -441,7 +441,14 @@ zero-initialized reference store.
   stretch after 3 s of static content ran >2× the target for 3+
   seconds unclamped, and is back inside regulation within one second
   clamped). The loop is fully opt-in (disabled by
-  default, a no-op). **Externally measured** (5-second 320×240 runs
+  default, a no-op) and **composes with adaptive quantization**: on a
+  stream built with both `with_adaptive_quant` and a target bitrate,
+  the rate-control loop owns each frame's `QIS[0]` (the frame-level
+  quantizer driving the DC quantizers, loop-filter limit, and RD λ)
+  while the caller's candidates ride along as the per-block AC
+  alternatives — the bucket steers each frame's base rate and the
+  per-block `D + λ·R` chooser still redistributes bits within the
+  frame. **Externally measured** (5-second 320×240 runs
   decoded black-box from the muxed `.ogv`): a 400 kb/s target lands
   +0.5 % and an 800 kb/s target −0.9 %, while a target below the
   content's `qi_min` rate floor saturates cleanly at the floor. Enabling the loop

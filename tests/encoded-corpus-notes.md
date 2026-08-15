@@ -1,6 +1,6 @@
-# Self-encoded corpus — generation + external-validation notes (rounds 413 / 437)
+# Self-encoded corpus — generation + external-validation notes (rounds 413 / 437 / 444)
 
-`encoded_corpus.rs` pins eleven deterministic encoder scenarios by
+`encoded_corpus.rs` pins twelve deterministic encoder scenarios by
 SHA-256, at two levels per scenario:
 
 * **wire** — the length-prefixed packet chain (`u32` LE length + bytes,
@@ -98,3 +98,25 @@ reconstruction **byte-for-byte** (304128 bytes each). Verdict:
   wire moved.
 * The generator and scenario parameters are part of the pin: changing
   either is a re-pin, not a fix.
+
+## Round 444 — the composed rate-control + adaptive-quant scenario
+
+Round 444 made `with_target_bitrate` and `with_adaptive_quant`
+compose (the loop owns each adaptive frame's `QIS[0]`; the caller's
+candidates ride as the per-block AC alternatives) — previously the
+loop was inert whenever adaptive quantization was enabled, so this
+stream shape did not exist. Scenario 12 (`rcadaptive`: 176×144
+4:2:0, interval 8, 16 frames, `qis = [40, 24, 56]`, 150 kb/s
+target) pins it, and the round-413 route was re-run on it end to
+end: packets rebuilt exactly as in the test, muxed to `.ogv`
+through the sibling container crate (same recipe — Xiph-laced
+extradata, `pts` = frame index, `unit_boundary` on keyframes,
+4096-byte page target), `oggz-validate` clean, black-box-decoded to
+raw planar video, byte-compared against this crate's own
+`TheoraDecoder` reconstruction.
+
+**Verdict: pixel-exact (16/16 scenarios cumulative across rounds
+413 + 437 + 444).** The wire evidence of composition is asserted in
+the test itself independent of the digests: every data frame
+carries a multi-entry `QIS` list and at least one frame's `QIS[0]`
+leaves the seed quantizer.

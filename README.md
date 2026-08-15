@@ -20,9 +20,10 @@ rate-distortion mode decision over all eight §7.5.2 coding modes, with
 motion estimation to half-pixel accuracy, per-block skip, adaptive
 quantization, content-tuned Huffman codebooks, non-macro-block-aligned
 picture regions, duplicate-frame packets, and optional target-bitrate
-rate control — and is **externally validated**: twelve scenario
+rate control — and is **externally validated**: sixteen scenario
 families (up to 1920×1080, all three pixel formats, every encoder
-feature above) were muxed into Ogg and black-box-decoded by an
+feature above including the composed rate-control + adaptive-quant
+stream) were muxed into Ogg and black-box-decoded by an
 independent reference decoder **pixel-exactly** against this crate's
 own reconstruction, with the corpus pinned by SHA-256 under `tests/`.
 
@@ -599,7 +600,10 @@ limits at the 7-bit ceiling, the all-zero `NBITS = 0` limit table,
 and a three-quant-range transmitted layout with adaptive-quant qis
 spanning the ranges (§6.4.3 interpolation across interior boundaries
 of a non-VP3 layout) — all three black-box-decoded byte-identically
-to this crate's reconstruction (15/15 scenarios cumulative). The external route surfaced and fixed
+to this crate's reconstruction. Round 444 added the **composed
+rate-control + adaptive-quant** scenario (a stream shape that did
+not previously exist — see the rate-control bullet) through the
+same route, also byte-identical (16/16 scenarios cumulative). The external route surfaced and fixed
 three real defects this round: `for_picture`'s `KFGSHIFT = 0` (inter
 frames had no representable Ogg granule position), a wrong-slope RD λ
 (the rate/PSNR curve folded over above qi 52), and a scene-cut

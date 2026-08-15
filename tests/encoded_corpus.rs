@@ -1,6 +1,6 @@
 //! Pinned self-encoded corpus (round 413).
 //!
-//! Eleven deterministic encoder scenarios — the same family that was
+//! Twelve deterministic encoder scenarios — the same family that was
 //! validated externally in round 413 (muxed into Ogg via the published
 //! container crate and black-box-decoded pixel-exactly; see
 //! `tests/encoded-corpus-notes.md`) — are re-encoded here on every run
@@ -284,14 +284,14 @@ fn check(pin: &Pin, id: &TheoraIdentHeader, pkts: &[Packet]) {
     );
 }
 
-/// The eleven-pin corpus. `CORPUS_PRINT=1 cargo test --test
+/// The twelve-pin corpus. `CORPUS_PRINT=1 cargo test --test
 /// encoded_corpus -- --nocapture` prints the current `Pin` lines for a
 /// deliberate re-pin.
 #[test]
 fn encoded_corpus_digests_are_stable() {
     let cid = || CodecId::new(THEORA_CODEC_ID);
 
-    const PINS: [Pin; 11] = [
+    const PINS: [Pin; 12] = [
         Pin {
             name: "basic420",
             wire_sha256: "dc711a7e953898769035d18ebcd2cb565facc19b39fc446191e414b00b4c4d19",
@@ -346,6 +346,11 @@ fn encoded_corpus_digests_are_stable() {
             name: "golden",
             wire_sha256: "92c6a89a9d3e0b721236649ad01090a6d88091494b98fde3fb9cd12c75607d4b",
             recon_sha256: "18ee6baa0788b715b7a216d4b6fa0c95e2c9baafcbd50506f11effbd593caade",
+        },
+        Pin {
+            name: "rcadaptive",
+            wire_sha256: "574940c9e588ccceb7e038182d458f5e198c3d58c86e2912ed60a763bbbf7be1",
+            recon_sha256: "25c1a0c6b9b110c6e23e2175c60f73884cd4d28c0768c38670c10178bdb755ed",
         },
     ];
 
@@ -512,6 +517,45 @@ fn encoded_corpus_digests_are_stable() {
         false,
     );
     check(&PINS[10], &id, &pkts);
+
+    // 12. Rate control **composed** with adaptive quantization (round
+    // 444): the leaky bucket owns each frame's QIS[0] while the
+    // caller's candidates ride as the per-block AC alternatives —
+    // scenarios 5 and 6 pin each feature alone; this pins them
+    // together (the combination was previously unreachable: the loop
+    // observed every adaptive frame but steered none).
+    let id = ident(176, 144, PixelFormat::Yuv420);
+    let pkts = drive(
+        TheoraEncoder::with_default_setup_keyframe_interval(cid(), id.clone(), 40, 8)
+            .unwrap()
+            .with_adaptive_quant(vec![40, 24, 56])
+            .with_target_bitrate(150_000),
+        &id,
+        16,
+        fam0,
+        false,
+    );
+    // Composition evidence on the wire, independent of the digests:
+    // some frame's QIS[0] left the seed (the bucket steered), and
+    // every data frame still carries a multi-entry QIS list (the
+    // caller's candidates ride).
+    {
+        let data: Vec<&Packet> = pkts.iter().filter(|p| !p.flags.header).collect();
+        let mut moved = false;
+        for (i, p) in data.iter().enumerate() {
+            let hdr = oxideav_theora::decode_frame_header(&p.data, i == 0).unwrap();
+            assert!(
+                hdr.qis.len() >= 2,
+                "rcadaptive frame {i}: AC candidates must ride behind the RC head"
+            );
+            moved |= hdr.qis[0] != 40;
+        }
+        assert!(
+            moved,
+            "rcadaptive: rate control must steer QIS[0] off the seed"
+        );
+    }
+    check(&PINS[11], &id, &pkts);
 }
 
 // ----------------------------------------------------------------------

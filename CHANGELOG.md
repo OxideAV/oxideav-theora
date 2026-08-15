@@ -25,7 +25,12 @@ All notable changes to `oxideav-theora` are recorded here.
   stream held far over budget walks `QIS[0]` strictly downward while
   the candidate tail keeps riding, the composed stream decodes
   through `TheoraDecoder`, and a rate-control-free encoder still uses
-  the caller's list verbatim.
+  the caller's list verbatim. The composed stream is corpus-pinned
+  (`rcadaptive`, scenario 12 in `tests/encoded_corpus.rs`) and
+  **externally validated** through the round-413 route — Ogg mux via
+  the sibling container crate, `oggz-validate`, black-box reference
+  decode — byte-identical to this crate's own reconstruction (16/16
+  scenarios cumulative; see `tests/encoded-corpus-notes.md`).
 
 - **Third-party-encoded decode fixtures pixel-exact — all three pixel
   formats and all eight coding modes (round 444)** — the three staged

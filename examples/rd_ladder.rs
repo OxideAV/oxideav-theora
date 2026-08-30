@@ -27,7 +27,7 @@
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{CodecId, Decoder as _, Encoder as _, Frame, Packet, VideoFrame};
 use oxideav_theora::{
-    PixelFormat, TheoraDecoder, TheoraEncoder, TheoraIdentHeader, THEORA_CODEC_ID,
+    PixelFormat, SourceFrame, TheoraDecoder, TheoraEncoder, TheoraIdentHeader, THEORA_CODEC_ID,
 };
 use std::collections::BTreeMap;
 
@@ -505,6 +505,7 @@ fn main() {
     let mut profile = "default".to_string();
     let mut only_seq: Option<String> = None;
     let mut interval = 16u32;
+    let mut twopass = false;
     let mut qis: Vec<u8> = vec![8, 20, 32, 44, 56];
     let mut bitrates: Vec<u64> = Vec::new();
     let mut i = 0;
@@ -522,6 +523,7 @@ fn main() {
             "--profile" => profile = val(&mut i),
             "--seq" => only_seq = Some(val(&mut i)),
             "--interval" => interval = val(&mut i).parse().unwrap(),
+            "--twopass" => twopass = true,
             "--qis" => qis = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
             "--bitrates" => bitrates = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
             _ => panic!("unknown option {a}"),
@@ -588,8 +590,44 @@ fn main() {
                 32,
                 interval,
             )
-            .unwrap()
-            .with_target_bitrate(br);
+            .unwrap();
+            let enc = if twopass {
+                // First pass over the exact frames (flipped to
+                // lower-left SourceFrames at the picture shape).
+                let sources: Vec<SourceFrame> = (0..seq.frames.len())
+                    .map(|t| {
+                        let vf = video_frame(seq, t);
+                        let (py, pc) = ident.picture_plane_dims();
+                        let flip = |p: &VideoPlane, w: u32, h: u32| -> Vec<u8> {
+                            let mut out = Vec::with_capacity((w * h) as usize);
+                            for row in (0..h as usize).rev() {
+                                out.extend_from_slice(
+                                    &p.data[row * p.stride..row * p.stride + w as usize],
+                                );
+                            }
+                            out
+                        };
+                        SourceFrame::from_picture(
+                            &ident,
+                            &flip(&vf.planes[0], py.width, py.height),
+                            &flip(&vf.planes[1], pc.width, pc.height),
+                            &flip(&vf.planes[2], pc.width, pc.height),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let stats = TheoraEncoder::two_pass_stats(
+                    &ident,
+                    &oxideav_theora::SetupHeaderTables::vp3_defaults(),
+                    32,
+                    interval,
+                    &sources,
+                )
+                .unwrap();
+                enc.with_two_pass_rate_control(br, &stats)
+            } else {
+                enc.with_target_bitrate(br)
+            };
             let enc = prof(enc);
             let p = measure(seq, enc, &format!("br{}k", br / 1000), out.as_deref());
             println!(

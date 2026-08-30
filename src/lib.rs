@@ -17352,6 +17352,9 @@ pub struct TheoraEncoder {
     /// running output size toward the target; when `None`, the fixed
     /// construction-time `qi` is used for every frame.
     rate_control: Option<RateControl>,
+    /// Optional two-pass budget schedule (measured first-pass shares)
+    /// riding on top of `rate_control`.
+    two_pass: Option<TwoPassSchedule>,
     /// Optional scene-cut threshold (mean absolute luma difference, in
     /// 0..=255 sample units, between the incoming source and the previous
     /// reconstructed reference). When `Some(t)`, a frame whose mean
@@ -17468,6 +17471,17 @@ struct RateControl {
     keyframe_weight: f64,
 }
 
+/// Two-pass extension state carried next to [`RateControl`]: the
+/// per-frame budget schedule derived from first-pass measurements.
+#[derive(Debug, Clone, Default)]
+struct TwoPassSchedule {
+    /// Per-frame budgets in bits (the whole-stream budget split in
+    /// proportion to each frame's measured first-pass share). Consumed
+    /// front to back; frames beyond the schedule fall back to the
+    /// one-pass budget law.
+    budgets: std::collections::VecDeque<f64>,
+}
+
 impl RateControl {
     /// The keyframe budget multiplier. A keyframe is allotted this many
     /// times the steady-state per-frame budget before it perturbs the
@@ -17549,8 +17563,36 @@ impl RateControl {
     /// Because a lower `qi` is stronger quantization, the step *opposes*
     /// the imbalance sign: over budget subtracts from `qi` (compress
     /// harder), under budget adds to it.
+    /// Fold the just-coded frame's size into the bucket under the
+    /// one-pass budget law (the flat per-frame budget with the
+    /// keyframe bonus).
     fn observe_frame(&mut self, coded_bytes: usize, was_keyframe: bool) {
+        self.observe_frame_with_budget(coded_bytes, was_keyframe, None)
+    }
+
+    /// As [`Self::observe_frame`], but draining an explicit per-frame
+    /// budget when the caller has one (a two-pass schedule): the
+    /// measured first-pass share already prices keyframe bulk, so the
+    /// keyframe bonus path is bypassed for scheduled frames. Without a
+    /// schedule the one-pass budget law below applies.
+    fn observe_frame_with_budget(
+        &mut self,
+        coded_bytes: usize,
+        was_keyframe: bool,
+        budget: Option<f64>,
+    ) {
         let coded_bits = (coded_bytes as f64) * 8.0;
+
+        if let Some(b) = budget {
+            self.fullness_bits += coded_bits - b;
+            let cap = 8.0 * self.bits_per_frame;
+            self.fullness_bits = self.fullness_bits.clamp(-cap, cap);
+            let budgets_over = self.fullness_bits / self.bits_per_frame;
+            let step = budgets_over.clamp(-8.0, 8.0) as i32;
+            let target = (self.next_qi as i32 - step).clamp(self.qi_min as i32, self.qi_max as i32);
+            self.next_qi = target as u8;
+            return;
+        }
 
         // Budget drained by this frame. A keyframe is allotted the weighted
         // budget and arms the repayment schedule; an inter frame drains the
@@ -17630,6 +17672,62 @@ pub enum InterModeStrategy {
     /// against the uniform modes the way
     /// [`InterModeStrategy::RateDistortion`] does.
     FourMv,
+}
+
+/// First-pass statistics for two-pass rate control: the measured coded
+/// size and frame type of every frame of a probe encode of the exact
+/// GOP the second pass will emit.
+///
+/// Produced by [`TheoraEncoder::two_pass_stats`]; consumed by
+/// [`TheoraEncoder::with_two_pass_rate_control`]. The probe runs the
+/// same rate-distortion planner and mirror-decoder reference chain as
+/// a real encode at a fixed probe quantizer, so each frame's share of
+/// the total is a direct measurement of its relative complexity —
+/// keyframe bulk included — rather than a model.
+#[derive(Debug, Clone)]
+pub struct TwoPassStats {
+    /// Per-frame coded size, in bits, at the probe quantizer.
+    frame_bits: Vec<f64>,
+    /// The probe quantizer the sizes were measured at.
+    probe_qi: u8,
+}
+
+impl TwoPassStats {
+    /// Total probe bits across the sequence.
+    fn total_bits(&self) -> f64 {
+        self.frame_bits.iter().sum()
+    }
+}
+
+/// Pick the §6.4.2 quantization index whose AC scale predicts a coded
+/// rate closest to `target_bits`, given a measured `(probe_qi,
+/// probe_bits)` operating point.
+///
+/// The §B.3 `ACSCALE` ladder is (up to the §6.4.3 base-matrix shaping)
+/// proportional to the quantizer step, and to first order a
+/// transform coder's rate at matched content scales inversely with
+/// the step — so `bits(qi) ≈ probe_bits · ACSCALE[probe_qi] /
+/// ACSCALE[qi]` is the natural spec-table-driven seed. The rate
+/// control loop then corrects the residual model error frame by
+/// frame; this only chooses where the loop *starts*, so the first
+/// GOP is already near the budget instead of walking there one qi
+/// step per frame.
+fn qi_for_target_rate(probe_qi: u8, probe_bits: f64, target_bits: f64) -> u8 {
+    if probe_bits <= 0.0 || target_bits <= 0.0 {
+        return probe_qi;
+    }
+    let probe_scale = ACSCALE_VP3[probe_qi.min(63) as usize] as f64;
+    let mut best = probe_qi;
+    let mut best_err = f64::INFINITY;
+    for qi in 0u8..=63 {
+        let predicted = probe_bits * probe_scale / ACSCALE_VP3[qi as usize] as f64;
+        let err = (predicted.ln() - target_bits.ln()).abs();
+        if err < best_err {
+            best_err = err;
+            best = qi;
+        }
+    }
+    best
 }
 
 impl std::fmt::Debug for TheoraEncoder {
@@ -17713,6 +17811,7 @@ impl TheoraEncoder {
             setup,
             inter_mode: InterModeStrategy::default(),
             rate_control: None,
+            two_pass: None,
             scene_cut_threshold: None,
             scene_cut_mad_avg: None,
             keyframe_rate_ratio: None,
@@ -18070,6 +18169,104 @@ impl TheoraEncoder {
         self
     }
 
+    /// Run the first pass of two-pass rate control: encode `samples`
+    /// as the exact GOP the second pass will emit (`samples[0]` intra,
+    /// then inter until `keyframe_interval` elapses, rate-distortion
+    /// planning against a mirror decoder's reconstructed references)
+    /// at the fixed probe quantizer `qi`, and record every frame's
+    /// coded size. The packets are discarded; only the measurements
+    /// survive.
+    pub fn two_pass_stats(
+        ident: &TheoraIdentHeader,
+        setup: &SetupHeaderTables,
+        qi: u8,
+        keyframe_interval: u32,
+        samples: &[SourceFrame],
+    ) -> Result<TwoPassStats, Error> {
+        let sampler = FrameEncoder::new(ident.clone(), setup.clone(), qi)?;
+        let interval = keyframe_interval.max(1);
+        let mut mirror: Option<FrameDecoder> = None;
+        let mut since_key = 0u32;
+        let mut frame_bits = Vec::with_capacity(samples.len());
+        for frame in samples {
+            let is_key = mirror.is_none() || since_key >= interval;
+            let pkt = if is_key {
+                since_key = 1;
+                sampler.encode_intra_frame(frame)?
+            } else {
+                since_key += 1;
+                let dec = mirror.as_mut().expect("mirror exists after a keyframe");
+                let refs = dec.reference_store().as_reference_plane_set()?;
+                sampler.encode_inter_frame_rd(frame, &refs)?
+            };
+            let dec = match mirror.as_mut() {
+                Some(d) => d,
+                None => {
+                    mirror = Some(FrameDecoder::new(ident.clone(), setup.clone())?);
+                    mirror.as_mut().expect("just inserted")
+                }
+            };
+            dec.decode_frame(&pkt)?;
+            frame_bits.push((pkt.len() * 8) as f64);
+        }
+        Ok(TwoPassStats {
+            frame_bits,
+            probe_qi: qi,
+        })
+    }
+
+    /// Enable **two-pass** target-bitrate rate control. Returns `self`
+    /// for builder chaining.
+    ///
+    /// Builds on [`Self::with_target_bitrate`]'s leaky bucket, with
+    /// two measured refinements from the first pass (`stats`, via
+    /// [`Self::two_pass_stats`]):
+    ///
+    /// * **Budget schedule** — the whole-stream budget
+    ///   (`target × nframes / fps`) is split across frames in
+    ///   proportion to each frame's measured first-pass share, so a
+    ///   hard frame is *supposed* to be big and does not perturb the
+    ///   bucket (the one-pass controller can only react after the
+    ///   fact, and its flat per-frame budget misprices every
+    ///   keyframe and scene change). Frames beyond the schedule fall
+    ///   back to the one-pass budget law.
+    /// * **Measured seed quantizer** — the loop starts at the §B.3
+    ///   `ACSCALE`-scaled prediction of the qi whose rate matches the
+    ///   target (`qi_for_target_rate`), so the first GOP is already
+    ///   near budget instead of walking there one step per frame.
+    ///
+    /// The control decisions remain a pure encoder tuning choice: the
+    /// bitstream is exactly what the fixed-`qi` paths emit for the
+    /// chosen quantizers.
+    pub fn with_two_pass_rate_control(
+        mut self,
+        target_bits_per_second: u64,
+        stats: &TwoPassStats,
+    ) -> Self {
+        self = self.with_target_bitrate(target_bits_per_second);
+        let total_probe = stats.total_bits();
+        if let Some(rc) = self.rate_control.as_mut() {
+            if total_probe > 0.0 && !stats.frame_bits.is_empty() {
+                let total_budget = rc.bits_per_frame * stats.frame_bits.len() as f64;
+                let budgets = stats
+                    .frame_bits
+                    .iter()
+                    .map(|&b| total_budget * b / total_probe)
+                    .collect();
+                self.two_pass = Some(TwoPassSchedule { budgets });
+                // Seed the loop at the scale-table prediction of the
+                // target-rate quantizer.
+                let seed = qi_for_target_rate(
+                    stats.probe_qi,
+                    total_probe / stats.frame_bits.len() as f64,
+                    rc.bits_per_frame,
+                );
+                rc.next_qi = seed.clamp(rc.qi_min, rc.qi_max);
+            }
+        }
+        self
+    }
+
     /// Encode one already-converted [`SourceFrame`] into a queued §7
     /// data packet, choosing intra (keyframe) or inter (P-frame) per the
     /// keyframe-interval policy. The encoder mirrors its own output
@@ -18314,7 +18511,12 @@ impl TheoraEncoder {
         // frame so its bulk does not spike the quantizer for the P-frames
         // that follow.
         if let Some(rc) = self.rate_control.as_mut() {
-            rc.observe_frame(bytes.len(), want_keyframe);
+            match self.two_pass.as_mut().and_then(|tp| tp.budgets.pop_front()) {
+                Some(budget) => {
+                    rc.observe_frame_with_budget(bytes.len(), want_keyframe, Some(budget))
+                }
+                None => rc.observe_frame(bytes.len(), want_keyframe),
+            }
         }
 
         if want_keyframe {
@@ -42641,5 +42843,118 @@ mod tests {
             let got = decode_single_motion_vector_inner(&mut r, mvmode).unwrap();
             assert_eq!(got, mv);
         }
+    }
+    /// Two-pass rate control: the first pass measures per-frame coded
+    /// sizes of the exact GOP; the second pass seeds its quantizer at
+    /// the §B.3 ACSCALE-scaled prediction of the target-rate qi and
+    /// drains measured budget shares. Pinned on the wire: the first
+    /// frame's `QIS[0]` is the predicted seed, the stream decodes
+    /// through `TheoraDecoder`, and the coded total lands near budget.
+    #[test]
+    fn two_pass_rate_control_seeds_and_tracks_budget() {
+        use oxideav_core::Encoder as _;
+        let ident = TheoraIdentHeader::for_picture(64, 64, PixelFormat::Yuv420, 30, 1).unwrap();
+        let setup = SetupHeaderTables::vp3_defaults();
+        let g = build_frame_geometry(&ident).unwrap();
+        let nframes = 12usize;
+        let mk = |t: usize| -> SourceFrame {
+            let mut y = vec![0u8; (g.dims_y.width * g.dims_y.height) as usize];
+            for (i, v) in y.iter_mut().enumerate() {
+                *v = ((i * 3 + t * 11) % 256) as u8;
+            }
+            SourceFrame {
+                samples_y: y,
+                samples_cb: vec![100u8; (g.dims_c.width * g.dims_c.height) as usize],
+                samples_cr: vec![160u8; (g.dims_c.width * g.dims_c.height) as usize],
+            }
+        };
+        let sources: Vec<SourceFrame> = (0..nframes).map(mk).collect();
+        let probe_qi = 32u8;
+        let stats = TheoraEncoder::two_pass_stats(&ident, &setup, probe_qi, 6, &sources).unwrap();
+        assert_eq!(stats.frame_bits.len(), nframes);
+        assert!(stats.frame_bits.iter().all(|&b| b > 0.0));
+
+        // Target: half the probe rate, so the seed must move toward a
+        // stronger quantizer (lower qi) than the probe. (An upward
+        // target would test the content's rate *ceiling* instead —
+        // weak quantization cannot spend arbitrary bits.)
+        let fps = 30.0;
+        let probe_avg = stats.total_bits() / nframes as f64;
+        let target_bps = (0.5 * probe_avg * fps) as u64;
+        let want_seed = qi_for_target_rate(probe_qi, probe_avg, target_bps as f64 / fps);
+        assert!(
+            want_seed < probe_qi,
+            "half-rate seed {want_seed} must undercut probe {probe_qi}"
+        );
+
+        let mut enc = TheoraEncoder::with_keyframe_interval(
+            oxideav_core::CodecId::new(THEORA_CODEC_ID),
+            ident.clone(),
+            setup.clone(),
+            probe_qi,
+            6,
+        )
+        .unwrap()
+        .with_two_pass_rate_control(target_bps, &stats);
+        for t in 0..nframes {
+            let src = mk(t);
+            // Feed as a top-down VideoFrame (flip rows).
+            let flip = |p: &[u8], w: u32, h: u32| -> Vec<u8> {
+                let mut out = Vec::with_capacity(p.len());
+                for row in (0..h as usize).rev() {
+                    out.extend_from_slice(&p[row * w as usize..(row + 1) * w as usize]);
+                }
+                out
+            };
+            let vf = oxideav_core::VideoFrame {
+                pts: Some(t as i64),
+                planes: vec![
+                    oxideav_core::frame::VideoPlane {
+                        stride: g.dims_y.width as usize,
+                        data: flip(&src.samples_y, g.dims_y.width, g.dims_y.height),
+                    },
+                    oxideav_core::frame::VideoPlane {
+                        stride: g.dims_c.width as usize,
+                        data: flip(&src.samples_cb, g.dims_c.width, g.dims_c.height),
+                    },
+                    oxideav_core::frame::VideoPlane {
+                        stride: g.dims_c.width as usize,
+                        data: flip(&src.samples_cr, g.dims_c.width, g.dims_c.height),
+                    },
+                ],
+            };
+            enc.send_frame(&oxideav_core::Frame::Video(vf)).unwrap();
+        }
+        let mut data_bytes = 0usize;
+        let mut first_frame_qi0 = None;
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    if !p.flags.header {
+                        if first_frame_qi0.is_none() {
+                            let hdr = decode_frame_header(&p.data, true).unwrap();
+                            first_frame_qi0 = Some(hdr.qis[0]);
+                        }
+                        data_bytes += p.data.len();
+                    }
+                }
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder error {e}"),
+            }
+        }
+        assert_eq!(
+            first_frame_qi0,
+            Some(want_seed),
+            "first frame must carry the ACSCALE-predicted seed"
+        );
+        // The coded total must land near the whole-stream budget: the
+        // schedule prices every frame from measurement, so even this
+        // 12-frame stream stays within ±40 % of budget (the one-pass
+        // walk from the probe qi overspends its whole first GOP).
+        let budget_bytes = (target_bps as f64 / fps * nframes as f64 / 8.0) as usize;
+        assert!(
+            data_bytes * 5 > budget_bytes * 3 && data_bytes * 5 < budget_bytes * 7,
+            "coded {data_bytes} B vs budget {budget_bytes} B"
+        );
     }
 }

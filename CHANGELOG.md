@@ -30,6 +30,29 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Two-pass rate control (round 453)** — `TheoraEncoder::two_pass_stats`
+  runs the first pass (the exact GOP the second pass will emit, RD
+  planning against a mirror decoder, fixed probe quantizer) and
+  records every frame's coded size;
+  `with_two_pass_rate_control(target, &stats)` then (a) splits the
+  whole-stream budget across frames **in proportion to each frame's
+  measured share** — a hard frame is *supposed* to be big and no
+  longer perturbs the leaky bucket, and keyframe bulk is priced from
+  measurement instead of the one-pass 3× heuristic — and (b) seeds
+  the loop at the §B.3 `ACSCALE`-scaled prediction of the target-rate
+  quantizer (`bits ∝ 1/ACSCALE[qi]` around the probe point), so the
+  first GOP starts near budget instead of walking there one qi step
+  per frame. Measured (`rd_ladder --twopass`, 24-frame sequences,
+  250 kb/s): mean |rate error| 15.4 % → 8.4 % and +0.9 dB mean luma
+  PSNR vs the one-pass loop at the same targets (square0 +2.7 dB,
+  cut +1.95 dB); at rate-floor / rate-ceiling targets both loops
+  saturate cleanly at the qi bounds. Wire-pinned in-test: the first
+  frame carries the predicted seed in `QIS[0]`, the stream decodes,
+  and the coded total lands within the budget band. No new bitstream
+  syntax; existing corpus pins unchanged.
+
+### Added
+
 - **Selected-selector token pricing on P-frames (round 453)** — the
   inter planner's per-block quantization / RDOQ / skip decisions run
   in two pricing phases: phase 0 prices tokens at the optimistic

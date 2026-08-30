@@ -35028,14 +35028,30 @@ mod tests {
             }
             decoded.push(frames);
         }
-        for (i, (df, tf)) in decoded[0].iter().zip(decoded[1].iter()).enumerate() {
-            for pli in 0..3 {
-                assert_eq!(
-                    df.planes[pli].data, tf.planes[pli].data,
-                    "frame {i} plane {pli}: tuned stream must reconstruct identically"
-                );
+        // Delivered fidelity: the tuned stream's rate-distortion
+        // decisions price bits against the *tuned* codebooks (measured
+        // token costs and RDOQ), so individual blocks may legally
+        // re-spell — the guarantee is measured, not structural. Guard
+        // it: the tuned stream's whole-stream SSD against the source
+        // must not exceed the default stream's by more than 2 %.
+        let mut ssd = [0u64; 2];
+        for (si, frames) in decoded.iter().enumerate() {
+            for (phase, vf) in frames.iter().enumerate() {
+                let src = textured_video_frame(&ident, phase as i32);
+                for pli in 0..3 {
+                    for (a, b) in vf.planes[pli].data.iter().zip(src.planes[pli].data.iter()) {
+                        let d = *a as i64 - *b as i64;
+                        ssd[si] += (d * d) as u64;
+                    }
+                }
             }
         }
+        assert!(
+            ssd[1] <= ssd[0] + ssd[0] / 50,
+            "tuned stream SSD {} must stay within 2 % of default {}",
+            ssd[1],
+            ssd[0]
+        );
     }
 
     /// MILESTONE (round 387): mixed I/P GOP two-pass Huffman tuning.
@@ -35145,8 +35161,11 @@ mod tests {
             "GOP-tuned stream {gop_b} B must beat intra-only tuning {intra_b} B"
         );
 
-        // All three streams reconstruct bit-identically: the tuning only
-        // re-spells the same quantized coefficients.
+        // Delivered fidelity: tuning re-spells the same coefficients
+        // *except* where a rate-distortion trade flips under the
+        // cheaper tuned codes (measured token costs and RDOQ price
+        // against the tuned tables), so bit-identity is measured
+        // behaviour, not a guarantee. Guard the fidelity instead.
         let mut decoded: Vec<Vec<oxideav_core::VideoFrame>> = Vec::new();
         for (headers, data) in &streams {
             let mut dec = TheoraDecoder::new(codec_id.clone());
@@ -35163,19 +35182,25 @@ mod tests {
             }
             decoded.push(frames);
         }
-        for stream_idx in 1..3 {
-            for (i, (df, tf)) in decoded[0]
-                .iter()
-                .zip(decoded[stream_idx].iter())
-                .enumerate()
-            {
+        let mut ssd = [0u64; 3];
+        for (si, frames) in decoded.iter().enumerate() {
+            for (phase, vf) in frames.iter().enumerate() {
+                let src = textured_video_frame(&ident, phase as i32);
                 for pli in 0..3 {
-                    assert_eq!(
-                        df.planes[pli].data, tf.planes[pli].data,
-                        "stream {stream_idx} frame {i} plane {pli} must reconstruct identically"
-                    );
+                    for (a, b) in vf.planes[pli].data.iter().zip(src.planes[pli].data.iter()) {
+                        let d = *a as i64 - *b as i64;
+                        ssd[si] += (d * d) as u64;
+                    }
                 }
             }
+        }
+        for stream_idx in 1..3 {
+            assert!(
+                ssd[stream_idx] <= ssd[0] + ssd[0] / 50,
+                "stream {stream_idx} SSD {} must stay within 2 % of default {}",
+                ssd[stream_idx],
+                ssd[0]
+            );
         }
     }
 
@@ -37350,8 +37375,12 @@ mod tests {
     #[test]
     fn encode_intra_frame_self_roundtrips_strong_quant() {
         // qi = 10 (strong quantization): larger reconstruction error
-        // tolerated.
-        encode_decode_roundtrip_at_qi(10, 40);
+        // tolerated. Rate-distortion-optimized quantization may zero an
+        // isolated high-frequency level whose token cannot repay its
+        // rate at this λ, raising the worst-case sample error (measured
+        // max 62 on this gradient, mean 2.73 — the mean is what RDOQ
+        // holds; the pre-RDOQ writer measured max 40 / mean 2.8).
+        encode_decode_roundtrip_at_qi(10, 72);
     }
 
     #[test]

@@ -30,6 +30,27 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Rate-distortion-optimized quantization (round 453)** — every coded
+  block's AC levels are refined against the measured §7.7 token plan:
+  each non-zero coefficient (zig-zag order, last to first, two passes)
+  is re-decided between its rounded magnitude and the next level
+  toward zero, scored `ΔSSE · 7/64 + λ · Δblock_bits` — the distortion
+  in dequantized-coefficient units mapped to pixel SSD by the
+  transform pair's *measured* energy gain (≈ 0.109 per unit, median
+  over random blocks; the integerised §7.9.3 transform is only
+  approximately orthogonal) and the rate from the block's re-priced
+  token plan, so dropping a trailing ±1 that deletes a token, merges
+  two zero runs, or pulls the EOB forward is recognised as the rate
+  win it is. DC is never touched (it feeds the §7.8 prediction chain
+  of neighbouring blocks). Applies to intra and inter paths, before
+  the skip decision (which then judges the refined spelling).
+  Measured (`rd_ladder`, six sequences × five qi): **−8.97 % mean
+  BD-rate / +0.72 dB mean BD-PSNR** (per-sequence −3.99 % to
+  −21.41 %, every sequence improved). Corpus re-pinned; external
+  route re-run — **15/15 byte-identical** black-box reference decodes.
+
+### Added
+
 - **§7.5.1 `MVMODE = 0` motion-vector entropy coding + measured MV
   rate in the mode decision (round 453)** — the §7.5 writer now elects
   each frame's `MVMODE` by measured rate: the transmitted vectors are

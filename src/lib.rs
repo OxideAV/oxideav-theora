@@ -13866,6 +13866,11 @@ impl FrameEncoder {
             ]);
         }
 
+        // Measured token costs + frame λ for the per-block RDOQ
+        // refinement (intra qti = 0 steps).
+        let token_costs = TokenBitCosts::from_tables(&self.setup.huffman_tables[..]);
+        let lambda = rd_lambda_for_qis(&self.setup.quantization_parameters, 0, qis)?;
+
         // Step 1: per-block forward DCT + quantize. The DC slot of each
         // block holds the absolute (reconstructed) quantized DC at this
         // point; forward DC prediction below converts it to a residual.
@@ -13886,7 +13891,17 @@ impl FrameEncoder {
                 }
             }
             let dqc = forward_dct_2d(&residual);
-            *out = quantize_block(&dqc, &qmats_dc[pli], &qmats_ac[qiis[bi] as usize][pli]);
+            let mut q = quantize_block(&dqc, &qmats_dc[pli], &qmats_ac[qiis[bi] as usize][pli]);
+            // Rate-distortion-optimized quantization on the AC levels
+            // (DC untouched — §7.8 prediction chain).
+            rdoq_refine(
+                &mut q,
+                &dqc,
+                &qmats_ac[qiis[bi] as usize][pli],
+                &token_costs,
+                lambda,
+            );
+            *out = q;
         }
 
         // Step 2: forward DC prediction. Every block is INTRA so
@@ -14887,7 +14902,7 @@ impl FrameEncoder {
             // records the winner's §7.6 selector. The DC quantizer is
             // always qis[0] (the §7.6 preamble's rule, so §7.8 DC
             // prediction is untouched by the per-block choice).
-            let (q, qii) = if nqis == 1 {
+            let (mut q, qii) = if nqis == 1 {
                 (quantize_block(&dqc, dc_mat, &ac_mats[0][pli]), 0u8)
             } else {
                 let mut best_q = [0i16; 64];
@@ -14919,6 +14934,18 @@ impl FrameEncoder {
                 }
                 (best_q, best_qii)
             };
+            // Rate-distortion-optimized quantization: refine the AC
+            // levels of the winning spelling against the measured
+            // token plan (DC untouched — it feeds the §7.8 prediction
+            // chain). Runs before the skip decision, which then judges
+            // the refined spelling.
+            rdoq_refine(
+                &mut q,
+                &dqc,
+                &ac_mats[qii as usize][pli],
+                &token_costs,
+                lambda,
+            );
 
             // A block whose quantized residual is all-zero is uncoded
             // (unless the macro block's mode forces it coded — any
@@ -15743,6 +15770,102 @@ impl TokenBitCosts {
             ti = ti.saturating_add(pt.advance).min(63);
         }
         Some(bits)
+    }
+}
+
+/// Rate-distortion-optimized quantization refinement for one coded
+/// block's AC coefficients.
+///
+/// Standard quantization rounds every coefficient to its nearest
+/// reconstruction level in isolation, but the §7.7 token stream prices
+/// coefficients jointly: dropping a trailing ±1 can delete a whole
+/// token, merge two zero runs, or pull the terminal EOB forward. This
+/// pass greedily re-decides each non-zero AC coefficient (zig-zag
+/// order, last to first) between its rounded magnitude and the next
+/// magnitude toward zero, scoring the *whole block's* measured token
+/// plan each time:
+///
+/// `cost = ΔSSE_coef · RDOQ_SSE_NUM / RDOQ_SSE_DEN + λ · block_bits`
+///
+/// The distortion term lives in the coefficient domain (the extra
+/// squared error of reconstructing at the cheaper level, in
+/// dequantized-coefficient units) mapped to pixel-domain SSD by the
+/// transform's measured energy gain: perturbing one dequantized
+/// coefficient by `e` moves the §7.9.3 inverse-DCT output by
+/// `≈ 0.109 · e²` summed squared error (measured over random blocks —
+/// the integerised transform pair is only approximately orthogonal;
+/// min 0.055, median 0.109, max 0.176), which the integer ratio 7/64
+/// approximates. λ is the same pixel-SSD-per-bit multiplier the mode
+/// decision uses, so the two decisions price bits identically.
+///
+/// The DC coefficient is never touched (its reconstruction feeds the
+/// §7.8 DC prediction chain of *neighbouring* blocks, so a DC change
+/// has non-local rate effects this per-block score cannot see). Only
+/// magnitude steps toward zero are considered: standard rounding is
+/// already distortion-optimal per coefficient, so moving away from
+/// zero can only help via rate, and a longer token is never cheaper.
+/// Two passes are run (a drop can enable a neighbouring drop by
+/// merging runs); the loop exits early when a pass changes nothing.
+///
+/// This is a pure encoder decision: the emitted tokens are ordinary
+/// §7.7 spellings of the refined coefficients.
+fn rdoq_refine(
+    q: &mut [i16; 64],
+    dqc_nat: &[i16; 64],
+    qmat_ac: &QuantizationMatrix,
+    costs: &TokenBitCosts,
+    lambda: u64,
+) {
+    /// Measured pixel-SSE per unit coefficient-SSE of the §7.9.3
+    /// inverse transform (see the function docs): ≈ 0.109 ≈ 7/64.
+    const RDOQ_SSE_NUM: u64 = 7;
+    const RDOQ_SSE_DEN: u64 = 64;
+
+    let Some(base_bits) = costs.block_bits(q) else {
+        return;
+    };
+    // Coefficient-domain squared error of reconstructing zig-zag slot
+    // `zzi` at quantized level `lvl` (dequantized against the AC
+    // matrix; DC is excluded from refinement).
+    let err2 = |zzi: usize, lvl: i16| -> u64 {
+        let ci = ZIGZAG_NATURAL_TO_ZIGZAG
+            .iter()
+            .position(|&z| z as usize == zzi)
+            .expect("zig-zag permutation is total");
+        let step = qmat_ac.values[ci] as i64;
+        let rec = (lvl as i64 * step).clamp(-32768, 32767);
+        let d = dqc_nat[ci] as i64 - rec;
+        (d * d) as u64
+    };
+    let mut cur_bits = base_bits;
+    for _pass in 0..2 {
+        let mut changed = false;
+        for zzi in (1..64).rev() {
+            let lvl = q[zzi];
+            if lvl == 0 {
+                continue;
+            }
+            let lower = if lvl > 0 { lvl - 1 } else { lvl + 1 };
+            let old = q[zzi];
+            q[zzi] = lower;
+            let Some(new_bits) = costs.block_bits(q) else {
+                q[zzi] = old;
+                continue;
+            };
+            // Bits can only shrink or stay; distortion can only grow.
+            let d_gain = err2(zzi, lower).saturating_sub(err2(zzi, old));
+            let d_pixels = d_gain * RDOQ_SSE_NUM / RDOQ_SSE_DEN;
+            let bit_save = u64::from(cur_bits.saturating_sub(new_bits));
+            if lambda.saturating_mul(bit_save) > d_pixels {
+                cur_bits = new_bits;
+                changed = true;
+            } else {
+                q[zzi] = old;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }
 

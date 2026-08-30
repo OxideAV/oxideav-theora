@@ -293,6 +293,7 @@ fn profiles() -> Vec<(&'static str, Profile)> {
         ("scenecut", |e| e.with_scene_cut_threshold(24.0)),
         ("kfpolicy", |e| e.with_keyframe_rate_policy(0.7)),
         ("adaptive", |e| e.with_adaptive_quant(vec![32, 16, 48])),
+        ("adaptauto", |e| e.with_adaptive_quant_auto()),
     ]
 }
 
@@ -506,6 +507,7 @@ fn main() {
     let mut only_seq: Option<String> = None;
     let mut interval = 16u32;
     let mut twopass = false;
+    let mut lfscale: Option<(u32, u32)> = None;
     let mut qis: Vec<u8> = vec![8, 20, 32, 44, 56];
     let mut bitrates: Vec<u64> = Vec::new();
     let mut i = 0;
@@ -524,6 +526,11 @@ fn main() {
             "--seq" => only_seq = Some(val(&mut i)),
             "--interval" => interval = val(&mut i).parse().unwrap(),
             "--twopass" => twopass = true,
+            "--lfscale" => {
+                let v = val(&mut i);
+                let (n, d) = v.split_once('/').unwrap_or((v.as_str(), "1"));
+                lfscale = Some((n.parse().unwrap(), d.parse().unwrap()));
+            }
             "--qis" => qis = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
             "--bitrates" => bitrates = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
             _ => panic!("unknown option {a}"),
@@ -567,10 +574,17 @@ fn main() {
         let ident =
             TheoraIdentHeader::for_picture(seq.width, seq.height, PixelFormat::Yuv420, 30, 1)
                 .unwrap();
+        let mut setup = oxideav_theora::SetupHeaderTables::vp3_defaults();
+        if let Some((n, d)) = lfscale {
+            for v in setup.loop_filter_limits.iter_mut() {
+                *v = ((*v as u32 * n / d).min(127)) as u8;
+            }
+        }
         for &qi in &qis {
-            let enc = TheoraEncoder::with_default_setup_keyframe_interval(
+            let enc = TheoraEncoder::with_keyframe_interval(
                 cid(),
                 ident.clone(),
+                setup.clone(),
                 qi,
                 interval,
             )

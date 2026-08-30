@@ -1,4 +1,4 @@
-# Self-encoded corpus — generation + external-validation notes (rounds 413 / 437 / 444)
+# Self-encoded corpus — generation + external-validation notes (rounds 413 / 437 / 444 / 453)
 
 `encoded_corpus.rs` pins twelve deterministic encoder scenarios by
 SHA-256, at two levels per scenario:
@@ -120,3 +120,30 @@ raw planar video, byte-compared against this crate's own
 the test itself independent of the digests: every data frame
 carries a multi-entry `QIS` list and at least one frame's `QIS[0]`
 leaves the seed quantizer.
+
+## Round 453 — quality-campaign re-pins
+
+Round 453's encoder changes (quarter-pixel chroma predictors,
+Table 7.23 `MVMODE = 0` vector coding, rate-distortion-optimized
+quantization, predictor-seeded motion search, selected-selector token
+re-pricing) re-spelled every scenario; the corpus was re-pinned at
+each step and the external route re-run **at every re-pin** (four
+times). Route details for this round: the exact pinned packet chains
+were dumped by the corpus test itself (`CORPUS_DUMP=<dir>` writes
+`<name>.chain`, the wire-pinned length-prefixed bytes), muxed into
+`.ogv` by a minimal throwaway RFC 3533 pager (ident on its own BOS
+page; comment + setup next; granule positions from this crate's own
+`GranulePositionTracker`; ~4 KB page target; CRC-32 poly
+`0x04c11db7`), validated by `oggz-validate`, and black-box decoded by
+`ffmpeg 8.1` with **timestamp passthrough** (`-fps_mode passthrough`,
+so zero-byte duplicate packets — for which the reference decoder
+emits no frame — are compared over the coded frames, per the round-413
+presentation caveat).
+
+**Verdict: 15/15 scenarios byte-identical to this crate's own
+reconstruction at every one of the four re-pins.** Two new stream
+shapes introduced this round — a **two-pass rate-controlled** stream
+(`with_two_pass_rate_control`) and an **auto-adaptive-quant** stream
+(`with_adaptive_quant_auto`) — were dumped from the `rd_ladder`
+harness (`--out`) and validated through the same route,
+byte-identical as well.

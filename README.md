@@ -17,15 +17,18 @@ eight §7.4 macro-block coding modes against third-party-encoded
 streams. The encoder emits complete self-describing
 streams — §6 headers plus intra and inter (P) frames through a unified
 rate-distortion mode decision over all eight §7.5.2 coding modes, with
-motion estimation to half-pixel accuracy, per-block skip, adaptive
-quantization, content-tuned Huffman codebooks, non-macro-block-aligned
-picture regions, duplicate-frame packets, and optional target-bitrate
-rate control — and is **externally validated**: sixteen scenario
-families (up to 1920×1080, all three pixel formats, every encoder
-feature above including the composed rate-control + adaptive-quant
-stream) were muxed into Ogg and black-box-decoded by an
-independent reference decoder **pixel-exactly** against this crate's
-own reconstruction, with the corpus pinned by SHA-256 under `tests/`.
+predictor-seeded motion estimation to half-pixel accuracy,
+rate-distortion-optimized quantization, measured-rate `MVMODE`
+election, per-block skip, adaptive quantization, content-tuned Huffman
+codebooks, non-macro-block-aligned picture regions, duplicate-frame
+packets, and one-pass or two-pass target-bitrate rate control. The
+round-453 quality campaign is **measured**: −21.0 % mean BD-rate /
++2.35 dB mean BD-PSNR over the six-sequence `rd_ladder` battery versus
+the round-451 encoder (see the measured rate-distortion section), and
+every re-pinned stream family is **externally validated** — muxed into
+Ogg and black-box-decoded by an independent reference decoder
+**pixel-exactly** against this crate's own reconstruction, with the
+corpus pinned by SHA-256 under `tests/`.
 
 ## What works
 
@@ -221,15 +224,21 @@ zero-initialized reference store.
   §7.3 coded-block-flag encoder (`encode_coded_block_flags`, deriving
   the `SBPCODED` / `SBFCODED` / per-block streams from a `bcoded`
   array), the §7.4 macro-block-mode encoder (`MSCHEME = 7` direct
-  modes), the §7.5 motion-vector encoder (`MVMODE = 1` fixed-length
-  components), and the shared §7.7 token writer. Each block is
+  modes), the §7.5 motion-vector encoder (the frame's `MVMODE` elected by
+  measured rate — Table 7.23 Huffman components unless the
+  fixed-length spelling is strictly cheaper), and the shared §7.7
+  token writer. Each block is
   predicted from the **reconstructed** previous reference (the bytes
   the decoder holds), so an unchanged second frame reconstructs
   bit-exactly as an all-uncoded `INTER_NOMV` pure copy; a changed
   frame stays within the quantizer bound. The motion path runs a
-  **four-step whole-pixel SAD descent** per macro block (steps 8, 4,
-  2, 1 around the running winner: every displacement in ±15 pixels
-  reachable with 33 probes, zero-biased, §7.5.1 ±31-component clamp;
+  **predictor-seeded four-step whole-pixel descent** per macro block
+  (the descent starts from the best of the zero vector, the running
+  §7.5.2 `LAST1`/`LAST2` predictors, and the previous macro block's
+  winner; steps 8, 4, 2, 1 around the running winner reach every
+  displacement in ±15 pixels of the start with 33 probes, zero-biased,
+  §7.5.1 ±31-component clamp, each probe loaded with `√λ ×` its
+  Table 7.23 vector bits;
   a (6, −5) translation spells a 16 B motion packet where the zero-MV
   spelling needs 125 B) **then refines the winner to
   half-pixel accuracy** (§7.5.1): the integer search only spells even
@@ -456,7 +465,14 @@ zero-initialized reference store.
   also **declares the target in the §6.2 `NOMBR`** nominal-bitrate
   header field (saturating at the 24-bit "`2^24 − 1` or greater"
   ceiling), rewriting the queued ident packet and the advertised
-  extradata chain so both header carriage paths agree.
+  extradata chain so both header carriage paths agree. A **two-pass**
+  mode (`two_pass_stats` + `with_two_pass_rate_control`) splits the
+  whole-stream budget in proportion to each frame's *measured*
+  first-pass share and seeds the loop at the §B.3 `ACSCALE`-scaled
+  prediction of the target-rate quantizer — measured at 250 kb/s
+  targets: mean |rate error| 15.4 % → 8.4 % and +0.9 dB mean luma
+  PSNR versus the one-pass loop (see the measured rate-distortion
+  section).
 
 End-to-end fixtures decoded sample-exactly cover intra-only streams,
 intra-then-inter sequences, explicit motion vectors, custom quantisation
@@ -548,6 +564,73 @@ chroma blocks that earlier diverged is now sample-exact.
   rather than staged, and container-level concerns among them
   (chaining, page framing) belong to the container crates.
 
+## Measured rate-distortion (round 453)
+
+`examples/rd_ladder.rs` is the crate's reproducible measurement
+harness: four deterministic 176×144 synthetic sequences (`square0`
+gradient + moving square, `blobs` sub-pixel drifting blobs over
+fixed-pattern noise, `pan` a half-pixel-per-frame textured pan, `cut`
+a mid-stream scene change) plus two fixture-derived sources
+(`all-mb-modes-64x64`, `keyframe-interval-30`), encoded at interval 16
+across the five-point quantizer ladder and decoded through this
+crate's own decoder (pixel-exact against the black-box reference
+decoder for every externally validated family). Reproduce with
+`cargo run --release --example rd_ladder -- --fixtures
+docs/video/theora/fixtures [--ref saved.tsv] [--twopass] [--lfscale n/d]`.
+
+Final operating points (bytes / luma PSNR dB, 24 frames):
+
+| sequence | qi 8 | qi 20 | qi 32 | qi 44 | qi 56 |
+|---|---|---|---|---|---|
+| square0 | 10358 / 29.23 | 13168 / 36.63 | 15044 / 41.11 | 18046 / 44.45 | 21822 / 48.46 |
+| blobs | 2562 / 34.77 | 4675 / 37.33 | 7801 / 39.03 | 11938 / 39.94 | 18799 / 40.94 |
+| pan | 9298 / 30.63 | 17068 / 33.65 | 29852 / 35.56 | 64926 / 36.77 | 139046 / 39.07 |
+| cut | 6378 / 31.41 | 8992 / 37.24 | 11653 / 40.02 | 15873 / 41.67 | 22266 / 43.21 |
+| fx-all-mb-modes | 3280 / 29.08 | 6554 / 33.00 | 11373 / 36.35 | 17511 / 39.94 | 23845 / 43.34 |
+| fx-kf-interval-30 | 237 / 23.19 | 425 / 26.97 | 597 / 30.53 | 816 / 35.66 | 904 / 41.45 |
+
+Cumulative round-453 gains versus the round-451 encoder
+(Bjøntegaard-style piecewise-linear deltas over the qi ladder, luma):
+
+| sequence | BD-rate | BD-PSNR |
+|---|---|---|
+| square0 | −32.4 % | +7.92 dB |
+| pan | −40.2 % | +1.58 dB |
+| cut | −24.3 % | +2.36 dB |
+| fx-all-mb-modes | −17.5 % | +1.44 dB |
+| blobs | −7.6 % | +0.22 dB |
+| fx-kf-interval-30 | −4.2 % | +0.56 dB |
+| **mean** | **−21.0 %** | **+2.35 dB** |
+
+Per-change contributions, measured incrementally in round order: the
+§7.5.1 quarter-pixel chroma-predictor correction −10.8 % mean BD-rate
+(and chroma PSNR curves un-inverted: `pan` 23.5 → 50.2 dB at qi 56);
+Table 7.23 `MVMODE = 0` vector coding + measured MV rate −1.6/−1.7 %
+on the motion-heavy sequences; rate-distortion-optimized quantization
+−9.0 % mean (+0.72 dB); predictor-seeded motion search −2.4 % mean;
+selected-selector token re-pricing −0.5 % mean (every sequence
+improved). No reference *encoder* binary is installed in this
+environment (`ffmpeg` ships only the Theora decoder), so the ladder
+measures this encoder against its own prior rounds; the black-box
+reference *decoder* validates every stream byte-exactly.
+
+Two-pass rate control at 250 kb/s targets (24-frame sequences, vs the
+one-pass loop): mean |rate error| 15.4 % → 8.4 %; luma PSNR square0
+44.40 → 47.09 dB, cut 42.10 → 44.05 dB, blobs 40.84 → 41.55 dB, pan
+35.27 → 35.04 dB (mean +0.9 dB). Rate-floor / rate-ceiling targets
+saturate cleanly at the qi bounds under both loops.
+
+Two measured elections close the round: a uniform rescale sweep of
+the §6.4.1 loop-filter limit table (×0, ×½, ×1, ×1.5, ×2 across
+qi 8–44) leaves the §B.2 VP3 defaults at or near the optimum (×2
+buys ≤ +0.6 dB on `square0` at qi 44 but loses at qi 8 and on
+`fx-all-mb-modes`, ×0 loses everywhere) — the defaults stand; and the
+keyframe-interval sweep (4/8/16/30 at qi 20/44) shows interval 16–30
+dominating coherent content (interval 4 costs 25–55 % more bytes at
+equal-or-lower PSNR), with the scene-cut and measured-rate keyframe
+policies covering content changes — the `TheoraEncoder` guidance is
+interval 16–30 plus those policies, not short intervals.
+
 ## Robustness and fuzzing (round 437)
 
 The decode surface is fuzzed by a `fuzz/` sub-crate with five
@@ -603,11 +686,17 @@ of a non-VP3 layout) — all three black-box-decoded byte-identically
 to this crate's reconstruction. Round 444 added the **composed
 rate-control + adaptive-quant** scenario (a stream shape that did
 not previously exist — see the rate-control bullet) through the
-same route, also byte-identical (16/16 scenarios cumulative). The external route surfaced and fixed
-three real defects this round: `for_picture`'s `KFGSHIFT = 0` (inter
+same route, also byte-identical (16/16 scenarios cumulative). The round-413 external route surfaced and fixed
+three real defects: `for_picture`'s `KFGSHIFT = 0` (inter
 frames had no representable Ogg granule position), a wrong-slope RD λ
 (the rate/PSNR curve folded over above qi 52), and a scene-cut
-detector that converted steady motion into keyframe storms.
+detector that converted steady motion into keyframe storms. Round 453
+re-ran the route at **every corpus re-pin** (four times — chroma-split
+fix, MV coding, RDOQ + seeded search, selector re-pricing): all
+**15/15 scenarios byte-identical** each time, and two new stream
+shapes (a two-pass rate-controlled stream and an auto-adaptive-quant
+stream) were validated the same way (see
+`tests/encoded-corpus-notes.md`).
 
 ## Usage
 

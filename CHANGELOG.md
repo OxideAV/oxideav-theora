@@ -30,6 +30,26 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **§7.5.1 `MVMODE = 0` motion-vector entropy coding + measured MV
+  rate in the mode decision (round 453)** — the §7.5 writer now elects
+  each frame's `MVMODE` by measured rate: the transmitted vectors are
+  tallied and spelled under the Table 7.23 Huffman alphabet (3 bits
+  for `0` / `±1` up to 8 bits for `±16..=±31`) unless the fixed-length
+  `MVMODE = 1` spelling (6 bits per component) is strictly cheaper —
+  which only happens on frames dominated by components of magnitude 8
+  or more. The rate-distortion mode decision charges explicit-MV
+  candidates (uniform and four-MV) their true Table 7.23 cost instead
+  of a flat 12 bits, so cheap small vectors are no longer
+  over-penalised against `INTER_NOMV`. Measured on the `rd_ladder`
+  battery: −1.6 % / −1.7 % BD-rate on the motion-heavy sequences
+  (`fx-all-mb-modes`, `pan`) at equal PSNR, within ±0.8 % elsewhere.
+  Unit tests pin the writer as the exact inverse of the Table 7.23
+  recogniser for every legal component and the election bit for both
+  alphabets; the corpus is re-pinned and the round-413 external route
+  re-run — **15/15 byte-identical** black-box reference decodes.
+
+### Added
+
 - **`examples/rd_ladder`** — the encoder's measured rate-distortion
   ladder: four deterministic 176×144 synthetic sequences (moving
   square, sub-pixel drifting blobs, a half-pixel pan, a scene cut)

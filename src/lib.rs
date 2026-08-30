@@ -6296,12 +6296,110 @@ fn encode_single_motion_vector_fixed(w: &mut BitWriter, mv: MotionVector) {
     }
 }
 
+/// Table 7.23 code length, in bits, of one motion-vector component
+/// under `MVMODE = 0` (the §7.5.1 Huffman alphabet): 3 bits for
+/// `0` / `±1`, 4 for `±2` / `±3`, 6 for `±4..=±7`, 7 for `±8..=±15`,
+/// 8 for `±16..=±31`. The fixed-length `MVMODE = 1` spelling is always
+/// 6 bits per component, so the Huffman alphabet is cheaper for every
+/// component of magnitude below 8 and dearer only for `|v| >= 8`.
+fn mv_component_huffman_len(v: i8) -> u32 {
+    match v.unsigned_abs() {
+        0 | 1 => 3,
+        2 | 3 => 4,
+        4..=7 => 6,
+        8..=15 => 7,
+        _ => 8,
+    }
+}
+
+/// Table 7.23 bit cost of one explicit motion vector under `MVMODE = 0`
+/// (both components).
+fn mv_huffman_bits(mv: MotionVector) -> u32 {
+    mv_component_huffman_len(mv.x) + mv_component_huffman_len(mv.y)
+}
+
+/// Encode one motion-vector component under `MVMODE = 0`, the exact
+/// inverse of `recognise_mv_huffman` (Table 7.23): a 3-bit prefix
+/// selects the magnitude class, then a bucket (magnitude − class base)
+/// and a trailing sign bit (`0` positive, `1` negative) for the classes
+/// wider than one value.
+fn encode_mv_component_huffman(w: &mut BitWriter, v: i8) {
+    let mag = v.unsigned_abs() as u32;
+    let sign = if v < 0 { 1u32 } else { 0 };
+    match mag {
+        0 => w.write_bits(0b000, 3),
+        // ±1 are two distinct 3-bit codewords (`b001` / `b010`), not a
+        // sign-suffixed class.
+        1 => w.write_bits(0b001 + sign, 3),
+        2 => w.write_bits(0b0110 | sign, 4),
+        3 => w.write_bits(0b1000 | sign, 4),
+        4..=7 => w.write_bits((0b101 << 3) | ((mag - 4) << 1) | sign, 6),
+        8..=15 => w.write_bits((0b110 << 4) | ((mag - 8) << 1) | sign, 7),
+        _ => w.write_bits((0b111 << 5) | ((mag - 16) << 1) | sign, 8),
+    }
+}
+
+/// Encode one motion vector under `MVMODE = 0` (Table 7.23 Huffman
+/// components, x then y).
+fn encode_single_motion_vector_huffman(w: &mut BitWriter, mv: MotionVector) {
+    encode_mv_component_huffman(w, mv.x);
+    encode_mv_component_huffman(w, mv.y);
+}
+
+/// The explicit motion vectors a §7.5.2 macro-block walk transmits, in
+/// wire order — the vectors both `MVMODE` spellings would carry.
+fn transmitted_motion_vectors(
+    mbmodes: &[MacroBlockMode],
+    bcoded: &[u8],
+    mvects: &[MotionVector],
+    macro_block_to_luma_blocks: &[[u32; 4]],
+) -> Vec<MotionVector> {
+    let mut out = Vec::new();
+    for (mbi, &mode) in mbmodes.iter().enumerate() {
+        let abcd = macro_block_to_luma_blocks[mbi];
+        match mode {
+            MacroBlockMode::InterMvFour => {
+                // One MV per coded luma block, raster order.
+                for &bi in abcd.iter() {
+                    if bcoded[bi as usize] == 1 {
+                        out.push(mvects[bi as usize]);
+                    }
+                }
+            }
+            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv => {
+                // One explicit MV. The decoder assigns it to every
+                // coded block in the macro block, so any coded block
+                // carries the value; pick the first coded luma block,
+                // falling back to the stored A-block MV.
+                let mv = abcd
+                    .iter()
+                    .find(|&&bi| bcoded[bi as usize] == 1)
+                    .map(|&bi| mvects[bi as usize])
+                    .unwrap_or(mvects[abcd[0] as usize]);
+                out.push(mv);
+            }
+            // No MV bits for the predicted / zero / intra modes.
+            MacroBlockMode::InterNoMv
+            | MacroBlockMode::InterMvLast
+            | MacroBlockMode::InterMvLast2
+            | MacroBlockMode::InterGoldenNoMv
+            | MacroBlockMode::Intra => {}
+        }
+    }
+    out
+}
+
 /// Encode the §7.5.2 macro-block motion-vector stream onto `w`, the
 /// inverse of [`decode_macroblock_motion_vectors_inner`].
 ///
-/// The encoder uses `MVMODE = 1` (fixed-length components). It walks
-/// macro blocks in coded order and, for each mode, writes exactly the
-/// motion-vector bits the decoder's step-3 arm for that mode consumes:
+/// The encoder elects the frame's `MVMODE` by measured rate: it tallies
+/// the vectors the walk transmits and writes them under the Table 7.23
+/// Huffman alphabet (`MVMODE = 0`) unless the fixed-length spelling
+/// (`MVMODE = 1`, 6 bits per component) is strictly cheaper — which
+/// only happens when most components have magnitude 8 or more. It
+/// walks macro blocks in coded order and, for each mode, writes
+/// exactly the motion-vector bits the decoder's step-3 arm for that
+/// mode consumes:
 ///
 /// * `INTER_MV` / `INTER_GOLDEN_MV` — one explicit MV (the MV stored
 ///   on the macro block's first luma block).
@@ -6322,37 +6420,18 @@ fn encode_macroblock_motion_vectors(
     mvects: &[MotionVector],
     macro_block_to_luma_blocks: &[[u32; 4]],
 ) {
-    // Step 2: MVMODE = 1.
-    w.write_bits(1, 1);
-    for (mbi, &mode) in mbmodes.iter().enumerate() {
-        let abcd = macro_block_to_luma_blocks[mbi];
-        match mode {
-            MacroBlockMode::InterMvFour => {
-                // One MV per coded luma block, raster order.
-                for &bi in abcd.iter() {
-                    if bcoded[bi as usize] == 1 {
-                        encode_single_motion_vector_fixed(w, mvects[bi as usize]);
-                    }
-                }
-            }
-            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv => {
-                // One explicit MV. The decoder assigns it to every
-                // coded block in the macro block, so any coded block
-                // carries the value; pick the first coded luma block,
-                // falling back to the stored A-block MV.
-                let mv = abcd
-                    .iter()
-                    .find(|&&bi| bcoded[bi as usize] == 1)
-                    .map(|&bi| mvects[bi as usize])
-                    .unwrap_or(mvects[abcd[0] as usize]);
-                encode_single_motion_vector_fixed(w, mv);
-            }
-            // No MV bits for the predicted / zero / intra modes.
-            MacroBlockMode::InterNoMv
-            | MacroBlockMode::InterMvLast
-            | MacroBlockMode::InterMvLast2
-            | MacroBlockMode::InterGoldenNoMv
-            | MacroBlockMode::Intra => {}
+    let vectors = transmitted_motion_vectors(mbmodes, bcoded, mvects, macro_block_to_luma_blocks);
+    // Step 2: MVMODE, elected by measured rate over the transmitted
+    // vectors (ties keep the Huffman alphabet).
+    let huffman_bits: u32 = vectors.iter().map(|&mv| mv_huffman_bits(mv)).sum();
+    let fixed_bits = 12 * vectors.len() as u32;
+    let mvmode = u32::from(fixed_bits < huffman_bits);
+    w.write_bits(mvmode, 1);
+    for mv in vectors {
+        if mvmode == 0 {
+            encode_single_motion_vector_huffman(w, mv);
+        } else {
+            encode_single_motion_vector_fixed(w, mv);
         }
     }
 }
@@ -14591,7 +14670,9 @@ impl FrameEncoder {
                         // bits; zero-MV / NOMV modes pay nothing.
                         let mv_bits = match mode {
                             MacroBlockMode::InterMv if mv == last1 || mv == last2 => 0,
-                            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv => 12,
+                            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv => {
+                                mv_huffman_bits(mv)
+                            }
                             _ => 0,
                         };
                         let cost = self.mb_uniform_mode_cost(
@@ -15401,8 +15482,8 @@ impl FrameEncoder {
         // explicit-MV bit charge. The caller predicts whether an
         // `INTER_MV` candidate will recode to a zero-MV-bit
         // `INTER_MV_LAST` / `INTER_MV_LAST2` mode (matching the running
-        // §7.5.2 predictor) and passes `0`, or the full 12 bits
-        // (MVMODE = 1: 6 bits per component) otherwise.
+        // §7.5.2 predictor) and passes `0`, or the vector's Table 7.23
+        // (`MVMODE = 0`) length otherwise.
         rate += 3 + mv_bits;
 
         Ok(distortion + lambda.saturating_mul(rate as u64))
@@ -15576,8 +15657,8 @@ impl FrameEncoder {
 
         // Header rate: the §7.4 mode code (~3 bits) plus one §7.5
         // explicit MV per luma block (every luma block is coded, so all
-        // four vectors are transmitted: 12 bits each).
-        rate += 3 + 4 * 12;
+        // four vectors are transmitted, each at its Table 7.23 length).
+        rate += 3 + luma.iter().map(|&mv| mv_huffman_bits(mv)).sum::<u32>();
 
         Ok((distortion + lambda.saturating_mul(rate as u64), luma))
     }
@@ -42187,5 +42268,57 @@ mod tests {
             errors[0].1 > errors[errors.len() - 1].1 && errors[errors.len() - 1].1 <= 8,
             "qi 63 must reconstruct the gradient to within the finest quantizer step: {errors:?}"
         );
+    }
+    /// The production `MVMODE = 0` writer is the exact inverse of the
+    /// Table 7.23 recogniser for every legal component value.
+    #[test]
+    fn mv_huffman_writer_round_trips_every_component() {
+        for x in -31i8..=31 {
+            for y in [-31i8, -16, -8, -4, -1, 0, 1, 3, 7, 15, 31] {
+                let mv = MotionVector { x, y };
+                let mut w = super::BitWriter::new();
+                encode_single_motion_vector_huffman(&mut w, mv);
+                let bytes = w.into_bytes();
+                let got = decode_single_motion_vector(&bytes, 0).unwrap();
+                assert_eq!(got, mv);
+                // And the priced length matches the written bit count.
+                let mut w2 = super::BitWriter::new();
+                encode_single_motion_vector_huffman(&mut w2, mv);
+                let bits = mv_huffman_bits(mv);
+                assert_eq!(w2.into_bytes().len(), bits.div_ceil(8) as usize);
+            }
+        }
+    }
+
+    /// The §7.5 writer elects `MVMODE` by measured rate: small vectors
+    /// spell under the Table 7.23 alphabet (cheaper than 12 bits per
+    /// vector), while a frame dominated by |component| >= 8 vectors
+    /// keeps the fixed-length spelling. Both spellings must decode to
+    /// the same vector.
+    #[test]
+    fn mv_mode_election_round_trips_both_alphabets() {
+        let mb_to_luma = [[0u32, 1, 2, 3]];
+        let bcoded = [1u8, 1, 1, 1, 1, 1];
+        for (mv, want_mode_bit) in [
+            (MotionVector { x: 1, y: -2 }, 0u8),
+            (MotionVector { x: -21, y: 19 }, 1u8),
+        ] {
+            let mvects = [mv; 6];
+            let mut w = super::BitWriter::new();
+            encode_macroblock_motion_vectors(
+                &mut w,
+                &[MacroBlockMode::InterMv],
+                &bcoded,
+                &mvects,
+                &mb_to_luma,
+            );
+            let bytes = w.into_bytes();
+            // First bit on the wire is the elected MVMODE.
+            assert_eq!(bytes[0] >> 7, want_mode_bit, "elected MVMODE for {mv:?}");
+            let mut r = BitReader::new(&bytes);
+            let mvmode = r.read_bits(1, "MVMODE").unwrap() as u8;
+            let got = decode_single_motion_vector_inner(&mut r, mvmode).unwrap();
+            assert_eq!(got, mv);
+        }
     }
 }

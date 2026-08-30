@@ -301,63 +301,63 @@ fn encoded_corpus_digests_are_stable() {
     const PINS: [Pin; 12] = [
         Pin {
             name: "basic420",
-            wire_sha256: "2d6c30450cac948624a8fbd183f60842431724a7b4959dd7724157b5f971f9bc",
-            recon_sha256: "ecd60900b75d4c963f6384147ed1094420b05f127bc274ec806f0a3ec3254184",
+            wire_sha256: "4e754875bf4d1cf318b48a1a5fb476f2f93876b798325b165370faab77980db5",
+            recon_sha256: "59f1c7bd4dd0439f595872e6bc0e87e77348d9fe1ac10bea13319c493013bf46",
         },
         Pin {
             name: "fmt422",
-            wire_sha256: "70d646e951aa7629642e5c032eb9e2f8ffa84612d646c93bd92d4525268f5e04",
-            recon_sha256: "1b4be661332f360b8ca988f68b30ae546143142068053f926c98f2391802f887",
+            wire_sha256: "27594f58cdf48c805098bf455675aaedea62a7d79b084896efda83cbb188fe76",
+            recon_sha256: "bf6a36e171ae630ce414c148727b87b9a672c986d30c4c65298e89e1ad99e348",
         },
         Pin {
             name: "fmt444",
-            wire_sha256: "92cd4ef1c4be0deab9d96fc1ca67809cc95a113db1c85d437983a7d25d3e1828",
-            recon_sha256: "2af8a81448a4b2d0898535828cfd741bc99b526c48ffe88f87d39e831914b860",
+            wire_sha256: "918af962e448d956ac1e3e0a4f1bf858f8361c27d2ecf6f7207aa69a4aac3c0e",
+            recon_sha256: "5d252faa80658f93d501b13e53a3448190f664e6bd7f0bf13f92344db3d39e9a",
         },
         Pin {
             name: "piccrop",
-            wire_sha256: "9c2fafff19c91ae18abdacae48d1c11f55caf56ea90dc1752bb5b3ed179dac70",
-            recon_sha256: "8d0e380cf8b403422ad278c492cdc068b0369b5a0bc5671b811e09693475b30d",
+            wire_sha256: "9748d900e59e45d87455234079dc8136d0e258acb0101502f877cdebde78bf04",
+            recon_sha256: "41a66faf65562c707c8078de47988cefab0442d38aae6ba99d40e6a04d164568",
         },
         Pin {
             name: "adaptiveq",
-            wire_sha256: "1a597e6859d22d4dc2380fa42ba7884ecec32c91655ce452866345620d8d25a3",
-            recon_sha256: "fdca1a271d61b6ba564ef8e4806deee97c949e159ee631a5baebc07b9463a5fe",
+            wire_sha256: "24a54529269554f13e5324bf189b9e1ee7a1497dd8be5a72f5c7309f906f44a6",
+            recon_sha256: "542e8c712963fa1d0206b6c3bf05a3c61da4a61d9aa555c57d201e79e19706db",
         },
         Pin {
             name: "ratecontrol",
-            wire_sha256: "88fb6e139e93f7c33b9e51015ebdf3773cb7736b8350be1742b3a3ba3e1e64d0",
-            recon_sha256: "02cfff982e12628d28801dfb664dfd5b55075d09b58d194ed87214e6489c4433",
+            wire_sha256: "e9bdea2458ab371db29605aa4ced6f74d3858ccad745d487c5d1fd4fb88cb4e2",
+            recon_sha256: "5238081791664f330513db1479552f1f8db6f387ae9f1dfc4cfbd49e025206ec",
         },
         Pin {
             name: "dupframes",
-            wire_sha256: "633065f337f5b3b10490596e629773c2a210c0fe2f3602a71271876eb72169de",
-            recon_sha256: "5b028a045aae96cf0ec0de40ade6a39c1669717f637af10aa6b199d519c9002b",
+            wire_sha256: "1c81d537c221df3d8a0a2b5124d26dd84d016a521df7503fd5a1fe11a370b004",
+            recon_sha256: "cc69480610fad25a0c94f063460ddf8f0dd1bbf2503bae06831aa80d43616d46",
         },
         Pin {
             name: "scenecut",
-            wire_sha256: "4b10501b203fa2b96cbd316734c82d5862a49e909934f16c1061bee26525058b",
-            recon_sha256: "f232dab8b3d960c525e63314ffcfed129d3cdc12c2d137e6d1296932b68dfbc3",
+            wire_sha256: "80a37ae5f41a03de589fa8c35e8b5197bd5bccb8b422301a35383e8ba574a881",
+            recon_sha256: "56e7ac082a4967f4fa2d05aa1eb282ed5de2d1e07ceeb94a61a8856588c185e7",
         },
         Pin {
             name: "goptuned",
-            wire_sha256: "74e58d0079731e1290f454155416dc6b34609966149ba0f89db1985cd9ccaa13",
-            recon_sha256: "7ef7b0412e29a850339b2402a92d059f5e537056a31504a43316194cf1ec56a5",
+            wire_sha256: "99292222dfeaedc5efc10c65fafb4a1d7f9a7440c10b476723b56177dbbf24e7",
+            recon_sha256: "158ec1e6c08634ee9dbdb222bd0a879af0ab997baa4071079f435b177439cbdd",
         },
         Pin {
             name: "fourmv",
-            wire_sha256: "7d85c9ecceaaafd858780d096a8bf28e18e8ddb2f770b3022e177ff977c7bfd1",
-            recon_sha256: "279e7ba7aa7cbcccbaf104053139fcad7857c4bbed8ff84c1c6a3890ad432508",
+            wire_sha256: "18b4632cecf0ebc02291e8642013b3f01383011dd38d09fa4be45b668fe2f943",
+            recon_sha256: "c5558baf77e2a05009a2c6971ee3ff11f46d56afeaa932788a93ca00e87bf2b1",
         },
         Pin {
             name: "golden",
-            wire_sha256: "e88deb93ccd45f8f46e82b8de257469321c1e162060c48518253edb4923a6a9d",
-            recon_sha256: "9602989d73056a34df268bd684d1d514e2eeb274d29a7ce96ff5f1ddb196e21b",
+            wire_sha256: "3bb38415a62f4a820b46d3e705b74b20d9c3b72c933f98dfa847948736ff778b",
+            recon_sha256: "7bb4b98490107afbf9e13a1300805261de845873d56b765c60a55ba393012858",
         },
         Pin {
             name: "rcadaptive",
-            wire_sha256: "9682c4a124f0b47a32905af791bf4317d4d647ae6171744b744431961dc6728d",
-            recon_sha256: "1b290a09ca262aed038878d92da7c7ed37435a066b0da0965ce58dcd7af56db8",
+            wire_sha256: "e8b4468b02ddc8b4d3188c566468e91427a119f0256767d4ddde5ff51d9eb8eb",
+            recon_sha256: "54c54b3d14fafd1b0a006fab8124b1288d0d44598793a0546c0badb918ac198f",
         },
     ];
 
@@ -623,18 +623,18 @@ fn encoded_corpus_decode_corner_digests_are_stable() {
     const PINS: [Pin; 3] = [
         Pin {
             name: "lflims127",
-            wire_sha256: "89062d65ed876f077f0627fd83140b999ae69be206a45472774caa5a70a184b1",
-            recon_sha256: "296b66de497e29ec93d321efeacbb4f8a41b4fa370354c3fb41fc03cd9d5358f",
+            wire_sha256: "62c1f094d6df8653b257179f46604b6e50004b707e9a27f7a78da9a585c39965",
+            recon_sha256: "44696866a926b47c0dc61ceec51408ef5561827eda1171635edacb3520e23aeb",
         },
         Pin {
             name: "lflims0",
-            wire_sha256: "62af6a99e486bd2a01ad5984465d7b6deeedf313dd32fe98df8031efc0b1850f",
-            recon_sha256: "9c2e7bbb17b018e26716848f6c66b10b860222a174c05345d7313e006955dfdb",
+            wire_sha256: "1a89b70fcb812dbfa249ee95547a0d880f4bfcd6e4237551eb1b34a83a78405f",
+            recon_sha256: "00a8b3dd080d44cb8891a6e472aca132993e09aa1c0a08f70aafc8dc3d76be58",
         },
         Pin {
             name: "multiqrange",
-            wire_sha256: "73343767adfe4100e9b0c6d90338a0a0eb47e7f76c1ee97f7e51684d5550a00e",
-            recon_sha256: "c1999b8602c94e813492708dca1bb379925bdae6ed2aa71704835b26611916d2",
+            wire_sha256: "dab5e3dc1f7a4ef4c44ba69b024fb64ea45a209571f32984cb8e83b0554b7f56",
+            recon_sha256: "91166ca6b2d5796dc3ae2689030eeb9b454d9c7078cf97d98f3670389bbd6dc4",
         },
     ];
 

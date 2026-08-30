@@ -13874,6 +13874,11 @@ impl FrameEncoder {
         // Step 1: per-block forward DCT + quantize. The DC slot of each
         // block holds the absolute (reconstructed) quantized DC at this
         // point; forward DC prediction below converts it to a residual.
+        // (A two-phase selected-selector pricing pass, as the inter
+        // planner runs, was tried here and measured net-negative on
+        // the intra side — the keyframe selector election is already
+        // dominated by the DC group — so the intra RDOQ keeps the
+        // group-minimum costs.)
         let mut coeffs = vec![[0i16; 64]; nbs];
         for (bi, out) in coeffs.iter_mut().enumerate() {
             let pli = g.pli_of_block[bi] as usize;
@@ -14856,176 +14861,212 @@ impl FrameEncoder {
         let force_coded_for =
             |mode: MacroBlockMode| -> bool { !matches!(mode, MacroBlockMode::InterNoMv) };
 
-        for bi in 0..nbs {
-            let pli = g.pli_of_block[bi] as usize;
-            let (plane, pw, ph) = match pli {
-                0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
-                1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
-                _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
-            };
-            let bx = g.bx_of_block[bi];
-            let by = g.by_of_block[bi];
-            let mbi = g.mbi_of_block[bi] as usize;
-            let mode = mbmodes[mbi];
-            let force_coded = force_coded_for(mode);
-            // The block's motion vector. INTER_MV_FOUR macro blocks
-            // already populated `block_mv` per block (luma per-block,
-            // chroma averaged) above; every other mode shares the macro
-            // block's uniform vector, which the §7.5.2 INTER_MV /
-            // INTER_GOLDEN_MV decode assigns to every coded block.
-            if mode != MacroBlockMode::InterMvFour {
-                block_mv[bi] = mb_mv[mbi];
+        // Two pricing phases. Phase 0 quantizes every block with the
+        // optimistic group-minimum token costs and yields a complete
+        // plan; its tally elects the §7.7.3 selectors exactly as the
+        // frame writer will, and phase 1 re-runs the per-block
+        // quantization / RDOQ / skip decisions priced against those
+        // *selected* tables — the codes the stream actually spends.
+        // The mode decision and motion vectors are fixed before this
+        // loop and are unaffected.
+        let mut plane_costs: Option<[TokenBitCosts; 2]> = None;
+        for phase in 0..2 {
+            if phase == 1 {
+                // Elect the selectors from the phase-0 plan (§7.7.3:
+                // the ti = 0 pair addresses group 0, the re-read
+                // ti = 1 pair groups 1..=4).
+                let Ok(token_plan) = plan_frame_tokens(g.nbs, g.nmbs, &bcoded, &coeffs) else {
+                    break;
+                };
+                let hts = &self.setup.huffman_tables[..];
+                let l_dc = best_huffman_selector(hts, &token_plan.tally[0], 0..=0);
+                let c_dc = best_huffman_selector(hts, &token_plan.tally[1], 0..=0);
+                let l_ac = best_huffman_selector(hts, &token_plan.tally[0], 1..=4);
+                let c_ac = best_huffman_selector(hts, &token_plan.tally[1], 1..=4);
+                plane_costs = Some([
+                    TokenBitCosts::for_selected_plane(hts, l_dc, l_ac),
+                    TokenBitCosts::for_selected_plane(hts, c_dc, c_ac),
+                ]);
+                bcoded.iter_mut().for_each(|b| *b = 0);
+                coeffs.iter_mut().for_each(|c| *c = [0i16; 64]);
+                qiis.iter_mut().for_each(|q| *q = 0);
             }
-            let mv = block_mv[bi];
-
-            let src = Self::extract_block(plane, pw, ph, bx, by)?;
-            // Predictor tile + forward-DCT residual + quantization
-            // matrices, per the macro block's mode. INTRA blocks use
-            // the §7.9.1.1 flat-128 predictor and the qti = 0 intra
-            // matrices (§7.9.4 step 2(d)ii resolves qti from the
-            // block's coding mode, not the frame type — no reference
-            // frame is read); every other mode reads its
-            // motion-compensated reference (§7.9.4 Table 7.75: Golden
-            // for the GOLDEN modes, Previous otherwise) and the
-            // qti = 1 inter matrices.
-            let (pred, dqc, dc_mat, ac_mats) = if mode == MacroBlockMode::Intra {
-                let pred = [[128u8; 8]; 8];
-                let mut residual = [[0i16; 8]; 8];
-                for r in 0..8 {
-                    for c in 0..8 {
-                        residual[r][c] = src[r][c] - 128;
-                    }
+            for bi in 0..nbs {
+                let pli = g.pli_of_block[bi] as usize;
+                let costs_in_use: &TokenBitCosts = match &plane_costs {
+                    Some(pc) => &pc[usize::from(pli != 0)],
+                    None => &token_costs,
+                };
+                let (plane, pw, ph) = match pli {
+                    0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+                    1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+                    _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+                };
+                let bx = g.bx_of_block[bi];
+                let by = g.by_of_block[bi];
+                let mbi = g.mbi_of_block[bi] as usize;
+                let mode = mbmodes[mbi];
+                let force_coded = force_coded_for(mode);
+                // The block's motion vector. INTER_MV_FOUR macro blocks
+                // already populated `block_mv` per block (luma per-block,
+                // chroma averaged) above; every other mode shares the macro
+                // block's uniform vector, which the §7.5.2 INTER_MV /
+                // INTER_GOLDEN_MV decode assigns to every coded block.
+                if mode != MacroBlockMode::InterMvFour {
+                    block_mv[bi] = mb_mv[mbi];
                 }
-                (
-                    pred,
-                    forward_dct_2d(&residual),
-                    &qmats_intra[pli],
-                    &qmats_ac_intra[..],
-                )
-            } else {
-                let refframe = reference_frame_for_mb_mode(mode);
-                let refp = refs.pick(refframe, pli)?;
-                let (hsub, vsub) = plane_subsampling(g.pf, pli);
-                let pred = inter_block_predictor_plane(&refp, bx, by, mv, hsub, vsub)?;
+                let mv = block_mv[bi];
 
-                // Residual = source - predictor.
-                let mut residual = [[0i16; 8]; 8];
-                for r in 0..8 {
-                    for c in 0..8 {
-                        residual[r][c] = src[r][c] - pred[r][c] as i16;
-                    }
-                }
-                (
-                    pred,
-                    forward_dct_2d(&residual),
-                    &qmats[pli],
-                    &qmats_ac_inter[..],
-                )
-            };
-
-            // Quantize. A single-qi frame takes one pass at qis[0]; a
-            // multi-qi frame scores every candidate AC quantizer by
-            // delivered distortion + λ × measured token rate and
-            // records the winner's §7.6 selector. The DC quantizer is
-            // always qis[0] (the §7.6 preamble's rule, so §7.8 DC
-            // prediction is untouched by the per-block choice).
-            let (mut q, qii) = if nqis == 1 {
-                (quantize_block(&dqc, dc_mat, &ac_mats[0][pli]), 0u8)
-            } else {
-                let mut best_q = [0i16; 64];
-                let mut best_qii = 0u8;
-                let mut best_cost = u64::MAX;
-                for (cand, ac) in ac_mats.iter().enumerate() {
-                    let qc = quantize_block(&dqc, dc_mat, &ac[pli]);
-                    // Reconstruct exactly as the decoder will and take
-                    // the delivered SSD against the source block.
-                    let dqc_rec = dequantize_block(&qc, dc_mat, &ac[pli]);
-                    let rec = inverse_dct_2d(&dqc_rec);
-                    let mut ssd = 0u64;
+                let src = Self::extract_block(plane, pw, ph, bx, by)?;
+                // Predictor tile + forward-DCT residual + quantization
+                // matrices, per the macro block's mode. INTRA blocks use
+                // the §7.9.1.1 flat-128 predictor and the qti = 0 intra
+                // matrices (§7.9.4 step 2(d)ii resolves qti from the
+                // block's coding mode, not the frame type — no reference
+                // frame is read); every other mode reads its
+                // motion-compensated reference (§7.9.4 Table 7.75: Golden
+                // for the GOLDEN modes, Previous otherwise) and the
+                // qti = 1 inter matrices.
+                let (pred, dqc, dc_mat, ac_mats) = if mode == MacroBlockMode::Intra {
+                    let pred = [[128u8; 8]; 8];
+                    let mut residual = [[0i16; 8]; 8];
                     for r in 0..8 {
                         for c in 0..8 {
-                            let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
-                            let d = src[r][c] as i32 - pv;
-                            ssd += (d * d) as u64;
+                            residual[r][c] = src[r][c] - 128;
                         }
                     }
-                    let bits = token_costs
-                        .block_bits(&qc)
+                    (
+                        pred,
+                        forward_dct_2d(&residual),
+                        &qmats_intra[pli],
+                        &qmats_ac_intra[..],
+                    )
+                } else {
+                    let refframe = reference_frame_for_mb_mode(mode);
+                    let refp = refs.pick(refframe, pli)?;
+                    let (hsub, vsub) = plane_subsampling(g.pf, pli);
+                    let pred = inter_block_predictor_plane(&refp, bx, by, mv, hsub, vsub)?;
+
+                    // Residual = source - predictor.
+                    let mut residual = [[0i16; 8]; 8];
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            residual[r][c] = src[r][c] - pred[r][c] as i16;
+                        }
+                    }
+                    (
+                        pred,
+                        forward_dct_2d(&residual),
+                        &qmats[pli],
+                        &qmats_ac_inter[..],
+                    )
+                };
+
+                // Quantize. A single-qi frame takes one pass at qis[0]; a
+                // multi-qi frame scores every candidate AC quantizer by
+                // delivered distortion + λ × measured token rate and
+                // records the winner's §7.6 selector. The DC quantizer is
+                // always qis[0] (the §7.6 preamble's rule, so §7.8 DC
+                // prediction is untouched by the per-block choice).
+                let (mut q, qii) = if nqis == 1 {
+                    (quantize_block(&dqc, dc_mat, &ac_mats[0][pli]), 0u8)
+                } else {
+                    let mut best_q = [0i16; 64];
+                    let mut best_qii = 0u8;
+                    let mut best_cost = u64::MAX;
+                    for (cand, ac) in ac_mats.iter().enumerate() {
+                        let qc = quantize_block(&dqc, dc_mat, &ac[pli]);
+                        // Reconstruct exactly as the decoder will and take
+                        // the delivered SSD against the source block.
+                        let dqc_rec = dequantize_block(&qc, dc_mat, &ac[pli]);
+                        let rec = inverse_dct_2d(&dqc_rec);
+                        let mut ssd = 0u64;
+                        for r in 0..8 {
+                            for c in 0..8 {
+                                let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
+                                let d = src[r][c] as i32 - pv;
+                                ssd += (d * d) as u64;
+                            }
+                        }
+                        let bits = costs_in_use
+                            .block_bits(&qc)
+                            .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
+                        let cost = ssd + lambda.saturating_mul(u64::from(bits));
+                        if cost < best_cost {
+                            best_cost = cost;
+                            best_q = qc;
+                            best_qii = cand as u8;
+                        }
+                    }
+                    (best_q, best_qii)
+                };
+                // Rate-distortion-optimized quantization: refine the AC
+                // levels of the winning spelling against the measured
+                // token plan (DC untouched — it feeds the §7.8 prediction
+                // chain). Runs before the skip decision, which then judges
+                // the refined spelling.
+                rdoq_refine(
+                    &mut q,
+                    &dqc,
+                    &ac_mats[qii as usize][pli],
+                    costs_in_use,
+                    lambda,
+                );
+
+                // A block whose quantized residual is all-zero is uncoded
+                // (unless the macro block's mode forces it coded — any
+                // non-zero-MV INTER_MV / INTER_GOLDEN_* / INTRA macro block,
+                // see `force_coded_for`; an all-zero forced-coded block
+                // reconstructs as the exact predictor, so forcing it is
+                // still bit-faithful). Uncoded blocks keep the default
+                // selector 0 (they never reach the §7.6 stream).
+                let any_nonzero = q.iter().any(|&v| v != 0);
+                let mut coded = any_nonzero || force_coded;
+
+                // Rate-distortion skip decision. For an INTER_NOMV macro
+                // block the decoder's uncoded path (§7.9.4 step 2(e)) copies
+                // the zero-MV colocated previous reference — exactly `pred`
+                // here — so *skipping* a block with a non-zero quantized
+                // residual is a legal spelling whose delivered reconstruction
+                // is the bare predictor. Score both spellings by the same
+                // Lagrangian the mode decision uses — skip at
+                // `SSD(src, pred)` and zero token bits, code at
+                // `SSD(src, clamp(pred + rec)) + λ·bits` — and keep the
+                // cheaper one. A near-noise residual whose tokens buy almost
+                // no distortion reduction is dropped (a pure rate win); any
+                // residual that pays for itself is kept. Ties keep the coded
+                // spelling (equal cost, and the coded block's loop-filter
+                // edges then behave exactly as before this decision existed).
+                if coded && !force_coded && any_nonzero {
+                    let dqc_rec = dequantize_block(&q, dc_mat, &ac_mats[qii as usize][pli]);
+                    let rec = inverse_dct_2d(&dqc_rec);
+                    let mut ssd_coded = 0u64;
+                    let mut ssd_skip = 0u64;
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let s = src[r][c] as i32;
+                            let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
+                            let dc = s - pv;
+                            ssd_coded += (dc * dc) as u64;
+                            let ds = s - pred[r][c] as i32;
+                            ssd_skip += (ds * ds) as u64;
+                        }
+                    }
+                    let bits = costs_in_use
+                        .block_bits(&q)
                         .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
-                    let cost = ssd + lambda.saturating_mul(u64::from(bits));
-                    if cost < best_cost {
-                        best_cost = cost;
-                        best_q = qc;
-                        best_qii = cand as u8;
+                    let cost_coded =
+                        ssd_coded.saturating_add(lambda.saturating_mul(u64::from(bits)));
+                    if ssd_skip < cost_coded {
+                        coded = false;
                     }
                 }
-                (best_q, best_qii)
-            };
-            // Rate-distortion-optimized quantization: refine the AC
-            // levels of the winning spelling against the measured
-            // token plan (DC untouched — it feeds the §7.8 prediction
-            // chain). Runs before the skip decision, which then judges
-            // the refined spelling.
-            rdoq_refine(
-                &mut q,
-                &dqc,
-                &ac_mats[qii as usize][pli],
-                &token_costs,
-                lambda,
-            );
 
-            // A block whose quantized residual is all-zero is uncoded
-            // (unless the macro block's mode forces it coded — any
-            // non-zero-MV INTER_MV / INTER_GOLDEN_* / INTRA macro block,
-            // see `force_coded_for`; an all-zero forced-coded block
-            // reconstructs as the exact predictor, so forcing it is
-            // still bit-faithful). Uncoded blocks keep the default
-            // selector 0 (they never reach the §7.6 stream).
-            let any_nonzero = q.iter().any(|&v| v != 0);
-            let mut coded = any_nonzero || force_coded;
-
-            // Rate-distortion skip decision. For an INTER_NOMV macro
-            // block the decoder's uncoded path (§7.9.4 step 2(e)) copies
-            // the zero-MV colocated previous reference — exactly `pred`
-            // here — so *skipping* a block with a non-zero quantized
-            // residual is a legal spelling whose delivered reconstruction
-            // is the bare predictor. Score both spellings by the same
-            // Lagrangian the mode decision uses — skip at
-            // `SSD(src, pred)` and zero token bits, code at
-            // `SSD(src, clamp(pred + rec)) + λ·bits` — and keep the
-            // cheaper one. A near-noise residual whose tokens buy almost
-            // no distortion reduction is dropped (a pure rate win); any
-            // residual that pays for itself is kept. Ties keep the coded
-            // spelling (equal cost, and the coded block's loop-filter
-            // edges then behave exactly as before this decision existed).
-            if coded && !force_coded && any_nonzero {
-                let dqc_rec = dequantize_block(&q, dc_mat, &ac_mats[qii as usize][pli]);
-                let rec = inverse_dct_2d(&dqc_rec);
-                let mut ssd_coded = 0u64;
-                let mut ssd_skip = 0u64;
-                for r in 0..8 {
-                    for c in 0..8 {
-                        let s = src[r][c] as i32;
-                        let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
-                        let dc = s - pv;
-                        ssd_coded += (dc * dc) as u64;
-                        let ds = s - pred[r][c] as i32;
-                        ssd_skip += (ds * ds) as u64;
-                    }
+                if coded {
+                    bcoded[bi] = 1;
+                    coeffs[bi] = q;
+                    qiis[bi] = qii;
                 }
-                let bits = token_costs
-                    .block_bits(&q)
-                    .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
-                let cost_coded = ssd_coded.saturating_add(lambda.saturating_mul(u64::from(bits)));
-                if ssd_skip < cost_coded {
-                    coded = false;
-                }
-            }
-
-            if coded {
-                bcoded[bi] = 1;
-                coeffs[bi] = q;
-                qiis[bi] = qii;
             }
         }
 
@@ -15813,6 +15854,30 @@ impl TokenBitCosts {
                 for (token, slot) in group_lens.iter_mut().enumerate() {
                     if let Some((_, len)) = huffman_code_for_token(table, token as u8) {
                         *slot = (*slot).min(len);
+                    }
+                }
+            }
+        }
+        Self { min_len }
+    }
+
+    /// Exact per-plane cost table for a chosen §7.7.3 selector set:
+    /// group 0 priced by the plane's DC selector table, groups 1..=4
+    /// by its AC selector table — the codes the frame writer will
+    /// actually emit, rather than the optimistic per-group minimum.
+    /// A token the selected table does not leaf falls back to the
+    /// group minimum (the writer re-elects selectors on the final
+    /// tally, so such a token re-routes the election rather than
+    /// failing).
+    fn for_selected_plane(hts: &[HuffmanTable], sel_dc: u8, sel_ac: u8) -> Self {
+        let fallback = Self::from_tables(hts);
+        let mut min_len = fallback.min_len;
+        for (hg, group_lens) in min_len.iter_mut().enumerate() {
+            let sel = if hg == 0 { sel_dc } else { sel_ac };
+            if let Some(table) = hts.get(16 * hg + sel as usize) {
+                for (token, slot) in group_lens.iter_mut().enumerate() {
+                    if let Some((_, len)) = huffman_code_for_token(table, token as u8) {
+                        *slot = len;
                     }
                 }
             }

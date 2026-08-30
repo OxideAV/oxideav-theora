@@ -30,6 +30,26 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Selected-selector token pricing on P-frames (round 453)** — the
+  inter planner's per-block quantization / RDOQ / skip decisions run
+  in two pricing phases: phase 0 prices tokens at the optimistic
+  per-group minimum over all 16 candidate tables (as before) and
+  yields a complete plan; that plan's tally elects the §7.7.3
+  selectors exactly as the frame writer will, and phase 1 re-runs the
+  per-block decisions priced against those *selected* tables — the
+  codes the stream actually spends (per plane: the DC pair for group
+  0, the AC pair for groups 1..=4; a token the selected table does
+  not leaf falls back to the group minimum, since the writer
+  re-elects on the final tally). Mode decisions and motion vectors
+  are fixed before the loop and unaffected. The same pass on the
+  intra side measured net-negative (the keyframe election is
+  DC-dominated) and is deliberately not applied. Measured
+  (`rd_ladder`): **−0.50 % mean BD-rate, every sequence improved**.
+  Corpus re-pinned; external route re-run — **15/15 byte-identical**
+  black-box reference decodes.
+
+### Added
+
 - **Predictor-seeded motion search with an in-search MV rate penalty
   (round 453)** — the rate-distortion path's four-step whole-pixel
   descent now starts from the best of the zero vector, the running

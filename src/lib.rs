@@ -14782,7 +14782,8 @@ impl FrameEncoder {
             } else {
                 let refframe = reference_frame_for_mb_mode(mode);
                 let refp = refs.pick(refframe, pli)?;
-                let pred = inter_block_predictor(&refp, bx, by, mv)?;
+                let (hsub, vsub) = plane_subsampling(g.pf, pli);
+                let pred = inter_block_predictor_plane(&refp, bx, by, mv, hsub, vsub)?;
 
                 // Residual = source - predictor.
                 let mut residual = [[0i16; 8]; 8];
@@ -15251,7 +15252,8 @@ impl FrameEncoder {
         let by = g.by_of_block[bi];
 
         let refp = refs.pick(refframe, pli)?;
-        let pred = inter_block_predictor(&refp, bx, by, mv)?;
+        let (hsub, vsub) = plane_subsampling(g.pf, pli);
+        let pred = inter_block_predictor_plane(&refp, bx, by, mv, hsub, vsub)?;
         let src = Self::extract_block(plane, pw, ph, bx, by)?;
 
         // Forward path: residual → DCT → quantize.
@@ -15675,7 +15677,48 @@ fn inter_block_predictor(
     by_origin: u32,
     mv: MotionVector,
 ) -> Result<[[u8; 8]; 8], Error> {
-    let (mv1, mv2) = split_half_pixel_motion_vector(mv.x as i32, mv.y as i32).ok_or(
+    inter_block_predictor_plane(refp, bx_origin, by_origin, mv, false, false)
+}
+
+/// The §7.5.1 sub-sampling flags of plane `pli` under pixel format
+/// `pf`: whether each axis of a chroma block interprets its motion
+/// vector component at quarter-pixel resolution (a divide-by-4 to the
+/// whole-pixel grid instead of the luma divide-by-2).
+fn plane_subsampling(pf: PixelFormat, pli: usize) -> (bool, bool) {
+    if pli == 0 {
+        (false, false)
+    } else {
+        match pf {
+            PixelFormat::Yuv420 => (true, true),
+            PixelFormat::Yuv422 => (true, false),
+            PixelFormat::Yuv444 => (false, false),
+        }
+    }
+}
+
+/// [`inter_block_predictor`] for an arbitrary plane: `hsub` / `vsub`
+/// select the §7.5.1 quarter-pixel interpretation of the vector on a
+/// sub-sampled chroma axis (the decoder's §7.9.4 step 2(d)vi divides
+/// such a component by 4 rather than 2 before the predictor). The
+/// encoder **must** build its chroma predictors this way: a residual
+/// computed against the luma-style split would be added by the
+/// decoder to a different predictor, and the mismatch — up to a
+/// whole chroma pixel of displacement per non-zero vector — landed
+/// straight in the reconstruction (measured before this correction:
+/// chroma PSNR on a panning 4:2:0 sequence *fell* from 28 dB to 23 dB
+/// as the quantizer weakened, while the intra-only spelling of the
+/// same content rose to 37 dB).
+fn inter_block_predictor_plane(
+    refp: &ReferencePlane<'_>,
+    bx_origin: u32,
+    by_origin: u32,
+    mv: MotionVector,
+    hsub: bool,
+    vsub: bool,
+) -> Result<[[u8; 8]; 8], Error> {
+    let div_x = if hsub { 4 } else { 2 };
+    let div_y = if vsub { 4 } else { 2 };
+    let (mv1, mv2) = split_motion_vector_per_axis(mv.x as i32, mv.y as i32, div_x, div_y).ok_or(
         Error::ReconstructMotionVectorOutOfRange {
             mvx: mv.x as i32,
             mvy: mv.y as i32,

@@ -263,6 +263,13 @@ fn check(pin: &Pin, id: &TheoraIdentHeader, pkts: &[Packet]) {
     );
     let wire = sha256_hex(&packet_chain_bytes(pkts));
     let recon = sha256_hex(&reconstruction_bytes(id, pkts));
+    // `CORPUS_DUMP=<dir>` writes each scenario's packet chain (the
+    // wire-pinned bytes) to `<dir>/<name>.chain` for the external
+    // validation route in `encoded-corpus-notes.md`.
+    if let Some(dir) = std::env::var_os("CORPUS_DUMP") {
+        let path = std::path::Path::new(&dir).join(format!("{}.chain", pin.name));
+        std::fs::write(path, packet_chain_bytes(pkts)).expect("CORPUS_DUMP write");
+    }
     if std::env::var_os("CORPUS_PRINT").is_some() {
         println!(
             "        Pin {{ name: \"{}\", wire_sha256: \"{wire}\", recon_sha256: \"{recon}\" }},",
@@ -294,13 +301,13 @@ fn encoded_corpus_digests_are_stable() {
     const PINS: [Pin; 12] = [
         Pin {
             name: "basic420",
-            wire_sha256: "dc711a7e953898769035d18ebcd2cb565facc19b39fc446191e414b00b4c4d19",
-            recon_sha256: "c1816e32c5e1e1d3c07bae535f67793026ea3e15d584f352dd7c4526fcafac88",
+            wire_sha256: "a4930c9932033ebc6390a05e7d62de76384207bea459163cf749a86e3d20d330",
+            recon_sha256: "8d5acc6e5bda4dd08e0ed40d556e886e184c77ba02add1ec9f5300986d41f4cc",
         },
         Pin {
             name: "fmt422",
-            wire_sha256: "8a88f6f48e4a63f5876bff3a88406b7e9e8699f76068044ad1cfb4fe39f1d2e1",
-            recon_sha256: "6505afaf546466c3c2af32982b4faffb52d9099856a5c0c553b09dfad6db48d5",
+            wire_sha256: "0ec0e600e41e06663baf55d31d5b4d2db11000e12c7afdd6673dbbdf0caa2231",
+            recon_sha256: "94ab87eb835f85852dcd9106708fb4d6ae9f274f8c96ad6b753cd6f8c358a76f",
         },
         Pin {
             name: "fmt444",
@@ -309,18 +316,18 @@ fn encoded_corpus_digests_are_stable() {
         },
         Pin {
             name: "piccrop",
-            wire_sha256: "70d09f102d8651711a3c9eca6901850547d4837c60eab1d15262bb5202243bee",
-            recon_sha256: "a2990ed8a3eda9722ffa8a365f97ac914e968df92d3eb465057141ea5744d78e",
+            wire_sha256: "642b6366452c6efba82a5858ed087c6c719264909bf1559d7d46eea5a4c2df24",
+            recon_sha256: "475fea4f579584c8da6eeb0e82e45e3ced5b2e5d45d840b93eb70a57f2fd3b35",
         },
         Pin {
             name: "adaptiveq",
-            wire_sha256: "abe8e0c4d72eaa8b24386c8e43ed0b0c35bdd9ef0b1a74be7629f7c32bc93878",
-            recon_sha256: "19edf8f0011dca44d6dea825d814be7f93f0225b8fb85abbe9b061f91d0dc9cb",
+            wire_sha256: "ac0dcae5eeb80faa5bd5cf484f9b14032f1f286aa2d7ea7dbe09a33621601eb5",
+            recon_sha256: "6d0d31be7e8f4bc3428407b62014839fe20ec0df00c23cecae49ea4747e90e5a",
         },
         Pin {
             name: "ratecontrol",
-            wire_sha256: "6361d1ef26954d6111d77d1e0d0391cb168dab1b518e9d55bd9430418ad88c86",
-            recon_sha256: "eddc6c3aa6a85a8a4e81b826f4d76eaed131c687bab150ddaa15d951a1e8cb0e",
+            wire_sha256: "81ed0ff6e246b6e23efeaa80df6427126bf209838e4d26c72f06d8e4a0db0edb",
+            recon_sha256: "ea5deedd785234e9287d13de8417ea0cfc2d13db0ee1f8448bbdd7461a3bf422",
         },
         Pin {
             name: "dupframes",
@@ -329,28 +336,28 @@ fn encoded_corpus_digests_are_stable() {
         },
         Pin {
             name: "scenecut",
-            wire_sha256: "18707825163795b991ae19a9a8e66132fe246848a6e0421c42fac953a1a5f66e",
-            recon_sha256: "393c102e389d9345c9f4ac941744664b3eeee311761b1469709369024cb6da2a",
+            wire_sha256: "fd1f14e09b30ebf994d18b69082b14ae6cbcd8ef3f2f4bb187250b664292f0e9",
+            recon_sha256: "c4931331d0da68d2ea50b23342e27d85b22ed90ff5c0b601934dfb2ea32c1d14",
         },
         Pin {
             name: "goptuned",
-            wire_sha256: "9bae7964b412a9278416dd0981fd2db0010d1d81ebfe656ff5c2b6b3c6417211",
-            recon_sha256: "b180da8390be222a7dd755c686b81970d93a0d83ee9c6df7df85ca16f26ad231",
+            wire_sha256: "17180cca82bc5ad24c9c4c7ea5cd6c5932d81deb6aaca7b05f8e9cbf0c81aa2a",
+            recon_sha256: "046cc7098881165cbd618e8d488b66b4eafac717486f657626e7513900a13545",
         },
         Pin {
             name: "fourmv",
-            wire_sha256: "68af6993968be068245e39db18e805d0e9f929ac7a0d0de7ea0d4a2e828b8eab",
-            recon_sha256: "d9554244df6ac57fcdb990010f4cdacc73b1134952deda67bd090615f5056b2e",
+            wire_sha256: "b0c29423c813373f216a49978a95c47e35499f0479bb20b039413e8cf4974e79",
+            recon_sha256: "8b9daf4407cbe09c5b4428c0fa6e67224942a02838cd57ae542b1efec21164c1",
         },
         Pin {
             name: "golden",
-            wire_sha256: "92c6a89a9d3e0b721236649ad01090a6d88091494b98fde3fb9cd12c75607d4b",
-            recon_sha256: "18ee6baa0788b715b7a216d4b6fa0c95e2c9baafcbd50506f11effbd593caade",
+            wire_sha256: "a21553cb1c7939b8b2c5c40759cc121bb2758227d75e53dfbf98ea756f707966",
+            recon_sha256: "60bb57f5c12da9d9906df2910c3d12e438e1dc5eda7395fb39181980280ca992",
         },
         Pin {
             name: "rcadaptive",
-            wire_sha256: "574940c9e588ccceb7e038182d458f5e198c3d58c86e2912ed60a763bbbf7be1",
-            recon_sha256: "25c1a0c6b9b110c6e23e2175c60f73884cd4d28c0768c38670c10178bdb755ed",
+            wire_sha256: "fc00546de2cec463b49d1b6d0fbd6ddba01218c3a9f171fd9e33095a00d72f88",
+            recon_sha256: "f3f817f87ef527b74b190fcc341fa49af39bd7df88ab39116012093661374db4",
         },
     ];
 
@@ -616,18 +623,18 @@ fn encoded_corpus_decode_corner_digests_are_stable() {
     const PINS: [Pin; 3] = [
         Pin {
             name: "lflims127",
-            wire_sha256: "08f9bf67d6e2ac5edc18998336a49c0b01750e64807beb3b1166066ac7e2ba78",
-            recon_sha256: "e81ec6272ddff5a67dfdbcac011e571d6003dd51a6dc167e749aa6c0278eff90",
+            wire_sha256: "021c5499c04b44f29e866f7e7c64fd30bc72da61070c91f4ff11488b9547ecf0",
+            recon_sha256: "69b474033201969bcdeff81c13adaacc9960e7f244d4aa84b15764101404bfc7",
         },
         Pin {
             name: "lflims0",
-            wire_sha256: "b02f34f360d2a701915bf2923db3e865aeb7feddaae15f0b4034179f2f513382",
-            recon_sha256: "4c8392a4b6c39b776a0821182f7361bf66c9ed3e600626f7e9f5fc26f37b8b7e",
+            wire_sha256: "2f9f367ba1405b9ebe7919410dfc79b99c4e25c2194f59632b023a1f8d7f110a",
+            recon_sha256: "b93c9a0bd164079a0c4e39aa374c566d70142cc748fd3ffbc33f561e1b5abea0",
         },
         Pin {
             name: "multiqrange",
-            wire_sha256: "9f9f8071cda25a4f3676a8374bf493191123f22fc370e7c6dd2df43a2865db03",
-            recon_sha256: "143d2f24861c8798ca9527039f4b19a5b3aceb76950cd1fa620852357d5724b6",
+            wire_sha256: "3b78209cbd44dad89aaf332fd18ec8718ecff990b27406d61f71ba061b472592",
+            recon_sha256: "13cfdaa95fd93a52f19c77af8740da521ff5627699fe192b0eff240fa4a67e6a",
         },
     ];
 

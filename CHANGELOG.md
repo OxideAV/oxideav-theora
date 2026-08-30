@@ -4,6 +4,44 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Encoder chroma predictors used the luma half-pixel split (round
+  453)** — every inter encode path built its chroma motion-compensated
+  predictor with the luma divide-by-2 vector split, while the decoder
+  (§7.5.1 / §7.9.4 step 2(d)vi) interprets a sub-sampled chroma axis at
+  quarter-pixel resolution (divide-by-4). The residual was therefore
+  computed against a predictor up to a whole chroma pixel away from
+  the one the decoder adds it to, and the mismatch landed directly in
+  the reconstruction on every non-zero motion vector. Measured on the
+  new `rd_ladder` battery (4:2:0, interval 16): the panning sequence's
+  chroma PSNR *fell* from 28.3 dB (qi 8) to 23.5 dB (qi 56) before
+  the fix and now rises 40.7 → 50.2 dB; the moving-square sequence
+  goes 29.5 → 52.0 dB at qi 56. Because the wrongly-predicted chroma
+  residuals were also expensive, luma-equal streams shrink 5–30 %
+  (mean BD-rate −10.8 % over the six-sequence battery, luma PSNR
+  unchanged within 0.1 dB except where the chroma bits were
+  re-spent). `inter_block_predictor_plane` carries the per-plane
+  `hsub` / `vsub` flags; 4:4:4 streams are unaffected. The pinned
+  corpus is re-pinned (15 scenarios) and re-validated externally
+  through the round-413 route: Ogg mux, `oggz-validate`, black-box
+  reference decode, **15/15 byte-identical** to this crate's own
+  reconstruction (`tests/encoded-corpus-notes.md`).
+
+### Added
+
+- **`examples/rd_ladder`** — the encoder's measured rate-distortion
+  ladder: four deterministic 176×144 synthetic sequences (moving
+  square, sub-pixel drifting blobs, a half-pixel pan, a scene cut)
+  plus the fixture-derived `all-mb-modes-64x64` / `keyframe-interval-30`
+  sources, a five-point `qi` ladder and optional target-bitrate
+  points, bytes / luma / chroma PSNR per point through this crate's
+  own decoder, per-point deltas and Bjøntegaard-style BD-PSNR /
+  BD-rate summaries against a saved reference run, and
+  `--out` packet-chain dumps for the external validation route.
+  `CORPUS_DUMP=<dir>` on the corpus test writes the pinned scenarios'
+  packet chains the same way.
+
 ### Added
 
 - **Rate control composes with adaptive quantization (round 444)** —

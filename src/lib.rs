@@ -14646,11 +14646,38 @@ impl FrameEncoder {
                 // charge would have lost to `INTER_NOMV`.
                 let mut last1 = MotionVector::ZERO;
                 let mut last2 = MotionVector::ZERO;
+                // The previous macro block's searched winners, seeding
+                // the next search (coded-order spatial coherence).
+                let mut neighbor_prev = MotionVector::ZERO;
+                let mut neighbor_gold = MotionVector::ZERO;
                 for mbi in 0..nmbs {
-                    let (prev_mv, _) =
-                        self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Previous);
-                    let (gold_mv, _) =
-                        self.search_macro_block_mv_ref(frame, refs, mbi, ReferenceFrame::Golden);
+                    // SAD-domain λ for the in-search MV rate penalty:
+                    // λ prices SSD per bit; per-sample absolute error
+                    // scales as its square root over the 256-sample
+                    // macro block, so √λ is the right order. Measured
+                    // near-neutral to slightly positive on the ladder
+                    // battery (the RD mode decision already reprices
+                    // the winner); kept because it bounds how far the
+                    // descent wanders for noise-level SAD gains.
+                    let lambda_sad = isqrt_u64(lambda) as u32;
+                    let (prev_mv, _) = self.search_macro_block_mv_seeded_priced(
+                        frame,
+                        refs,
+                        mbi,
+                        ReferenceFrame::Previous,
+                        &[last1, last2, neighbor_prev],
+                        lambda_sad,
+                    );
+                    let (gold_mv, _) = self.search_macro_block_mv_seeded_priced(
+                        frame,
+                        refs,
+                        mbi,
+                        ReferenceFrame::Golden,
+                        &[neighbor_gold],
+                        lambda_sad,
+                    );
+                    neighbor_prev = prev_mv;
+                    neighbor_gold = gold_mv;
 
                     // Candidate uniform modes, each scored by its true
                     // rate-distortion cost. INTER_NOMV is always a
@@ -15194,6 +15221,45 @@ impl FrameEncoder {
         mbi: usize,
         which: ReferenceFrame,
     ) -> (MotionVector, u32) {
+        self.search_macro_block_mv_seeded(frame, refs, mbi, which, &[])
+    }
+
+    /// [`FrameEncoder::search_macro_block_mv_ref`] with predictor
+    /// seeding (see [`whole_pixel_step_search_seeded`]): the caller
+    /// passes vectors the frame's walk already established — the
+    /// running `LAST1` / `LAST2` predictors and the previous macro
+    /// block's searched winner — and the descent starts from the best
+    /// of them.
+    fn search_macro_block_mv_seeded(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        mbi: usize,
+        which: ReferenceFrame,
+        seeds: &[MotionVector],
+    ) -> (MotionVector, u32) {
+        self.search_macro_block_mv_seeded_priced(frame, refs, mbi, which, seeds, 0)
+    }
+
+    /// [`FrameEncoder::search_macro_block_mv_seeded`] with a motion-
+    /// vector rate penalty: each probe's SAD is loaded with
+    /// `lambda_sad × ` its Table 7.23 bit cost, so the descent stops
+    /// wandering off a predictor for noise-level SAD gains that the
+    /// extra vector bits outweigh. `lambda_sad` is in SAD units per
+    /// bit (the caller derives it from the frame quantizer); `0`
+    /// disables the penalty. The returned SAD is the *unpenalized*
+    /// value of the winner, so golden/previous comparisons stay on
+    /// raw prediction quality.
+    #[allow(clippy::too_many_arguments)]
+    fn search_macro_block_mv_seeded_priced(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        mbi: usize,
+        which: ReferenceFrame,
+        seeds: &[MotionVector],
+        lambda_sad: u32,
+    ) -> (MotionVector, u32) {
         let g = &self.geometry;
         let refp = match refs.pick(which, 0) {
             Ok(p) => p,
@@ -15241,16 +15307,24 @@ impl FrameEncoder {
             sad
         };
 
-        // Four-step whole-pixel descent (±15 pixels reachable), zero-
-        // biased: strict improvement required to move off the zero
-        // vector.
-        let (best_mv, best_sad) = whole_pixel_step_search(sad_for);
+        let cost_for = |mv: MotionVector| -> u32 {
+            let sad = sad_for(mv);
+            if lambda_sad == 0 || sad == u32::MAX {
+                sad
+            } else {
+                sad.saturating_add(lambda_sad.saturating_mul(mv_huffman_bits(mv)))
+            }
+        };
+        // Seeded four-step whole-pixel descent, zero-biased: strict
+        // improvement required to move off the zero vector.
+        let (best_mv, best_cost) = whole_pixel_step_search_seeded(seeds, cost_for);
         // §7.5.1 half-pixel refinement around the integer winner: the
         // whole-pixel search only ever tries even components, so the
         // decoder's two-tap half-pixel predictor would otherwise be
         // unreachable from the encoder. Probe the eight half-pixel
-        // neighbours and keep any strict SAD improvement.
-        refine_half_pixel_mv(best_mv, best_sad, sad_for)
+        // neighbours and keep any strict improvement.
+        let (best_mv, _) = refine_half_pixel_mv(best_mv, best_cost, cost_for);
+        (best_mv, sad_for(best_mv))
     }
 
     /// Search the previous luma reference for the single best
@@ -15983,8 +16057,38 @@ const HALF_PIXEL_NEIGHBORS: [(i32, i32); 8] = [
 /// refinement ([`refine_half_pixel_mv`]) then probes the odd
 /// neighbours of the winner exactly as before.
 fn whole_pixel_step_search(sad_for: impl Fn(MotionVector) -> u32) -> (MotionVector, u32) {
+    whole_pixel_step_search_seeded(&[], sad_for)
+}
+
+/// [`whole_pixel_step_search`] with predictor seeding: before the
+/// four-step descent the zero vector *and* every `seeds` entry are
+/// probed, and the descent runs around the best of them. Seeds come
+/// from vectors the frame already paid for (the running §7.5.2
+/// `LAST1` / `LAST2` predictors, the previous macro block's searched
+/// winner), so content whose motion exceeds the descent's ±15-pixel
+/// reach from zero — or whose SAD surface has local minima the
+/// zero-centred descent falls into — starts next to the true motion.
+/// The zero-bias tie rule is kept: a seed (or any probe) must
+/// *strictly* beat the running best, so an all-equal field still codes
+/// the free zero vector. Seeds with odd (half-pixel) components are
+/// legal; the descent preserves their parity and the §7.5.1 half-pixel
+/// refinement still probes the final winner's neighbours.
+fn whole_pixel_step_search_seeded(
+    seeds: &[MotionVector],
+    sad_for: impl Fn(MotionVector) -> u32,
+) -> (MotionVector, u32) {
     let mut best_mv = MotionVector::ZERO;
     let mut best_sad = sad_for(MotionVector::ZERO);
+    for &seed in seeds {
+        if seed == MotionVector::ZERO {
+            continue;
+        }
+        let sad = sad_for(seed);
+        if sad < best_sad {
+            best_sad = sad;
+            best_mv = seed;
+        }
+    }
     // Step distances in whole pixels; vector components are doubled.
     for step in [8i32, 4, 2, 1] {
         let (cx, cy) = (best_mv.x as i32, best_mv.y as i32);

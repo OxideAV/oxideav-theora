@@ -30,6 +30,25 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ### Added
 
+- **Predictor-seeded motion search with an in-search MV rate penalty
+  (round 453)** — the rate-distortion path's four-step whole-pixel
+  descent now starts from the best of the zero vector, the running
+  §7.5.2 `LAST1` / `LAST2` predictors, and the previous macro block's
+  searched winner (per reference frame), so motion beyond the
+  zero-centred descent's ±15-pixel reach — or across a SAD surface
+  whose zero-basin is a local minimum — is found at vectors the frame
+  has already paid for; the zero-bias tie rule is unchanged. Each
+  probe is additionally loaded with `√λ ×` its Table 7.23 bit cost
+  (unpenalized SAD still decides previous-vs-golden), bounding how far
+  the descent wanders for noise-level SAD gains. Measured
+  (`rd_ladder`): **−2.4 % mean BD-rate / +0.37 dB mean BD-PSNR** on
+  top of the RDOQ baseline (square0 −5.7 %, cut −4.6 %,
+  fx-all-mb-modes −3.2 %, pan −1.3 %, others neutral). Corpus
+  re-pinned; external route re-run — **15/15 byte-identical**
+  black-box reference decodes.
+
+### Added
+
 - **Rate-distortion-optimized quantization (round 453)** — every coded
   block's AC levels are refined against the measured §7.7 token plan:
   each non-zero coefficient (zig-zag order, last to first, two passes)

@@ -4,6 +4,67 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-theora/compare/v0.0.11...v0.0.12) - 2026-08-30
+
+### Other
+
+- measured rate-distortion section — round-453 ladder, BD gains, elections
+- with_adaptive_quant_auto (opt-in, measured) + lflims/keyframe-interval election experiments
+- two-pass rate control — measured budget schedule + ACSCALE-seeded quantizer
+- P-frame block decisions re-priced against the frame's elected Huffman selectors
+- predictor-seeded motion search + in-search MV rate penalty
+- update three premises RDOQ invalidated
+- rate-distortion-optimized quantization on every coded block's AC levels
+- MVMODE=0 Table 7.23 motion-vector coding, elected by measured rate
+- chroma predictors use the §7.5.1 quarter-pixel split; rd_ladder measurement harness
+- pin + externally validate the composed rate-control/adaptive-quant stream
+- compose rate control with adaptive quantization
+- seed fuzz corpus with third-party spellings; dedup shared setup constant
+- third-party decode fixtures pixel-exact — all pixel formats + all eight modes
+- describe fixture table spellings without attributive naming
+- §5.2.5 zero-bit-at-exact-end pin + reference-table variant in the frame-chain fuzz target
+- README — round 437 robustness/fuzzing section, decode-corner validation tallies
+- fuzz — seed decode_headers with the reference-encoded fixture headers
+- exhaustive truncation + corruption sweeps on the reference fixture packets
+- decode-corner corpus — lflims ceiling/zero + multi-range quant, 3/3 externally pixel-exact
+- fuzz harness — five targets over the decode surface
+- reject quant ranges referencing base matrices past NBMS
+- doc — the staged corpus carries eleven Ogg streams, not ten
+- README — document the codec side of Ogg carriage
+- carriage rehearsal across pixel formats + packet-level qi sweep
+- pin the §A.2.3 mapping against every data page of the staged corpus
+- declare the identification-header payload magic on the registration
+- §6.1 packet classification — header/data routing a demuxer can drive blind
+- §A.2.3 granule-position mapping — split/join, frame/keyframe/count inverses, VREV<1 normalization, mux tracker
+- Mark internal primitives #[doc(hidden)] so semver-checks ignores them
+- tuning docs — the first-pass tally is a profile, not a byte-exact promise
+- rate-control anti-windup — clamp fullness to the step's +-8-budget reach
+- README — external validation, step-derived lambda, gated scene-cut
+- scene-cut fires on a relative difference spike, not sustained motion
+- pinned self-encoded corpus after 11/11 external decode validation
+- RD lambda from the actual quantizer step (was a wrong-slope qi ramp)
+- for_picture — container-carriable KFGSHIFT default (6, was 0)
+- README — modernize the encoder summary and validation notes
+- clippy — pass the Copy closure by value to the step search
+- four-step whole-pixel motion search (±15-pixel reach)
+- declare the rate-control target in the §6.2 NOMBR field
+- encoder-output corruption storm + randomized format/qi stress
+- duplicate-frame detection — zero-byte packet emission
+- rate-distortion per-block skip on INTER_NOMV macro blocks
+- §2.2 picture-region (non-MB-aligned) encoding end-to-end
+- §7.5.1 half-pixel motion-vector refinement in the encoder search
+- add CI / crates.io / docs.rs / MIT-license badges
+- README — round 387 inter-side encoder quality
+- measured-rate keyframe policy (golden-frame refresh on reference decay)
+- wire adaptive quantization into TheoraEncoder P-frames
+- adaptive block-level quantization on the inter encoder (§7.1 MOREQIS + §7.6 on P-frames)
+- INTRA joins the P-frame RD mode decision (8th coding mode)
+- measured §7.7 token rate in the RD mode + adaptive-quant decisions
+- fix clippy lints in the §7.4 scheme-selection commit
+- frame-optimal §7.4 mode-coding scheme selection
+- mixed I/P GOP two-pass Huffman tuning (four tuned codebooks)
+- inter-frame §7.7 token statistics (plan/write split)
+
 ### Fixed
 
 - **Encoder chroma predictors used the luma half-pixel split (round

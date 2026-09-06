@@ -693,10 +693,17 @@ equal-or-lower PSNR), with the scene-cut and measured-rate keyframe
 policies covering content changes — the `TheoraEncoder` guidance is
 interval 16–30 plus those policies, not short intervals.
 
-## Robustness and fuzzing (round 437)
+## Robustness and fuzzing (round 437, extended round 457)
 
-The decode surface is fuzzed by a `fuzz/` sub-crate with five
-libFuzzer targets: arbitrary bytes at the three §6 header decoders
+The decode surface is fuzzed by a `fuzz/` sub-crate with six
+libFuzzer targets (round 457 added `setup_header_pair`, a structured
+writer/parser target: fuzz-perturbed *valid* §6.4 tables — 7-bit
+loop-filter limits including the `NBITS = 0` table, 16-bit scale
+ladders, up to eight base matrices, fresh multi-range quant layouts —
+must serialize, parse, decode back equal, re-serialize
+byte-identically and evaluate §6.4.3 everywhere; the encoder→decoder
+contract target now also drives lookahead, VBV and activity masking;
+bounded sessions of all six this round found nothing): arbitrary bytes at the three §6 header decoders
 (with the crate's own serializers as self-inverse oracles — an
 accepted ident header re-encodes byte-exactly, accepted setup tables
 survive an encode → decode fixpoint), hostile §7 packet chains

@@ -122,6 +122,19 @@ All notable changes to `oxideav-theora` are recorded here.
   (`square0`), 0.72 → 0.48 s (`blobs`) — 1.5× throughout (176×144:
   ≈ 94 → 140 fps on `pan`, 164 → 245 fps on `square0`, per-frame
   encode + decode).
+- **Fuzzing (round 457)** — new structured `setup_header_pair` target:
+  fuzz-perturbed *valid* setup tables (7-bit loop-filter limits
+  including the all-zero `NBITS = 0` table, 16-bit scale ladders,
+  1..=8 base matrices, fresh 1..=4-range quant layouts per `(qti,
+  pli)`) must serialize, parse, decode back equal, re-serialize
+  byte-identically, and evaluate §6.4.3 at every `(qti, pli, qi)`.
+  `encode_decode_roundtrip` now also drives lookahead windows, VBV
+  models and activity masking through `flush`, asserting source-order
+  `pts`. Bounded foreground sessions this round: `setup_header_pair`
+  157k runs / 300 s, `encode_decode_roundtrip` 6.5k / 240 s,
+  `decode_headers` 917k / 120 s, `decode_frame_chain` 91k / 60 s,
+  `decoder_trait_stream` 361k / 60 s, `granule_mapping` 8.7M / 30 s —
+  no findings.
 - `CORPUS_DUMP` in `tests/encoded_corpus.rs` also writes each
   scenario's `<name>.recon` (this crate's reconstruction) next to the
   `.chain`, so the black-box decode route byte-compares without a

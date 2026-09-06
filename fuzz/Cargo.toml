@@ -95,3 +95,14 @@ name = "encode_decode_roundtrip"
 path = "fuzz_targets/encode_decode_roundtrip.rs"
 test = false
 doc = false
+
+# Structured writer/parser pair: fuzz-perturbed *valid* setup tables
+# (loop-filter limits incl. the NBITS = 0 table, 16-bit scale
+# ladders, 1..=8 base matrices, fresh 1..=4-range quant layouts per
+# (qti, pli)) must serialize, parse, decode back equal, re-serialize
+# byte-identically, and evaluate §6.4.3 at every (qti, pli, qi).
+[[bin]]
+name = "setup_header_pair"
+path = "fuzz_targets/setup_header_pair.rs"
+test = false
+doc = false

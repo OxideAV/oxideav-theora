@@ -5,9 +5,11 @@
 //! Fuzz bytes choose a picture geometry (1..=48 per axis,
 //! non-macro-block-aligned included), pixel format, quantizer,
 //! keyframe interval, inter-mode strategy, optional adaptive
-//! quantization / target-bitrate rate control, and every plane's
-//! content. `TheoraEncoder` (zero-setup VP3-defaults entry point)
-//! encodes the frames through the `oxideav_core::Encoder` trait;
+//! quantization / activity masking / target-bitrate rate control /
+//! lookahead window / VBV model, and every plane's content.
+//! `TheoraEncoder` (the zero-setup encoder-defaults entry point)
+//! encodes the frames through the `oxideav_core::Encoder` trait
+//! (`flush` drains a lookahead window);
 //! the emitted packet chain is then decoded back through the
 //! `make_decoder` factory fed the encoder's own advertised
 //! `output_params` (the length-prefixed extradata header chain).
@@ -75,6 +77,16 @@ fuzz_target!(|data: &[u8]| {
     if opts & 0x10 != 0 {
         enc = enc.with_target_bitrate(200_000);
     }
+    if opts & 0x20 != 0 {
+        enc = enc.with_activity_masking(1 + (opts >> 6));
+    }
+    if opts & 0x08 != 0 {
+        // A window of 1..=3 frames; with rate control also a VBV.
+        enc = enc.with_lookahead(1 + (opts >> 6) as usize);
+        if opts & 0x10 != 0 {
+            enc = enc.with_vbv_buffer(20_000 + 40_000 * (opts >> 6) as u64);
+        }
+    }
 
     // Plane fill: cycle the fuzz content bytes with a per-frame,
     // per-plane offset so successive frames differ (exercising the
@@ -110,6 +122,17 @@ fuzz_target!(|data: &[u8]| {
             packets.push(pkt);
         }
     }
+    enc.flush().expect("flush drains the lookahead window");
+    while let Ok(pkt) = enc.receive_packet() {
+        packets.push(pkt);
+    }
+    // Data packets come out in source order whatever the window.
+    let pts: Vec<i64> = packets
+        .iter()
+        .filter(|p| !p.flags.header)
+        .map(|p| p.pts.expect("data packets carry pts"))
+        .collect();
+    assert_eq!(pts, (0..nframes as i64).collect::<Vec<_>>(), "source order");
 
     // Every packet must classify; header flags must agree with §6.1.
     let mut n_data = 0usize;

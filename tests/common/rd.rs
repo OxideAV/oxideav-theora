@@ -293,6 +293,8 @@ pub struct Point {
     /// Mean luma SSIM (8×8 windows, stride 4) over the sequence.
     pub ssim_y: f64,
     pub keyframes: usize,
+    /// Closest approach of the encoder's VBV model, when one was set.
+    pub vbv_min_bits: Option<f64>,
 }
 
 pub fn video_frame(seq: &Sequence, t: usize) -> VideoFrame {
@@ -335,6 +337,7 @@ pub fn measure(
     }
     // Drain any lookahead the encoder is holding.
     enc.flush().unwrap();
+    let vbv_min_bits = enc.vbv_min_level_bits();
     let mut pkts: Vec<Packet> = Vec::new();
     loop {
         match enc.receive_packet() {
@@ -363,6 +366,10 @@ pub fn measure(
     }
 
     let mut dec = TheoraDecoder::new(CodecId::new(THEORA_CODEC_ID));
+    // With `out`, the decoded frames are also written as `<name>.recon`
+    // (cropped top-down planes, concatenated) next to the chain, for
+    // the black-box decode comparison.
+    let mut recon: Vec<u8> = Vec::new();
     let mut sse_y = 0f64;
     let mut sse_c = 0f64;
     let mut ssim_sum = 0f64;
@@ -386,6 +393,9 @@ pub fn measure(
             let mut sse = 0u64;
             for row in 0..*h {
                 let got = &pl.data[row * pl.stride..row * pl.stride + w];
+                if out.is_some() {
+                    recon.extend_from_slice(got);
+                }
                 let want = &src[row * w..row * w + w];
                 for (a, b) in got.iter().zip(want) {
                     let d = *a as i64 - *b as i64;
@@ -414,6 +424,10 @@ pub fn measure(
         t += 1;
     }
     assert_eq!(t, seq.frames.len(), "{}: decoded frame count", seq.name);
+    if let Some(dir) = out {
+        let fname = dir.join(format!("{}-{}.recon", seq.name, label.replace(' ', "_")));
+        std::fs::write(fname, &recon).unwrap();
+    }
     let n = seq.frames.len() as f64;
     let ny = n * (seq.width * seq.height) as f64;
     let nc = 2.0 * n * ((seq.width / 2) * (seq.height / 2)) as f64;
@@ -425,6 +439,7 @@ pub fn measure(
         psnr_c: psnr(sse_c, nc),
         ssim_y: ssim_sum / n,
         keyframes,
+        vbv_min_bits,
     }
 }
 

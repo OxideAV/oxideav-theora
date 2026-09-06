@@ -17599,6 +17599,220 @@ pub struct TheoraEncoder {
     /// the single-`qi` paths. Non-RD inter strategies are unaffected
     /// (they have no adaptive variant).
     adaptive_qis: Option<Vec<u8>>,
+    /// Lookahead depth in frames (`with_lookahead`). `0` codes every
+    /// frame on `send_frame` (the historical behaviour); `n > 0`
+    /// holds up to `n` source frames and plans each frame against the
+    /// ones after it — keyframe placement from a two-sided scene-cut
+    /// detector, interval keyframes deferred onto an upcoming cut,
+    /// and (under rate control) a complexity-weighted window budget
+    /// with a VBV clamp. `flush` drains the window.
+    lookahead: usize,
+    /// The held source frames with their source-domain statistics,
+    /// oldest first.
+    lookahead_queue: std::collections::VecDeque<LookaheadFrame>,
+    /// Luma of the most recent frame that entered the window (or was
+    /// coded), the reference for the next frame's `inter_mad`.
+    lookahead_prev_luma: Option<Vec<u8>>,
+    /// Optional decoder-buffer (VBV) model consulted by the lookahead
+    /// planner under rate control (`with_vbv_buffer`).
+    vbv: Option<VbvModel>,
+    /// Bits-per-complexity model fitted from the coded frames, the
+    /// lookahead planner's rate predictor.
+    rate_model: RateModel,
+}
+
+/// One frame held in the lookahead window with the source-domain
+/// statistics the planner reads.
+struct LookaheadFrame {
+    frame: SourceFrame,
+    pts: Option<i64>,
+    /// Mean absolute luma difference against the previous source frame
+    /// (a zero-vector inter-cost proxy, in sample units).
+    inter_mad: f64,
+    /// Mean absolute deviation of each 8×8 luma block from its own mean,
+    /// averaged over the frame (an intra-cost proxy, in sample units).
+    intra_act: f64,
+}
+
+/// Decoder-buffer (VBV / leaky-bucket) model: the buffer fills at the
+/// target rate (`bits_per_frame` per frame interval) and each coded
+/// frame is removed whole at its decode time, so a frame larger than
+/// the current level would stall a real decoder. The planner picks a
+/// quantizer whose predicted size fits the level; `min_level` records
+/// the closest approach (negative = a modelled underflow).
+#[derive(Debug, Clone, Copy)]
+struct VbvModel {
+    size_bits: f64,
+    level_bits: f64,
+    min_level_bits: f64,
+}
+
+impl VbvModel {
+    fn new(size_bits: f64) -> Self {
+        Self {
+            size_bits,
+            level_bits: size_bits,
+            min_level_bits: size_bits,
+        }
+    }
+
+    /// Remove a coded frame, then let one frame interval of the target
+    /// rate flow in (overflow is dropped — a real stream would pad).
+    fn observe(&mut self, coded_bits: f64, bits_per_frame: f64) {
+        self.level_bits -= coded_bits;
+        self.min_level_bits = self.min_level_bits.min(self.level_bits);
+        self.level_bits = (self.level_bits + bits_per_frame).min(self.size_bits);
+    }
+}
+
+/// Bits-per-complexity model, one fit per frame type:
+/// `ln(bits / complexity) = a + γ · ln(ACSCALE[32] / ACSCALE[qi])`.
+///
+/// Intra frames are measured against `intra_act`, inter frames
+/// against `inter_mad`. The §B.3 `ACSCALE` ladder supplies the shape
+/// of the quantizer axis and the exponent `γ` is fitted online: the
+/// rate of cheap content is dominated by headers, modes and DC terms
+/// and barely moves with the quantizer (the battery's `square0`
+/// doubles from qi 8 to qi 56 while the ladder moves 11.7×), busy
+/// content tracks the ladder and beyond (`pan` 15×), so a fixed
+/// exponent mis-sizes one or the other by a factor of several. Each
+/// type keeps exponentially-forgotten least-squares sums over the
+/// coded frames; until the fit has seen two distinct quantizers the
+/// exponent is a 0.6 prior.
+#[derive(Debug, Clone, Copy, Default)]
+struct RateModel {
+    intra: RateFit,
+    inter: RateFit,
+}
+
+/// Forgetting least-squares sums for one frame type.
+#[derive(Debug, Clone, Copy, Default)]
+struct RateFit {
+    n: f64,
+    sx: f64,
+    sy: f64,
+    sxx: f64,
+    sxy: f64,
+    /// Exponential average of `actual / predicted` for the coded
+    /// frames of this type — how far the fit has been running under
+    /// the truth lately. The VBV planner scales predictions by it so
+    /// a buffer decision is taken against the fit's recent error, not
+    /// its optimism.
+    bias: f64,
+}
+
+impl RateFit {
+    /// Forgetting factor applied to the sums before each new frame.
+    const FORGET: f64 = 0.8;
+    /// Exponent prior before the fit has quantizer variation, and the
+    /// clamp range once it has.
+    const GAMMA_PRIOR: f64 = 0.6;
+    const GAMMA_RANGE: (f64, f64) = (0.2, 1.6);
+
+    fn observe(&mut self, x: f64, y: f64, predicted_y: Option<f64>) {
+        if let Some(py) = predicted_y {
+            let ratio = (y - py).exp().clamp(0.25, 4.0);
+            self.bias = if self.n <= 0.0 {
+                ratio
+            } else {
+                0.5 * self.bias + 0.5 * ratio
+            };
+        } else if self.n <= 0.0 {
+            self.bias = 1.0;
+        }
+        self.n *= Self::FORGET;
+        self.sx *= Self::FORGET;
+        self.sy *= Self::FORGET;
+        self.sxx *= Self::FORGET;
+        self.sxy *= Self::FORGET;
+        self.n += 1.0;
+        self.sx += x;
+        self.sy += y;
+        self.sxx += x * x;
+        self.sxy += x * y;
+    }
+
+    /// `(a, γ)` of the fit, `None` before any frame.
+    fn coefficients(&self) -> Option<(f64, f64)> {
+        if self.n <= 0.0 {
+            return None;
+        }
+        let det = self.n * self.sxx - self.sx * self.sx;
+        let gamma = if det > 1e-6 * self.n * self.n {
+            ((self.n * self.sxy - self.sx * self.sy) / det)
+                .clamp(Self::GAMMA_RANGE.0, Self::GAMMA_RANGE.1)
+        } else {
+            Self::GAMMA_PRIOR
+        };
+        let a = (self.sy - gamma * self.sx) / self.n;
+        Some((a, gamma))
+    }
+}
+
+impl RateModel {
+    /// Log of the relative rate scale of `qi` against the reference
+    /// index 32 (the fit's abscissa).
+    fn x(qi: u8) -> f64 {
+        (ACSCALE_VP3[32] as f64 / ACSCALE_VP3[qi.min(63) as usize] as f64).ln()
+    }
+
+    fn fit(&self, keyframe: bool) -> &RateFit {
+        if keyframe {
+            &self.intra
+        } else {
+            &self.inter
+        }
+    }
+
+    fn observe(&mut self, keyframe: bool, complexity: f64, qi: u8, bits: f64) {
+        if complexity <= 0.0 || bits <= 0.0 {
+            return;
+        }
+        let y = (bits / complexity).ln();
+        let x = Self::x(qi);
+        let fit = if keyframe {
+            &mut self.intra
+        } else {
+            &mut self.inter
+        };
+        let predicted_y = fit.coefficients().map(|(a, g)| a + g * x);
+        fit.observe(x, y, predicted_y);
+    }
+
+    /// [`Self::predict`] scaled by the type's recent `actual /
+    /// predicted` ratio — the pessimistic size the VBV planner budgets
+    /// against.
+    fn predict_calibrated(&self, keyframe: bool, complexity: f64, qi: u8) -> Option<f64> {
+        let bias = self.fit(keyframe).bias.max(1.0);
+        self.predict(keyframe, complexity, qi).map(|p| p * bias)
+    }
+
+    /// Predicted bits for a frame of `complexity` at `qi`, `None`
+    /// until a frame of that type has been measured.
+    fn predict(&self, keyframe: bool, complexity: f64, qi: u8) -> Option<f64> {
+        let (a, gamma) = self.fit(keyframe).coefficients()?;
+        Some((a + gamma * Self::x(qi)).exp() * complexity)
+    }
+}
+
+/// What the lookahead planner decided for the frame about to be coded.
+#[derive(Debug, Clone, Copy, Default)]
+struct LookaheadPlan {
+    /// The lookahead window is active: its two-sided detector replaces
+    /// the in-loop scene-cut test and its model update runs.
+    active: bool,
+    /// Code this frame intra (a cut lands on it).
+    force_keyframe: bool,
+    /// Hold an interval keyframe that is due: a cut sits within the
+    /// window and the keyframe will land on it instead.
+    defer_keyframe: bool,
+    /// Frame-level quantizer chosen by the rate model, when it could.
+    qi: Option<u8>,
+    /// Explicit per-frame budget for the bucket, when planned.
+    budget: Option<f64>,
+    /// The frame's complexity measure (intra or inter, per its type),
+    /// fed back to the rate model.
+    complexity: f64,
 }
 
 /// A target-bitrate rate-control loop that adapts the frame-level
@@ -18018,6 +18232,11 @@ impl TheoraEncoder {
             keyframe_rate_ratio: None,
             last_keyframe_bytes: None,
             adaptive_qis: None,
+            lookahead: 0,
+            lookahead_queue: std::collections::VecDeque::new(),
+            lookahead_prev_luma: None,
+            vbv: None,
+            rate_model: RateModel::default(),
         })
     }
 
@@ -18228,6 +18447,266 @@ impl TheoraEncoder {
     pub fn with_scene_cut_threshold(mut self, threshold: f64) -> Self {
         self.scene_cut_threshold = Some(threshold);
         self
+    }
+
+    /// Hold up to `frames` source frames in a lookahead window and plan
+    /// each frame against the ones after it before coding it.
+    ///
+    /// With the window the encoder places keyframes from a two-sided
+    /// scene-cut detector (a frame whose source-domain difference
+    /// against its predecessor spikes above both the absolute
+    /// [`Self::with_scene_cut_threshold`] level — default 24 when the
+    /// threshold was not set — and twice the difference of the frames
+    /// around it, on *both* sides, is coded intra), defers an interval
+    /// keyframe that is due when a cut sits inside the window (the
+    /// keyframe lands on the cut instead of a few frames before it —
+    /// two keyframes a handful of frames apart cost a whole intra
+    /// frame for nothing), and, under rate control, sizes each frame's
+    /// budget from the window's complexity profile (`intra_act` for
+    /// planned keyframes, `inter_mad` for inter frames, through the
+    /// bits-per-complexity model fitted on the coded frames) with the
+    /// [`Self::with_vbv_buffer`] clamp. Packets come out `frames`
+    /// frames late; [`oxideav_core::Encoder::flush`] drains the
+    /// window. `0` restores the code-on-arrival behaviour exactly.
+    pub fn with_lookahead(mut self, frames: usize) -> Self {
+        self.lookahead = frames;
+        self
+    }
+
+    /// Model a decoder buffer of `size_bits` for the lookahead planner
+    /// under rate control: the buffer fills at the target rate and
+    /// each frame is removed whole, and the planned quantizer is
+    /// lowered until the predicted frame fits the buffer level. Only
+    /// consulted when both [`Self::with_lookahead`] and a target
+    /// bitrate are set. [`Self::vbv_min_level_bits`] reports the
+    /// closest approach afterwards.
+    pub fn with_vbv_buffer(mut self, size_bits: u64) -> Self {
+        self.vbv = Some(VbvModel::new(size_bits.max(1) as f64));
+        self
+    }
+
+    /// Lowest level (in bits) the [`Self::with_vbv_buffer`] model
+    /// reached so far — negative means a modelled decoder underflow.
+    /// `None` without a VBV model.
+    pub fn vbv_min_level_bits(&self) -> Option<f64> {
+        self.vbv.map(|v| v.min_level_bits)
+    }
+
+    /// Source-domain statistics of one frame for the lookahead window:
+    /// the mean absolute luma difference against `prev` (when it has
+    /// the same size) and the mean absolute deviation of each 8×8 luma
+    /// block from its own mean.
+    fn lookahead_stats(frame: &SourceFrame, width: u32, prev: Option<&[u8]>) -> (f64, f64) {
+        let y = &frame.samples_y;
+        let inter_mad = match prev {
+            Some(p) if p.len() == y.len() && !y.is_empty() => {
+                let total: u64 = y
+                    .iter()
+                    .zip(p.iter())
+                    .map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs() as u64)
+                    .sum();
+                total as f64 / y.len() as f64
+            }
+            _ => 0.0,
+        };
+        let w = width as usize;
+        let h = y.len().checked_div(w).unwrap_or(0);
+        let mut dev_total = 0u64;
+        let mut blocks = 0u64;
+        let mut by = 0;
+        while by + 8 <= h {
+            let mut bx = 0;
+            while bx + 8 <= w {
+                let mut sum = 0u32;
+                for r in 0..8 {
+                    for c in 0..8 {
+                        sum += y[(by + r) * w + bx + c] as u32;
+                    }
+                }
+                let mean = ((sum + 32) / 64) as i32;
+                for r in 0..8 {
+                    for c in 0..8 {
+                        dev_total += (y[(by + r) * w + bx + c] as i32 - mean).unsigned_abs() as u64;
+                    }
+                }
+                blocks += 1;
+                bx += 8;
+            }
+            by += 8;
+        }
+        let intra_act = if blocks == 0 {
+            0.0
+        } else {
+            dev_total as f64 / (blocks * 64) as f64
+        };
+        (inter_mad, intra_act)
+    }
+
+    /// Plan the frame at the front of the lookahead window.
+    fn plan_front(&self) -> LookaheadPlan {
+        let n = self.lookahead_queue.len();
+        let mut plan = LookaheadPlan {
+            active: true,
+            ..LookaheadPlan::default()
+        };
+        if n == 0 {
+            return plan;
+        }
+        let interval = self.keyframe_interval.max(1);
+        let since = self.frames_since_keyframe;
+        let threshold = self.scene_cut_threshold.unwrap_or(24.0);
+
+        // Two-sided cut detection over the window: frame j is a cut
+        // when its difference against its predecessor is large both
+        // absolutely and relative to the differences around it — the
+        // window frames other than j plus the GOP's running average
+        // (steady fast motion keeps every difference high but flat).
+        // Frame 0 right after a keyframe has no meaningful difference
+        // (its reference is one frame old) and is never a cut.
+        let mads: Vec<f64> = self.lookahead_queue.iter().map(|f| f.inter_mad).collect();
+        let is_cut = |j: usize| -> bool {
+            if mads[j] <= threshold {
+                return false;
+            }
+            if j == 0 && (self.mirror.is_none() || since == 0) {
+                return false;
+            }
+            let mut others: Vec<f64> = mads
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != j)
+                .map(|(_, &m)| m)
+                .collect();
+            if let Some(avg) = self.scene_cut_mad_avg {
+                others.push(avg);
+            }
+            if others.is_empty() {
+                return false;
+            }
+            let mean = others.iter().sum::<f64>() / others.len() as f64;
+            mads[j] > 2.0 * mean
+        };
+        let cut_at = (0..n).find(|&j| is_cut(j));
+
+        let first = self.mirror.is_none();
+        plan.force_keyframe = !first && cut_at == Some(0);
+        // Defer an interval keyframe onto an upcoming cut when the cut
+        // is inside the window; the GOP may stretch by at most the
+        // window depth.
+        if !first && since >= interval {
+            if let Some(j) = cut_at {
+                if j > 0 && since as usize + j <= interval as usize + self.lookahead {
+                    plan.defer_keyframe = true;
+                }
+            }
+        }
+        let key0 = first || plan.force_keyframe || (since >= interval && !plan.defer_keyframe);
+        let front = &self.lookahead_queue[0];
+        plan.complexity = if key0 {
+            front.intra_act
+        } else {
+            front.inter_mad
+        };
+
+        // Rate planning: the frame's complexity-weighted share of the
+        // window's nominal budget. The bucket's proportional law still
+        // chooses the quantizer and corrects any deviation; the plan
+        // only shapes *when* the bucket moves — a keyframe is budgeted
+        // for its bulk (so it does not slam the frames after it) and a
+        // cheap frame for its cheapness (so its savings bank as
+        // credit instead of reading as "under budget, raise qi"). This
+        // is the two-pass schedule's mechanism with the shares
+        // estimated online from the source statistics through the
+        // fitted rate model instead of measured by a probe encode. A
+        // planner that also chose the quantizer from the model was
+        // measured at 10 % mean rate error against the bucket's 2 %
+        // (96-frame runs): the first-order model is good enough to
+        // rank frames, not to size them.
+        let Some(rc) = self.rate_control.as_ref() else {
+            return plan;
+        };
+        // Frame types across the window, replaying the keyframe rules.
+        let mut kinds = Vec::with_capacity(n);
+        let mut s = since;
+        for i in 0..n {
+            let key = if i == 0 {
+                key0
+            } else {
+                let due = s >= interval;
+                let deferred = due
+                    && cut_at.is_some_and(|j| {
+                        j > i && s as usize + (j - i) <= interval as usize + self.lookahead
+                    });
+                cut_at == Some(i) || (due && !deferred)
+            };
+            kinds.push(key);
+            s = if key { 1 } else { s + 1 };
+        }
+        let qi_ref = rc.next_qi;
+        let mut preds = Vec::with_capacity(n);
+        for (i, f) in self.lookahead_queue.iter().enumerate() {
+            let c = if kinds[i] { f.intra_act } else { f.inter_mad };
+            let Some(p) = self.rate_model.predict(kinds[i], c, qi_ref) else {
+                return plan;
+            };
+            preds.push(p.max(1.0));
+        }
+        let total: f64 = preds.iter().sum();
+        let budget = rc.bits_per_frame * n as f64 * preds[0] / total;
+        plan.budget = Some(budget);
+        // VBV planning. Simulate the buffer across the window at the
+        // bucket's operating point (calibrated predictions): the front
+        // frame must fit what the buffer holds now, and if a later
+        // frame — typically the keyframe the window can see coming —
+        // would drain it below the guard band, the front frame gives
+        // up the deficit so the level is rebuilt before the big frame
+        // rather than crashed by it. Either way the quantizer is
+        // lowered until the calibrated prediction fits.
+        if let Some(vbv) = self.vbv {
+            let guard = 0.02 * vbv.size_bits;
+            let mut cal = Vec::with_capacity(n);
+            for (i, f) in self.lookahead_queue.iter().enumerate() {
+                let c = if kinds[i] { f.intra_act } else { f.inter_mad };
+                let Some(p) = self.rate_model.predict_calibrated(kinds[i], c, qi_ref) else {
+                    return plan;
+                };
+                cal.push(p.max(1.0));
+            }
+            let mut level = vbv.level_bits;
+            let mut min_level = f64::INFINITY;
+            for &p in &cal {
+                level -= p;
+                min_level = min_level.min(level);
+                level = (level + rc.bits_per_frame).min(vbv.size_bits);
+            }
+            let deficit = (guard - min_level).max(0.0);
+            let room = (vbv.level_bits - guard)
+                .min(cal[0] - deficit)
+                .max(0.2 * cal[0]);
+            let mut qi = qi_ref;
+            while qi > rc.qi_min {
+                match self
+                    .rate_model
+                    .predict_calibrated(key0, plan.complexity, qi)
+                {
+                    Some(p) if p > room => qi -= 1,
+                    _ => break,
+                }
+            }
+            if qi != qi_ref {
+                plan.qi = Some(qi);
+            }
+        }
+        plan
+    }
+
+    /// Pop the front of the lookahead window and code it.
+    fn encode_front(&mut self) -> Result<(), Error> {
+        let plan = self.plan_front();
+        let Some(front) = self.lookahead_queue.pop_front() else {
+            return Ok(());
+        };
+        self.push_source_frame_with_plan(&front.frame, front.pts, plan)
     }
 
     /// Enable the measured-rate keyframe policy (the golden-frame
@@ -18492,68 +18971,10 @@ impl TheoraEncoder {
         self
     }
 
-    /// Encode one already-converted [`SourceFrame`] into a queued §7
-    /// data packet, choosing intra (keyframe) or inter (P-frame) per the
-    /// keyframe-interval policy. The encoder mirrors its own output
-    /// through an internal [`FrameDecoder`] so inter frames predict from
-    /// the exact reconstructed references the downstream decoder holds.
-    fn push_source_frame(&mut self, frame: &SourceFrame, pts: Option<i64>) -> Result<(), Error> {
-        // Decide intra vs inter: the very first frame, and every frame
-        // at a keyframe boundary, is intra.
-        let mut want_keyframe =
-            self.mirror.is_none() || self.frames_since_keyframe >= self.keyframe_interval;
-
-        // Scene-cut detection: when enabled and this frame would otherwise
-        // be an inter frame, compare the incoming source luma against the
-        // previous reconstructed reference. A mean absolute difference that
-        // is large both absolutely (past the threshold) and relatively
-        // (more than twice the GOP's running average difference) signals a
-        // scene change — inter prediction against an unrelated reference
-        // would code a residual nearly as large as a fresh intra frame, so
-        // force a keyframe instead (smaller, and it resets the references
-        // cleanly). The relative gate is what separates a *cut* from
-        // steadily fast-moving content: motion keeps the difference high
-        // but flat frame over frame, and an externally-measured stream that
-        // converted every such frame to intra ran 1.5× the bytes of the
-        // gated spelling at 1.4 dB lower luma PSNR. The first inter frame after a
-        // keyframe only seeds the average — its references are one frame
-        // old, so a "cut" against them is indistinguishable from motion,
-        // and the keyframe it would ask for was just emitted.
-        if !want_keyframe {
-            if let (Some(threshold), Some(mirror)) =
-                (self.scene_cut_threshold, self.mirror.as_ref())
-            {
-                let prev_y = &mirror.reference_store().previous_y;
-                if prev_y.len() == frame.samples_y.len() && !prev_y.is_empty() {
-                    let total: u64 = frame
-                        .samples_y
-                        .iter()
-                        .zip(prev_y.iter())
-                        .map(|(&s, &p)| (s as i16 - p as i16).unsigned_abs() as u64)
-                        .sum();
-                    let mad = total as f64 / frame.samples_y.len() as f64;
-                    match self.scene_cut_mad_avg {
-                        None => self.scene_cut_mad_avg = Some(mad),
-                        Some(avg) => {
-                            if mad > threshold && mad > 2.0 * avg {
-                                want_keyframe = true;
-                            } else {
-                                self.scene_cut_mad_avg = Some(0.5 * avg + 0.5 * mad);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Rate control: pick this frame's quantizer from the running
-        // bucket fullness before encoding. The chosen `qi` lands in the
-        // frame header `QIS[0]`, so the mirror decoder (which reads the
-        // emitted bytes) and any downstream decoder stay in lock-step.
-        if let Some(rc) = self.rate_control.as_ref() {
-            self.frame_encoder.set_qi(rc.qi_for_next_frame())?;
-        }
-
+    /// The effective §7.1 adaptive-quant candidate list for the frame
+    /// about to be coded, derived from the frame encoder's current
+    /// quantizer (see the body for the composition rules).
+    fn effective_adaptive_qis(&self) -> Option<Vec<u8>> {
         // Effective §7.1 adaptive-quant candidate list for this frame.
         // Under rate control the loop owns `qis[0]` — the frame-level
         // quantizer that drives the DC quantizers, the loop-filter
@@ -18567,7 +18988,7 @@ impl TheoraEncoder {
         // through untouched so the encode paths' own validation still
         // rejects it. Without rate control the caller's list is used
         // verbatim, as before.
-        let adaptive_qis: Option<Vec<u8>> = if self.adaptive_quant_auto {
+        if self.adaptive_quant_auto {
             let qi0 = self.frame_encoder.qi();
             let mut eff = vec![qi0];
             for cand in [qi0.saturating_sub(8), (qi0 + 8).min(63)] {
@@ -18590,8 +19011,19 @@ impl TheoraEncoder {
                     qis.clone()
                 }
             })
-        };
+        }
+    }
 
+    /// Code `frame` as decided (`want_keyframe`) at the frame encoder's
+    /// current quantizer, returning the packet bytes and whether an
+    /// inter frame came out de-facto intra (a majority of its
+    /// transmitted macro blocks coded `INTRA`).
+    fn encode_decided(
+        &self,
+        frame: &SourceFrame,
+        want_keyframe: bool,
+        adaptive_qis: &Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, bool), Error> {
         // Set by the RD inter branch below: did the mode decision code a
         // majority of this P-frame's transmitted macro blocks INTRA? A
         // de-facto intra frame is the direct reference-decay signal the
@@ -18599,8 +19031,8 @@ impl TheoraEncoder {
         // trigger alone misses the case where the *new* content is
         // inherently cheaper than the old keyframe's).
         let mut de_facto_intra = false;
-        let mut bytes = if want_keyframe {
-            match &adaptive_qis {
+        let bytes = if want_keyframe {
+            match adaptive_qis {
                 Some(qis) => self.frame_encoder.encode_intra_frame_adaptive(frame, qis)?,
                 None => self.frame_encoder.encode_intra_frame(frame)?,
             }
@@ -18614,7 +19046,7 @@ impl TheoraEncoder {
             match self.inter_mode {
                 InterModeStrategy::RateDistortion => {
                     let single_qi = [self.frame_encoder.qi()];
-                    let qis: &[u8] = match &adaptive_qis {
+                    let qis: &[u8] = match adaptive_qis {
                         Some(q) => q,
                         None => &single_qi,
                     };
@@ -18668,6 +19100,94 @@ impl TheoraEncoder {
                     .encode_inter_frame_four_mv(frame, &refs)?,
             }
         };
+        Ok((bytes, de_facto_intra))
+    }
+
+    /// Encode one already-converted [`SourceFrame`] into a queued §7
+    /// data packet, choosing intra (keyframe) or inter (P-frame) per the
+    /// keyframe-interval policy. The encoder mirrors its own output
+    /// through an internal [`FrameDecoder`] so inter frames predict from
+    /// the exact reconstructed references the downstream decoder holds.
+    fn push_source_frame(&mut self, frame: &SourceFrame, pts: Option<i64>) -> Result<(), Error> {
+        self.push_source_frame_with_plan(frame, pts, LookaheadPlan::default())
+    }
+
+    /// [`Self::push_source_frame`] under a lookahead plan (the default
+    /// plan reproduces the code-on-arrival behaviour exactly).
+    fn push_source_frame_with_plan(
+        &mut self,
+        frame: &SourceFrame,
+        pts: Option<i64>,
+        plan: LookaheadPlan,
+    ) -> Result<(), Error> {
+        // Decide intra vs inter: the very first frame, and every frame
+        // at a keyframe boundary, is intra — unless the lookahead
+        // planner holds the interval keyframe for a cut it can see, or
+        // forces one onto a cut.
+        let mut want_keyframe = self.mirror.is_none()
+            || plan.force_keyframe
+            || (self.frames_since_keyframe >= self.keyframe_interval && !plan.defer_keyframe);
+
+        // Scene-cut detection: when enabled and this frame would otherwise
+        // be an inter frame, compare the incoming source luma against the
+        // previous reconstructed reference. A mean absolute difference that
+        // is large both absolutely (past the threshold) and relatively
+        // (more than twice the GOP's running average difference) signals a
+        // scene change — inter prediction against an unrelated reference
+        // would code a residual nearly as large as a fresh intra frame, so
+        // force a keyframe instead (smaller, and it resets the references
+        // cleanly). The relative gate is what separates a *cut* from
+        // steadily fast-moving content: motion keeps the difference high
+        // but flat frame over frame, and an externally-measured stream that
+        // converted every such frame to intra ran 1.5× the bytes of the
+        // gated spelling at 1.4 dB lower luma PSNR. The first inter frame after a
+        // keyframe only seeds the average — its references are one frame
+        // old, so a "cut" against them is indistinguishable from motion,
+        // and the keyframe it would ask for was just emitted.
+        if !want_keyframe && !plan.active {
+            if let (Some(threshold), Some(mirror)) =
+                (self.scene_cut_threshold, self.mirror.as_ref())
+            {
+                let prev_y = &mirror.reference_store().previous_y;
+                if prev_y.len() == frame.samples_y.len() && !prev_y.is_empty() {
+                    let total: u64 = frame
+                        .samples_y
+                        .iter()
+                        .zip(prev_y.iter())
+                        .map(|(&s, &p)| (s as i16 - p as i16).unsigned_abs() as u64)
+                        .sum();
+                    let mad = total as f64 / frame.samples_y.len() as f64;
+                    match self.scene_cut_mad_avg {
+                        None => self.scene_cut_mad_avg = Some(mad),
+                        Some(avg) => {
+                            if mad > threshold && mad > 2.0 * avg {
+                                want_keyframe = true;
+                            } else {
+                                self.scene_cut_mad_avg = Some(0.5 * avg + 0.5 * mad);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rate control: pick this frame's quantizer from the running
+        // bucket fullness before encoding. The chosen `qi` lands in the
+        // frame header `QIS[0]`, so the mirror decoder (which reads the
+        // emitted bytes) and any downstream decoder stay in lock-step.
+        if let Some(rc) = self.rate_control.as_mut() {
+            if let Some(qi) = plan.qi {
+                // The VBV clamp lowered the bucket's quantizer; the
+                // bucket continues from there.
+                rc.next_qi = qi.clamp(rc.qi_min, rc.qi_max);
+            }
+            self.frame_encoder.set_qi(rc.qi_for_next_frame())?;
+        }
+
+        let adaptive_qis = self.effective_adaptive_qis();
+
+        let (mut bytes, de_facto_intra) =
+            self.encode_decided(frame, want_keyframe, &adaptive_qis)?;
 
         // Measured-rate keyframe policy: an inter frame whose coded
         // size approaches the last keyframe's says the references have
@@ -18725,6 +19245,33 @@ impl TheoraEncoder {
                 }
             }
         }
+        // VBV enforcement: a frame larger than what the modelled
+        // decoder buffer holds would stall a real decoder, and the
+        // planner's calibrated prediction can still be beaten by a
+        // frame it has no precedent for (the keyframe on a cut into
+        // unseen content). Re-code such a frame at a stronger
+        // quantizer — four steps at a time, at most three tries — and
+        // keep the last spelling (it fits, or it is the strongest
+        // tried); the bucket continues from the quantizer used.
+        if let (true, Some(vbv), Some(rc)) = (plan.active, self.vbv, self.rate_control) {
+            let guard = 0.02 * vbv.size_bits;
+            let mut tries = 0;
+            while (bytes.len() as f64) * 8.0 > vbv.level_bits - guard
+                && self.frame_encoder.qi() > rc.qi_min
+                && tries < 3
+            {
+                let qi = self.frame_encoder.qi().saturating_sub(4).max(rc.qi_min);
+                self.frame_encoder.set_qi(qi)?;
+                let qis = self.effective_adaptive_qis();
+                bytes = self.encode_decided(frame, want_keyframe, &qis)?.0;
+                tries += 1;
+            }
+            if tries > 0 {
+                if let Some(rc) = self.rate_control.as_mut() {
+                    rc.next_qi = self.frame_encoder.qi();
+                }
+            }
+        }
         if want_keyframe {
             self.last_keyframe_bytes = Some(bytes.len());
         }
@@ -18747,12 +19294,24 @@ impl TheoraEncoder {
         // frame so its bulk does not spike the quantizer for the P-frames
         // that follow.
         if let Some(rc) = self.rate_control.as_mut() {
-            match self.two_pass.as_mut().and_then(|tp| tp.budgets.pop_front()) {
+            let scheduled = self.two_pass.as_mut().and_then(|tp| tp.budgets.pop_front());
+            match plan.budget.or(scheduled) {
                 Some(budget) => {
                     rc.observe_frame_with_budget(bytes.len(), want_keyframe, Some(budget))
                 }
                 None => rc.observe_frame(bytes.len(), want_keyframe),
             }
+            if let Some(vbv) = self.vbv.as_mut() {
+                vbv.observe(bytes.len() as f64 * 8.0, rc.bits_per_frame);
+            }
+        }
+        if plan.active {
+            self.rate_model.observe(
+                want_keyframe,
+                plan.complexity,
+                self.frame_encoder.qi(),
+                bytes.len() as f64 * 8.0,
+            );
         }
 
         if want_keyframe {
@@ -18855,8 +19414,27 @@ impl oxideav_core::Encoder for TheoraEncoder {
         let source = self
             .video_frame_to_source(vf)
             .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
-        self.push_source_frame(&source, vf.pts)
-            .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+        if self.lookahead == 0 {
+            self.push_source_frame(&source, vf.pts)
+                .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+            return Ok(());
+        }
+        let (inter_mad, intra_act) = Self::lookahead_stats(
+            &source,
+            self.frame_encoder.geometry().dims_y.width,
+            self.lookahead_prev_luma.as_deref(),
+        );
+        self.lookahead_prev_luma = Some(source.samples_y.clone());
+        self.lookahead_queue.push_back(LookaheadFrame {
+            frame: source,
+            pts: vf.pts,
+            inter_mad,
+            intra_act,
+        });
+        while self.lookahead_queue.len() > self.lookahead {
+            self.encode_front()
+                .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -18867,8 +19445,12 @@ impl oxideav_core::Encoder for TheoraEncoder {
     }
 
     fn flush(&mut self) -> oxideav_core::Result<()> {
-        // Intra-only: every frame is emitted on send_frame, so there is
-        // no buffered state to drain.
+        // Drain the lookahead window (a no-op without one: every frame
+        // was emitted on send_frame).
+        while !self.lookahead_queue.is_empty() {
+            self.encode_front()
+                .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+        }
         Ok(())
     }
 }

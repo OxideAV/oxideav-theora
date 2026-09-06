@@ -167,3 +167,10 @@ Re-pins this round, each validated 15/15 byte-identical:
    distortion model.
 2. Motion search: explicit `LAST1` / `LAST2` candidates, priced four-MV
    block searches, iterated half-pixel refinement.
+3. (No re-pin.) Lookahead planning defaults off, so the corpus is
+   unchanged; eight lookahead streams — four fixed-`qi` with the
+   scene-cut profile and four rate-controlled with an 8-frame window
+   and a 40000-bit VBV, 48 frames each, dumped by `rd_ladder --out`
+   (which now writes `.recon` next to each `.chain`) — went through the
+   same route, all byte-identical (two carried a zero-byte duplicate
+   packet, compared over the coded frames).

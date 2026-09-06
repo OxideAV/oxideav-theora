@@ -23,6 +23,9 @@
 //!   --interval <n>     keyframe interval (default 16)
 //!   --qis a,b,c        the qi ladder (default 8,20,32,44,56)
 //!   --bitrates a,b     target-bitrate points (bits per second)
+//!   --lookahead n      hold n frames of lookahead (keyframe planning + rate)
+//!   --frames n         length of the synthetic sequences (default 24)
+//!   --vbv bits         model a decoder buffer of this size under rate control
 //!   --twopass          drive the bitrate points through two-pass control
 //!   --lfscale n/d      rescale the §6.4.1 loop-filter limit table
 //! ```
@@ -49,6 +52,9 @@ fn main() {
     let mut lfscale: Option<(u32, u32)> = None;
     let mut qis: Vec<u8> = vec![8, 20, 32, 44, 56];
     let mut bitrates: Vec<u64> = Vec::new();
+    let mut lookahead = 0usize;
+    let mut frames = 24u32;
+    let mut vbv: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -72,6 +78,9 @@ fn main() {
             }
             "--qis" => qis = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
             "--bitrates" => bitrates = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
+            "--lookahead" => lookahead = val(&mut i).parse().unwrap(),
+            "--frames" => frames = val(&mut i).parse().unwrap(),
+            "--vbv" => vbv = Some(val(&mut i).parse().unwrap()),
             _ => panic!("unknown option {a}"),
         }
         i += 1;
@@ -86,10 +95,10 @@ fn main() {
         .unwrap_or_else(|| panic!("unknown profile {profile}"));
 
     let mut seqs = vec![
-        synth_square(176, 144, 24, 0),
-        synth_blobs(176, 144, 24),
-        synth_pan(176, 144, 24),
-        synth_cut(176, 144, 24),
+        synth_square(176, 144, frames, 0),
+        synth_blobs(176, 144, frames),
+        synth_pan(176, 144, frames),
+        synth_cut(176, 144, frames),
     ];
     if let Some(dir) = &fixtures {
         if let Some(s) = fixture_sequence(dir, "all-mb-modes-64x64", 64, 64) {
@@ -128,7 +137,7 @@ fn main() {
                 interval,
             )
             .unwrap();
-            let enc = prof(enc);
+            let enc = prof(enc).with_lookahead(lookahead);
             let p = measure(seq, enc, &format!("qi{qi}"), out.as_deref());
             println!(
                 "{:<22} {:<10} {:>8} {:>8.2} {:>8.2} {:>7.4} {:>4}",
@@ -181,11 +190,23 @@ fn main() {
             } else {
                 enc.with_target_bitrate(br)
             };
-            let enc = prof(enc);
+            let enc = prof(enc).with_lookahead(lookahead);
+            let enc = match vbv {
+                Some(v) => enc.with_vbv_buffer(v),
+                None => enc,
+            };
             let p = measure(seq, enc, &format!("br{}k", br / 1000), out.as_deref());
             println!(
-                "{:<22} {:<10} {:>8} {:>8.2} {:>8.2} {:>7.4} {:>4}",
-                p.seq, p.label, p.bytes, p.psnr_y, p.psnr_c, p.ssim_y, p.keyframes
+                "{:<22} {:<10} {:>8} {:>8.2} {:>8.2} {:>7.4} {:>4}{}",
+                p.seq,
+                p.label,
+                p.bytes,
+                p.psnr_y,
+                p.psnr_c,
+                p.ssim_y,
+                p.keyframes,
+                p.vbv_min_bits
+                    .map_or(String::new(), |v| format!("  vbv-min {v:.0}"))
             );
             points.push(p);
         }

@@ -591,6 +591,18 @@ encoder, mean over the six ladder sequences, measured incrementally):
   candidates −2.6 %, priced `INTER_MV_FOUR` block searches −0.4 %,
   iterated half-pixel refinement −0.8 % (cumulative −5.7 % luma /
   −5.7 % chroma, +0.70 dB BD-PSNR vs round 453).
+* Lookahead (`with_lookahead(n)`, off by default and byte-identical
+  when off): keyframes land on cuts seen by a two-sided detector and
+  an interval keyframe due just before a cut is deferred onto it
+  (`cut` content with the cut at frame 18, interval 16: {0, 16, 18} →
+  {0, 18}, −17 % bytes at +0.5 dB). Under rate control the window's
+  budget is shared by an online per-type log-linear rate fit — the
+  two-pass mechanism without the probe pass: 96-frame runs at
+  120/150/180 kb/s reach 37.08 dB at 2.9 % mean |rate error| against
+  one-pass 36.26 dB / 2.2 % and two-pass 38.72 dB / 1.1 %.
+  `with_vbv_buffer(bits)` simulates a decoder buffer across the window
+  and re-codes an oversized frame; a 40000-bit buffer at 150 kb/s
+  never underflows on the battery (`vbv_min_level_bits()`).
 
 ## Measured rate-distortion (round 453)
 

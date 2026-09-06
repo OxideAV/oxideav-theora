@@ -53,6 +53,34 @@ All notable changes to `oxideav-theora` are recorded here.
   SAD-domain vector penalty (flat) were measured and left out.
   Cumulative vs round 453: −5.7 % luma / −5.7 % chroma, +0.70 dB.
   Corpus re-pinned (15/15 black-box byte-identical).
+- **Lookahead planning (round 457)** — `TheoraEncoder::with_lookahead(n)`
+  holds up to `n` source frames and plans each against the ones after
+  it: a two-sided scene-cut detector places keyframes on cuts (absolute
+  threshold from `with_scene_cut_threshold`, default 24, and twice the
+  difference of the frames on *both* sides), an interval keyframe that
+  is due is deferred onto a cut the window can see (a cut at frame 18
+  under interval 16 codes keyframes {0, 18} instead of {0, 16, 18}:
+  −17 % bytes at +0.5 dB on the battery's `cut` content), and under
+  rate control each frame's budget is its complexity-weighted share of
+  the window's nominal budget through an online per-frame-type
+  log-linear rate fit (`ln(bits/complexity) = a + γ·ln ACSCALE-ratio`,
+  γ fitted with forgetting) — the two-pass schedule's mechanism with
+  the shares estimated from source statistics instead of a probe
+  encode. Measured on 96-frame runs at 120/150/180 kb/s: mean luma
+  PSNR 37.08 dB at 2.9 % mean |rate error| against the one-pass loop's
+  36.26 dB / 2.2 % and the two-pass schedule's 38.72 dB / 1.1 %.
+  `with_vbv_buffer(bits)` adds a decoder-buffer model the planner
+  simulates across the window (calibrated by each type's recent
+  actual/predicted ratio) and an enforcement pass that re-codes an
+  oversized frame at a stronger quantizer; `vbv_min_level_bits()`
+  reports the closest approach (a 40000-bit buffer at 150 kb/s stays
+  above zero on every battery scene, a 30000-bit one within its 2 %
+  guard band). `flush` drains the window; lookahead 0 (the default) is
+  byte-identical to the code-on-arrival encoder, so the pinned corpus
+  is unchanged. `examples/rd_ladder.rs` gained `--lookahead`, `--vbv`
+  and `--frames`; `tests/lookahead.rs` pins the placement, the packet
+  contract, the rate accuracy and the VBV behaviour; eight lookahead /
+  VBV / scene-cut streams were black-box decoded byte-identically.
 - `CORPUS_DUMP` in `tests/encoded_corpus.rs` also writes each
   scenario's `<name>.recon` (this crate's reconstruction) next to the
   `.chain`, so the black-box decode route byte-compares without a

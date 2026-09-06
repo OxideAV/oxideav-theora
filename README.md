@@ -564,6 +564,23 @@ chroma blocks that earlier diverged is now sample-exact.
   rather than staged, and container-level concerns among them
   (chaining, page framing) belong to the container crates.
 
+## Measured rate-distortion (round 457)
+
+`tests/bd_rate.rs` pins the crate's Bjøntegaard battery: four
+deterministic 176×144 scenes (`square0`, `blobs`, `pan`, `cut` from
+`tests/common/rd.rs`, 24 frames, keyframe interval 16) across the
+qi 8/20/32/44/56 ladder, each stream decoded back through this crate's
+own decoder and scored on bytes, luma PSNR, chroma PSNR and luma
+SSIM. Every scene must hold two pins — no luma / chroma BD-rate
+regression against the round-453 reference curves below, and the
+campaign floor recorded in the test — and the same harness drives
+`examples/rd_ladder.rs` (now with an SSIM column and chroma / SSIM
+BD-rates against a `--save` reference). No reference *encoder* binary
+exists in this environment (`ffmpeg` ships only the Theora decoder), so
+the battery measures this encoder against its own prior rounds; the
+black-box reference *decoder* validates every re-pinned stream
+byte-exactly (see `tests/encoded-corpus-notes.md`).
+
 ## Measured rate-distortion (round 453)
 
 `examples/rd_ladder.rs` is the crate's reproducible measurement

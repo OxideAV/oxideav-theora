@@ -265,10 +265,15 @@ fn check(pin: &Pin, id: &TheoraIdentHeader, pkts: &[Packet]) {
     let recon = sha256_hex(&reconstruction_bytes(id, pkts));
     // `CORPUS_DUMP=<dir>` writes each scenario's packet chain (the
     // wire-pinned bytes) to `<dir>/<name>.chain` for the external
-    // validation route in `encoded-corpus-notes.md`.
+    // validation route in `encoded-corpus-notes.md` ...
     if let Some(dir) = std::env::var_os("CORPUS_DUMP") {
         let path = std::path::Path::new(&dir).join(format!("{}.chain", pin.name));
         std::fs::write(path, packet_chain_bytes(pkts)).expect("CORPUS_DUMP write");
+        // ... and this crate's own reconstruction next to it
+        // (`<name>.recon`, the reconstruction-pinned bytes) so the
+        // black-box decode can be byte-compared without rebuilding it.
+        let path = std::path::Path::new(&dir).join(format!("{}.recon", pin.name));
+        std::fs::write(path, reconstruction_bytes(id, pkts)).expect("CORPUS_DUMP write");
     }
     if std::env::var_os("CORPUS_PRINT").is_some() {
         println!(

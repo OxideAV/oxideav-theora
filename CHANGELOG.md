@@ -4,6 +4,23 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Pinned Bjøntegaard battery (round 457)** — `tests/bd_rate.rs`
+  encodes four deterministic 176×144 scenes (`square0`, `blobs`, `pan`,
+  `cut`; 24 frames, keyframe interval 16) across the five-point quantizer
+  ladder, decodes each stream through this crate's own decoder, and
+  holds two pins per scene: no luma / chroma BD-rate regression against
+  the round-453 reference curves, and a per-scene campaign floor. The
+  measurement loop (bytes, luma + chroma PSNR, luma SSIM, BD deltas) now
+  lives in `tests/common/rd.rs`, shared by `examples/rd_ladder.rs`, which
+  gained an SSIM column and chroma / SSIM BD-rate output; `--save`
+  files carry the SSIM column (round-453 files still load).
+- `CORPUS_DUMP` in `tests/encoded_corpus.rs` also writes each
+  scenario's `<name>.recon` (this crate's reconstruction) next to the
+  `.chain`, so the black-box decode route byte-compares without a
+  rebuild.
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-theora/compare/v0.0.11...v0.0.12) - 2026-08-30
 
 ### Other

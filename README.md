@@ -584,6 +584,32 @@ the battery measures this encoder against its own prior rounds; the
 black-box reference *decoder* validates every re-pinned stream
 byte-exactly (see `tests/encoded-corpus-notes.md`).
 
+Final round-457 operating points (bytes / luma PSNR dB, 24 frames,
+keyframe interval 16, encoder-default setup tables):
+
+| sequence | qi 8 | qi 20 | qi 32 | qi 44 | qi 56 |
+|---|---|---|---|---|---|
+| square0 | 9266 / 33.29 | 11188 / 39.94 | 13210 / 44.68 | 15820 / 47.99 | 21776 / 51.35 |
+| blobs | 2423 / 34.49 | 4442 / 37.06 | 7542 / 38.79 | 11117 / 39.73 | 22015 / 43.19 |
+| pan | 8377 / 30.45 | 12869 / 33.16 | 20446 / 35.21 | 49426 / 36.55 | 123498 / 39.80 |
+| cut | 5768 / 33.89 | 7725 / 38.43 | 10361 / 40.80 | 14261 / 42.08 | 23264 / 44.39 |
+| fx-all-mb-modes | 2899 / 28.32 | 5688 / 32.10 | 10551 / 35.73 | 17309 / 40.50 | 23487 / 42.98 |
+| fx-kf-interval-30 | 283 / 26.34 | 441 / 30.72 | 629 / 38.73 | 791 / 42.08 | 1064 / 45.95 |
+
+Cumulative round-457 gains versus the round-453 encoder (Bjøntegaard
+piecewise-linear deltas over the qi ladder; luma rate, chroma rate,
+luma PSNR):
+
+| sequence | BD-rate Y | BD-rate C | BD-PSNR Y |
+|---|---|---|---|
+| square0 | −24.2 % | −16.2 % | +6.24 dB |
+| cut | −20.8 % | −8.5 % | +1.90 dB |
+| pan | −17.6 % | −12.9 % | +0.64 dB |
+| blobs | −0.5 % | +1.2 % | +0.12 dB |
+| fx-all-mb-modes | −0.8 % | −5.1 % | +0.06 dB |
+| fx-kf-interval-30 | −28.0 % | −12.5 % | +4.72 dB |
+| **mean** | **−15.3 %** | **−9.0 %** | **+2.28 dB** |
+
 Per-change contributions this round (luma BD-rate vs the round-453
 encoder, mean over the six ladder sequences, measured incrementally):
 
@@ -626,21 +652,28 @@ encoder, mean over the six ladder sequences, measured incrementally):
   luma BD-rate and +6.9 % SSIM-rate against the single-`qi` default on
   this battery, so neither is on by default.)
 
-## Measured rate-distortion (round 453)
+Both elections that closed round 453 were re-run on the finished
+round-457 encoder and stand: a uniform rescale of the §6.4.1
+loop-filter limits (×½ −0.3 % luma but +0.6 % chroma and −0.10 dB;
+×1.5 +2.4 %; ×2 +5.8 %) and the RD λ divisor (36 → +0.8 %, 42 → +0.2 %,
+56 → +0.3 %, 64 → +0.2 % against 48).
 
-`examples/rd_ladder.rs` is the crate's reproducible measurement
-harness: four deterministic 176×144 synthetic sequences (`square0`
-gradient + moving square, `blobs` sub-pixel drifting blobs over
-fixed-pattern noise, `pan` a half-pixel-per-frame textured pan, `cut`
-a mid-stream scene change) plus two fixture-derived sources
-(`all-mb-modes-64x64`, `keyframe-interval-30`), encoded at interval 16
-across the five-point quantizer ladder and decoded through this
-crate's own decoder (pixel-exact against the black-box reference
-decoder for every externally validated family). Reproduce with
-`cargo run --release --example rd_ladder -- --fixtures
-docs/video/theora/fixtures [--ref saved.tsv] [--twopass] [--lfscale n/d]`.
+## Round-453 reference curves
 
-Final operating points (bytes / luma PSNR dB, 24 frames):
+`examples/rd_ladder.rs` (now over `tests/common/rd.rs`) is the
+crate's reproducible measurement harness: four deterministic 176×144
+synthetic sequences (`square0` gradient + moving square, `blobs`
+sub-pixel drifting blobs over fixed-pattern noise, `pan` a
+half-pixel-per-frame textured pan, `cut` a mid-stream scene change)
+plus two fixture-derived sources (`all-mb-modes-64x64`,
+`keyframe-interval-30`), encoded at interval 16 across the five-point
+quantizer ladder and decoded through this crate's own decoder.
+Reproduce with `cargo run --release --example rd_ladder -- --fixtures
+docs/video/theora/fixtures [--ref saved.tsv] [--twopass] [--lookahead n]
+[--vbv bits] [--frames n] [--lfscale n/d] [--flat n/d] [--vp3]`.
+
+Round-453 operating points, the reference the battery's floors are
+measured against (bytes / luma PSNR dB, 24 frames, VP3 tables):
 
 | sequence | qi 8 | qi 20 | qi 32 | qi 44 | qi 56 |
 |---|---|---|---|---|---|
@@ -651,8 +684,8 @@ Final operating points (bytes / luma PSNR dB, 24 frames):
 | fx-all-mb-modes | 3280 / 29.08 | 6554 / 33.00 | 11373 / 36.35 | 17511 / 39.94 | 23845 / 43.34 |
 | fx-kf-interval-30 | 237 / 23.19 | 425 / 26.97 | 597 / 30.53 | 816 / 35.66 | 904 / 41.45 |
 
-Cumulative round-453 gains versus the round-451 encoder
-(Bjøntegaard-style piecewise-linear deltas over the qi ladder, luma):
+Round 453's own gains versus the round-451 encoder (history;
+Bjøntegaard-style piecewise-linear deltas over the qi ladder, luma):
 
 | sequence | BD-rate | BD-PSNR |
 |---|---|---|

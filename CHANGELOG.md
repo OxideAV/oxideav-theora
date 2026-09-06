@@ -4,6 +4,12 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+Round 457 encoder-quality campaign, cumulative against the round-453
+encoder on the battery: **−15.3 % luma / −9.0 % chroma BD-rate,
++2.28 dB BD-PSNR** (`square0` −24.2 %, `cut` −20.8 %, `pan` −17.6 %,
+fixture `keyframe-interval-30` −28.0 %), 1.5× faster, every re-pinned
+stream black-box decoded byte-identically.
+
 ### Added
 
 - **Pinned Bjøntegaard battery (round 457)** — `tests/bd_rate.rs`

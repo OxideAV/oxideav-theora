@@ -28,6 +28,10 @@
 //!   --vbv bits         model a decoder buffer of this size under rate control
 //!   --twopass          drive the bitrate points through two-pass control
 //!   --lfscale n/d      rescale the §6.4.1 loop-filter limit table
+//!   --vp3              start from the §B VP3 tables instead of the
+//!                      encoder defaults (flattened intra matrices)
+//!   --flat n/d         blend the base matrices' AC entries toward flat
+//!   --flat-bm a,b      which base matrices --flat touches (default 0,1,2)
 //! ```
 
 #[path = "../tests/common/rd.rs"]
@@ -50,6 +54,9 @@ fn main() {
     let mut interval = 16u32;
     let mut twopass = false;
     let mut lfscale: Option<(u32, u32)> = None;
+    let mut flat: Option<(u32, u32)> = None;
+    let mut vp3 = false;
+    let mut flat_bms: Vec<usize> = vec![0, 1, 2];
     let mut qis: Vec<u8> = vec![8, 20, 32, 44, 56];
     let mut bitrates: Vec<u64> = Vec::new();
     let mut lookahead = 0usize;
@@ -76,6 +83,13 @@ fn main() {
                 let (n, d) = v.split_once('/').unwrap_or((v.as_str(), "1"));
                 lfscale = Some((n.parse().unwrap(), d.parse().unwrap()));
             }
+            "--flat" => {
+                let v = val(&mut i);
+                let (n, d) = v.split_once('/').unwrap_or((v.as_str(), "1"));
+                flat = Some((n.parse().unwrap(), d.parse().unwrap()));
+            }
+            "--vp3" => vp3 = true,
+            "--flat-bm" => flat_bms = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
             "--qis" => qis = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
             "--bitrates" => bitrates = val(&mut i).split(',').map(|s| s.parse().unwrap()).collect(),
             "--lookahead" => lookahead = val(&mut i).parse().unwrap(),
@@ -122,10 +136,33 @@ fn main() {
         let ident =
             TheoraIdentHeader::for_picture(seq.width, seq.height, PixelFormat::Yuv420, 30, 1)
                 .unwrap();
-        let mut setup = oxideav_theora::SetupHeaderTables::vp3_defaults();
+        let mut setup = if vp3 {
+            oxideav_theora::SetupHeaderTables::vp3_defaults()
+        } else {
+            oxideav_theora::SetupHeaderTables::encoder_defaults()
+        };
         if let Some((n, d)) = lfscale {
             for v in setup.loop_filter_limits.iter_mut() {
                 *v = ((*v as u32 * n / d).min(127)) as u8;
+            }
+        }
+        if let Some((n, d)) = flat {
+            // Blend every base matrix's AC entries toward its first AC
+            // entry by n/d (1/1 = flat AC matrices).
+            for (bmi, m) in setup
+                .quantization_parameters
+                .base_matrices
+                .iter_mut()
+                .enumerate()
+            {
+                if !flat_bms.contains(&bmi) {
+                    continue;
+                }
+                let anchor = m[1] as i32;
+                for v in m.iter_mut().skip(1) {
+                    let cur = *v as i32;
+                    *v = (cur + (anchor - cur) * n as i32 / d as i32).clamp(1, 255) as u8;
+                }
             }
         }
         for &qi in &qis {
@@ -178,14 +215,8 @@ fn main() {
                         .unwrap()
                     })
                     .collect();
-                let stats = TheoraEncoder::two_pass_stats(
-                    &ident,
-                    &oxideav_theora::SetupHeaderTables::vp3_defaults(),
-                    32,
-                    interval,
-                    &sources,
-                )
-                .unwrap();
+                let stats =
+                    TheoraEncoder::two_pass_stats(&ident, &setup, 32, interval, &sources).unwrap();
                 enc.with_two_pass_rate_control(br, &stats)
             } else {
                 enc.with_target_bitrate(br)

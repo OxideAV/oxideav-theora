@@ -20,7 +20,7 @@ fn encoder(seq: &Sequence, qi: u8, interval: u32) -> TheoraEncoder {
     TheoraEncoder::with_keyframe_interval(
         CodecId::new(THEORA_CODEC_ID),
         ident(seq),
-        SetupHeaderTables::vp3_defaults(),
+        SetupHeaderTables::encoder_defaults(),
         qi,
         interval,
     )

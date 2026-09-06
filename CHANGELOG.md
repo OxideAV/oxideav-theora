@@ -81,6 +81,31 @@ All notable changes to `oxideav-theora` are recorded here.
   and `--frames`; `tests/lookahead.rs` pins the placement, the packet
   contract, the rate accuracy and the VBV behaviour; eight lookahead /
   VBV / scene-cut streams were black-box decoded byte-identically.
+- **Encoder-default quantization matrices elected by measurement (round
+  457)** — `SetupHeaderTables::encoder_defaults()` is the VP3 bundle
+  with the two *intra* base matrices (§B.4 `bm0` luma, `bm1` chroma)
+  flattened three quarters of the way toward their first AC entry; the
+  inter matrix, loop-filter limits, scale tables and codebooks are
+  unchanged. `TheoraEncoder::with_default_setup*` (and so the registry
+  `make_encoder` without setup extradata) now synthesize these tables;
+  `vp3_defaults()` still returns the §B tables verbatim. Measured on
+  the battery against the VP3 tables: −10.2 % luma / −3.7 % chroma
+  BD-rate (+1.65 dB), every sequence improving (`square0` −15.6 %,
+  `cut` −13.8 %, `pan` −3.8 %, `blobs` −0.9 %); 7/8 and fully flat were
+  within noise on the mean but lost a sequence each, and flattening the
+  inter matrix cost +1.2 % (`rd_ladder --flat n/d --flat-bm a,b`
+  reproduces the sweep, `--vp3` restores the §B tables). Cumulative vs
+  round 453: −15.3 % luma / −9.0 % chroma, +2.28 dB. Corpus re-pinned
+  (15/15 black-box byte-identical — the flattened tables ride in the
+  stream's own setup header).
+- **Activity masking (round 457)** — `TheoraEncoder::with_activity_masking(level)`
+  (`FrameEncoder::set_activity_masking`) scales the per-block quantizer
+  chooser's λ by each block's activity relative to the frame mean (to
+  the half or first power, clamped to `[1/2, 2]`, integer arithmetic),
+  so busy blocks take the coarser candidate and flat blocks the finer
+  one under a multi-`qi` list. Measured against `with_adaptive_quant_auto`
+  alone: level 1 −0.35 % luma SSIM-rate at +0.15 % PSNR-rate, level 2
+  −0.59 % / +0.75 % — a small perceptual trade, opt-in.
 - `CORPUS_DUMP` in `tests/encoded_corpus.rs` also writes each
   scenario's `<name>.recon` (this crate's reconstruction) next to the
   `.chain`, so the black-box decode route byte-compares without a

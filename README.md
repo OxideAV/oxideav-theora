@@ -542,14 +542,17 @@ chroma blocks that earlier diverged is now sample-exact.
   P-frame default — see the inter-encoder bullet above). A
   **target-bitrate rate-control loop** is now wired in too (see the
   rate-control bullet above). The encoder also **synthesizes its own
-  §6.4 setup header** from scratch (`SetupHeaderTables::vp3_defaults()`:
-  the §B.2 loop-filter limits, §B.3 AC/DC scale tables, §B.4 base
-  matrices with their single-range quant assignment, and the §B.4 80
-  DCT-token Huffman codebooks — all from the published Appendix B data),
-  so `TheoraEncoder::with_default_setup` needs only the identification
-  header and a quantizer to emit a complete self-describing stream; a
-  caller may still supply pre-decoded tables via `TheoraEncoder::new` /
-  `extradata` when matching an existing setup.
+  §6.4 setup header** from scratch
+  (`SetupHeaderTables::encoder_defaults()`: the §B.2 loop-filter
+  limits, §B.3 AC/DC scale tables, §B.4 base matrices — the two intra
+  ones flattened by the round-457 measured election, see below — with
+  their single-range quant assignment, and the §B.4 80 DCT-token
+  Huffman codebooks; `vp3_defaults()` keeps the published Appendix B
+  data verbatim), so `TheoraEncoder::with_default_setup` needs only
+  the identification header and a quantizer to emit a complete
+  self-describing stream; a caller may still supply pre-decoded tables
+  via `TheoraEncoder::new` / `extradata` when matching an existing
+  setup.
 * **Pre-3.2.0 (legacy) bitstreams** — the §A.2.3 pre-3.2.1 granule
   normalization is implemented, but no *decodable* `VREV < 1` fixture
   exists: the staged catalogue
@@ -603,6 +606,21 @@ encoder, mean over the six ladder sequences, measured incrementally):
   `with_vbv_buffer(bits)` simulates a decoder buffer across the window
   and re-codes an oversized frame; a 40000-bit buffer at 150 kb/s
   never underflows on the battery (`vbv_min_level_bits()`).
+* Quantization matrices: the encoder's default setup header
+  (`SetupHeaderTables::encoder_defaults()`) flattens the two intra
+  base matrices three quarters of the way toward their first AC entry
+  — elected by a `--flat n/d --flat-bm a,b` sweep: −10.2 % luma /
+  −3.7 % chroma BD-rate (+1.65 dB) against the §B VP3 tables with every
+  sequence improving; flattening the inter matrix cost +1.2 % and is
+  not done. Cumulative vs round 453: **−15.3 % luma / −9.0 % chroma,
+  +2.28 dB BD-PSNR** (`square0` −24.2 %, `cut` −20.8 %, `pan` −17.6 %,
+  `blobs` −0.5 %).
+* Activity masking (`with_activity_masking(1|2)`, opt-in, needs a
+  multi-`qi` list): −0.35 % / −0.59 % luma SSIM-rate for +0.15 % /
+  +0.75 % PSNR-rate against `with_adaptive_quant_auto` alone — a small
+  perceptual trade. (`with_adaptive_quant_auto` itself measures +2.9 %
+  luma BD-rate and +6.9 % SSIM-rate against the single-`qi` default on
+  this battery, so neither is on by default.)
 
 ## Measured rate-distortion (round 453)
 

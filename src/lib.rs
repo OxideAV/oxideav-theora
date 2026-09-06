@@ -3157,6 +3157,42 @@ impl SetupHeaderTables {
         }
     }
 
+    /// The setup tables this crate's encoder synthesizes by default:
+    /// [`Self::vp3_defaults`] with the two **intra** base matrices
+    /// (§B.4 `bm0` luma, `bm1` chroma) flattened — every AC entry moved
+    /// three quarters of the way toward the matrix's first AC entry —
+    /// while the inter matrix (`bm2`), the §B.2 loop-filter limits,
+    /// the §B.3 scale tables and the §B.4 codebooks are unchanged.
+    ///
+    /// Elected by measurement on the rate-distortion battery (round
+    /// 457): the VP3 intra matrices quantize high frequencies far more
+    /// coarsely than the low ones, which trades PSNR for a
+    /// perceptual weighting the rate-distortion planner cannot see.
+    /// Flattening the intra matrices by 3/4 measured −10.2 % luma /
+    /// −3.7 % chroma BD-rate (+1.65 dB) against the VP3 tables with
+    /// every battery sequence improving; 7/8 and fully flat were
+    /// within noise of it on the mean but lost on a sequence each, and
+    /// flattening the inter matrix cost +1.2 %. The tables travel in
+    /// the stream's own §6.4 setup header, so any decoder reproduces
+    /// them; a caller matching an existing stream's tables still
+    /// supplies its own [`SetupHeaderTables`].
+    pub fn encoder_defaults() -> Self {
+        let mut setup = Self::vp3_defaults();
+        for m in setup
+            .quantization_parameters
+            .base_matrices
+            .iter_mut()
+            .take(2)
+        {
+            let anchor = m[1] as i32;
+            for v in m.iter_mut().skip(1) {
+                let cur = *v as i32;
+                *v = (cur + (anchor - cur) * 3 / 4).clamp(1, 255) as u8;
+            }
+        }
+        setup
+    }
+
     /// Derive a setup-table set whose §6.4.4 Huffman codebooks are
     /// tuned to measured token statistics.
     ///
@@ -13478,6 +13514,13 @@ pub struct FrameEncoder {
     /// Frame-level quantization index used for both the frame header
     /// `QIS[0]` and the per-block dequantization. `0..=63`.
     qi: u8,
+    /// Activity-masking level for the per-block quantizer chooser
+    /// (`0` off, `1` half strength, `2` full): each block's λ is scaled
+    /// by the ratio of its own activity to the frame's mean activity
+    /// (to the half or first power), so busy blocks — where the eye
+    /// masks error — take the coarser candidate and flat blocks the
+    /// finer one. Only the multi-`qi` paths read it.
+    activity_masking: u8,
 }
 
 /// Per-macro-block motion strategy the shared inter-frame encode body
@@ -13711,7 +13754,57 @@ impl FrameEncoder {
             setup,
             geometry,
             qi,
+            activity_masking: 0,
         })
+    }
+
+    /// Set the activity-masking level of the per-block quantizer
+    /// chooser (`0` off, `1` half strength, `2` full strength; higher
+    /// values clamp to `2`). See [`TheoraEncoder::with_activity_masking`].
+    pub fn set_activity_masking(&mut self, level: u8) {
+        self.activity_masking = level.min(2);
+    }
+
+    /// Mean absolute deviation of an 8×8 block from its own mean, in
+    /// 1/64 sample units (the sum of absolute deviations).
+    fn block_activity(src: &[[i16; 8]; 8]) -> u32 {
+        let sum: i32 = src.iter().flatten().map(|&v| v as i32).sum();
+        let mean = (sum + 32) / 64;
+        src.iter()
+            .flatten()
+            .map(|&v| (v as i32 - mean).unsigned_abs())
+            .sum()
+    }
+
+    /// Per-block λ under activity masking: `lambda × (activity /
+    /// mean_activity)^(level/2)`, the ratio clamped to `[1/2, 2]` and
+    /// evaluated in integer arithmetic (deterministic across
+    /// platforms). Level `0` returns `lambda`.
+    fn masked_lambda(lambda: u64, level: u8, activity: u32, mean_activity: u32) -> u64 {
+        if level == 0 {
+            return lambda;
+        }
+        // Ratio in 1/256 units, clamped to [128, 512].
+        let ratio = ((activity as u64 + 1) * 256 / (mean_activity as u64 + 1)).clamp(128, 512);
+        let factor = if level == 1 {
+            isqrt_u64(ratio * 256) // √(ratio/256) in 1/256 units
+        } else {
+            ratio
+        };
+        (lambda * factor / 256).max(1)
+    }
+
+    /// Mean [`Self::block_activity`] of a plane's blocks.
+    fn plane_mean_activity(plane: &[u8], pw: u32, ph: u32, bxs: &[u32], bys: &[u32]) -> u32 {
+        let mut total = 0u64;
+        let mut n = 0u64;
+        for (&bx, &by) in bxs.iter().zip(bys.iter()) {
+            if let Ok(src) = Self::extract_block(plane, pw, ph, bx, by) {
+                total += Self::block_activity(&src) as u64;
+                n += 1;
+            }
+        }
+        total.checked_div(n).unwrap_or(0) as u32
     }
 
     /// The identification header this encoder was built from.
@@ -14172,6 +14265,23 @@ impl FrameEncoder {
         // codebooks, shared by every block's candidate scoring.
         let token_costs = TokenBitCosts::from_tables(&self.setup.huffman_tables[..]);
 
+        // Frame-mean luma activity for the activity-masking λ (chroma
+        // blocks take the luma mean too: masking follows the picture's
+        // luma texture).
+        let mean_activity = if self.activity_masking > 0 {
+            let luma: Vec<usize> = (0..nbs).filter(|&bi| g.pli_of_block[bi] == 0).collect();
+            let bxs: Vec<u32> = luma.iter().map(|&bi| g.bx_of_block[bi]).collect();
+            let bys: Vec<u32> = luma.iter().map(|&bi| g.by_of_block[bi]).collect();
+            Self::plane_mean_activity(
+                &frame.samples_y,
+                g.dims_y.width,
+                g.dims_y.height,
+                &bxs,
+                &bys,
+            )
+        } else {
+            0
+        };
         let mut qiis = vec![0u8; nbs];
         for (bi, qii_out) in qiis.iter_mut().enumerate() {
             let pli = g.pli_of_block[bi] as usize;
@@ -14181,6 +14291,12 @@ impl FrameEncoder {
                 _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
             };
             let src = Self::extract_block(plane, pw, ph, g.bx_of_block[bi], g.by_of_block[bi])?;
+            let lambda = Self::masked_lambda(
+                lambda,
+                self.activity_masking,
+                Self::block_activity(&src),
+                mean_activity,
+            );
             let mut residual = [[0i16; 8]; 8];
             for (r, row) in residual.iter_mut().enumerate() {
                 for (c, slot) in row.iter_mut().enumerate() {
@@ -14554,6 +14670,22 @@ impl FrameEncoder {
         // rate-distortion mode decision and the per-block qi chooser.
         let token_costs = TokenBitCosts::from_tables(&self.setup.huffman_tables[..]);
         let lambda = rd_lambda_for_qis(&self.setup.quantization_parameters, 1, qis)?;
+        // Frame-mean luma activity for the activity-masking λ of the
+        // per-block quantizer chooser (multi-qi frames only).
+        let mean_activity = if self.activity_masking > 0 && nqis > 1 {
+            let luma: Vec<usize> = (0..nbs).filter(|&bi| g.pli_of_block[bi] == 0).collect();
+            let bxs: Vec<u32> = luma.iter().map(|&bi| g.bx_of_block[bi]).collect();
+            let bys: Vec<u32> = luma.iter().map(|&bi| g.by_of_block[bi]).collect();
+            Self::plane_mean_activity(
+                &frame.samples_y,
+                g.dims_y.width,
+                g.dims_y.height,
+                &bxs,
+                &bys,
+            )
+        } else {
+            0
+        };
 
         // Per-macro-block motion vector + mode. The mode determines
         // both the on-wire §7.5.2 mode code and the reference frame the
@@ -15006,6 +15138,12 @@ impl FrameEncoder {
                 // records the winner's §7.6 selector. The DC quantizer is
                 // always qis[0] (the §7.6 preamble's rule, so §7.8 DC
                 // prediction is untouched by the per-block choice).
+                let block_lambda = Self::masked_lambda(
+                    lambda,
+                    self.activity_masking,
+                    Self::block_activity(&src),
+                    mean_activity,
+                );
                 let (mut q, qii) = if nqis == 1 {
                     (quantize_block(&dqc, dc_mat, &ac_mats[0][pli]), 0u8)
                 } else {
@@ -15029,7 +15167,7 @@ impl FrameEncoder {
                         let bits = costs_in_use
                             .block_bits(&qc)
                             .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
-                        let cost = ssd + lambda.saturating_mul(u64::from(bits));
+                        let cost = ssd + block_lambda.saturating_mul(u64::from(bits));
                         if cost < best_cost {
                             best_cost = cost;
                             best_q = qc;
@@ -18260,7 +18398,13 @@ impl TheoraEncoder {
         ident: TheoraIdentHeader,
         qi: u8,
     ) -> Result<Self, Error> {
-        Self::with_keyframe_interval(codec_id, ident, SetupHeaderTables::vp3_defaults(), qi, 1)
+        Self::with_keyframe_interval(
+            codec_id,
+            ident,
+            SetupHeaderTables::encoder_defaults(),
+            qi,
+            1,
+        )
     }
 
     /// As [`with_default_setup`](Self::with_default_setup) but with an
@@ -18275,7 +18419,7 @@ impl TheoraEncoder {
         Self::with_keyframe_interval(
             codec_id,
             ident,
-            SetupHeaderTables::vp3_defaults(),
+            SetupHeaderTables::encoder_defaults(),
             qi,
             keyframe_interval,
         )
@@ -18470,6 +18614,22 @@ impl TheoraEncoder {
     /// window. `0` restores the code-on-arrival behaviour exactly.
     pub fn with_lookahead(mut self, frames: usize) -> Self {
         self.lookahead = frames;
+        self
+    }
+
+    /// Activity masking for the per-block quantizer chooser (`0` off,
+    /// `1` half strength, `2` full strength). With a multi-`qi` list
+    /// ([`Self::with_adaptive_quant`] / [`Self::with_adaptive_quant_auto`])
+    /// each block's λ is scaled by the ratio of its own activity (mean
+    /// absolute deviation from its mean) to the frame's mean activity,
+    /// to the half or first power, clamped to `[1/2, 2]`: busy blocks,
+    /// where the eye masks coding error, take the coarser candidate and
+    /// flat blocks — where the same error is visible — the finer one.
+    /// A perceptual trade, not a PSNR one: measured on the battery it
+    /// costs luma PSNR BD-rate and buys luma SSIM (see the README).
+    /// Inert without a multi-`qi` list.
+    pub fn with_activity_masking(mut self, level: u8) -> Self {
+        self.frame_encoder.set_activity_masking(level);
         self
     }
 
@@ -35420,9 +35580,19 @@ mod tests {
             }
         }
         assert_eq!(header_pkts.len(), 3, "three synthesized §6 header packets");
-        // The synthesized setup header is the VP3 default bundle.
+        // The synthesized setup header is the encoder's default bundle
+        // (the VP3 tables with the intra base matrices flattened —
+        // round 457's measured election) and round-trips exactly.
         let setup_from_stream = decode_setup_header(&header_pkts[2].data).unwrap();
-        assert_eq!(setup_from_stream, SetupHeaderTables::vp3_defaults());
+        assert_eq!(setup_from_stream, SetupHeaderTables::encoder_defaults());
+        assert_ne!(setup_from_stream, SetupHeaderTables::vp3_defaults());
+        assert_eq!(
+            setup_from_stream.quantization_parameters.base_matrices[2],
+            SetupHeaderTables::vp3_defaults()
+                .quantization_parameters
+                .base_matrices[2],
+            "the inter matrix is the VP3 one"
+        );
         let data_pkt = data_pkt.expect("one data packet");
 
         // The whole self-describing stream decodes through a fresh trait

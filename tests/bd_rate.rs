@@ -10,16 +10,17 @@
 //! every externally validated family), and scored on bytes, luma PSNR,
 //! chroma PSNR and luma SSIM.
 //!
-//! Two pins:
+//! The pins:
 //!
-//! * **chroma never regresses** against the round-453 encoder's
+//! * **campaign floors** — the per-scene luma and chroma BD-rates the
+//!   round-457 campaign measured against the round-453 encoder's
 //!   curves (`BASELINE_R453`, the operating points the README's
-//!   round-453 table records) beyond a 1 % tolerance on any scene;
-//! * **campaign floor** — the per-scene luma BD-rate the round-457
-//!   campaign measured against that reference must still be delivered
+//!   round-453 table records) must still be delivered
 //!   (`CAMPAIGN_FLOOR_PCT`; a positive entry records a scene the
 //!   campaign knowingly traded), so a later change that quietly gives
-//!   a gain back — or widens a known trade — fails here.
+//!   a gain back — or widens a known trade — fails here;
+//! * every stream decodes through this crate's decoder to the source
+//!   frame count (the measurement itself).
 //!
 //! Run with `--nocapture` to see the full table and the per-scene BD
 //! deltas; the same numbers come out of
@@ -61,15 +62,16 @@ const BASELINE_R453: &[(&str, u8, usize, f64, f64, f64)] = &[
 
 const QI_LADDER: [u8; 5] = [8, 20, 32, 44, 56];
 
-/// Per-scene luma BD-rate (percent, negative = fewer bytes at equal
-/// PSNR) the round-457 campaign must keep delivering against the
-/// round-453 reference. Set from the measured campaign result; tighten
-/// when the encoder improves, never loosen without a README note.
-const CAMPAIGN_FLOOR_PCT: &[(&str, f64)] = &[
-    ("square0", -10.5),
-    ("blobs", 1.4),
-    ("pan", -13.4),
-    ("cut", -8.5),
+/// Per-scene luma and chroma BD-rate (percent, negative = fewer bytes
+/// at equal PSNR) the round-457 campaign must keep delivering against
+/// the round-453 reference. Set from the measured campaign result;
+/// tighten when the encoder improves, never loosen without a README
+/// note.
+const CAMPAIGN_FLOOR_PCT: &[(&str, f64, f64)] = &[
+    ("square0", -24.0, -16.0),
+    ("blobs", -0.4, 1.3),
+    ("pan", -17.5, -12.5),
+    ("cut", -20.7, -8.2),
 ];
 
 /// Slack on the campaign-floor comparison, in BD-rate percent: the
@@ -89,7 +91,7 @@ fn scenes() -> Vec<Sequence> {
 fn ladder(seq: &Sequence) -> Vec<Point> {
     let ident =
         TheoraIdentHeader::for_picture(seq.width, seq.height, PixelFormat::Yuv420, 30, 1).unwrap();
-    let setup = SetupHeaderTables::vp3_defaults();
+    let setup = SetupHeaderTables::encoder_defaults();
     QI_LADDER
         .iter()
         .map(|&qi| {
@@ -147,19 +149,19 @@ fn check_scene(name: &str) {
         "  {:<10} vs round 453: BD-PSNR {dpy:+.3} dB  BD-rate Y {dry:+.2} %  C {drc:+.2} %  SSIM {drs:+.2} %",
         seq.name
     );
-    assert!(
-        drc <= 1.0,
-        "{}: chroma BD-rate regressed {drc:+.2} % against the round-453 reference",
-        seq.name
-    );
-    let floor = CAMPAIGN_FLOOR_PCT
+    let (floor_y, floor_c) = CAMPAIGN_FLOOR_PCT
         .iter()
         .find(|f| f.0 == seq.name)
-        .map(|f| f.1)
+        .map(|f| (f.1, f.2))
         .expect("campaign floor for every scene");
     assert!(
-        dry <= floor + EPS,
-        "{}: luma BD-rate {dry:+.2} % misses the campaign floor {floor:+.2} %",
+        dry <= floor_y + EPS,
+        "{}: luma BD-rate {dry:+.2} % misses the campaign floor {floor_y:+.2} %",
+        seq.name
+    );
+    assert!(
+        drc <= floor_c + EPS,
+        "{}: chroma BD-rate {drc:+.2} % misses the campaign floor {floor_c:+.2} %",
         seq.name
     );
 }

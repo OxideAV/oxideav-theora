@@ -277,6 +277,12 @@ pub fn profiles() -> Vec<(&'static str, Profile)> {
         ("kfpolicy", |e| e.with_keyframe_rate_policy(0.7)),
         ("adaptive", |e| e.with_adaptive_quant(vec![32, 16, 48])),
         ("adaptauto", |e| e.with_adaptive_quant_auto()),
+        ("psy1", |e| {
+            e.with_adaptive_quant_auto().with_activity_masking(1)
+        }),
+        ("psy2", |e| {
+            e.with_adaptive_quant_auto().with_activity_masking(2)
+        }),
     ]
 }
 

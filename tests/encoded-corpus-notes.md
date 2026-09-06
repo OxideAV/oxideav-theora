@@ -174,3 +174,8 @@ Re-pins this round, each validated 15/15 byte-identical:
    (which now writes `.recon` next to each `.chain`) — went through the
    same route, all byte-identical (two carried a zero-byte duplicate
    packet, compared over the coded frames).
+4. Encoder-default setup tables (`SetupHeaderTables::encoder_defaults`,
+   intra base matrices flattened 3/4): every `with_default_setup*`
+   scenario re-spelled — the black-box decoder reads the flattened
+   matrices from the stream's own §6.4 setup header — 15/15
+   byte-identical.

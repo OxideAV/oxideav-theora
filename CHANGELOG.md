@@ -36,6 +36,23 @@ All notable changes to `oxideav-theora` are recorded here.
   fine-first over a checkerboard so the split follows from the rate
   arithmetic rather than from noise). Corpus re-pinned (15/15
   black-box byte-identical, see `tests/encoded-corpus-notes.md`).
+- **Motion-search quality (round 457)** — three measured changes to
+  the rate-distortion P-frame planner: the running `LAST1` / `LAST2`
+  predictors join the per-macro-block candidate list as explicit
+  `INTER_MV` entries (they recode to the free `INTER_MV_LAST` /
+  `INTER_MV_LAST2` modes, so a predictor that loses the SAD race by a
+  few units still wins the rate-distortion race; −2.6 % mean luma
+  BD-rate, `square0` −5.0 %, `pan` −6.6 %, `cut` −3.8 %); the
+  `INTER_MV_FOUR` per-luma-block searches are priced for their explicit
+  Table 7.23 vector bits (−0.4 %; seeding them with the uniform winner
+  was measured at +0.9 % and rejected); and the §7.5.1 half-pixel
+  refinement iterates — alternating whole-pixel and half-pixel rings
+  around the running winner until neither moves it, at most three
+  times (−0.8 %, `square0` −2.2 %, `cut` −3.0 %). Golden-search seeding
+  with the previous-reference winners (+0.2 %) and a rescaled
+  SAD-domain vector penalty (flat) were measured and left out.
+  Cumulative vs round 453: −5.7 % luma / −5.7 % chroma, +0.70 dB.
+  Corpus re-pinned (15/15 black-box byte-identical).
 - `CORPUS_DUMP` in `tests/encoded_corpus.rs` also writes each
   scenario's `<name>.recon` (this crate's reconstruction) next to the
   `.chain`, so the black-box decode route byte-compares without a

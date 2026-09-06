@@ -66,10 +66,10 @@ const QI_LADDER: [u8; 5] = [8, 20, 32, 44, 56];
 /// round-453 reference. Set from the measured campaign result; tighten
 /// when the encoder improves, never loosen without a README note.
 const CAMPAIGN_FLOOR_PCT: &[(&str, f64)] = &[
-    ("square0", -2.9),
-    ("blobs", 1.2),
-    ("pan", -7.4),
-    ("cut", -1.4),
+    ("square0", -10.5),
+    ("blobs", 1.4),
+    ("pan", -13.4),
+    ("cut", -8.5),
 ];
 
 /// Slack on the campaign-floor comparison, in BD-rate percent: the

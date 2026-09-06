@@ -165,3 +165,5 @@ Re-pins this round, each validated 15/15 byte-identical:
 
 1. RDOQ end-of-block search + the corrected 1/16 transform-gain
    distortion model.
+2. Motion search: explicit `LAST1` / `LAST2` candidates, priced four-MV
+   block searches, iterated half-pixel refinement.

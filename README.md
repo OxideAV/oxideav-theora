@@ -587,6 +587,10 @@ encoder, mean over the six ladder sequences, measured incrementally):
 * RDOQ end-of-block search + corrected transform-gain distortion model
   (1/16, was ≈ 7/64): −2.0 % luma / −1.4 % chroma, +0.22 dB BD-PSNR
   (`pan` −7.5 %, `square0` −3.0 %; the noise-textured `blobs` +1.1 %).
+* Motion search: `LAST1` / `LAST2` as explicit rate-distortion
+  candidates −2.6 %, priced `INTER_MV_FOUR` block searches −0.4 %,
+  iterated half-pixel refinement −0.8 % (cumulative −5.7 % luma /
+  −5.7 % chroma, +0.70 dB BD-PSNR vs round 453).
 
 ## Measured rate-distortion (round 453)
 

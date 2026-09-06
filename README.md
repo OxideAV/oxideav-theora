@@ -615,6 +615,10 @@ encoder, mean over the six ladder sequences, measured incrementally):
   not done. Cumulative vs round 453: **−15.3 % luma / −9.0 % chroma,
   +2.28 dB BD-PSNR** (`square0` −24.2 %, `cut` −20.8 %, `pan` −17.6 %,
   `blobs` −0.5 %).
+* Speed (byte-identical): stack token plans, predictor fast paths,
+  hoisted source extraction and early-abandoned search SADs — 1.5×
+  faster encode+decode on every ladder scene (176×144 `pan`
+  ≈ 94 → 140 fps, `square0` 164 → 245 fps), output unchanged.
 * Activity masking (`with_activity_masking(1|2)`, opt-in, needs a
   multi-`qi` list): −0.35 % / −0.59 % luma SSIM-rate for +0.15 % /
   +0.75 % PSNR-rate against `with_adaptive_quant_auto` alone — a small

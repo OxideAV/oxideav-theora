@@ -7421,8 +7421,10 @@ struct PlannedToken {
     token: u8,
     /// Extra-bits payload, written MSb-first after the Huffman code.
     /// `(value, nbits)` pairs in emission order. At most three (e.g.
-    /// run+sign+mag).
-    extra: [(u32, u32); 3],
+    /// run+sign+mag). Values fit 12 bits (the widest §7.7 payload)
+    /// and widths 6; the compact pair keeps the per-block plan buffer
+    /// small enough to live on the stack of every rate query.
+    extra: [(u16, u8); 3],
     /// Number of `extra` entries that are meaningful.
     n_extra: u8,
     /// How many zig-zag positions this token consumes (`TIS` advance).
@@ -7440,9 +7442,10 @@ impl PlannedToken {
     }
 
     fn with_extra(token: u8, advance: u8, extra: &[(u32, u32)]) -> Self {
-        let mut e = [(0u32, 0u32); 3];
-        for (i, &pair) in extra.iter().enumerate() {
-            e[i] = pair;
+        let mut e = [(0u16, 0u8); 3];
+        for (i, &(val, nbits)) in extra.iter().enumerate() {
+            debug_assert!(val <= 0xfff && nbits <= 12);
+            e[i] = (val as u16, nbits as u8);
         }
         Self {
             token,
@@ -7520,22 +7523,63 @@ fn plan_single_coefficient(v: i16) -> Option<PlannedToken> {
 /// Returns `None` if any coefficient magnitude exceeds the
 /// single-coefficient token range (`|v| > 580`); callers clamp before
 /// quantization so this does not fire for spec-conformant content.
+/// A block's token plan in a fixed-capacity buffer: at most 64
+/// coefficient-consuming tokens plus the terminal EOB. The
+/// rate-distortion loops plan a block many times per coded block
+/// (every RDOQ candidate, every quantizer candidate), so the plan is
+/// built in place rather than allocated.
+struct BlockTokenPlan {
+    tokens: [PlannedToken; 65],
+    len: usize,
+}
+
+impl BlockTokenPlan {
+    const EMPTY: Self = Self {
+        tokens: [PlannedToken {
+            token: 0,
+            extra: [(0, 0); 3],
+            n_extra: 0,
+            advance: 0,
+        }; 65],
+        len: 0,
+    };
+
+    #[inline]
+    fn push(&mut self, t: PlannedToken) {
+        self.tokens[self.len] = t;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[PlannedToken] {
+        &self.tokens[..self.len]
+    }
+}
+
+/// [`plan_block_tokens_into`] returning the plan as a `Vec` (the
+/// frame-level planner keeps per-block plans around for the EOB-run
+/// coalescing pass).
 fn plan_block_tokens(coeffs_zz: &[i16; 64]) -> Option<Vec<PlannedToken>> {
+    let mut buf = BlockTokenPlan::EMPTY;
+    plan_block_tokens_into(coeffs_zz, &mut buf)?;
+    Some(buf.as_slice().to_vec())
+}
+
+fn plan_block_tokens_into(coeffs_zz: &[i16; 64], out: &mut BlockTokenPlan) -> Option<()> {
     // Find the highest non-zero zig-zag index.
     let last_nz = (0..64).rev().find(|&i| coeffs_zz[i] != 0);
-    let mut plan: Vec<PlannedToken> = Vec::new();
+    out.len = 0;
 
     let Some(last_nz) = last_nz else {
         // All-zero block: a single EOB token (token 0) zero-fills
         // [0..64] and pins TIS to 64.
-        plan.push(PlannedToken::simple(0, 64));
-        return Some(plan);
+        out.push(PlannedToken::simple(0, 64));
+        return Some(());
     };
 
     let mut ti = 0usize;
     while ti <= last_nz {
         if coeffs_zz[ti] != 0 {
-            plan.push(plan_single_coefficient(coeffs_zz[ti])?);
+            out.push(plan_single_coefficient(coeffs_zz[ti])?);
             ti += 1;
             continue;
         }
@@ -7570,13 +7614,13 @@ fn plan_block_tokens(coeffs_zz: &[i16; 64]) -> Option<Vec<PlannedToken>> {
                     &[(sign, 1), ((run - 10) as u32, 3)],
                 ),
             };
-            plan.push(pt);
+            out.push(pt);
             ti += run + 1;
             continue;
         }
         if (2..=3).contains(&mag) && run == 1 {
             // Token 30: fixed run 1, SIGN + 1-bit MAG (2..=3).
-            plan.push(PlannedToken::with_extra(
+            out.push(PlannedToken::with_extra(
                 30,
                 2,
                 &[(sign, 1), (u32::from(mag) - 2, 1)],
@@ -7586,7 +7630,7 @@ fn plan_block_tokens(coeffs_zz: &[i16; 64]) -> Option<Vec<PlannedToken>> {
         }
         if (2..=3).contains(&mag) && (2..=3).contains(&run) {
             // Token 31: SIGN + 1-bit MAG (2..=3) + 1-bit RLEN (2..=3).
-            plan.push(PlannedToken::with_extra(
+            out.push(PlannedToken::with_extra(
                 31,
                 (run + 1) as u8,
                 &[(sign, 1), (u32::from(mag) - 2, 1), ((run - 2) as u32, 1)],
@@ -7598,13 +7642,13 @@ fn plan_block_tokens(coeffs_zz: &[i16; 64]) -> Option<Vec<PlannedToken>> {
         // Pure zero run: token 7 (3-bit RLEN, run 1..=8) halves the
         // payload of token 8 (6-bit RLEN, run 1..=64) for short gaps.
         if run <= 8 {
-            plan.push(PlannedToken::with_extra(
+            out.push(PlannedToken::with_extra(
                 7,
                 run as u8,
                 &[((run - 1) as u32, 3)],
             ));
         } else {
-            plan.push(PlannedToken::with_extra(
+            out.push(PlannedToken::with_extra(
                 8,
                 run as u8,
                 &[((run - 1) as u32, 6)],
@@ -7615,8 +7659,8 @@ fn plan_block_tokens(coeffs_zz: &[i16; 64]) -> Option<Vec<PlannedToken>> {
 
     // Close the block: EOB token 0 zero-fills [ti..64], TIS := 64.
     let remaining = (64 - ti) as u8;
-    plan.push(PlannedToken::simple(0, remaining));
-    Some(plan)
+    out.push(PlannedToken::simple(0, remaining));
+    Some(())
 }
 
 /// Locate the `(code, len)` for a given `token` in a §6.4.4 Huffman
@@ -7973,7 +8017,7 @@ fn encode_dct_coefficients_inner(
             w.write_bits(code, len as u32);
             for k in 0..pt.n_extra as usize {
                 let (val, nbits) = pt.extra[k];
-                w.write_bits(val, nbits);
+                w.write_bits(u32::from(val), u32::from(nbits));
             }
         }
     }
@@ -9115,6 +9159,20 @@ pub fn compute_whole_pixel_predictor(
     let mvx = mv.x as i32;
     let mvy = mv.y as i32;
 
+    // Fast path: a window wholly inside the plane needs no clamping,
+    // so each row is a straight copy (identical samples to the
+    // clamped walk below, which is only ever reached at the edges).
+    let rx0 = bx0 + mvx;
+    let ry0 = by0 + mvy;
+    if rx0 >= 0 && ry0 >= 0 && rx0 + 8 <= refp.rpw as i32 && ry0 + 8 <= refp.rph as i32 {
+        let w = refp.rpw as usize;
+        for (by, row) in pred.iter_mut().enumerate() {
+            let base = (ry0 as usize + by) * w + rx0 as usize;
+            row.copy_from_slice(&refp.samples[base..base + 8]);
+        }
+        return pred;
+    }
+
     // Step 1: by from 0..=7. The spec's "for each by" wraps the per-
     // row clamping then the inner bx loop.
     for by in 0i32..=7 {
@@ -9197,6 +9255,33 @@ pub fn compute_half_pixel_predictor(
     let mvy1 = mv1.y as i32;
     let mvx2 = mv2.x as i32;
     let mvy2 = mv2.y as i32;
+
+    // Fast path: both windows wholly inside the plane — no clamping,
+    // straight row reads (the same samples the clamped walk below
+    // produces; that walk is only reached at the edges).
+    let (rx1, ry1, rx2, ry2) = (bx0 + mvx1, by0 + mvy1, bx0 + mvx2, by0 + mvy2);
+    let (w, h) = (refp.rpw as i32, refp.rph as i32);
+    if rx1 >= 0
+        && ry1 >= 0
+        && rx1 + 8 <= w
+        && ry1 + 8 <= h
+        && rx2 >= 0
+        && ry2 >= 0
+        && rx2 + 8 <= w
+        && ry2 + 8 <= h
+    {
+        let w = w as usize;
+        for (by, row) in pred.iter_mut().enumerate() {
+            let b1 = (ry1 as usize + by) * w + rx1 as usize;
+            let b2 = (ry2 as usize + by) * w + rx2 as usize;
+            let r1 = &refp.samples[b1..b1 + 8];
+            let r2 = &refp.samples[b2..b2 + 8];
+            for (bx, out) in row.iter_mut().enumerate() {
+                *out = ((r1[bx] as u16 + r2[bx] as u16) >> 1) as u8;
+            }
+        }
+        return pred;
+    }
 
     // Step 1: by from 0..=7.
     for by in 0i32..=7 {
@@ -15502,34 +15587,41 @@ impl FrameEncoder {
                 g.by_of_block[abcd[3] as usize],
             ),
         ];
-        let sad_for = |mv: MotionVector| -> u32 {
-            let mut sad = 0u32;
-            for &(bx, by) in origins.iter() {
-                let pred = match inter_block_predictor(&refp, bx, by, mv) {
-                    Ok(p) => p,
-                    Err(_) => return u32::MAX,
-                };
-                if let Ok(src) =
-                    Self::extract_block(&frame.samples_y, g.dims_y.width, g.dims_y.height, bx, by)
-                {
-                    for r in 0..8 {
-                        for c in 0..8 {
-                            sad += (src[r][c] - pred[r][c] as i16).unsigned_abs() as u32;
-                        }
-                    }
-                } else {
-                    return u32::MAX;
-                }
+        // The four source blocks, extracted once for the whole search
+        // (every probe compares against the same samples).
+        let mut srcs = [[[0i16; 8]; 8]; 4];
+        for (k, &(bx, by)) in origins.iter().enumerate() {
+            match Self::extract_block(&frame.samples_y, g.dims_y.width, g.dims_y.height, bx, by) {
+                Ok(src) => srcs[k] = src,
+                Err(_) => return (MotionVector::ZERO, u32::MAX),
             }
-            sad
+        }
+        // Bounded SAD over the four blocks: the running sum gives up
+        // once it reaches `limit` (see `luma_block_sad_bounded`).
+        let sad_bounded = |mv: MotionVector, limit: u32| -> Option<u32> {
+            let mut sad = 0u32;
+            for (k, &(bx, by)) in origins.iter().enumerate() {
+                sad += luma_block_sad_bounded(&refp, bx, by, mv, &srcs[k], limit - sad)?;
+            }
+            Some(sad)
         };
+        let sad_for = |mv: MotionVector| -> u32 { sad_bounded(mv, u32::MAX).unwrap_or(u32::MAX) };
 
-        let cost_for = |mv: MotionVector| -> u32 {
-            let sad = sad_for(mv);
-            if lambda_sad == 0 || sad == u32::MAX {
-                sad
+        // Priced cost, evaluated no further than `limit`: the vector
+        // bits are known up front, and the SAD is abandoned as soon as
+        // penalty + partial SAD reaches the limit.
+        let cost_for = |mv: MotionVector, limit: u32| -> u32 {
+            let penalty = if lambda_sad == 0 {
+                0
             } else {
-                sad.saturating_add(lambda_sad.saturating_mul(mv_huffman_bits(mv)))
+                lambda_sad.saturating_mul(mv_huffman_bits(mv))
+            };
+            if penalty >= limit {
+                return u32::MAX;
+            }
+            match sad_bounded(mv, limit - penalty) {
+                Some(sad) => sad + penalty,
+                None => u32::MAX,
             }
         };
         // Seeded four-step whole-pixel descent, zero-biased: strict
@@ -15590,25 +15682,20 @@ impl FrameEncoder {
                 Ok(s) => s,
                 Err(_) => return MotionVector::ZERO,
             };
-        let sad_for = |mv: MotionVector| -> u32 {
-            let pred = match inter_block_predictor(&refp, bx, by, mv) {
-                Ok(p) => p,
-                Err(_) => return u32::MAX,
-            };
-            let mut sad = 0u32;
-            for r in 0..8 {
-                for c in 0..8 {
-                    sad += (src[r][c] - pred[r][c] as i16).unsigned_abs() as u32;
-                }
-            }
-            sad
-        };
-        let cost_for = |mv: MotionVector| -> u32 {
-            let sad = sad_for(mv);
-            if lambda_sad == 0 || sad == u32::MAX {
-                sad
+        // Priced cost evaluated no further than `limit` (see the macro
+        // block search).
+        let cost_for = |mv: MotionVector, limit: u32| -> u32 {
+            let penalty = if lambda_sad == 0 {
+                0
             } else {
-                sad.saturating_add(lambda_sad.saturating_mul(mv_huffman_bits(mv)))
+                lambda_sad.saturating_mul(mv_huffman_bits(mv))
+            };
+            if penalty >= limit {
+                return u32::MAX;
+            }
+            match luma_block_sad_bounded(&refp, bx, by, mv, &src, limit - penalty) {
+                Some(sad) => sad + penalty,
+                None => u32::MAX,
             }
         };
         // Seeded four-step whole-pixel descent, as
@@ -16131,10 +16218,11 @@ impl TokenBitCosts {
     /// `None` when a coefficient overflows the token alphabet or a
     /// token has no leaf in its group.
     fn block_bits(&self, coeffs_zz: &[i16; 64]) -> Option<u32> {
-        let plan = plan_block_tokens(coeffs_zz)?;
+        let mut plan = BlockTokenPlan::EMPTY;
+        plan_block_tokens_into(coeffs_zz, &mut plan)?;
         let mut ti: u8 = 0;
         let mut bits = 0u32;
-        for pt in &plan {
+        for pt in plan.as_slice() {
             let hg = huffman_table_group(ti) as usize;
             let len = self.min_len[hg][pt.token as usize];
             if len == u8::MAX {
@@ -16142,7 +16230,7 @@ impl TokenBitCosts {
             }
             bits += u32::from(len);
             for k in 0..pt.n_extra as usize {
-                bits += pt.extra[k].1;
+                bits += u32::from(pt.extra[k].1);
             }
             ti = ti.saturating_add(pt.advance).min(63);
         }
@@ -16310,12 +16398,45 @@ fn rdoq_refine(
     }
 }
 
-/// Build the §7.9.1 motion-compensated predictor tile for one block,
-/// returning it in `[by][bx]` row-major order (the same orientation
-/// [`reconstruct_block`] produces). `mv` is the §7.5 half-pixel-unit
-/// vector; even components route through the whole-pixel predictor and
-/// odd components through the half-pixel predictor, exactly as the
-/// decoder's step 2(d)vi does.
+/// SAD of one luma source block against its motion-compensated
+/// predictor at `mv`, abandoned (`None`) as soon as the running sum
+/// reaches `limit`. A search only ever asks whether a candidate is
+/// *strictly* better than the running best, so evaluating it no
+/// further than the best is decision-identical and skips most of the
+/// arithmetic on losing probes.
+fn luma_block_sad_bounded(
+    refp: &ReferencePlane<'_>,
+    bx: u32,
+    by: u32,
+    mv: MotionVector,
+    src: &[[i16; 8]; 8],
+    limit: u32,
+) -> Option<u32> {
+    let (mv1, mv2) = split_motion_vector_per_axis(mv.x as i32, mv.y as i32, 2, 2)?;
+    let pred = if mv1 == mv2 {
+        compute_whole_pixel_predictor(refp, bx, by, mv1)
+    } else {
+        compute_half_pixel_predictor(refp, bx, by, mv1, mv2)
+    };
+    let mut sad = 0u32;
+    for (srow, prow) in src.iter().zip(pred.iter()) {
+        for (s, p) in srow.iter().zip(prow.iter()) {
+            sad += (s - *p as i16).unsigned_abs() as u32;
+        }
+        if sad >= limit {
+            return None;
+        }
+    }
+    Some(sad)
+}
+
+/// Build the §7.9.1 motion-compensated predictor tile for one luma
+/// block (the `[by][bx]` row-major tile [`reconstruct_block`]
+/// produces): even vector components route through the whole-pixel
+/// predictor and odd ones through the half-pixel predictor, exactly as
+/// the decoder's step 2(d)vi does. The encoder's searches take the
+/// bounded-SAD path instead; this is the tests' reference tile.
+#[cfg(test)]
 fn inter_block_predictor(
     refp: &ReferencePlane<'_>,
     bx_origin: u32,
@@ -16440,15 +16561,15 @@ const HALF_PIXEL_NEIGHBORS: [(i32, i32); 8] = [
 /// refinement still probes the final winner's neighbours.
 fn whole_pixel_step_search_seeded(
     seeds: &[MotionVector],
-    sad_for: impl Fn(MotionVector) -> u32,
+    sad_for: impl Fn(MotionVector, u32) -> u32,
 ) -> (MotionVector, u32) {
     let mut best_mv = MotionVector::ZERO;
-    let mut best_sad = sad_for(MotionVector::ZERO);
+    let mut best_sad = sad_for(MotionVector::ZERO, u32::MAX);
     for &seed in seeds {
         if seed == MotionVector::ZERO {
             continue;
         }
-        let sad = sad_for(seed);
+        let sad = sad_for(seed, best_sad);
         if sad < best_sad {
             best_sad = sad;
             best_mv = seed;
@@ -16477,7 +16598,7 @@ fn whole_pixel_step_search_seeded(
                 x: x as i8,
                 y: y as i8,
             };
-            let sad = sad_for(mv);
+            let sad = sad_for(mv, best_sad);
             if sad < best_sad {
                 best_sad = sad;
                 best_mv = mv;
@@ -16490,7 +16611,7 @@ fn whole_pixel_step_search_seeded(
 fn refine_half_pixel_mv(
     best: MotionVector,
     best_sad: u32,
-    sad_for: impl Fn(MotionVector) -> u32,
+    sad_for: impl Fn(MotionVector, u32) -> u32,
 ) -> (MotionVector, u32) {
     let (mut best_mv, mut best_sad) = probe_neighbors(best, best_sad, 1, &sad_for);
     // Iterate: the half-pixel winner may sit next to a better
@@ -16521,7 +16642,7 @@ fn probe_neighbors(
     best: MotionVector,
     best_sad: u32,
     d: i32,
-    sad_for: &impl Fn(MotionVector) -> u32,
+    sad_for: &impl Fn(MotionVector, u32) -> u32,
 ) -> (MotionVector, u32) {
     let mut best_mv = best;
     let mut best_sad = best_sad;
@@ -16535,7 +16656,7 @@ fn probe_neighbors(
             x: x as i8,
             y: y as i8,
         };
-        let sad = sad_for(mv);
+        let sad = sad_for(mv, best_sad);
         if sad < best_sad {
             best_sad = sad;
             best_mv = mv;
@@ -27169,7 +27290,7 @@ mod tests {
             match want_extra {
                 Some(e) => {
                     assert_eq!(first.n_extra, 1, "n={n}");
-                    assert_eq!(first.extra[0], e, "n={n}");
+                    assert_eq!(first.extra[0], (e.0 as u16, e.1 as u8), "n={n}");
                 }
                 None => assert_eq!(first.n_extra, 0, "n={n}"),
             }

@@ -106,6 +106,22 @@ All notable changes to `oxideav-theora` are recorded here.
   one under a multi-`qi` list. Measured against `with_adaptive_quant_auto`
   alone: level 1 −0.35 % luma SSIM-rate at +0.15 % PSNR-rate, level 2
   −0.59 % / +0.75 % — a small perceptual trade, opt-in.
+- **Encoder hot-path speedups, byte-identical (round 457)** — profiled
+  with a sampling profiler on the battery: per-block token plans are
+  built in a fixed stack buffer instead of a `Vec` (every RDOQ and
+  quantizer candidate plans the block), the `PlannedToken` extra-bits
+  pairs are `(u16, u8)`, the whole- and half-pixel predictor builders
+  take a straight-copy fast path when the window lies inside the
+  reference plane, the macro-block search extracts its four source
+  blocks once per search instead of once per probe, and every search
+  probe's SAD is abandoned as soon as it reaches the running best
+  (decision-identical: a probe only ever has to beat the best
+  strictly). The ladder's output is byte-for-byte unchanged (corpus
+  digests untouched); encode+decode+measure time on the 120-frame
+  per-scene ladders fell 1.28 → 0.86 s (`pan`), 0.73 → 0.49 s
+  (`square0`), 0.72 → 0.48 s (`blobs`) — 1.5× throughout (176×144:
+  ≈ 94 → 140 fps on `pan`, 164 → 245 fps on `square0`, per-frame
+  encode + decode).
 - `CORPUS_DUMP` in `tests/encoded_corpus.rs` also writes each
   scenario's `<name>.recon` (this crate's reconstruction) next to the
   `.chain`, so the black-box decode route byte-compares without a

@@ -581,6 +581,13 @@ the battery measures this encoder against its own prior rounds; the
 black-box reference *decoder* validates every re-pinned stream
 byte-exactly (see `tests/encoded-corpus-notes.md`).
 
+Per-change contributions this round (luma BD-rate vs the round-453
+encoder, mean over the six ladder sequences, measured incrementally):
+
+* RDOQ end-of-block search + corrected transform-gain distortion model
+  (1/16, was ≈ 7/64): −2.0 % luma / −1.4 % chroma, +0.22 dB BD-PSNR
+  (`pan` −7.5 %, `square0` −3.0 %; the noise-textured `blobs` +1.1 %).
+
 ## Measured rate-distortion (round 453)
 
 `examples/rd_ladder.rs` is the crate's reproducible measurement

@@ -16,6 +16,26 @@ All notable changes to `oxideav-theora` are recorded here.
   lives in `tests/common/rd.rs`, shared by `examples/rd_ladder.rs`, which
   gained an SSIM column and chroma / SSIM BD-rate output; `--save`
   files carry the SSIM column (round-453 files still load).
+- **RDOQ end-of-block search + corrected distortion model (round
+  457)** — `rdoq_refine` now first searches the block's end-of-block
+  position (zeroing every trailing stretch of non-zero AC levels as one
+  joint move, judged on the whole block's measured token plan) before
+  the per-coefficient descent, and prices coefficient-domain error
+  through the transform's exact energy gain of 1/16 (the impulse
+  response of this crate's own `inverse_dct_2d` at every position,
+  pinned by `idct_impulse_energy_gain_is_one_sixteenth`) instead of the
+  round-453 ≈ 7/64 figure, which was measured at rounding-dominated
+  magnitudes and over-priced distortion 1.75×. Battery (luma BD-rate
+  vs round 453): `pan` −7.5 %, `square0` −3.0 %, `cut` −1.5 %,
+  fixture `keyframe-interval-30` −2.2 %; the noise-textured `blobs`
+  gives back +1.1 % and `all-mb-modes` +0.9 % (a correct model zeroes
+  the noise a lower effective λ used to keep) — mean −2.0 % luma /
+  −1.4 % chroma, +0.22 dB BD-PSNR. Three test premises the extra
+  zeroing invalidated were rewritten (worst-sample bounds on the
+  sawtooth textures; the multi-`qi` P-frame probe now orders its list
+  fine-first over a checkerboard so the split follows from the rate
+  arithmetic rather than from noise). Corpus re-pinned (15/15
+  black-box byte-identical, see `tests/encoded-corpus-notes.md`).
 - `CORPUS_DUMP` in `tests/encoded_corpus.rs` also writes each
   scenario's `<name>.recon` (this crate's reconstruction) next to the
   `.chain`, so the black-box decode route byte-compares without a

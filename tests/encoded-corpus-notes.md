@@ -1,4 +1,4 @@
-# Self-encoded corpus — generation + external-validation notes (rounds 413 / 437 / 444 / 453)
+# Self-encoded corpus — generation + external-validation notes (rounds 413 / 437 / 444 / 453 / 457)
 
 `encoded_corpus.rs` pins twelve deterministic encoder scenarios by
 SHA-256, at two levels per scenario:
@@ -147,3 +147,21 @@ shapes introduced this round — a **two-pass rate-controlled** stream
 (`with_adaptive_quant_auto`) — were dumped from the `rd_ladder`
 harness (`--out`) and validated through the same route,
 byte-identical as well.
+
+## Round 457 — quality-campaign re-pins
+
+The route is now scripted end to end: `CORPUS_DUMP=<dir>` writes both
+`<name>.chain` (wire) and `<name>.recon` (this crate's reconstruction),
+a throwaway RFC 3533 pager (ident on its own BOS page; comment + setup
+on the next; one data packet per page with §A.2.3 granule positions
+`keyframe_index << KFGSHIFT | offset`; CRC-32 poly `0x04c11db7`) turns
+each chain into `.ogv`, `oggz-validate` checks the framing, `ffmpeg
+8.1` decodes with `-fps_mode passthrough` to raw planar video, and the
+output is byte-compared against `.recon` (dropping the frames that
+correspond to zero-byte duplicate packets, for which the reference
+decoder emits nothing).
+
+Re-pins this round, each validated 15/15 byte-identical:
+
+1. RDOQ end-of-block search + the corrected 1/16 transform-gain
+   distortion model.

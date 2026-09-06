@@ -4,6 +4,19 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-theora/compare/v0.0.12...v0.0.13) - 2026-09-06
+
+### Other
+
+- round-457 measured rate-distortion — final ladder, cumulative BD table, re-run elections; CHANGELOG summary
+- structured setup-header writer/parser pair target; roundtrip target drives lookahead/VBV/masking
+- byte-identical hot-path speedups — stack token plans, predictor fast paths, hoisted extraction, early-abandoned search SADs
+- measured-election intra quant matrices as the synthesized setup default; opt-in activity masking
+- lookahead planning — two-sided scene-cut keyframes, interval deferral, windowed rate shares, VBV model + enforcement
+- LAST1/LAST2 as explicit RD candidates, priced four-MV block search, iterated half-pixel refinement
+- RDOQ end-of-block search + exact 1/16 transform-gain distortion model
+- pinned Bjøntegaard battery — shared rd harness, luma/chroma/SSIM BD-rate vs round-453 curves, corpus .recon dump
+
 Round 457 encoder-quality campaign, cumulative against the round-453
 encoder on the battery: **−15.3 % luma / −9.0 % chroma BD-rate,
 +2.28 dB BD-PSNR** (`square0` −24.2 %, `cut` −20.8 %, `pan` −17.6 %,

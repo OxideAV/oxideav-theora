@@ -805,6 +805,7 @@ stream) were validated the same way (see
 ```rust
 use oxideav_theora::{decode_identification_header, decode_setup_header, FrameDecoder};
 
+# let (ident_packet, setup_packet, data_packet): (&[u8], &[u8], &[u8]) = (&[], &[], &[]);
 // `ident_packet`, `setup_packet`, and the data packets are de-framed
 // from the container by the caller.
 let ident = decode_identification_header(ident_packet)?;

@@ -50,8 +50,8 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(tables) = decode_setup_header(data) {
         let bytes =
             encode_setup_header(&tables).expect("accepted setup tables must serialize (§6.4.5)");
-        let back = decode_setup_header(&bytes)
-            .expect("a serialized §6.4 setup header must decode back");
+        let back =
+            decode_setup_header(&bytes).expect("a serialized §6.4 setup header must decode back");
         assert_eq!(
             back, tables,
             "§6.4 decode∘encode∘decode must be a fixpoint on accepted tables"

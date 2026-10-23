@@ -36,7 +36,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
-use oxideav_theora::{decode_identification_header, make_decoder, THEORA_CODEC_ID};
+use oxideav_theora::{THEORA_CODEC_ID, decode_identification_header, make_decoder};
 
 /// Upper bound on the declared coded-frame area (≈ 4 Mpixel — HD
 /// class). Larger declarations are resource requests the harness

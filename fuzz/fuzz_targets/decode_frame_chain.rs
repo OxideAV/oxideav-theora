@@ -30,7 +30,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_theora::{
-    decode_setup_header, FrameDecoder, PixelFormat, SetupHeaderTables, TheoraIdentHeader,
+    FrameDecoder, PixelFormat, SetupHeaderTables, TheoraIdentHeader, decode_setup_header,
 };
 use std::sync::OnceLock;
 
@@ -70,8 +70,7 @@ fuzz_target!(|data: &[u8]| {
     } else {
         SetupHeaderTables::vp3_defaults()
     };
-    let mut dec =
-        FrameDecoder::new(ident, setup).expect("small VP3-default geometry must build");
+    let mut dec = FrameDecoder::new(ident, setup).expect("small VP3-default geometry must build");
 
     let mut rest = &data[3..];
     let mut packets = 0usize;

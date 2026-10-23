@@ -8,7 +8,7 @@ mod rd;
 
 use oxideav_core::{CodecId, Encoder as _, Frame, Packet};
 use oxideav_theora::{
-    PixelFormat, SetupHeaderTables, TheoraEncoder, TheoraIdentHeader, THEORA_CODEC_ID,
+    PixelFormat, SetupHeaderTables, THEORA_CODEC_ID, TheoraEncoder, TheoraIdentHeader,
 };
 use rd::*;
 

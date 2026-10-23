@@ -1652,10 +1652,9 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: pli={pli} out of range 0..=2 (§6.4.3 / Table 2.1)"
             ),
-            Error::QuantIndexOutOfRange { qi } => write!(
-                f,
-                "oxideav-theora: qi={qi} out of range 0..=63 (§6.4.3)"
-            ),
+            Error::QuantIndexOutOfRange { qi } => {
+                write!(f, "oxideav-theora: qi={qi} out of range 0..=63 (§6.4.3)")
+            }
             Error::HuffmanCodeTooLong { hti } => write!(
                 f,
                 "oxideav-theora: HTS[{hti}] code exceeded 32 bits (§6.4.4 step 1(b): undecodable)"
@@ -1692,12 +1691,7 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: §7.4 macro-block-to-luma-blocks map length {map_len} != nmbs {nmbs}"
             ),
-            Error::MacroBlockLumaBlockIndexOutOfRange {
-                mbi,
-                slot,
-                bi,
-                nbs,
-            } => write!(
+            Error::MacroBlockLumaBlockIndexOutOfRange { mbi, slot, bi, nbs } => write!(
                 f,
                 "oxideav-theora: §7.4 mb {mbi} slot {slot} → bi {bi} >= nbs {nbs}"
             ),
@@ -1713,21 +1707,11 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: §7.5.2 luma-block map length {map_len} != nmbs {nmbs}"
             ),
-            Error::MotionVectorLumaBlockIndexOutOfRange {
-                mbi,
-                slot,
-                bi,
-                nbs,
-            } => write!(
+            Error::MotionVectorLumaBlockIndexOutOfRange { mbi, slot, bi, nbs } => write!(
                 f,
                 "oxideav-theora: §7.5.2 mb {mbi} slot {slot} → bi {bi} >= nbs {nbs}"
             ),
-            Error::MotionVectorChromaBlockIndexOutOfRange {
-                mbi,
-                slot,
-                bi,
-                nbs,
-            } => write!(
+            Error::MotionVectorChromaBlockIndexOutOfRange { mbi, slot, bi, nbs } => write!(
                 f,
                 "oxideav-theora: §7.5.2 chroma mb {mbi} slot {slot} → bi {bi} >= nbs {nbs}"
             ),
@@ -1752,18 +1736,15 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: §7.6 bcoded length {bcoded_len} != nbs {nbs}"
             ),
-            Error::BlockLevelQiNqisOutOfRange { nqis } => write!(
-                f,
-                "oxideav-theora: §7.6 NQIS={nqis} out of range 1..=3"
-            ),
-            Error::EobTokenOutOfRange { token } => write!(
-                f,
-                "oxideav-theora: §7.7.1 TOKEN={token} out of range 0..=6"
-            ),
-            Error::EobTokenBlockIndexOutOfRange { bi, nbs } => write!(
-                f,
-                "oxideav-theora: §7.7.1 bi={bi} >= nbs={nbs}"
-            ),
+            Error::BlockLevelQiNqisOutOfRange { nqis } => {
+                write!(f, "oxideav-theora: §7.6 NQIS={nqis} out of range 1..=3")
+            }
+            Error::EobTokenOutOfRange { token } => {
+                write!(f, "oxideav-theora: §7.7.1 TOKEN={token} out of range 0..=6")
+            }
+            Error::EobTokenBlockIndexOutOfRange { bi, nbs } => {
+                write!(f, "oxideav-theora: §7.7.1 bi={bi} >= nbs={nbs}")
+            }
             Error::EobTokenIndexOutOfRange { ti } => write!(
                 f,
                 "oxideav-theora: §7.7.1 ti={ti} > 63 (zig-zag indices are 0..=63)"
@@ -1776,10 +1757,9 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: §7.7.2 TOKEN={token} out of range 7..=31"
             ),
-            Error::CoefficientTokenBlockIndexOutOfRange { bi, nbs } => write!(
-                f,
-                "oxideav-theora: §7.7.2 bi={bi} >= nbs={nbs}"
-            ),
+            Error::CoefficientTokenBlockIndexOutOfRange { bi, nbs } => {
+                write!(f, "oxideav-theora: §7.7.2 bi={bi} >= nbs={nbs}")
+            }
             Error::CoefficientTokenIndexOutOfRange { ti } => write!(
                 f,
                 "oxideav-theora: §7.7.2 ti={ti} > 63 (zig-zag indices are 0..=63)"
@@ -1788,18 +1768,13 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: §7.7.2 state slice {which:?} length {got} != nbs {nbs}"
             ),
-            Error::CoefficientTokenWouldOverflowBlock {
-                token,
-                ti,
-                new_tis,
-            } => write!(
+            Error::CoefficientTokenWouldOverflowBlock { token, ti, new_tis } => write!(
                 f,
                 "oxideav-theora: §7.7.2 TOKEN={token} from ti={ti} would advance TIS to {new_tis} > 64"
             ),
-            Error::DctCoefficientBcodedLenMismatch { got, nbs } => write!(
-                f,
-                "oxideav-theora: §7.7.3 BCODED length {got} != nbs {nbs}"
-            ),
+            Error::DctCoefficientBcodedLenMismatch { got, nbs } => {
+                write!(f, "oxideav-theora: §7.7.3 BCODED length {got} != nbs {nbs}")
+            }
             Error::DctCoefficientNlbsExceedsNbs { nmbs, nbs } => {
                 let nlbs = (*nmbs).saturating_mul(4);
                 write!(
@@ -1807,18 +1782,15 @@ impl core::fmt::Display for Error {
                     "oxideav-theora: §7.7.3 NLBS = NMBS*4 = {nlbs} > NBS = {nbs}"
                 )
             }
-            Error::DctCoefficientEmptyHuffmanTable { hti } => write!(
-                f,
-                "oxideav-theora: §7.7.3 HTS[{hti}] is empty (no leaves)"
-            ),
-            Error::DctCoefficientHuffmanWalkOffTree { hti } => write!(
-                f,
-                "oxideav-theora: §7.7.3 Huffman walk fell off HTS[{hti}]"
-            ),
-            Error::DctCoefficientLeftoverEobs { residual } => write!(
-                f,
-                "oxideav-theora: §7.7.3 ended with EOBS={residual} > 0"
-            ),
+            Error::DctCoefficientEmptyHuffmanTable { hti } => {
+                write!(f, "oxideav-theora: §7.7.3 HTS[{hti}] is empty (no leaves)")
+            }
+            Error::DctCoefficientHuffmanWalkOffTree { hti } => {
+                write!(f, "oxideav-theora: §7.7.3 Huffman walk fell off HTS[{hti}]")
+            }
+            Error::DctCoefficientLeftoverEobs { residual } => {
+                write!(f, "oxideav-theora: §7.7.3 ended with EOBS={residual} > 0")
+            }
             Error::DctCoefficientBlockNotClosed { bi, tis } => write!(
                 f,
                 "oxideav-theora: §7.7.3 coded block bi={bi} unclosed: TIS={tis} != 64"
@@ -1853,10 +1825,9 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: encode qis list length {got} outside §7.1 NQIS range 1..=3"
             ),
-            Error::EncodeQiisLenMismatch { got, nbs } => write!(
-                f,
-                "oxideav-theora: encode qiis length {got} != nbs {nbs}"
-            ),
+            Error::EncodeQiisLenMismatch { got, nbs } => {
+                write!(f, "oxideav-theora: encode qiis length {got} != nbs {nbs}")
+            }
             Error::EncodeQiiOutOfRange { bi, qii, nqis } => write!(
                 f,
                 "oxideav-theora: encode qiis[{bi}] = {qii} >= NQIS {nqis}"
@@ -1865,22 +1836,19 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: header field {field} value {value} overruns its on-wire width"
             ),
-            Error::DcPredictorBlockIndexOutOfRange { bi, nbs } => write!(
-                f,
-                "oxideav-theora: §7.8.1 bi={bi} >= nbs={nbs}"
-            ),
+            Error::DcPredictorBlockIndexOutOfRange { bi, nbs } => {
+                write!(f, "oxideav-theora: §7.8.1 bi={bi} >= nbs={nbs}")
+            }
             Error::DcPredictorBcodedLenMismatch { which, got, nbs } => write!(
                 f,
                 "oxideav-theora: §7.8.1 input slice {which:?} length {got} != nbs {nbs}"
             ),
-            Error::DcPredictorMacroBlockIndexOutOfRange { mbi, nmbs } => write!(
-                f,
-                "oxideav-theora: §7.8.1 mbi={mbi} >= nmbs={nmbs}"
-            ),
-            Error::DcPredictorNeighborIndexOutOfRange { bj, nbs } => write!(
-                f,
-                "oxideav-theora: §7.8.1 neighbor bj={bj} >= nbs={nbs}"
-            ),
+            Error::DcPredictorMacroBlockIndexOutOfRange { mbi, nmbs } => {
+                write!(f, "oxideav-theora: §7.8.1 mbi={mbi} >= nmbs={nmbs}")
+            }
+            Error::DcPredictorNeighborIndexOutOfRange { bj, nbs } => {
+                write!(f, "oxideav-theora: §7.8.1 neighbor bj={bj} >= nbs={nbs}")
+            }
             Error::DcInversionPlaneCount { got } => write!(
                 f,
                 "oxideav-theora: §7.8.2 expected 3 plane raster orderings (Table 2.1), got {got}"
@@ -2018,11 +1986,7 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-theora: §7.10.3 QIS[0] = {qi0} exceeds 6-bit LFLIMS index range 0..=63"
             ),
-            Error::LoopFilterFrameRasterLenMismatch {
-                pli,
-                got,
-                expected,
-            } => write!(
+            Error::LoopFilterFrameRasterLenMismatch { pli, got, expected } => write!(
                 f,
                 "oxideav-theora: §7.10.3 raster walk for pli={pli} has {got} entries, expected {expected}"
             ),
@@ -4219,10 +4183,10 @@ impl HuffmanTable {
     pub fn lookup(&self, code: u32, len: u8) -> Option<u8> {
         // Degenerate single-leaf-at-root table: the root itself is the
         // only leaf, reached by the empty (zero-length) code.
-        if self.nodes.len() == 1 {
-            if let HuffmanNode::Leaf { token } = self.nodes[0] {
-                return if len == 0 { Some(token) } else { None };
-            }
+        if self.nodes.len() == 1
+            && let HuffmanNode::Leaf { token } = self.nodes[0]
+        {
+            return if len == 0 { Some(token) } else { None };
         }
         let mut idx = 0u32;
         for i in (0..len).rev() {
@@ -4259,10 +4223,10 @@ impl HuffmanTable {
     ///   caller surfaces it as [`Error::TruncatedHeader`].
     pub(crate) fn read_token(&self, r: &mut BitReader<'_>) -> Result<u8, ReadTokenErr> {
         // Degenerate single-leaf table: the root is the leaf.
-        if self.nodes.len() == 1 {
-            if let HuffmanNode::Leaf { token } = self.nodes[0] {
-                return Ok(token);
-            }
+        if self.nodes.len() == 1
+            && let HuffmanNode::Leaf { token } = self.nodes[0]
+        {
+            return Ok(token);
         }
         let mut idx = 0u32;
         // Hard upper bound on the walk length: §6.4.4 step 1(b) caps
@@ -5309,7 +5273,7 @@ fn encode_coded_block_flags(
     let block_stream: Vec<u8> = block_to_super_block
         .iter()
         .zip(bcoded.iter())
-        .filter(|(&sbi, _)| sbpcoded[sbi as usize] == 1)
+        .filter(|&(&sbi, _)| sbpcoded[sbi as usize] == 1)
         .map(|(_, &flag)| flag)
         .collect();
     encode_short_run_bit_string(w, &block_stream);
@@ -5440,11 +5404,7 @@ fn read_table_7_19_mi(r: &mut BitReader<'_>) -> Result<u8, Error> {
     // Six `1` bits already consumed — the seventh bit decides between
     // `b1111110` (mi=6) and `b1111111` (mi=7).
     let tail = r.read_bits(1, "MBMODES_huffman_code")?;
-    if tail == 0 {
-        Ok(6)
-    } else {
-        Ok(7)
-    }
+    if tail == 0 { Ok(6) } else { Ok(7) }
 }
 
 /// Decode the `MBMODES` per-macro-block coding-mode array per §7.4 of
@@ -5667,20 +5627,12 @@ fn recognise_mv_huffman(r: &mut BitReader<'_>) -> Result<i8, Error> {
         // b011x → +2 / -2 (4 bits)
         0b011 => {
             let t = r.read_bits(1, "MV_huffman")? as u8;
-            if t == 0 {
-                Ok(2)
-            } else {
-                Ok(-2)
-            }
+            if t == 0 { Ok(2) } else { Ok(-2) }
         }
         // b100x → +3 / -3 (4 bits)
         0b100 => {
             let t = r.read_bits(1, "MV_huffman")? as u8;
-            if t == 0 {
-                Ok(3)
-            } else {
-                Ok(-3)
-            }
+            if t == 0 { Ok(3) } else { Ok(-3) }
         }
         // b101xxx → ±4..±7 (6 bits). Three more bits decode the
         // (magnitude − 4) bucket plus sign:
@@ -6170,11 +6122,7 @@ pub(crate) fn decode_macroblock_motion_vectors_inner(
 /// `mi` (`b0` = 1 bit, `b10` = 2 bits, …, `b111110` = 6 bits,
 /// `b1111110` / `b1111111` = 7 bits each).
 fn table_7_19_code_len(mi: u8) -> u64 {
-    if mi >= 6 {
-        7
-    } else {
-        mi as u64 + 1
-    }
+    if mi >= 6 { 7 } else { mi as u64 + 1 }
 }
 
 /// Write the Table 7.19 Huffman code for rank `mi` (`0..=7`) onto `w`,
@@ -6563,7 +6511,7 @@ pub(crate) fn decode_block_level_qi_inner(
         let nbits: u64 = bcoded
             .iter()
             .zip(qiis.iter())
-            .filter(|(&bc, &q)| bc != 0 && q == qii_u8)
+            .filter(|&(&bc, &q)| bc != 0 && q == qii_u8)
             .count() as u64;
 
         // Step 2(b): decode the NBITS-bit string via the §7.2.1 long-
@@ -7730,7 +7678,7 @@ fn best_huffman_selector(
                 break;
             }
         }
-        if usable && best_bits.map_or(true, |b| bits < b) {
+        if usable && best_bits.is_none_or(|b| bits < b) {
             best_bits = Some(bits);
             best_sel = sel;
         }
@@ -10665,8 +10613,8 @@ pub fn reconstruct_frame(
         // `(BX + bx, BY + by)` is always in-bounds.
         let plane_w = dims.width;
         let plane_h = dims.height;
-        if bx.checked_add(8).map_or(true, |end| end > plane_w)
-            || by.checked_add(8).map_or(true, |end| end > plane_h)
+        if bx.checked_add(8).is_none_or(|end| end > plane_w)
+            || by.checked_add(8).is_none_or(|end| end > plane_h)
         {
             return Err(Error::ReconstructFrameBlockOutOfPlane {
                 bi,
@@ -11281,8 +11229,8 @@ pub fn horizontal_loop_filter_edge(
     check_plane_buffer_len(recp.len(), plane_w, plane_h)?;
     // Footprint guard — read four pixels along x, write two of them;
     // step 8 rows along y.
-    if fx.checked_add(4).map_or(true, |e| e > plane_w)
-        || fy.checked_add(8).map_or(true, |e| e > plane_h)
+    if fx.checked_add(4).is_none_or(|e| e > plane_w)
+        || fy.checked_add(8).is_none_or(|e| e > plane_h)
     {
         return Err(Error::LoopFilterHorizontalFootprintOutOfPlane {
             fx,
@@ -11348,8 +11296,8 @@ pub fn vertical_loop_filter_edge(
     check_plane_buffer_len(recp.len(), plane_w, plane_h)?;
     // Footprint guard — step 8 columns along x, read four rows / write
     // two of them along y.
-    if fx.checked_add(8).map_or(true, |e| e > plane_w)
-        || fy.checked_add(4).map_or(true, |e| e > plane_h)
+    if fx.checked_add(8).is_none_or(|e| e > plane_w)
+        || fy.checked_add(4).is_none_or(|e| e > plane_h)
     {
         return Err(Error::LoopFilterVerticalFootprintOutOfPlane {
             fx,
@@ -11659,8 +11607,8 @@ pub fn loop_filter_frame(
                 let by = by_of_block[bi];
                 // Bounds check: 8x8 block footprint must lie within
                 // the plane.
-                if bx.checked_add(8).map_or(true, |end| end > plane_w)
-                    || by.checked_add(8).map_or(true, |end| end > plane_h)
+                if bx.checked_add(8).is_none_or(|end| end > plane_w)
+                    || by.checked_add(8).is_none_or(|end| end > plane_h)
                 {
                     return Err(Error::LoopFilterFrameBlockOutOfPlane {
                         bi,
@@ -13109,8 +13057,8 @@ fn crop_plane(
             expected,
         });
     }
-    if win.x.checked_add(win.w).map_or(true, |e| e > src_w)
-        || win.y.checked_add(win.h).map_or(true, |e| e > src_h)
+    if win.x.checked_add(win.w).is_none_or(|e| e > src_w)
+        || win.y.checked_add(win.h).is_none_or(|e| e > src_h)
     {
         return Err(Error::CropRegionOutOfPlane {
             pli,
@@ -14413,7 +14361,7 @@ impl FrameEncoder {
                     continue;
                 };
                 let cost = ssd + lambda * u64::from(bits);
-                if best.map_or(true, |(b, _)| cost < b) {
+                if best.is_none_or(|(b, _)| cost < b) {
                     best = Some((cost, cand as u8));
                 }
             }
@@ -16346,7 +16294,7 @@ fn rdoq_refine(
                 break;
             };
             let c = cost_of(tail_d, bits);
-            if c < cur_cost && best.map_or(true, |(_, bc, _)| c < bc) {
+            if c < cur_cost && best.is_none_or(|(_, bc, _)| c < bc) {
                 best = Some((zzi, c, bits));
                 // Remember the distortion at this truncation point.
                 cur_d = tail_d;
@@ -16881,11 +16829,7 @@ pub fn encode_setup_header(setup: &SetupHeaderTables) -> Result<Vec<u8>, Error> 
 /// add one" decode (the stored 4-bit value is `nbits - 1`).
 fn scale_nbits(scales: &[u16; 64]) -> u32 {
     let m = scales.iter().copied().max().unwrap_or(0);
-    if m == 0 {
-        1
-    } else {
-        16 - m.leading_zeros()
-    }
+    if m == 0 { 1 } else { 16 - m.leading_zeros() }
 }
 
 /// Write the §6.4.2 quantization-parameter payload onto `w`, the
@@ -18016,11 +17960,7 @@ impl RateModel {
     }
 
     fn fit(&self, keyframe: bool) -> &RateFit {
-        if keyframe {
-            &self.intra
-        } else {
-            &self.inter
-        }
+        if keyframe { &self.intra } else { &self.inter }
     }
 
     fn observe(&mut self, keyframe: bool, complexity: f64, qi: u8, bits: f64) {
@@ -18874,12 +18814,13 @@ impl TheoraEncoder {
         // Defer an interval keyframe onto an upcoming cut when the cut
         // is inside the window; the GOP may stretch by at most the
         // window depth.
-        if !first && since >= interval {
-            if let Some(j) = cut_at {
-                if j > 0 && since as usize + j <= interval as usize + self.lookahead {
-                    plan.defer_keyframe = true;
-                }
-            }
+        if !first
+            && since >= interval
+            && let Some(j) = cut_at
+            && j > 0
+            && since as usize + j <= interval as usize + self.lookahead
+        {
+            plan.defer_keyframe = true;
         }
         let key0 = first || plan.force_keyframe || (since >= interval && !plan.defer_keyframe);
         let front = &self.lookahead_queue[0];
@@ -19230,24 +19171,25 @@ impl TheoraEncoder {
     ) -> Self {
         self = self.with_target_bitrate(target_bits_per_second);
         let total_probe = stats.total_bits();
-        if let Some(rc) = self.rate_control.as_mut() {
-            if total_probe > 0.0 && !stats.frame_bits.is_empty() {
-                let total_budget = rc.bits_per_frame * stats.frame_bits.len() as f64;
-                let budgets = stats
-                    .frame_bits
-                    .iter()
-                    .map(|&b| total_budget * b / total_probe)
-                    .collect();
-                self.two_pass = Some(TwoPassSchedule { budgets });
-                // Seed the loop at the scale-table prediction of the
-                // target-rate quantizer.
-                let seed = qi_for_target_rate(
-                    stats.probe_qi,
-                    total_probe / stats.frame_bits.len() as f64,
-                    rc.bits_per_frame,
-                );
-                rc.next_qi = seed.clamp(rc.qi_min, rc.qi_max);
-            }
+        if let Some(rc) = self.rate_control.as_mut()
+            && total_probe > 0.0
+            && !stats.frame_bits.is_empty()
+        {
+            let total_budget = rc.bits_per_frame * stats.frame_bits.len() as f64;
+            let budgets = stats
+                .frame_bits
+                .iter()
+                .map(|&b| total_budget * b / total_probe)
+                .collect();
+            self.two_pass = Some(TwoPassSchedule { budgets });
+            // Seed the loop at the scale-table prediction of the
+            // target-rate quantizer.
+            let seed = qi_for_target_rate(
+                stats.probe_qi,
+                total_probe / stats.frame_bits.len() as f64,
+                rc.bits_per_frame,
+            );
+            rc.next_qi = seed.clamp(rc.qi_min, rc.qi_max);
         }
         self
     }
@@ -19425,27 +19367,27 @@ impl TheoraEncoder {
         // keyframe only seeds the average — its references are one frame
         // old, so a "cut" against them is indistinguishable from motion,
         // and the keyframe it would ask for was just emitted.
-        if !want_keyframe && !plan.active {
-            if let (Some(threshold), Some(mirror)) =
+        if !want_keyframe
+            && !plan.active
+            && let (Some(threshold), Some(mirror)) =
                 (self.scene_cut_threshold, self.mirror.as_ref())
-            {
-                let prev_y = &mirror.reference_store().previous_y;
-                if prev_y.len() == frame.samples_y.len() && !prev_y.is_empty() {
-                    let total: u64 = frame
-                        .samples_y
-                        .iter()
-                        .zip(prev_y.iter())
-                        .map(|(&s, &p)| (s as i16 - p as i16).unsigned_abs() as u64)
-                        .sum();
-                    let mad = total as f64 / frame.samples_y.len() as f64;
-                    match self.scene_cut_mad_avg {
-                        None => self.scene_cut_mad_avg = Some(mad),
-                        Some(avg) => {
-                            if mad > threshold && mad > 2.0 * avg {
-                                want_keyframe = true;
-                            } else {
-                                self.scene_cut_mad_avg = Some(0.5 * avg + 0.5 * mad);
-                            }
+        {
+            let prev_y = &mirror.reference_store().previous_y;
+            if prev_y.len() == frame.samples_y.len() && !prev_y.is_empty() {
+                let total: u64 = frame
+                    .samples_y
+                    .iter()
+                    .zip(prev_y.iter())
+                    .map(|(&s, &p)| (s as i16 - p as i16).unsigned_abs() as u64)
+                    .sum();
+                let mad = total as f64 / frame.samples_y.len() as f64;
+                match self.scene_cut_mad_avg {
+                    None => self.scene_cut_mad_avg = Some(mad),
+                    Some(avg) => {
+                        if mad > threshold && mad > 2.0 * avg {
+                            want_keyframe = true;
+                        } else {
+                            self.scene_cut_mad_avg = Some(0.5 * avg + 0.5 * mad);
                         }
                     }
                 }
@@ -19480,50 +19422,49 @@ impl TheoraEncoder {
         // re-seeds both references (only an intra frame ever refreshes
         // the golden frame), so every following P-frame predicts from
         // fresh references.
-        if !want_keyframe {
-            if let (Some(ratio), Some(kb)) = (self.keyframe_rate_ratio, self.last_keyframe_bytes) {
-                if de_facto_intra || bytes.len() as f64 > ratio * kb as f64 {
-                    let intra_bytes = match &adaptive_qis {
-                        Some(qis) => self.frame_encoder.encode_intra_frame_adaptive(frame, qis)?,
-                        None => self.frame_encoder.encode_intra_frame(frame)?,
-                    };
-                    let mirror = self
-                        .mirror
-                        .as_ref()
-                        .expect("mirror is Some on the inter branch");
-                    let ssd_of = |pkt: &[u8]| -> Result<u64, Error> {
-                        let mut probe = (**mirror).clone();
-                        let out = probe.decode_frame(pkt)?;
-                        let mut ssd = 0u64;
-                        for (got, want) in [
-                            (&out.frame.samples_y, &frame.samples_y),
-                            (&out.frame.samples_cb, &frame.samples_cb),
-                            (&out.frame.samples_cr, &frame.samples_cr),
-                        ] {
-                            ssd += got
-                                .iter()
-                                .zip(want.iter())
-                                .map(|(&a, &b)| {
-                                    let d = a as i64 - b as i64;
-                                    (d * d) as u64
-                                })
-                                .sum::<u64>();
-                        }
-                        Ok(ssd)
-                    };
-                    let qi0 = adaptive_qis
-                        .as_ref()
-                        .map_or(self.frame_encoder.qi(), |qis| qis[0]);
-                    let lambda = inter_rd_lambda(&self.setup.quantization_parameters, qi0)?;
-                    let inter_cost = ssd_of(&bytes)?
-                        .saturating_add(lambda.saturating_mul(8 * bytes.len() as u64));
-                    let intra_cost = ssd_of(&intra_bytes)?
-                        .saturating_add(lambda.saturating_mul(8 * intra_bytes.len() as u64));
-                    if intra_cost <= inter_cost {
-                        bytes = intra_bytes;
-                        want_keyframe = true;
-                    }
+        if !want_keyframe
+            && let (Some(ratio), Some(kb)) = (self.keyframe_rate_ratio, self.last_keyframe_bytes)
+            && (de_facto_intra || bytes.len() as f64 > ratio * kb as f64)
+        {
+            let intra_bytes = match &adaptive_qis {
+                Some(qis) => self.frame_encoder.encode_intra_frame_adaptive(frame, qis)?,
+                None => self.frame_encoder.encode_intra_frame(frame)?,
+            };
+            let mirror = self
+                .mirror
+                .as_ref()
+                .expect("mirror is Some on the inter branch");
+            let ssd_of = |pkt: &[u8]| -> Result<u64, Error> {
+                let mut probe = (**mirror).clone();
+                let out = probe.decode_frame(pkt)?;
+                let mut ssd = 0u64;
+                for (got, want) in [
+                    (&out.frame.samples_y, &frame.samples_y),
+                    (&out.frame.samples_cb, &frame.samples_cb),
+                    (&out.frame.samples_cr, &frame.samples_cr),
+                ] {
+                    ssd += got
+                        .iter()
+                        .zip(want.iter())
+                        .map(|(&a, &b)| {
+                            let d = a as i64 - b as i64;
+                            (d * d) as u64
+                        })
+                        .sum::<u64>();
                 }
+                Ok(ssd)
+            };
+            let qi0 = adaptive_qis
+                .as_ref()
+                .map_or(self.frame_encoder.qi(), |qis| qis[0]);
+            let lambda = inter_rd_lambda(&self.setup.quantization_parameters, qi0)?;
+            let inter_cost =
+                ssd_of(&bytes)?.saturating_add(lambda.saturating_mul(8 * bytes.len() as u64));
+            let intra_cost = ssd_of(&intra_bytes)?
+                .saturating_add(lambda.saturating_mul(8 * intra_bytes.len() as u64));
+            if intra_cost <= inter_cost {
+                bytes = intra_bytes;
+                want_keyframe = true;
             }
         }
         // VBV enforcement: a frame larger than what the modelled
@@ -19547,10 +19488,10 @@ impl TheoraEncoder {
                 bytes = self.encode_decided(frame, want_keyframe, &qis)?.0;
                 tries += 1;
             }
-            if tries > 0 {
-                if let Some(rc) = self.rate_control.as_mut() {
-                    rc.next_qi = self.frame_encoder.qi();
-                }
+            if tries > 0
+                && let Some(rc) = self.rate_control.as_mut()
+            {
+                rc.next_qi = self.frame_encoder.qi();
             }
         }
         if want_keyframe {
@@ -20540,7 +20481,7 @@ mod tests {
         let mut bad = vec![0x81, b't', b'h', b'e', b'o', b'r', b'a'];
         bad.extend_from_slice(&0u32.to_le_bytes()); // vendor_len = 0
         bad.extend_from_slice(&1u32.to_le_bytes()); // ncomments = 1
-                                                    // (no comment_len follows)
+        // (no comment_len follows)
         match parse_comment_header(&bad) {
             Err(Error::TruncatedHeader {
                 field: "comment_len",
@@ -21119,7 +21060,7 @@ mod tests {
         let nbms = 2u32;
         w.put(nbms - 1, 9); // NBMS field
         let bmi_bits = test_ilog(nbms as i64 - 1); // ilog(1) = 1
-                                                   // Base matrices: matrix 0 = all 16, matrix 1 = all 100.
+        // Base matrices: matrix 0 = all 16, matrix 1 = all 100.
         for _ci in 0..64 {
             w.put(16, 8);
         }
@@ -21135,7 +21076,7 @@ mod tests {
                 }
                 // 7(a)iv: qri=0, qi=0
                 w.put(0, bmi_bits); // QRBMIS[0] = 0
-                                    // D: ilog(62 - 0) = 6 bits; size = read + 1 = 63 -> read 62.
+                // D: ilog(62 - 0) = 6 bits; size = read + 1 = 63 -> read 62.
                 w.put(62, test_ilog(62));
                 // G: QRBMIS[1] = 1
                 w.put(1, bmi_bits);
@@ -21203,7 +21144,7 @@ mod tests {
         // (1,0): NEWQR=0 -> qti>0 so read RPQR. RPQR=1 -> copy (0,0).
         w.put(0, 1); // NEWQR
         w.put(1, 1); // RPQR
-                     // (1,1): NEWQR=0 -> RPQR=1 -> copy (0,1).
+        // (1,1): NEWQR=0 -> RPQR=1 -> copy (0,1).
         w.put(0, 1);
         w.put(1, 1);
         // (1,2): NEWQR=0 -> RPQR=1 -> copy (0,2).
@@ -21345,7 +21286,7 @@ mod tests {
         // A payload that ends mid-ACSCALE returns TruncatedHeader.
         let mut w = BitWriter::new();
         w.put(7, 4); // ACSCALE NBITS = 8
-                     // Only 3 ACSCALE values, then EOF.
+        // Only 3 ACSCALE values, then EOF.
         w.put(100, 8);
         w.put(99, 8);
         w.put(98, 8);
@@ -21406,7 +21347,7 @@ mod tests {
         // (1,0): NEWQR=0, RPQR=0 -> copy (0,2): QRBMIS {0,0}
         w.put(0, 1); // NEWQR
         w.put(0, 1); // RPQR
-                     // (1,1): NEWQR=1, size 63, QRBMIS {1,1}
+        // (1,1): NEWQR=1, size 63, QRBMIS {1,1}
         w.put(1, 1);
         w.put(1, bmi_bits);
         w.put(62, test_ilog(62));
@@ -22112,7 +22053,7 @@ mod tests {
         let mut w = BitWriter::new();
         write_trivial_table(&mut w, 5);
         w.put(0, 1); // hti=1: ISLEAF=0 (interior)
-                     // The subsequent ISLEAF for the left child runs out of bits.
+        // The subsequent ISLEAF for the left child runs out of bits.
         let payload = w.finish();
         match decode_dct_token_huffman_tables(&payload) {
             Err(Error::TruncatedHeader { field }) => assert_eq!(field, "ISLEAF"),
@@ -22344,11 +22285,11 @@ mod tests {
         // After byte 0 is exhausted, the second 4-bit half of QIS[0]
         // must come from byte 1, which is missing.
         let packet = [0b00_000000u8]; // exactly 1 byte
-                                      // packet-type=0 (bit 7), FTYPE=0 (bit 6), then 6 bits of QIS[0]
-                                      // = the low 6 bits of byte 0 = 0. With only 1 byte we can
-                                      // actually read all 8 bits without truncating since QIS[0] only
-                                      // needs 6 bits — so this returns Ok(QIS[0] = 0). We then need
-                                      // MOREQIS bit (1 more bit) — which requires byte 1.
+        // packet-type=0 (bit 7), FTYPE=0 (bit 6), then 6 bits of QIS[0]
+        // = the low 6 bits of byte 0 = 0. With only 1 byte we can
+        // actually read all 8 bits without truncating since QIS[0] only
+        // needs 6 bits — so this returns Ok(QIS[0] = 0). We then need
+        // MOREQIS bit (1 more bit) — which requires byte 1.
         match decode_frame_header(&packet, true) {
             Err(Error::TruncatedHeader { field }) => {
                 // Should fail at MOREQIS[0] (bit 9 = byte 1, bit 7).
@@ -22662,7 +22603,7 @@ mod tests {
         // encoder can express runs of arbitrary length.
         let mut w = BitWriter::new();
         w.put(0, 1); // BIT = 0
-                     // First run: code b111111 + roffs=4095 → RLEN = 34 + 4095 = 4129.
+        // First run: code b111111 + roffs=4095 → RLEN = 34 + 4095 = 4129.
         write_long_run_record(&mut w, 0b111111, 6, 12, 4095);
         // After max run: read fresh BIT = 0 (same value, same run kind).
         w.put(0, 1);
@@ -22702,7 +22643,7 @@ mod tests {
         // toggle path and verifying the result is correct.
         let mut w = BitWriter::new();
         w.put(0, 1); // BIT = 0
-                     // First run: code b111111 + roffs=4094 → RLEN = 34+4094 = 4128.
+        // First run: code b111111 + roffs=4094 → RLEN = 34+4094 = 4128.
         write_long_run_record(&mut w, 0b111111, 6, 12, 4094);
         // No fresh BIT — toggle → 1.
         write_long_run_record(&mut w, 0b0, 1, 0, 0);
@@ -23236,8 +23177,8 @@ mod tests {
         ];
         let mut w = BitWriter::new();
         encode_long_run_runs(&mut w, &[1, 1]); // SBPCODED = [1, 1].
-                                               // SBFCODED stream is empty (no SBPCODED==0 entries) so encode
-                                               // nothing.
+        // SBFCODED stream is empty (no SBPCODED==0 entries) so encode
+        // nothing.
         encode_short_run_runs(&mut w, &blocks);
         let bytes = w.finish();
         let out = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
@@ -23352,7 +23293,7 @@ mod tests {
         let blocks: Vec<u8> = vec![1, 0, 0, 1, 1, 0, 1, 0];
         let mut w = BitWriter::new();
         encode_long_run_runs(&mut w, &[1]); // SBPCODED = [1].
-                                            // SBFCODED stream is empty.
+        // SBFCODED stream is empty.
         encode_short_run_runs(&mut w, &blocks);
         let bytes = w.finish();
         let out = decode_coded_block_flags(&bytes, FrameType::Inter, nsbs, nbs, &map).unwrap();
@@ -23660,7 +23601,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.put(7, 3); // MSCHEME = 7
         w.put(2, 3); // MBMODES[0] = INTER_MV (2)
-                     // No bits emitted for MBMODES[1] — step 2(d)ii.
+        // No bits emitted for MBMODES[1] — step 2(d)ii.
         w.put(6, 3); // MBMODES[2] = INTER_GOLDEN_MV (6)
         let bytes = w.finish();
         let out =
@@ -23779,7 +23720,7 @@ mod tests {
         w.put(7, 3); // MSCHEME = 7
         w.put(0, 3); // mb0 mode = INTER_NOMV
         w.put(0, 2); // first 2 bits of mb1 mode
-                     // Byte fills exactly, no further bytes.
+        // Byte fills exactly, no further bytes.
         let bytes = w.finish();
         assert_eq!(bytes.len(), 1);
         let err = decode_macroblock_modes(&bytes, FrameType::Inter, nmbs, nbs, &bcoded, &map)
@@ -23888,8 +23829,8 @@ mod tests {
         // be read. Provide just one byte with MSCHEME in the top 3 bits.
         let mut w = BitWriter::new();
         w.put(1, 3); // MSCHEME = 1 (Huffman) — but no codes follow.
-                     // Pad the byte with zeros; if any per-mb decode bit is read, the
-                     // result would be polluted.
+        // Pad the byte with zeros; if any per-mb decode bit is read, the
+        // result would be polluted.
         w.put(0, 5);
         let bytes = w.finish();
         let out =
@@ -24539,7 +24480,7 @@ mod tests {
         let g = MotionVector::new(-10, 10);
         let mut w = BitWriter::new();
         w.put(0, 1); // MVMODE=0
-                     // mb0: INTER_MV
+        // mb0: INTER_MV
         write_mv_huffman_component(&mut w, a.x);
         write_mv_huffman_component(&mut w, a.y);
         // mb1: INTER_GOLDEN_MV
@@ -25067,7 +25008,7 @@ mod tests {
         w.put(0, 1); // MVMODE=0
         write_mv_huffman_component(&mut w, 1); // 3 bits
         write_mv_huffman_component(&mut w, 1); // 3 bits
-                                               // Total = 7 bits. Pad one bit to align to byte and emit 0xAB.
+        // Total = 7 bits. Pad one bit to align to byte and emit 0xAB.
         w.put(0, 1); // pad to byte boundary
         w.put(0xAB, 8);
         let bytes = w.finish();
@@ -25416,16 +25357,15 @@ mod tests {
         let mut w = BitWriter::new();
         // Pass 0: 10 zeros then 14 ones (two long-run records,
         // RSTART=10 chosen for both).
-        let pass0: Vec<u8> = std::iter::repeat(0)
-            .take(10)
-            .chain(std::iter::repeat(1).take(14))
+        let pass0: Vec<u8> = std::iter::repeat_n(0, 10)
+            .chain(std::iter::repeat_n(1, 14))
             .collect();
         encode_long_run_runs(&mut w, &pass0);
         let packet = w.finish();
         let qiis = decode_block_level_qi(&packet, bcoded.len() as u32, &bcoded, 2).unwrap();
         // The first 10 stay at 0; the remaining 14 promote to 1.
         let mut expected = vec![0u8; 10];
-        expected.extend(std::iter::repeat(1).take(14));
+        expected.extend(std::iter::repeat_n(1, 14));
         assert_eq!(qiis, expected);
     }
 
@@ -27714,8 +27654,8 @@ mod tests {
     #[test]
     fn dct_coefficients_table_indices_only_at_ti_0_and_1() {
         let hts = make_uniform_hts(0); // TOKEN=0 — fixed EOB-run-1.
-                                       // Pack htiL=3 (4 bits) + htiC=5 (4 bits) at ti=0; htiL=3 + htiC=5
-                                       // at ti=1: 0011_0101 0011_0101 = 0x35 0x35.
+        // Pack htiL=3 (4 bits) + htiC=5 (4 bits) at ti=0; htiL=3 + htiC=5
+        // at ti=1: 0011_0101 0011_0101 = 0x35 0x35.
         let packet = [0x35, 0x35];
         let bcoded = vec![1u8];
         let (coeffs, ncoeffs) = decode_dct_coefficients(&packet, 1, 0, &bcoded, &hts).unwrap();
@@ -27730,8 +27670,8 @@ mod tests {
     #[test]
     fn dct_coefficients_inner_shares_bit_reader() {
         let hts = make_uniform_hts(0); // TOKEN=0 closes the block.
-                                       // 8 bits (htiL/htiC at ti=0) + 8 bits (htiL/htiC at ti=1) + 8
-                                       // sentinel bits set to 0xA5.
+        // 8 bits (htiL/htiC at ti=0) + 8 bits (htiL/htiC at ti=1) + 8
+        // sentinel bits set to 0xA5.
         let packet = [0u8, 0u8, 0xA5u8];
         let bcoded = vec![1u8];
         let mut r = BitReader::new(&packet);
@@ -30097,8 +30037,8 @@ mod tests {
         assert_eq!(IDCT_S3, 36410); // = C5 row
         assert_eq!(IDCT_S6, 60547); // = C2 row
         assert_eq!(IDCT_S7, 64277); // = C1 row
-                                    // Each (Ci, Sj) pair must satisfy the float identity within
-                                    // the 16-bit fixed-point rounding the table encodes.
+        // Each (Ci, Sj) pair must satisfy the float identity within
+        // the 16-bit fixed-point rounding the table encodes.
         for (c, angle_num) in [
             (IDCT_C3, 3.0f64),
             (IDCT_C4, 4.0),
@@ -32081,7 +32021,7 @@ mod tests {
         assert_eq!(lflim(-9, l), -(-9) - 10); // = -1
         assert_eq!(lflim(-7, l), -(-7) - 10); // = -3
         assert_eq!(lflim(-5, l), -(-5) - 10); // = -5 (the -L peak)
-                                              // Through-origin segment: -L < R < L → R.
+        // Through-origin segment: -L < R < L → R.
         assert_eq!(lflim(-4, l), -4);
         assert_eq!(lflim(0, l), 0);
         assert_eq!(lflim(4, l), 4);
@@ -33917,9 +33857,9 @@ mod tests {
         w.put(12, 6); // QIS[0]
         w.put(0, 1); // MOREQIS = 0
         w.put(0, 3); // §7.1 step 7 reserved trailer
-                     // 1(b) / 1(c) / 1(d) / 1(e) all read zero bits on this frame
-                     // (intra short-circuits; NQIS=1). §7.7.3 resumes on the SAME
-                     // bitstream, mid-byte: htiL + htiC at ti=0 and ti=1.
+        // 1(b) / 1(c) / 1(d) / 1(e) all read zero bits on this frame
+        // (intra short-circuits; NQIS=1). §7.7.3 resumes on the SAME
+        // bitstream, mid-byte: htiL + htiC at ti=0 and ti=1.
         w.put(0, 4); // htiL at ti=0
         w.put(0, 4); // htiC at ti=0
         w.put(0, 4); // htiL at ti=1
@@ -34003,9 +33943,9 @@ mod tests {
         w.put(1, 1); // FTYPE = inter
         w.put(7, 6); // QIS[0]
         w.put(0, 1); // MOREQIS = 0
-                     // §7.3 resumes on the SAME bitstream, mid-byte: every super
-                     // block fully coded (SBPCODED=0, SBFCODED=1), no per-block
-                     // stream.
+        // §7.3 resumes on the SAME bitstream, mid-byte: every super
+        // block fully coded (SBPCODED=0, SBFCODED=1), no per-block
+        // stream.
         encode_long_run_runs(&mut w, &[0, 0, 0]);
         encode_long_run_runs(&mut w, &[1, 1, 1]);
         // §7.4 resumes on the SAME bitstream: MSCHEME=7 (direct 3-bit
@@ -34128,9 +34068,9 @@ mod tests {
         w.put(9, 6); // QIS[1]
         w.put(1, 1); // MOREQIS = 1
         w.put(40, 6); // QIS[2]
-                      // §7.3: SBPCODED = [1, 0, 0] (SB 0 partial), SBFCODED over
-                      // the non-partial subset = [1, 1] (SBs 1 and 2 fully
-                      // coded), then the per-block short-run stream for SB 0.
+        // §7.3: SBPCODED = [1, 0, 0] (SB 0 partial), SBFCODED over
+        // the non-partial subset = [1, 1] (SBs 1 and 2 fully
+        // coded), then the per-block short-run stream for SB 0.
         encode_long_run_runs(&mut w, &[1, 0, 0]);
         encode_long_run_runs(&mut w, &[1, 1]);
         encode_short_run_runs(&mut w, &sb0_blocks);
@@ -34157,11 +34097,11 @@ mod tests {
         write_mv_fixed_component(&mut w, 6); // MB 1 MVY
         write_mv_fixed_component(&mut w, 1); // MB 3 MVX
         write_mv_fixed_component(&mut w, 0); // MB 3 MVY
-                                             // §7.6 resumes on the SAME bitstream. NQIS=3 → two §7.2.1
-                                             // long-run passes. The 21 coded blocks (5 in SB 0 + 16 in
-                                             // SBs 1/2) are visited in ascending bi; pass 0 promotes the
-                                             // first two (bi 0 and 1) to qii=1, pass 1 (NBITS=2, only the
-                                             // promoted pair) promotes bi 0 again to qii=2.
+        // §7.6 resumes on the SAME bitstream. NQIS=3 → two §7.2.1
+        // long-run passes. The 21 coded blocks (5 in SB 0 + 16 in
+        // SBs 1/2) are visited in ascending bi; pass 0 promotes the
+        // first two (bi 0 and 1) to qii=1, pass 1 (NBITS=2, only the
+        // promoted pair) promotes bi 0 again to qii=2.
         let mut qi_pass0 = vec![0u8; 21];
         qi_pass0[0] = 1;
         qi_pass0[1] = 1;
@@ -34377,8 +34317,8 @@ mod tests {
         w.put(2, 6); // QIS[1]
         w.put(0, 1); // MOREQIS = 0
         w.put(0, 3); // §7.1 step 7 reserved trailer
-                     // §7.6 (step 1(e)): one pass over the 24 coded blocks;
-                     // promote block 5 to qii=1.
+        // §7.6 (step 1(e)): one pass over the 24 coded blocks;
+        // promote block 5 to qii=1.
         let mut qi_pass0 = vec![0u8; 24];
         qi_pass0[5] = 1;
         encode_long_run_runs(&mut w, &qi_pass0);
@@ -34541,8 +34481,8 @@ mod tests {
         }
         write_mv_fixed_component(&mut w, 0); // MB 3 MVX
         write_mv_fixed_component(&mut w, -1); // MB 3 MVY
-                                              // §7.6 reads zero bits (NQIS=1); §7.7.3 reads htiL/htiC at
-                                              // ti ∈ {0, 1} and token-0-closes the 20 coded blocks.
+        // §7.6 reads zero bits (NQIS=1); §7.7.3 reads htiL/htiC at
+        // ti ∈ {0, 1} and token-0-closes the 20 coded blocks.
         w.put(0, 4);
         w.put(0, 4);
         w.put(0, 4);
@@ -34702,8 +34642,8 @@ mod tests {
         write_mv_huffman_component(&mut w, 1); // MB 0 MVY
         write_mv_huffman_component(&mut w, 7); // MB 3 MVX
         write_mv_huffman_component(&mut w, -7); // MB 3 MVY
-                                                // §7.6 reads zero bits (NQIS=1); §7.7.3 reads htiL/htiC at
-                                                // ti ∈ {0, 1} and token-0-closes the 24 coded blocks.
+        // §7.6 reads zero bits (NQIS=1); §7.7.3 reads htiL/htiC at
+        // ti ∈ {0, 1} and token-0-closes the 24 coded blocks.
         w.put(0, 4);
         w.put(0, 4);
         w.put(0, 4);
@@ -35908,7 +35848,7 @@ mod tests {
     /// `oxideav_core::Encoder` / `Decoder` traits end-to-end.
     #[test]
     fn encoder_trait_gradient_frame_round_trips_within_quantizer() {
-        use oxideav_core::{frame::VideoPlane, Decoder, Encoder};
+        use oxideav_core::{Decoder, Encoder, frame::VideoPlane};
         let ident = decode_identification_header(&TINY_HEADER).unwrap();
         let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
         let codec_id = oxideav_core::CodecId::new(THEORA_CODEC_ID);
@@ -36986,11 +36926,7 @@ mod tests {
                 for col in 0..w {
                     let v = if i < 3 {
                         let (x, yy) = (col + i, row + i);
-                        if (x / 2 + yy / 2) % 2 == 0 {
-                            230
-                        } else {
-                            25
-                        }
+                        if (x / 2 + yy / 2) % 2 == 0 { 230 } else { 25 }
                     } else {
                         60 + ((3 * (col + i) + 2 * row) % 160)
                     };
@@ -37695,7 +37631,7 @@ mod tests {
         }
         msg.extend_from_slice(&bit_len.to_be_bytes());
 
-        for chunk in msg.chunks_exact(64) {
+        for chunk in msg.as_chunks::<64>().0 {
             let mut w = [0u32; 64];
             for (i, word) in w.iter_mut().enumerate().take(16) {
                 *word = u32::from_be_bytes([
@@ -38955,8 +38891,8 @@ mod tests {
             {
                 // mixed long runs of both values
                 let mut v = vec![1u8; 40];
-                v.extend(std::iter::repeat(0u8).take(50));
-                v.extend(std::iter::repeat(1u8).take(5));
+                v.extend(std::iter::repeat_n(0u8, 50));
+                v.extend(std::iter::repeat_n(1u8, 5));
                 v
             },
         ];
@@ -38982,7 +38918,7 @@ mod tests {
             vec![0; 16],
             {
                 let mut v = vec![1u8; 8];
-                v.extend(std::iter::repeat(0u8).take(8));
+                v.extend(std::iter::repeat_n(0u8, 8));
                 v
             },
         ];
@@ -39465,7 +39401,8 @@ mod tests {
             &g.plane_raster_order[1],
             &g.plane_raster_order[2],
         ];
-        let out = decode_data_packet_header_and_blocks(
+
+        decode_data_packet_header_and_blocks(
             pkt,
             first_frame,
             g.pf,
@@ -39486,8 +39423,7 @@ mod tests {
             },
         )
         .map(|d| d.mbmodes)
-        .unwrap_or_else(|e| panic!("re-decode of encoded packet failed: {e:?}"));
-        out
+        .unwrap_or_else(|e| panic!("re-decode of encoded packet failed: {e:?}"))
     }
 
     /// Re-parse an encoded video-data packet through the production
@@ -43026,8 +42962,8 @@ mod tests {
         assert_eq!(granule_position_for_frame(1, 0, 6).unwrap(), 65); // 1|1
         assert_eq!(granule_position_for_frame(2, 0, 6).unwrap(), 66); // 1|2
         assert_eq!(granule_position_for_frame(3, 0, 6).unwrap(), 67); // 1|3
-                                                                      // A mid-stream keyframe restarts the low half at zero with the
-                                                                      // high half at its own decodable-frame count (index + 1).
+        // A mid-stream keyframe restarts the low half at zero with the
+        // high half at its own decodable-frame count (index + 1).
         assert_eq!(
             granule_position_for_frame(1270, 1270, 6).unwrap(),
             1271 << 6 // 1271|0

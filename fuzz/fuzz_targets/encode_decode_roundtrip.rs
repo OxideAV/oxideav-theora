@@ -29,8 +29,8 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, Encoder, Frame, Packet, TimeBase};
 use oxideav_theora::{
-    classify_packet, make_decoder, InterModeStrategy, PixelFormat, TheoraEncoder,
-    TheoraIdentHeader, TheoraPacketKind, THEORA_CODEC_ID,
+    InterModeStrategy, PixelFormat, THEORA_CODEC_ID, TheoraEncoder, TheoraIdentHeader,
+    TheoraPacketKind, classify_packet, make_decoder,
 };
 
 /// Frame-count cap: each frame is a full RD encode + mirror decode.
@@ -58,13 +58,9 @@ fuzz_target!(|data: &[u8]| {
     let (dims_y, dims_c) = ident.picture_plane_dims();
 
     let codec_id = CodecId::new(THEORA_CODEC_ID);
-    let mut enc = TheoraEncoder::with_default_setup_keyframe_interval(
-        codec_id.clone(),
-        ident,
-        qi,
-        interval,
-    )
-    .expect("VP3-default encoder must build at any qi");
+    let mut enc =
+        TheoraEncoder::with_default_setup_keyframe_interval(codec_id.clone(), ident, qi, interval)
+            .expect("VP3-default encoder must build at any qi");
     enc = enc.with_inter_mode(match (opts >> 1) & 3 {
         0 => InterModeStrategy::RateDistortion,
         1 => InterModeStrategy::PreviousMotion,
@@ -117,7 +113,8 @@ fuzz_target!(|data: &[u8]| {
 
     let mut packets: Vec<Packet> = Vec::new();
     for fi in 0..nframes {
-        enc.send_frame(&mk_frame(fi)).expect("picture-shaped frame must encode");
+        enc.send_frame(&mk_frame(fi))
+            .expect("picture-shaped frame must encode");
         while let Ok(pkt) = enc.receive_packet() {
             packets.push(pkt);
         }

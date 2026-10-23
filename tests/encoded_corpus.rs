@@ -16,8 +16,8 @@
 
 use oxideav_core::{CodecId, Decoder as _, Encoder as _, Packet};
 use oxideav_theora::{
-    InterModeStrategy, PixelFormat, SetupHeaderTables, SourceFrame, TheoraDecoder, TheoraEncoder,
-    TheoraIdentHeader, THEORA_CODEC_ID,
+    InterModeStrategy, PixelFormat, SetupHeaderTables, SourceFrame, THEORA_CODEC_ID, TheoraDecoder,
+    TheoraEncoder, TheoraIdentHeader,
 };
 
 // ----------------------------------------------------------------------
@@ -48,10 +48,10 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bitlen.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes(word.try_into().unwrap());
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -241,11 +241,7 @@ fn fam0(_t: u32) -> u32 {
 }
 
 fn fam_cut(t: u32) -> u32 {
-    if t < 4 {
-        0
-    } else {
-        1
-    }
+    if t < 4 { 0 } else { 1 }
 }
 
 struct Pin {

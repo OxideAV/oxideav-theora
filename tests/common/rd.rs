@@ -12,7 +12,7 @@
 
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{CodecId, Decoder as _, Encoder as _, Frame, Packet, VideoFrame};
-use oxideav_theora::{TheoraDecoder, TheoraEncoder, THEORA_CODEC_ID};
+use oxideav_theora::{THEORA_CODEC_ID, TheoraDecoder, TheoraEncoder};
 
 // ----------------------------------------------------------------------
 // Sequences
@@ -45,8 +45,8 @@ pub fn isin(phase: i64) -> i64 {
     let p = phase.rem_euclid(4096);
     let (q, sign) = if p < 2048 { (p, 1) } else { (p - 2048, -1) };
     let x = if q < 1024 { q } else { 2048 - q }; // 0..=1024
-                                                 // sin(x·π/2048) ≈ x·(3π/2 − ... ) — use Bhaskara-style rational.
-                                                 // 16·x·(π−x)/(5π²−4·x·(π−x)) with x in [0, π] mapped from 0..2048.
+    // sin(x·π/2048) ≈ x·(3π/2 − ... ) — use Bhaskara-style rational.
+    // 16·x·(π−x)/(5π²−4·x·(π−x)) with x in [0, π] mapped from 0..2048.
     let xx = x * 2; // 0..=2048 → maps to 0..=π over 2048
     let t = xx * (2048 - xx); // ≤ 1024²
     let num = 16 * t;

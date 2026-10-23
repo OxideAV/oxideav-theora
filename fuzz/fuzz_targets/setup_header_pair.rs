@@ -25,8 +25,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_theora::{
-    compute_quantization_matrix, decode_setup_header, encode_setup_header, parse_setup_header,
-    SetupHeaderTables,
+    SetupHeaderTables, compute_quantization_matrix, decode_setup_header, encode_setup_header,
+    parse_setup_header,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -85,7 +85,7 @@ fuzz_target!(|data: &[u8]| {
             let nqr = 1 + (next() % 4) as usize;
             let mut sizes = [0u8; 63];
             let mut left = 63u32;
-            for r in 0..nqr {
+            for (r, slot) in sizes.iter_mut().enumerate().take(nqr) {
                 let remaining_ranges = (nqr - r) as u32;
                 let size = if r + 1 == nqr {
                     left
@@ -94,7 +94,7 @@ fuzz_target!(|data: &[u8]| {
                     let max = left - (remaining_ranges - 1);
                     1 + (next() as u32 % max)
                 };
-                sizes[r] = size as u8;
+                *slot = size as u8;
                 left -= size;
             }
             let mut bmis = [0u16; 64];
@@ -110,9 +110,15 @@ fuzz_target!(|data: &[u8]| {
     let bytes = encode_setup_header(&setup).expect("valid tables must serialize");
     parse_setup_header(&bytes).expect("the writer's output must parse");
     let back = decode_setup_header(&bytes).expect("the writer's output must decode");
-    assert_eq!(back, setup, "§6.4 encode∘decode must be the identity on valid tables");
+    assert_eq!(
+        back, setup,
+        "§6.4 encode∘decode must be the identity on valid tables"
+    );
     let again = encode_setup_header(&back).expect("decoded tables must re-serialize");
-    assert_eq!(again, bytes, "the writer must be canonical on its own output");
+    assert_eq!(
+        again, bytes,
+        "the writer must be canonical on its own output"
+    );
     for qti in 0..2 {
         for pli in 0..3 {
             for qi in 0..64 {

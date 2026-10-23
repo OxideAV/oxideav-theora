@@ -4,6 +4,10 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 Round 457 encoder-quality campaign, cumulative against the round-453
 encoder on the battery: **−15.3 % luma / −9.0 % chroma BD-rate,
 +2.28 dB BD-PSNR** (`square0` −24.2 %, `cut` −20.8 %, `pan` −17.6 %,

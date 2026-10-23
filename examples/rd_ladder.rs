@@ -37,9 +37,9 @@
 #[path = "../tests/common/rd.rs"]
 mod rd;
 
-use oxideav_core::frame::VideoPlane;
 use oxideav_core::CodecId;
-use oxideav_theora::{PixelFormat, SourceFrame, TheoraEncoder, TheoraIdentHeader, THEORA_CODEC_ID};
+use oxideav_core::frame::VideoPlane;
+use oxideav_theora::{PixelFormat, SourceFrame, THEORA_CODEC_ID, TheoraEncoder, TheoraIdentHeader};
 use rd::*;
 use std::collections::BTreeMap;
 

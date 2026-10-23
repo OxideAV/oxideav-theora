@@ -15,8 +15,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_theora::{
-    frame_index_from_granule_position, granule_position_for_frame, join_granule_position,
-    keyframe_index_from_granule_position, split_granule_position, GranulePositionTracker,
+    GranulePositionTracker, frame_index_from_granule_position, granule_position_for_frame,
+    join_granule_position, keyframe_index_from_granule_position, split_granule_position,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -45,8 +45,7 @@ fuzz_target!(|data: &[u8]| {
     let back_span = u64::from(data[9]);
     let keyframe_index = frame_index.saturating_sub(back_span);
     if let Ok(fgp) = granule_position_for_frame(frame_index, keyframe_index, shift) {
-        let split =
-            split_granule_position(fgp, shift).expect("forward-mapped value must split");
+        let split = split_granule_position(fgp, shift).expect("forward-mapped value must split");
         assert_eq!(
             split.keyframe_count,
             keyframe_index + 1,
@@ -87,8 +86,8 @@ fuzz_target!(|data: &[u8]| {
                         );
                     }
                     last = Some(gp);
-                    let split = split_granule_position(gp, shift)
-                        .expect("tracker output must split");
+                    let split =
+                        split_granule_position(gp, shift).expect("tracker output must split");
                     if is_keyframe {
                         assert_eq!(
                             split.frames_since_keyframe, 0,

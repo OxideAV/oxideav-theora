@@ -354,6 +354,7 @@ use oxideav_core::RuntimeContext;
 
 /// Crate-local error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Packet was shorter than the field being read.
     TruncatedHeader {
@@ -1441,6 +1442,7 @@ pub enum Error {
 /// (`nbs`), since each is indexed by the same `bi` coded-order index
 /// resolved from the raster walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoopFilterFrameBlockSlice {
     /// `BCODED[bi]` — true if the block is coded.
     Bcoded,
@@ -1470,6 +1472,7 @@ impl core::fmt::Display for LoopFilterFrameBlockSlice {
 /// The driver requires every per-block array to have the same length
 /// (`nbs`), since each is indexed by the same `bi in 0..NBS` loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReconstructFrameBlockSlice {
     /// `BCODED[bi]` — true if the block is coded.
     Bcoded,
@@ -1496,6 +1499,7 @@ pub enum ReconstructFrameBlockSlice {
 /// Identifies which §7.7.1 state slice failed an
 /// [`Error::EobTokenStateLenMismatch`] check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EobTokenStateSlice {
     /// `TIS` — per-block current token index.
     Tis,
@@ -1508,6 +1512,7 @@ pub enum EobTokenStateSlice {
 /// Identifies which §7.7.2 state slice failed an
 /// [`Error::CoefficientTokenStateLenMismatch`] check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CoefficientTokenStateSlice {
     /// `TIS` — per-block current token index.
     Tis,
@@ -1520,6 +1525,7 @@ pub enum CoefficientTokenStateSlice {
 /// Identifies which of the §7.8.1 length-paired inputs failed an
 /// [`Error::DcPredictorBcodedLenMismatch`] check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DcPredictorLenField {
     /// The per-block macro-block lookup vector
     /// `block_to_macro_block: &[u32]`.
@@ -1534,6 +1540,7 @@ pub enum DcPredictorLenField {
 /// Identifies which of the §7.8.2 length-paired inputs failed an
 /// [`Error::DcInversionLenMismatch`] check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DcInversionLenField {
     /// The per-block macro-block lookup vector
     /// `block_to_macro_block: &[u32]`.
@@ -12662,6 +12669,7 @@ impl ReferenceFrameStore {
 /// chroma planes this is *not* always `2 * ceil(FMB? / 2)` (see
 /// [`PlaneBlockCodedOrder::from_block_extent`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrameGeometry {
     /// `NBS` — total blocks across all three planes (Table 6.6).
     pub nbs: u32,
@@ -12941,6 +12949,7 @@ pub fn build_frame_geometry(ident: &TheoraIdentHeader) -> Result<FrameGeometry, 
 /// region before display", which is a presentation step left to the
 /// caller (the picture region lives on [`TheoraIdentHeader`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedFrame {
     /// The §7.1 frame type (intra/inter); the §7.11 step 2 branch
     /// synthesises [`FrameType::Inter`] for a zero-byte packet.
@@ -12951,6 +12960,13 @@ pub struct DecodedFrame {
     /// The reconstructed, loop-filtered planes (lower-left origin
     /// row-major, per the §2.1 coordinate convention).
     pub frame: ReconstructedFrame,
+}
+
+impl DecodedFrame {
+    /// Build a [`DecodedFrame`] from all of its fields.
+    pub fn new(ftype: FrameType, qis: Vec<u8>, frame: ReconstructedFrame) -> Self {
+        Self { ftype, qis, frame }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -12985,6 +13001,7 @@ pub struct DecodedFrame {
 /// convention. `PICY` is itself a lower-left offset (§6.2 step 10),
 /// so the crop is a direct sub-rectangle copy with no vertical flip.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CroppedFrame {
     /// Cropped Y plane (`PICW` × `PICH`).
     pub samples_y: Vec<u8>,
@@ -12996,6 +13013,25 @@ pub struct CroppedFrame {
     pub dims_y: PlaneDimensions,
     /// Cb / Cr crop dimensions (§4.4.4 round-up).
     pub dims_c: PlaneDimensions,
+}
+
+impl CroppedFrame {
+    /// Build a [`CroppedFrame`] from all of its fields.
+    pub fn new(
+        samples_y: Vec<u8>,
+        samples_cb: Vec<u8>,
+        samples_cr: Vec<u8>,
+        dims_y: PlaneDimensions,
+        dims_c: PlaneDimensions,
+    ) -> Self {
+        Self {
+            samples_y,
+            samples_cb,
+            samples_cr,
+            dims_y,
+            dims_c,
+        }
+    }
 }
 
 /// Per-axis chroma subsampling factors `(sx, sy)` for a pixel format,
@@ -18251,6 +18287,7 @@ impl RateControl {
 /// The per-macro-block inter mode-decision strategy a [`TheoraEncoder`]
 /// applies to its P-frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum InterModeStrategy {
     /// The unified rate-distortion decision
     /// ([`FrameEncoder::encode_inter_frame_rd`]): each macro block codes

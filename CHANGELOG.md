@@ -13,6 +13,17 @@ encoder on the battery: **−15.3 % luma / −9.0 % chroma BD-rate,
 +2.28 dB BD-PSNR** (`square0` −24.2 %, `cut` −20.8 %, `pan` −17.6 %,
 fixture `keyframe-interval-30` −28.0 %), 1.5× faster, every re-pinned
 stream black-box decoded byte-identically.
+- API hygiene: `#[non_exhaustive]` on the `Error` enum, its slice /
+  length-field detail enums (`LoopFilterFrameBlockSlice`,
+  `ReconstructFrameBlockSlice`, `EobTokenStateSlice`,
+  `CoefficientTokenStateSlice`, `DcPredictorLenField`,
+  `DcInversionLenField`), the `InterModeStrategy` option, and the
+  `DecodedFrame`, `CroppedFrame` and `FrameGeometry` records
+  (`FrameGeometry` is built by `build_frame_geometry`). Spec-fixed
+  header records and field enums (`TheoraIdentHeader`,
+  `TheoraCommentHeader`, setup tables, `PixelFormat`, `ColorSpace`,
+  `FrameType`, `TheoraPacketKind`, `CommentField`, `MacroblockDimension`,
+  `FrameRateField`) stay exhaustive.
 
 ### Added
 
@@ -149,6 +160,7 @@ stream black-box decoded byte-identically.
   scenario's `<name>.recon` (this crate's reconstruction) next to the
   `.chain`, so the black-box decode route byte-compares without a
   rebuild.
+- All-field `new(..)` constructors for `DecodedFrame` and `CroppedFrame`.
 
 ## [0.0.12](https://github.com/OxideAV/oxideav-theora/compare/v0.0.11...v0.0.12) - 2026-08-30
 

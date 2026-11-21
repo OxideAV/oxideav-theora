@@ -7970,8 +7970,7 @@ fn encode_dct_coefficients_inner(
 
             // Write the Huffman code, then the extra-bits payload.
             w.write_bits(code, len as u32);
-            for k in 0..pt.n_extra as usize {
-                let (val, nbits) = pt.extra[k];
+            for &(val, nbits) in pt.extra.iter().take(pt.n_extra as usize) {
                 w.write_bits(u32::from(val), u32::from(nbits));
             }
         }
@@ -10685,12 +10684,9 @@ pub fn reconstruct_frame(
         // values are already clamped to 0..=255 by step 2(f)ii /
         // 2(f)iii inside reconstruct_block.
         let stride = plane_w as usize;
-        for by_off in 0..8usize {
-            for bx_off in 0..8usize {
-                let row = by as usize + by_off;
-                let col = bx as usize + bx_off;
-                samples[row * stride + col] = block.samples[by_off][bx_off];
-            }
+        for (by_off, src_row) in block.samples.iter().enumerate() {
+            let at = (by as usize + by_off) * stride + bx as usize;
+            samples[at..at + 8].copy_from_slice(src_row);
         }
     }
 
@@ -16213,8 +16209,8 @@ impl TokenBitCosts {
                 return None;
             }
             bits += u32::from(len);
-            for k in 0..pt.n_extra as usize {
-                bits += u32::from(pt.extra[k].1);
+            for extra in pt.extra.iter().take(pt.n_extra as usize) {
+                bits += u32::from(extra.1);
             }
             ti = ti.saturating_add(pt.advance).min(63);
         }
@@ -16908,8 +16904,8 @@ fn encode_quant_params_inner(w: &mut BitWriter, qp: &QuantizationParameters) -> 
             value: qp.base_matrices.len() as u64,
         });
     }
-    for bmi in 0..nbms as usize {
-        for &v in qp.base_matrices[bmi].iter() {
+    for matrix in qp.base_matrices.iter().take(nbms as usize) {
+        for &v in matrix.iter() {
             w.write_bits(v as u32, 8);
         }
     }
@@ -30342,10 +30338,10 @@ mod tests {
         let out = reconstruct_block(&inputs, 0, 4, 4, &qis, &params, &refs).unwrap();
         // The previous-Y plane is ramp((rx + ry) % 256). With
         // BX=4, BY=4, MV=0, the 8×8 tile reads (rx+ry+8)..(rx+ry+18).
-        for by in 0..8 {
-            for bx in 0..8 {
+        for (by, row) in out.samples.iter().enumerate() {
+            for (bx, &got) in row.iter().enumerate() {
                 let expected = ((bx + by + 8) % 256) as u8;
-                assert_eq!(out.samples[by][bx], expected);
+                assert_eq!(got, expected);
             }
         }
     }
@@ -33943,14 +33939,10 @@ mod tests {
         // (carried through LASTDC[0]), so DCs run 1..=16 across the Y
         // plane and 1..=4 across each chroma plane. AC coefficients
         // are untouched by §7.8.2 and stay +1.
-        for bi in 0..24usize {
+        for (bi, block) in out.coeffs.iter().enumerate().take(24) {
             let plane_pos = if bi < 16 { bi } else { (bi - 16) % 4 };
-            assert_eq!(
-                out.coeffs[bi][0],
-                (plane_pos + 1) as i16,
-                "DC of block {bi}"
-            );
-            assert_eq!(out.coeffs[bi][1..], [1i16; 63], "AC of block {bi}");
+            assert_eq!(block[0], (plane_pos + 1) as i16, "DC of block {bi}");
+            assert_eq!(block[1..], [1i16; 63], "AC of block {bi}");
         }
     }
 
@@ -40593,13 +40585,13 @@ mod tests {
 
         // Group minimum <= every individual table's code length.
         for hg in 0..5usize {
-            for token in 0..32usize {
+            for (token, &group_min) in costs.min_len[hg].iter().enumerate() {
                 for s in 0..16usize {
                     if let Some((_, len)) =
                         huffman_code_for_token(&setup.huffman_tables[16 * hg + s], token as u8)
                     {
                         assert!(
-                            costs.min_len[hg][token] <= len,
+                            group_min <= len,
                             "min_len[{hg}][{token}] must not exceed slot {s}'s length"
                         );
                     }

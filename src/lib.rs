@@ -14342,35 +14342,39 @@ impl FrameEncoder {
         // the intra side — the keyframe selector election is already
         // dominated by the DC group — so the intra RDOQ keeps the
         // group-minimum costs.)
-        let mut coeffs = vec![[0i16; 64]; nbs];
-        for (bi, out) in coeffs.iter_mut().enumerate() {
-            let pli = g.pli_of_block[bi] as usize;
-            let (plane, pw, ph) = match pli {
-                0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
-                1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
-                _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
-            };
-            let block = Self::extract_block(plane, pw, ph, g.bx_of_block[bi], g.by_of_block[bi])?;
-            // Subtract the §7.9.1.1 intra predictor (constant 128).
-            let mut residual = [[0i16; 8]; 8];
-            for (r, row) in residual.iter_mut().enumerate() {
-                for (c, slot) in row.iter_mut().enumerate() {
-                    *slot = block[r][c] - 128;
+        // Blocks are transformed and quantised independently of one
+        // another, so they are spread over the worker budget.
+        let blocks: Vec<Result<[i16; 64], Error>> =
+            inter_decision::par_map(self.threads, nbs, |bi| {
+                let pli = g.pli_of_block[bi] as usize;
+                let (plane, pw, ph) = match pli {
+                    0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+                    1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+                    _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+                };
+                let block =
+                    Self::extract_block(plane, pw, ph, g.bx_of_block[bi], g.by_of_block[bi])?;
+                // Subtract the §7.9.1.1 intra predictor (constant 128).
+                let mut residual = [[0i16; 8]; 8];
+                for (r, row) in residual.iter_mut().enumerate() {
+                    for (c, slot) in row.iter_mut().enumerate() {
+                        *slot = block[r][c] - 128;
+                    }
                 }
-            }
-            let dqc = frame_pipeline::forward_dct_block(&residual);
-            let mut q = quantize_block(&dqc, &qmats_dc[pli], &qmats_ac[qiis[bi] as usize][pli]);
-            // Rate-distortion-optimized quantization on the AC levels
-            // (DC untouched — §7.8 prediction chain).
-            rdoq_refine(
-                &mut q,
-                &dqc,
-                &qmats_ac[qiis[bi] as usize][pli],
-                &token_costs,
-                lambda,
-            );
-            *out = q;
-        }
+                let dqc = frame_pipeline::forward_dct_block(&residual);
+                let mut q = quantize_block(&dqc, &qmats_dc[pli], &qmats_ac[qiis[bi] as usize][pli]);
+                // Rate-distortion-optimized quantization on the AC levels
+                // (DC untouched — §7.8 prediction chain).
+                rdoq_refine(
+                    &mut q,
+                    &dqc,
+                    &qmats_ac[qiis[bi] as usize][pli],
+                    &token_costs,
+                    lambda,
+                );
+                Ok(q)
+            });
+        let mut coeffs = blocks.into_iter().collect::<Result<Vec<_>, Error>>()?;
 
         // Step 2: forward DC prediction. Every block is INTRA so
         // mbmodes is uniform; bcoded is all-coded.

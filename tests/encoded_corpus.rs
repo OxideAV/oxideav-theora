@@ -730,15 +730,16 @@ fn encoded_corpus_decode_corner_digests_are_stable() {
 /// The encoder's packets do not depend on its worker budget: the
 /// per-macro-block analysis and per-block coding stages are pure
 /// functions of their inputs and the order-dependent part (the
-/// LAST1 / LAST2 bit charges) is resolved serially. Three stream
+/// LAST1 / LAST2 bit charges) is resolved serially. Four stream
 /// shapes — plain rate-distortion I/P at a non-MB-aligned size,
-/// 4:2:2 with adaptive quantization, and a rate-controlled stream —
-/// must come out byte-identical at 1, 2, 3, 4 and 7 workers.
+/// 4:2:2 with adaptive quantization, a rate-controlled stream, and an
+/// intra-only 4:4:4 stream — must come out byte-identical at 1, 2, 3,
+/// 4 and 7 workers.
 #[test]
 fn encoder_output_is_identical_at_every_worker_budget() {
     let cid = || CodecId::new(THEORA_CODEC_ID);
     type Build = fn(CodecId, &TheoraIdentHeader) -> TheoraEncoder;
-    let shapes: [(&str, TheoraIdentHeader, Build, u32); 3] = [
+    let shapes: [(&str, TheoraIdentHeader, Build, u32); 4] = [
         (
             "rd 4:2:0 210x130",
             ident(210, 130, PixelFormat::Yuv420),
@@ -766,6 +767,14 @@ fn encoder_output_is_identical_at_every_worker_budget() {
                     .with_target_bitrate(150_000)
             },
             12,
+        ),
+        (
+            "intra-only 4:4:4 100x76",
+            ident(100, 76, PixelFormat::Yuv444),
+            |cid, id| {
+                TheoraEncoder::with_default_setup_keyframe_interval(cid, id.clone(), 44, 1).unwrap()
+            },
+            4,
         ),
     ];
     for (name, id, build, nframes) in shapes {

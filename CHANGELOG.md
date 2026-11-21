@@ -61,8 +61,9 @@ All notable changes to `oxideav-theora` are recorded here.
   `Encoder::set_execution_context`, `FrameEncoder::set_threads`;
   serial by default. The analysis stage and the per-block transform /
   quantise / RDOQ stage are spread over the budget (the internal
-  reference decoder uses it too); packets are byte-identical at every
-  budget (`encoder_output_is_identical_at_every_worker_budget`).
+  reference decoder uses it too), as is the per-block stage of
+  keyframes; packets are byte-identical at every budget
+  (`encoder_output_is_identical_at_every_worker_budget`).
 - **Encoder speed, byte-identical output (round 492)** — the forward
   and inverse transforms of the encoder run on eight lanes
   (`forward_dct_block` / `inverse_dct_block`, equal to the
@@ -115,6 +116,11 @@ stream black-box decoded byte-identically.
 - `examples/speed.rs` — encode / decode throughput probe on the shared
   synthetic sequences (frames per second, wire and reconstruction
   digests, worker budget).
+- `examples/rd_reference.rs` — rate-distortion comparison against a
+  black-box reference Theora encoder (four sequences, PSNR + SSIM vs
+  bytes, Bjøntegaard deltas). It needs an `ffmpeg` build that lists a
+  Theora encoder and skips at run time when there is none (as on the
+  machine this round ran on, whose `ffmpeg` carries only the decoder).
 - **Pinned Bjøntegaard battery (round 457)** — `tests/bd_rate.rs`
   encodes four deterministic 176×144 scenes (`square0`, `blobs`, `pan`,
   `cut`; 24 frames, keyframe interval 16) across the five-point quantizer

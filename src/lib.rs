@@ -18246,9 +18246,9 @@ impl oxideav_core::Decoder for TheoraDecoder {
 /// otherwise returns a decoder awaiting the headers as leading stream
 /// packets.
 ///
-/// The extradata layout consumed here is the concatenation of the three
-/// header packets each prefixed by a 16-bit big-endian length — the
-/// minimal self-describing packing. When `extradata` is empty the
+/// Two extradata layouts are read (see `split_extradata_headers`): the
+/// three header packets each prefixed by a 16-bit big-endian length, and
+/// the laced form a container hands over (Ogg, Matroska). When `extradata` is empty the
 /// decoder collects the headers from [`Decoder::send_packet`]
 /// (dispatched per the §6.1 type bit), so callers whose container hands
 /// the headers inline still work.
@@ -18256,23 +18256,86 @@ pub fn make_decoder(
     params: &oxideav_core::CodecParameters,
 ) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
     let mut dec = TheoraDecoder::new(params.codec_id.clone());
-    let ed = &params.extradata;
-    if !ed.is_empty() {
-        let mut off = 0usize;
-        while off + 2 <= ed.len() {
-            let len = ((ed[off] as usize) << 8) | (ed[off + 1] as usize);
-            off += 2;
-            if off + len > ed.len() {
-                return Err(oxideav_core::Error::invalid(
-                    "oxideav-theora: extradata header length runs past the buffer",
-                ));
-            }
-            dec.consume_header_packet(&ed[off..off + len])
-                .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
-            off += len;
-        }
+    for pkt in split_extradata_headers(&params.extradata)? {
+        dec.consume_header_packet(pkt)
+            .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
     }
     Ok(Box::new(dec))
+}
+
+/// Split [`CodecParameters::extradata`](oxideav_core::CodecParameters)
+/// into the §6 header packets it carries.
+///
+/// Two packings are read:
+///
+/// * the chain this crate's encoder writes — each packet preceded by a
+///   16-bit big-endian length;
+/// * the laced form containers hand over (the Ogg demuxer's gathered
+///   headers, a Matroska `CodecPrivate`): one byte holding the packet
+///   count minus one, then for every packet but the last its size as a
+///   run of `255` bytes closed by a byte below 255, then the packets
+///   back to back.
+///
+/// The laced form is recognised by its first packet: after the size
+/// run it must begin with the §6.1 identification signature (`0x80`
+/// `"theora"`). A length-prefixed chain cannot look like that, since its
+/// first two bytes are the length of a header that is well under
+/// `0x0200` bytes only when the count byte would read 0 or 1 and the
+/// signature would then sit at the wrong offset.
+fn split_extradata_headers(ed: &[u8]) -> oxideav_core::Result<Vec<&[u8]>> {
+    if ed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(packets) = split_laced_headers(ed) {
+        return Ok(packets);
+    }
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 2 <= ed.len() {
+        let len = ((ed[off] as usize) << 8) | (ed[off + 1] as usize);
+        off += 2;
+        if off + len > ed.len() {
+            return Err(oxideav_core::Error::invalid(
+                "oxideav-theora: extradata header length runs past the buffer",
+            ));
+        }
+        out.push(&ed[off..off + len]);
+        off += len;
+    }
+    Ok(out)
+}
+
+/// The laced packing of [`split_extradata_headers`], or `None` when
+/// `ed` is not in that form.
+fn split_laced_headers(ed: &[u8]) -> Option<Vec<&[u8]>> {
+    let count = usize::from(*ed.first()?) + 1;
+    let mut off = 1usize;
+    let mut sizes = Vec::with_capacity(count);
+    for _ in 0..count - 1 {
+        let mut size = 0usize;
+        loop {
+            let b = *ed.get(off)?;
+            off += 1;
+            size += usize::from(b);
+            if b < 255 {
+                break;
+            }
+        }
+        sizes.push(size);
+    }
+    let body = ed.get(off..)?;
+    let listed: usize = sizes.iter().sum();
+    sizes.push(body.len().checked_sub(listed)?);
+    if !body.starts_with(b"\x80theora") {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut at = 0usize;
+    for size in sizes {
+        out.push(&body[at..at + size]);
+        at += size;
+    }
+    Some(out)
 }
 
 // -----------------------------------------------------------------------------
@@ -20378,17 +20441,7 @@ pub fn make_encoder(
 ) -> oxideav_core::Result<Box<dyn oxideav_core::Encoder>> {
     let mut ident: Option<TheoraIdentHeader> = None;
     let mut setup: Option<SetupHeaderTables> = None;
-    let ed = &params.extradata;
-    let mut off = 0usize;
-    while off + 2 <= ed.len() {
-        let len = ((ed[off] as usize) << 8) | (ed[off + 1] as usize);
-        off += 2;
-        if off + len > ed.len() {
-            return Err(oxideav_core::Error::invalid(
-                "oxideav-theora: encoder extradata header length runs past the buffer",
-            ));
-        }
-        let pkt = &ed[off..off + len];
+    for pkt in split_extradata_headers(&params.extradata)? {
         match pkt.first() {
             Some(0x80) => {
                 ident = Some(
@@ -20406,7 +20459,6 @@ pub fn make_encoder(
             // encoder writes its own comment header.
             _ => {}
         }
-        off += len;
     }
     let ident = ident.ok_or_else(|| {
         oxideav_core::Error::invalid(
@@ -44861,5 +44913,50 @@ mod tests {
             data_bytes * 5 > budget_bytes * 3 && data_bytes * 5 < budget_bytes * 7,
             "coded {data_bytes} B vs budget {budget_bytes} B"
         );
+    }
+}
+
+#[cfg(test)]
+mod extradata_layout_tests {
+    use super::*;
+
+    fn laced(headers: &[&[u8]]) -> Vec<u8> {
+        let mut out = vec![(headers.len() - 1) as u8];
+        for h in &headers[..headers.len() - 1] {
+            let mut n = h.len();
+            while n >= 255 {
+                out.push(255);
+                n -= 255;
+            }
+            out.push(n as u8);
+        }
+        for h in headers {
+            out.extend_from_slice(h);
+        }
+        out
+    }
+
+    /// The laced packing a container hands over splits into the same
+    /// packets as the length-prefixed chain.
+    #[test]
+    fn laced_and_length_prefixed_extradata_split_alike() {
+        let mut ident = b"\x80theora".to_vec();
+        ident.extend_from_slice(&[7u8; 35]);
+        let mut comment = b"\x81theora".to_vec();
+        comment.extend_from_slice(&[1u8; 300]);
+        let mut setup = b"\x82theora".to_vec();
+        setup.extend_from_slice(&[9u8; 700]);
+        let headers: [&[u8]; 3] = [&ident, &comment, &setup];
+
+        let chain = pack_extradata(&headers).unwrap();
+        let from_chain = split_extradata_headers(&chain).unwrap();
+        let lace = laced(&headers);
+        let from_lace = split_extradata_headers(&lace).unwrap();
+        assert_eq!(from_chain, headers.to_vec());
+        assert_eq!(from_lace, headers.to_vec());
+        assert!(split_extradata_headers(&[]).unwrap().is_empty());
+        // A laced blob whose sizes overrun the buffer is not laced, and
+        // is then a malformed chain.
+        assert!(split_extradata_headers(&[2, 255, 255, 1]).is_err());
     }
 }

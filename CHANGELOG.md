@@ -4,6 +4,10 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- registry decoder / encoder: `extradata` in the laced packing containers hand over (the Ogg demuxer's gathered headers, a Matroska `CodecPrivate`) is read as well as the length-prefixed chain. A Theora stream in Ogg could not be opened: the decoder stopped with "expected identification header type 0x80".
+
 ### Changed
 
 - edition 2024, MSRV 1.95

@@ -106,3 +106,15 @@ name = "setup_header_pair"
 path = "fuzz_targets/setup_header_pair.rs"
 test = false
 doc = false
+
+# Differential target: `FrameDecoder::decode_frame` (the throughput
+# pipeline, at the serial budget and at a fuzz-chosen 2..=5 worker
+# budget) against `decode_frame_stepwise` (the numbered §7 procedures
+# chained with every intermediate array materialised) on hostile
+# packet chains, at picture sizes large enough for interior band
+# boundaries. Acceptance, frames, and reference planes must agree.
+[[bin]]
+name = "pipeline_vs_stepwise"
+path = "fuzz_targets/pipeline_vs_stepwise.rs"
+test = false
+doc = false

@@ -1,0 +1,21 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/ (header
+# decode, hostile frame chains, the framework-trait stream, the
+# pipeline-vs-stepwise differential, encode/decode round trip, the
+# setup-header writer/parser pair, and the granule mapping). The
+# org-level reusable workflow auto-discovers the targets and splits
+# the time budget across them; the committed seed corpora under
+# fuzz/corpus/<target>/ ship in the checkout.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"   # daily 04:17 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

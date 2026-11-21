@@ -605,6 +605,102 @@ fn idct_block(dqc: &[i16; 64], rows_upper: bool, cols_upper: bool) -> [[i16; 8];
     out
 }
 
+/// [`crate::inverse_dct_2d`] through the lane kernel: `dqc` in natural
+/// (row-major) order, result row-major. Bit-identical to the
+/// step-by-step transform.
+pub(crate) fn inverse_dct_block(dqc: &[i16; 64]) -> [[i16; 8]; 8] {
+    let mut slots = [0i16; 64];
+    for (c, group) in slots.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        for (r, slot) in group.iter_mut().enumerate() {
+            *slot = dqc[r * 8 + c];
+        }
+    }
+    idct_block(&slots, true, true)
+}
+
+// ---------------------------------------------------------------------
+// §7.9.3.3 forward DCT on eight lanes (encoder side)
+// ---------------------------------------------------------------------
+
+/// `x / 2¹⁶` rounded toward zero.
+#[inline(always)]
+fn div_2p16(x: i32) -> i32 {
+    (x + ((x >> 31) & 0xFFFF)) >> 16
+}
+
+/// The one-dimensional forward transform of [`crate::forward_dct_1d`]
+/// on eight independent lanes: `x[k][lane]` is input sample `k`,
+/// `y[k][lane]` output coefficient `k` (truncated to 16 bits, as the
+/// step-by-step procedure stores it).
+#[inline(always)]
+fn fdct_lanes(x: &[[i32; 8]; 8], y: &mut [[i32; 8]; 8]) {
+    for i in 0..8 {
+        let a0 = x[0][i].wrapping_add(x[7][i]);
+        let a1 = x[1][i].wrapping_add(x[6][i]);
+        let a2 = x[2][i].wrapping_add(x[5][i]);
+        let a3 = x[3][i].wrapping_add(x[4][i]);
+        let a4 = x[3][i].wrapping_sub(x[4][i]);
+        let a5 = x[2][i].wrapping_sub(x[5][i]);
+        let a6 = x[1][i].wrapping_sub(x[6][i]);
+        let a7 = x[0][i].wrapping_sub(x[7][i]);
+
+        let b0 = a0.wrapping_add(a3);
+        let b3 = a0.wrapping_sub(a3);
+        let b1 = a1.wrapping_add(a2);
+        let b2 = a1.wrapping_sub(a2);
+
+        let c6 = div_2p16(C4.wrapping_mul(a6.wrapping_add(a5)));
+        let c5 = div_2p16(C4.wrapping_mul(a6.wrapping_sub(a5)));
+
+        let d4 = a4.wrapping_add(c5);
+        let d5 = a4.wrapping_sub(c5);
+        let d7 = a7.wrapping_add(c6);
+        let d6 = a7.wrapping_sub(c6);
+
+        let t = |v: i32| i32::from(v as i16);
+        y[0][i] = t(div_2p16(C4.wrapping_mul(b0.wrapping_add(b1))));
+        y[4][i] = t(div_2p16(C4.wrapping_mul(b0.wrapping_sub(b1))));
+        y[2][i] = t(div_2p16(C2.wrapping_mul(b3)).wrapping_add(div_2p16(C6.wrapping_mul(b2))));
+        y[6][i] = t(div_2p16(C6.wrapping_mul(b3)).wrapping_sub(div_2p16(C2.wrapping_mul(b2))));
+        y[1][i] = t(div_2p16(C1.wrapping_mul(d7)).wrapping_add(div_2p16(C7.wrapping_mul(d4))));
+        y[5][i] = t(div_2p16(C5.wrapping_mul(d6)).wrapping_add(div_2p16(C3.wrapping_mul(d5))));
+        y[3][i] = t(div_2p16(C3.wrapping_mul(d6)).wrapping_sub(div_2p16(C5.wrapping_mul(d5))));
+        y[7][i] = t(div_2p16(C7.wrapping_mul(d7)).wrapping_sub(div_2p16(C1.wrapping_mul(d4))));
+    }
+}
+
+/// [`crate::forward_dct_2d`] through the lane kernel: rows first, then
+/// columns; the result is in natural (row-major) order. Bit-identical
+/// to the step-by-step transform.
+pub(crate) fn forward_dct_block(input: &[[i16; 8]; 8]) -> [i16; 64] {
+    // Row pass: lane = row, sample k = column k.
+    let mut x = [[0i32; 8]; 8];
+    for (k, lanes) in x.iter_mut().enumerate() {
+        for (row, lane) in lanes.iter_mut().enumerate() {
+            *lane = i32::from(input[row][k]);
+        }
+    }
+    let mut y = [[0i32; 8]; 8];
+    fdct_lanes(&x, &mut y);
+    // y[k][row] is coefficient k of row `row`. Column pass: lane =
+    // column, sample k = row k.
+    let mut z = [[0i32; 8]; 8];
+    for (k, lanes) in z.iter_mut().enumerate() {
+        for (col, lane) in lanes.iter_mut().enumerate() {
+            *lane = y[col][k];
+        }
+    }
+    let mut o = [[0i32; 8]; 8];
+    fdct_lanes(&z, &mut o);
+    let mut out = [0i16; 64];
+    for (k, lanes) in o.iter().enumerate() {
+        for (col, &v) in lanes.iter().enumerate() {
+            out[k * 8 + col] = v as i16;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------
 // §7.9 reconstruction
 // ---------------------------------------------------------------------
@@ -1504,6 +1600,25 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The encoder-side lane transforms equal the step-by-step ones
+    /// on residual-range and on overflowing inputs.
+    #[test]
+    fn lane_transforms_match_stepwise_for_the_encoder() {
+        let mut rng = Lcg(0xfeed_beef);
+        for trial in 0..3000 {
+            let amp: u32 = if trial % 3 == 0 { 65536 } else { 511 };
+            let mut block = [[0i16; 8]; 8];
+            for row in &mut block {
+                for v in row.iter_mut() {
+                    *v = ((rng.next() % amp) as i32 - (amp as i32) / 2) as i16;
+                }
+            }
+            let fwd = crate::forward_dct_2d(&block);
+            assert_eq!(forward_dct_block(&block), fwd);
+            assert_eq!(inverse_dct_block(&fwd), inverse_dct_2d(&fwd));
         }
     }
 

@@ -8870,6 +8870,20 @@ pub fn dequantize_block_from_params(
     Ok(dequantize_block(coeffs_zz, &qmat_dc, &qmat_ac))
 }
 
+/// `⌈2²⁸ / d⌉` for every quantizer value `d` in `1..=4096` (§6.4.3
+/// clamps matrix entries to that range); entry 0 is unused. Lets
+/// [`quantize_block`] divide by multiplying: for a dividend below 2¹⁶
+/// and a divisor of at most 2¹², `⌊a / d⌋ = (a · ⌈2²⁸ / d⌉) >> 28`.
+static QUANT_RECIPROCALS: [u32; 4097] = {
+    let mut out = [0u32; 4097];
+    let mut d = 1usize;
+    while d <= 4096 {
+        out[d] = (1u64 << 28).div_ceil(d as u64) as u32;
+        d += 1;
+    }
+    out
+};
+
 /// Forward (encoder-side) quantization: the inverse of
 /// [`dequantize_block`].
 ///
@@ -8896,6 +8910,9 @@ pub fn dequantize_block_from_params(
 /// magnitudes and the `1..=4096` quantizer range the clamp is never
 /// reached.
 ///
+/// The divisions are carried out as reciprocal multiplications (see
+/// `QUANT_RECIPROCALS`), exact over the whole quantizer range.
+///
 /// Inputs are the same two [`QuantizationMatrix`] arguments
 /// [`dequantize_block`] consumes; callers building a whole frame
 /// pre-compute the at-most-six per-plane matrices once and reuse them
@@ -8911,10 +8928,24 @@ pub fn quantize_block(
     /// Divide `num` by the positive quantizer `den`, rounding to the
     /// nearest integer with ties rounded away from zero, then clamp to
     /// the `i16` range.
+    ///
+    /// For the §6.4.3 quantizer range `1..=4096` the division is a
+    /// multiplication by the tabulated reciprocal `⌈2²⁸ / den⌉`:
+    /// with a dividend below 2¹⁶ (`|num| + den / 2 ≤ 32768 + 2048`) and
+    /// a divisor of at most 2¹², `⌊a / den⌋ = (a · ⌈2²⁸ / den⌉) >> 28`
+    /// exactly.
+    #[inline(always)]
     fn quant_round(num: i32, den: i32) -> i16 {
         debug_assert!(den > 0, "quantizer values are in 1..=4096");
         let half = den / 2;
-        let q = if num >= 0 {
+        let q = if let Some(&recip) = QUANT_RECIPROCALS.get(den as usize)
+            && den > 0
+            && (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&num)
+        {
+            let a = u64::from(num.unsigned_abs()) + half as u64;
+            let q = ((a * u64::from(recip)) >> 28) as i32;
+            if num < 0 { -q } else { q }
+        } else if num >= 0 {
             (num + half) / den
         } else {
             (num - half) / den
@@ -14236,7 +14267,7 @@ impl FrameEncoder {
                     *slot = block[r][c] - 128;
                 }
             }
-            let dqc = forward_dct_2d(&residual);
+            let dqc = frame_pipeline::forward_dct_block(&residual);
             let mut q = quantize_block(&dqc, &qmats_dc[pli], &qmats_ac[qiis[bi] as usize][pli]);
             // Rate-distortion-optimized quantization on the AC levels
             // (DC untouched — §7.8 prediction chain).
@@ -14551,7 +14582,7 @@ impl FrameEncoder {
                     *slot = src[r][c] - 128;
                 }
             }
-            let dqc = forward_dct_2d(&residual);
+            let dqc = frame_pipeline::forward_dct_block(&residual);
 
             let mut best: Option<(u64, u8)> = None;
             for (cand, ac) in qmats_ac.iter().enumerate() {
@@ -14560,7 +14591,7 @@ impl FrameEncoder {
                 // will (128 predictor + dequantized inverse DCT,
                 // clamped) and take the SSD against the source.
                 let dqc_rec = dequantize_block(&q, &qmats_dc[pli], &ac[pli]);
-                let rec = inverse_dct_2d(&dqc_rec);
+                let rec = frame_pipeline::inverse_dct_block(&dqc_rec);
                 let mut ssd = 0u64;
                 for r in 0..8 {
                     for c in 0..8 {
@@ -15355,7 +15386,7 @@ impl FrameEncoder {
                     }
                     (
                         pred,
-                        forward_dct_2d(&residual),
+                        frame_pipeline::forward_dct_block(&residual),
                         &qmats_intra[pli],
                         &qmats_ac_intra[..],
                     )
@@ -15374,7 +15405,7 @@ impl FrameEncoder {
                     }
                     (
                         pred,
-                        forward_dct_2d(&residual),
+                        frame_pipeline::forward_dct_block(&residual),
                         &qmats[pli],
                         &qmats_ac_inter[..],
                     )
@@ -15403,7 +15434,7 @@ impl FrameEncoder {
                         // Reconstruct exactly as the decoder will and take
                         // the delivered SSD against the source block.
                         let dqc_rec = dequantize_block(&qc, dc_mat, &ac[pli]);
-                        let rec = inverse_dct_2d(&dqc_rec);
+                        let rec = frame_pipeline::inverse_dct_block(&dqc_rec);
                         let mut ssd = 0u64;
                         for r in 0..8 {
                             for c in 0..8 {
@@ -15463,7 +15494,7 @@ impl FrameEncoder {
                 // edges then behave exactly as before this decision existed).
                 if coded && !force_coded && any_nonzero {
                     let dqc_rec = dequantize_block(&q, dc_mat, &ac_mats[qii as usize][pli]);
-                    let rec = inverse_dct_2d(&dqc_rec);
+                    let rec = frame_pipeline::inverse_dct_block(&dqc_rec);
                     let mut ssd_coded = 0u64;
                     let mut ssd_skip = 0u64;
                     for r in 0..8 {
@@ -15787,6 +15818,15 @@ impl FrameEncoder {
                 None => u32::MAX,
             }
         };
+        // Each vector is priced once (see `ProbedVectors`).
+        let probed = std::cell::RefCell::new(ProbedVectors::new());
+        let cost_for = |mv: MotionVector, limit: u32| -> u32 {
+            if probed.borrow_mut().first_visit(mv) {
+                cost_for(mv, limit)
+            } else {
+                u32::MAX
+            }
+        };
         // Seeded four-step whole-pixel descent, zero-biased: strict
         // improvement required to move off the zero vector.
         let (best_mv, best_cost) = whole_pixel_step_search_seeded(seeds, cost_for);
@@ -15859,6 +15899,15 @@ impl FrameEncoder {
             match luma_block_sad_bounded(&refp, bx, by, mv, &src, limit - penalty) {
                 Some(sad) => sad + penalty,
                 None => u32::MAX,
+            }
+        };
+        // Each vector is priced once (see `ProbedVectors`).
+        let probed = std::cell::RefCell::new(ProbedVectors::new());
+        let cost_for = |mv: MotionVector, limit: u32| -> u32 {
+            if probed.borrow_mut().first_visit(mv) {
+                cost_for(mv, limit)
+            } else {
+                u32::MAX
             }
         };
         // Seeded four-step whole-pixel descent, as
@@ -15942,7 +15991,7 @@ impl FrameEncoder {
                 residual[r][c] = src[r][c] - pred[r][c] as i16;
             }
         }
-        let dqc_fwd = forward_dct_2d(&residual);
+        let dqc_fwd = frame_pipeline::forward_dct_block(&residual);
         let q = quantize_block(&dqc_fwd, &qmats[pli], &qmats[pli]);
         let any_nonzero = q.iter().any(|&v| v != 0);
         let coded = any_nonzero || force_coded;
@@ -15952,7 +16001,7 @@ impl FrameEncoder {
         // own quantized coefficients and inverse-transforms them.
         let recon_res = if coded {
             let dqc_rec = dequantize_block(&q, &qmats[pli], &qmats[pli]);
-            inverse_dct_2d(&dqc_rec)
+            frame_pipeline::inverse_dct_block(&dqc_rec)
         } else {
             [[0i16; 8]; 8]
         };
@@ -16115,11 +16164,11 @@ impl FrameEncoder {
                 residual[r][c] = src[r][c] - 128;
             }
         }
-        let dqc_fwd = forward_dct_2d(&residual);
+        let dqc_fwd = frame_pipeline::forward_dct_block(&residual);
         let q = quantize_block(&dqc_fwd, &qmats_intra[pli], &qmats_intra[pli]);
 
         let dqc_rec = dequantize_block(&q, &qmats_intra[pli], &qmats_intra[pli]);
-        let recon_res = inverse_dct_2d(&dqc_rec);
+        let recon_res = frame_pipeline::inverse_dct_block(&dqc_rec);
         let mut ssd = 0u64;
         for r in 0..8 {
             for c in 0..8 {
@@ -16380,7 +16429,10 @@ impl TokenBitCosts {
     /// code length plus the exact extra-bits payload per token. Returns
     /// `None` when a coefficient overflows the token alphabet or a
     /// token has no leaf in its group.
-    fn block_bits(&self, coeffs_zz: &[i16; 64]) -> Option<u32> {
+    /// [`TokenBitCosts::block_bits`] computed from the materialised
+    /// token plan — the definition the direct walk is tested against.
+    #[cfg(test)]
+    fn block_bits_planned(&self, coeffs_zz: &[i16; 64]) -> Option<u32> {
         let mut plan = BlockTokenPlan::EMPTY;
         plan_block_tokens_into(coeffs_zz, &mut plan)?;
         let mut ti: u8 = 0;
@@ -16398,6 +16450,109 @@ impl TokenBitCosts {
             ti = ti.saturating_add(pt.advance).min(63);
         }
         Some(bits)
+    }
+
+    /// Table 7.42 Huffman group of the token starting at index `ti`
+    /// (an index of 64 — a block that ran to the end — prices like 63).
+    #[inline(always)]
+    fn group_of(ti: usize) -> usize {
+        const GROUP_OF_TI: [u8; 64] = {
+            let mut out = [4u8; 64];
+            let mut ti = 0;
+            while ti < 28 {
+                out[ti] = match ti {
+                    0 => 0,
+                    1..=5 => 1,
+                    6..=14 => 2,
+                    _ => 3,
+                };
+                ti += 1;
+            }
+            out
+        };
+        GROUP_OF_TI[ti.min(63)] as usize
+    }
+
+    /// Price of one token (code length plus `extra` payload bits) at
+    /// token index `ti`; `None` when no table of the group codes it.
+    #[inline(always)]
+    fn token_bits(&self, ti: usize, token: usize, extra: u32) -> Option<u32> {
+        let len = self.min_len[Self::group_of(ti)][token];
+        (len != u8::MAX).then(|| u32::from(len) + extra)
+    }
+
+    /// Bits of the closing EOB token of a block whose last coded
+    /// coefficient ends just before token index `ti`.
+    #[inline(always)]
+    fn eob_bits(&self, ti: usize) -> Option<u32> {
+        self.token_bits(ti, 0, 0)
+    }
+
+    /// Bits spent on one non-zero coefficient `v` together with the
+    /// `run` zeros before it, the first of which sits at token index
+    /// `start` — exactly the token(s) `plan_block_tokens_into` spells
+    /// for that stretch. A block's token bits are the sum of these
+    /// terms over its non-zero coefficients plus [`Self::eob_bits`]:
+    /// the greedy walk restarts after every non-zero coefficient, so
+    /// each term depends only on its own run, value and start index.
+    #[inline(always)]
+    fn term_bits(&self, start: usize, run: usize, v: i16) -> Option<u32> {
+        // (token, extra bits) of a lone coefficient
+        // (`plan_single_coefficient`).
+        let lone = |v: i16| -> Option<(usize, u32)> {
+            Some(match v.unsigned_abs() {
+                1 => (if v > 0 { 9 } else { 10 }, 0),
+                2 => (if v > 0 { 11 } else { 12 }, 0),
+                mag @ 3..=6 => (10 + mag as usize, 1),
+                7..=8 => (17, 2),
+                9..=12 => (18, 3),
+                13..=20 => (19, 4),
+                21..=36 => (20, 5),
+                37..=68 => (21, 6),
+                69..=580 => (22, 10),
+                _ => return None,
+            })
+        };
+        if run == 0 {
+            let (token, extra) = lone(v)?;
+            return self.token_bits(start, token, extra);
+        }
+        let mag = v.unsigned_abs();
+        if mag == 1 && run <= 17 {
+            let (token, extra) = match run {
+                1..=5 => (22 + run, 1),
+                6..=9 => (28, 3),
+                _ => (29, 4),
+            };
+            self.token_bits(start, token, extra)
+        } else if (2..=3).contains(&mag) && run == 1 {
+            self.token_bits(start, 30, 2)
+        } else if (2..=3).contains(&mag) && (2..=3).contains(&run) {
+            self.token_bits(start, 31, 3)
+        } else {
+            // A pure zero-run token, then the coefficient on its own.
+            let (token, extra) = lone(v)?;
+            let zeros = if run <= 8 {
+                self.token_bits(start, 7, 3)?
+            } else {
+                self.token_bits(start, 8, 6)?
+            };
+            Some(zeros + self.token_bits(start + run, token, extra)?)
+        }
+    }
+
+    fn block_bits(&self, coeffs_zz: &[i16; 64]) -> Option<u32> {
+        // The token walk of `plan_block_tokens_into`, priced term by
+        // term instead of materialising the plan.
+        let mut bits = 0u32;
+        let mut start = 0usize;
+        for (ti, &v) in coeffs_zz.iter().enumerate() {
+            if v != 0 {
+                bits += self.term_bits(start, ti - start, v)?;
+                start = ti + 1;
+            }
+        }
+        Some(bits + self.eob_bits(start)?)
     }
 }
 
@@ -16443,6 +16598,175 @@ impl TokenBitCosts {
 /// This is a pure encoder decision: the emitted tokens are ordinary
 /// §7.7 spellings of the refined coefficients.
 fn rdoq_refine(
+    q: &mut [i16; 64],
+    dqc_nat: &[i16; 64],
+    qmat_ac: &QuantizationMatrix,
+    costs: &TokenBitCosts,
+    lambda: u64,
+) {
+    const RDOQ_SSE_NUM: u64 = 1;
+    const RDOQ_SSE_DEN: u64 = 16;
+    /// "No coefficient" marker in the non-zero position links.
+    const NONE: u8 = u8::MAX;
+
+    let Some(base_bits) = costs.block_bits(q) else {
+        return;
+    };
+    // Natural-order index for each zig-zag slot.
+    const NAT_OF_ZZ: [u8; 64] = {
+        let mut out = [0u8; 64];
+        let mut ci = 0;
+        while ci < 64 {
+            out[ZIGZAG_NATURAL_TO_ZIGZAG[ci] as usize] = ci as u8;
+            ci += 1;
+        }
+        out
+    };
+    // Squared reconstruction error of AC slot `zzi` at level `lvl`,
+    // in dequantized-coefficient units.
+    let err2 = |zzi: usize, lvl: i16| -> u64 {
+        let ci = NAT_OF_ZZ[zzi] as usize;
+        let step = qmat_ac.values[ci] as i64;
+        let rec = (lvl as i64 * step).clamp(-32768, 32767);
+        let d = dqc_nat[ci] as i64 - rec;
+        (d * d) as u64
+    };
+    let cost_of = |d_coef: u64, bits: u32| -> u64 {
+        (d_coef * RDOQ_SSE_NUM / RDOQ_SSE_DEN)
+            .saturating_add(lambda.saturating_mul(u64::from(bits)))
+    };
+    let mut cur_d: u64 = (1..64).map(|zzi| err2(zzi, q[zzi])).sum();
+    let mut cur_bits = base_bits;
+    let mut cur_cost = cost_of(cur_d, cur_bits);
+
+    // A block's token bits are a sum of one term per non-zero
+    // coefficient (its preceding zero run and itself) plus the closing
+    // EOB (`TokenBitCosts::term_bits`), so every candidate below is
+    // priced by exchanging the terms it touches rather than by
+    // re-walking the block. Links over the non-zero positions give
+    // each coefficient its neighbours; `prefix[zzi]` is the bit total
+    // of the terms strictly before `zzi`.
+    let mut prev_nz = [NONE; 64];
+    let mut next_nz = [NONE; 64];
+    let mut prefix = [0u32; 64];
+    {
+        let mut last = NONE;
+        let mut acc = 0u32;
+        for zzi in 0..64 {
+            prefix[zzi] = acc;
+            if q[zzi] != 0 {
+                let start = if last == NONE { 0 } else { last as usize + 1 };
+                // `base_bits` exists, so every term of `q` does.
+                acc += costs.term_bits(start, zzi - start, q[zzi]).unwrap_or(0);
+                prev_nz[zzi] = last;
+                if last != NONE {
+                    next_nz[last as usize] = zzi as u8;
+                }
+                last = zzi as u8;
+            }
+        }
+    }
+    let start_of = |prev: u8| -> usize { if prev == NONE { 0 } else { prev as usize + 1 } };
+
+    // --- Stage 1: end-of-block position search. --------------------
+    // Zeroing every AC coefficient from `zzi` on leaves the terms
+    // before `zzi` untouched and closes the block right after the
+    // previous non-zero coefficient.
+    {
+        let mut tail_d = cur_d;
+        // (zzi, cost, bits) of the best truncation found so far.
+        let mut best: Option<(usize, u64, u32)> = None;
+        for zzi in (1..64).rev() {
+            if q[zzi] == 0 {
+                continue;
+            }
+            tail_d = tail_d - err2(zzi, q[zzi]) + err2(zzi, 0);
+            let Some(eob) = costs.eob_bits(start_of(prev_nz[zzi])) else {
+                break;
+            };
+            let bits = prefix[zzi] + eob;
+            let c = cost_of(tail_d, bits);
+            if c < cur_cost && best.is_none_or(|(_, bc, _)| c < bc) {
+                best = Some((zzi, c, bits));
+                cur_d = tail_d;
+            }
+        }
+        if let Some((zzi, c, bits)) = best {
+            for slot in q.iter_mut().skip(zzi) {
+                *slot = 0;
+            }
+            if prev_nz[zzi] != NONE {
+                next_nz[prev_nz[zzi] as usize] = NONE;
+            }
+            cur_cost = c;
+            cur_bits = bits;
+        }
+    }
+
+    // --- Stage 2: per-coefficient magnitude lowering. ---------------
+    for _pass in 0..2 {
+        let mut changed = false;
+        for zzi in (1..64).rev() {
+            let old = q[zzi];
+            if old == 0 {
+                continue;
+            }
+            let lower = if old > 0 { old - 1 } else { old + 1 };
+            let start = start_of(prev_nz[zzi]);
+            // The coefficient's own term is being replaced either way.
+            let own = costs.term_bits(start, zzi - start, old).unwrap_or(0);
+            let next = next_nz[zzi];
+            let new_bits = if lower != 0 {
+                costs
+                    .term_bits(start, zzi - start, lower)
+                    .map(|t| cur_bits - own + t)
+            } else if next != NONE {
+                // The coefficient disappears: the next non-zero one
+                // inherits its zero run.
+                let n = next as usize;
+                let was = costs.term_bits(zzi + 1, n - zzi - 1, q[n]).unwrap_or(0);
+                costs
+                    .term_bits(start, n - start, q[n])
+                    .map(|t| cur_bits - own - was + t)
+            } else {
+                // It was the last one: the EOB moves forward.
+                let was = costs.eob_bits(zzi + 1).unwrap_or(0);
+                costs.eob_bits(start).map(|e| cur_bits - own - was + e)
+            };
+            let Some(new_bits) = new_bits else {
+                continue;
+            };
+            let new_d = cur_d - err2(zzi, old) + err2(zzi, lower);
+            let new_cost = cost_of(new_d, new_bits);
+            if new_cost < cur_cost {
+                q[zzi] = lower;
+                cur_cost = new_cost;
+                cur_d = new_d;
+                cur_bits = new_bits;
+                changed = true;
+                if lower == 0 {
+                    // Unlink the vanished coefficient.
+                    let prev = prev_nz[zzi];
+                    if prev != NONE {
+                        next_nz[prev as usize] = next;
+                    }
+                    if next != NONE {
+                        prev_nz[next as usize] = prev;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// [`rdoq_refine`] as originally written: every candidate priced by
+/// re-walking the whole block. The exchange-of-terms version above
+/// must make exactly the same decisions.
+#[cfg(test)]
+fn rdoq_refine_reference(
     q: &mut [i16; 64],
     dqc_nat: &[i16; 64],
     qmat_ac: &QuantizationMatrix,
@@ -16576,6 +16900,38 @@ fn luma_block_sad_bounded(
     limit: u32,
 ) -> Option<u32> {
     let (mv1, mv2) = split_motion_vector_per_axis(mv.x as i32, mv.y as i32, 2, 2)?;
+    // When both predictor footprints lie inside the plane, read the
+    // reference rows in place: a candidate abandoned after its first
+    // rows never pays for the rest of its predictor.
+    let (w, h) = (refp.rpw as i32, refp.rph as i32);
+    let origin = |m: MotionVector| -> Option<usize> {
+        let (x, y) = (bx as i32 + m.x as i32, by as i32 + m.y as i32);
+        (x >= 0 && y >= 0 && x + 8 <= w && y + 8 <= h).then(|| (y * w + x) as usize)
+    };
+    if let (Some(o1), Some(o2)) = (origin(mv1), origin(mv2)) {
+        let stride = w as usize;
+        let mut sad = 0u32;
+        for (j, srow) in src.iter().enumerate() {
+            let r1: &[u8; 8] = refp.samples[o1 + j * stride..o1 + j * stride + 8]
+                .try_into()
+                .expect("8-sample row");
+            let r2: &[u8; 8] = refp.samples[o2 + j * stride..o2 + j * stride + 8]
+                .try_into()
+                .expect("8-sample row");
+            let mut row = 0u32;
+            for i in 0..8 {
+                // (a + b) >> 1 is a itself when both rows coincide
+                // (the whole-pixel case).
+                let p = (i16::from(r1[i]) + i16::from(r2[i])) >> 1;
+                row += u32::from((srow[i] - p).unsigned_abs());
+            }
+            sad += row;
+            if sad >= limit {
+                return None;
+            }
+        }
+        return Some(sad);
+    }
     let pred = if mv1 == mv2 {
         compute_whole_pixel_predictor(refp, bx, by, mv1)
     } else {
@@ -16591,6 +16947,34 @@ fn luma_block_sad_bounded(
         }
     }
     Some(sad)
+}
+
+/// The set of motion vectors one search has already priced.
+///
+/// The step search and the half-pixel refinement revisit vectors
+/// (overlapping probe rings, a refinement step landing back on an
+/// earlier candidate). A vector that was priced once can never win
+/// later — the running best only improves, and a candidate must beat
+/// it strictly — so re-pricing is skipped by reporting "no better".
+struct ProbedVectors([u64; 63]);
+
+impl ProbedVectors {
+    fn new() -> Self {
+        Self([0u64; 63])
+    }
+
+    /// Record `mv`; `true` the first time it is seen. Vectors outside
+    /// the §7.5 component range `-31..=31` are never recorded.
+    fn first_visit(&mut self, mv: MotionVector) -> bool {
+        let (x, y) = (mv.x as i32 + 31, mv.y as i32 + 31);
+        if !(0..63).contains(&x) || !(0..63).contains(&y) {
+            return true;
+        }
+        let bit = 1u64 << y;
+        let seen = self.0[x as usize] & bit != 0;
+        self.0[x as usize] |= bit;
+        !seen
+    }
 }
 
 /// Build the §7.9.1 motion-compensated predictor tile for one luma
@@ -40841,6 +41225,145 @@ mod tests {
             "RD global-motion inter luma max error {} exceeds tolerance",
             plane_max_err(&f1.frame.samples_y, &source.samples_y)
         );
+    }
+
+    /// The direct token-bit walk prices every block exactly as the
+    /// materialised token plan does (same bits, same unencodable
+    /// verdicts), across sparse, dense, long-run and out-of-alphabet
+    /// blocks.
+    #[test]
+    fn token_bit_costs_direct_walk_matches_planned_pricing() {
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let all = TokenBitCosts::from_tables(&setup.huffman_tables[..]);
+        let sel = TokenBitCosts::for_selected_plane(&setup.huffman_tables[..], 3, 11);
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let mut encodable = 0usize;
+        for trial in 0..20000 {
+            let mut block = [0i16; 64];
+            // Density from empty to full; magnitudes from ±1 to past
+            // the 580 alphabet ceiling.
+            let fill = next() % 65;
+            let amp = [2u32, 4, 8, 40, 600, 1300][trial % 6];
+            for _ in 0..fill {
+                let at = (next() % 64) as usize;
+                block[at] = (next() % (2 * amp + 1)) as i16 - amp as i16;
+            }
+            for costs in [&all, &sel] {
+                let want = costs.block_bits_planned(&block);
+                assert_eq!(costs.block_bits(&block), want, "block {block:?}");
+                encodable += usize::from(want.is_some());
+            }
+        }
+        assert!(encodable > 10000, "the sweep must mostly price real blocks");
+    }
+
+    /// The exchange-of-terms RDOQ makes exactly the decisions of the
+    /// re-walk-everything original, on quantized blocks of every
+    /// density, across λ from negligible to dominant, with real
+    /// codebooks and with a cost table full of uncodable tokens.
+    #[test]
+    fn rdoq_incremental_matches_full_repricing() {
+        let setup = decode_setup_header(&fixture_data::FIXTURE_SETUP_PACKET).unwrap();
+        let all = TokenBitCosts::from_tables(&setup.huffman_tables[..]);
+        let sel = TokenBitCosts::for_selected_plane(&setup.huffman_tables[..], 5, 2);
+        // A table where several run tokens (and the group-3 EOB) have
+        // no code: candidates that need them must be rejected the
+        // same way by both versions.
+        let mut holes = TokenBitCosts {
+            min_len: all.min_len,
+        };
+        for group in &mut holes.min_len {
+            group[7] = u8::MAX;
+            group[24] = u8::MAX;
+            group[30] = u8::MAX;
+        }
+        holes.min_len[3][0] = u8::MAX;
+        let params = &setup.quantization_parameters;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let mut moved = 0usize;
+        for trial in 0..12000 {
+            let qi = [4usize, 20, 40, 60][trial % 4];
+            let qmat = compute_quantization_matrix(params, trial % 2, trial % 3, qi).unwrap();
+            // A natural-order coefficient block with a decaying
+            // spectrum, so the quantized block has realistic structure.
+            let energy = [40u32, 300, 2000, 12000][(trial / 4) % 4];
+            let mut dqc = [0i16; 64];
+            for (ci, d) in dqc.iter_mut().enumerate() {
+                let weight = 1 + (ci / 8 + ci % 8) as u32;
+                let span = (energy / weight).max(1);
+                *d = (next() % (2 * span + 1)) as i16 - span as i16;
+            }
+            let q0 = quantize_block(&dqc, &qmat, &qmat);
+            let lambda = [1u64, 30, 400, 6000, 90000][(trial / 16) % 5];
+            for costs in [&all, &sel, &holes] {
+                let mut got = q0;
+                let mut want = q0;
+                rdoq_refine(&mut got, &dqc, &qmat, costs, lambda);
+                rdoq_refine_reference(&mut want, &dqc, &qmat, costs, lambda);
+                assert_eq!(got, want, "trial {trial}, λ = {lambda}");
+                moved += usize::from(got != q0);
+            }
+        }
+        assert!(moved > 3000, "the sweep must exercise real refinements");
+    }
+
+    /// The reciprocal-multiply quantizer equals rounded division for
+    /// every quantizer value and a dense sweep of dividends (the full
+    /// 2²⁸-case product was verified exhaustively offline).
+    #[test]
+    fn quantizer_reciprocals_reproduce_rounded_division() {
+        let reference = |num: i32, den: i32| -> i16 {
+            let half = den / 2;
+            let q = if num >= 0 {
+                (num + half) / den
+            } else {
+                (num - half) / den
+            };
+            q.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        };
+        let mut dqc = [0i16; 64];
+        let mut m = QuantizationMatrix { values: [1; 64] };
+        for den in 1u16..=4096 {
+            m.values = [den; 64];
+            // 64 dividends per quantizer: the extremes, the rounding
+            // boundaries around small multiples, and a stride through
+            // the range that shifts with the quantizer.
+            let d = i32::from(den);
+            let mut cases = [0i32; 64];
+            cases[..8].copy_from_slice(&[-32768, -32767, 32767, 32766, 0, 1, -1, d]);
+            for (k, slot) in cases[8..36].iter_mut().enumerate() {
+                let mult = (k as i32 / 4) + 1;
+                let edge = mult * d + d / 2 + [-1, 0, 1, 2][k % 4] - 1;
+                *slot = if k % 8 < 4 { edge } else { -edge };
+            }
+            for (k, slot) in cases[36..].iter_mut().enumerate() {
+                *slot = ((k as i32 * 2341 + d * 37) % 65536) - 32768;
+            }
+            for (slot, &c) in dqc.iter_mut().zip(&cases) {
+                *slot = c.clamp(-32768, 32767) as i16;
+            }
+            let got = quantize_block(&dqc, &m, &m);
+            for (ci, &num) in dqc.iter().enumerate() {
+                let zzi = ZIGZAG_NATURAL_TO_ZIGZAG[ci] as usize;
+                assert_eq!(
+                    got[zzi],
+                    reference(i32::from(num), d),
+                    "num={num} den={den}"
+                );
+            }
+        }
     }
 
     /// `TokenBitCosts` prices every token at the cheapest §6.4.4 code

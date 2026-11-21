@@ -37,6 +37,18 @@ All notable changes to `oxideav-theora` are recorded here.
   `pipeline_vs_stepwise` fuzz target).
 - The bit writer packs whole fields through a 64-bit register instead
   of one bit per iteration (same bytes).
+- **Encoder speed, byte-identical output (round 492)** — the forward
+  and inverse transforms of the encoder run on eight lanes
+  (`forward_dct_block` / `inverse_dct_block`, equal to the
+  step-by-step transforms on every input including overflowing ones);
+  `quantize_block` divides by multiplying with tabulated reciprocals
+  `⌈2²⁸ / d⌉` (exact for every quantizer value and 16-bit dividend,
+  verified exhaustively); token bits are priced as a sum of separable
+  per-coefficient terms without materialising the token plan, which
+  lets RDOQ price each candidate by exchanging the terms it touches
+  instead of re-walking the block; the motion search reads reference
+  rows in place and never prices a vector twice. 720p `pan`
+  6.8 → 11.9 fps with the same bytes out.
 
 ### Fixed
 

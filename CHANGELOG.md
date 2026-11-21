@@ -4,6 +4,31 @@ All notable changes to `oxideav-theora` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-theora/compare/v0.0.12...v0.0.13) - 2026-11-21
+
+### Other
+
+- read the laced extradata containers hand over
+- state the measured serial speed-up ranges exactly
+- README / CHANGELOG: round-492 throughput and rate-distortion tables
+- keyframe block stage under the worker budget; examples/rd_reference (reference-encoder RD comparison, runtime skip)
+- order-independent RD mode decision (-1.7% BD-rate) + threading under a caller budget
+- byte-identical speedups — lane transforms, reciprocal quantiser, separable token pricing, incremental RDOQ, in-place SAD
+- pipeline_vs_stepwise differential target + scheduled Fuzz workflow
+- throughput pipeline (2.8-3.5x serial) + band threading under a caller budget
+- clippy 1.100: iterator forms for needless_range_loop sites (output unchanged)
+- API hygiene: #[non_exhaustive] growable types, #[doc(hidden)] internals
+- edition 2024, MSRV 1.95
+- README examples use the current registry API
+- round-457 measured rate-distortion — final ladder, cumulative BD table, re-run elections; CHANGELOG summary
+- structured setup-header writer/parser pair target; roundtrip target drives lookahead/VBV/masking
+- byte-identical hot-path speedups — stack token plans, predictor fast paths, hoisted extraction, early-abandoned search SADs
+- measured-election intra quant matrices as the synthesized setup default; opt-in activity masking
+- lookahead planning — two-sided scene-cut keyframes, interval deferral, windowed rate shares, VBV model + enforcement
+- LAST1/LAST2 as explicit RD candidates, priced four-MV block search, iterated half-pixel refinement
+- RDOQ end-of-block search + exact 1/16 transform-gain distortion model
+- pinned Bjøntegaard battery — shared rd harness, luma/chroma/SSIM BD-rate vs round-453 curves, corpus .recon dump
+
 ### Fixed
 
 - registry decoder / encoder: `extradata` in the laced packing containers hand over (the Ogg demuxer's gathered headers, a Matroska `CodecPrivate`) is read as well as the length-prefixed chain. A Theora stream in Ogg could not be opened: the decoder stopped with "expected identification header type 0x80".

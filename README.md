@@ -21,7 +21,11 @@ predictor-seeded motion estimation to half-pixel accuracy,
 rate-distortion-optimized quantization, measured-rate `MVMODE`
 election, per-block skip, adaptive quantization, content-tuned Huffman
 codebooks, non-macro-block-aligned picture regions, duplicate-frame
-packets, and one-pass or two-pass target-bitrate rate control. The
+packets, and one-pass or two-pass target-bitrate rate control. Both
+directions take a caller-granted worker budget (serial by default)
+with output identical at every budget; round 492 made the decoder
+2.8–3.5× faster serially and the encoder 1.6–3.4× (see the throughput
+sections). The
 round-453 quality campaign is **measured**: −21.0 % mean BD-rate /
 +2.35 dB mean BD-PSNR over the six-sequence `rd_ladder` battery versus
 the round-451 encoder (see the measured rate-distortion section), and
@@ -309,7 +313,19 @@ zero-initialized reference store.
   its four explicit vectors are paid for out of the rate term, so it is
   chosen only when the per-block fidelity gain justifies them (an
   all-equal four-MV is strictly dominated by uniform `INTER_MV` and never
-  wins). On a scene the golden
+  wins). Since round 492 this decision is **order independent**
+  (`src/inter_decision.rs`): the motion searches and the pricing of
+  every candidate are a pure per-macro-block analysis — seeded by the
+  previous inter frame's vector field rather than by the running
+  predictors, followed by a pass in which each macro block may adopt a
+  vector that won at one of its four neighbours or one of the frame's
+  three most common vectors — and a serial sweep in coded order then
+  adds the motion-vector bits the `LAST1` / `LAST2` state actually
+  leaves each candidate and prices the two predictors themselves. The
+  four-vector blocks are searched locally around the macro block's and
+  its neighbours' vectors, and the golden search is skipped while the
+  golden frame is still the previous frame (see the round-492 encoder
+  section for the measured effect). On a scene the golden
   reference predicts perfectly the RD path codes a distortion-free golden
   copy (SSD 0, 25 B) where the previous-reference-only motion path must
   code a large residual against the unrelated previous reference
@@ -567,6 +583,104 @@ chroma blocks that earlier diverged is now sample-exact.
   rather than staged, and container-level concerns among them
   (chaining, page framing) belong to the container crates.
 
+## Encoder throughput and rate-distortion (round 492)
+
+**Speed.** Two steps, measured with
+`cargo run --release --example speed -- --size WxH --seq <name> --threads n`
+(qi 32, keyframe interval 64 or intra-only; frames per second of
+`send_frame` → packets, medians of 3 runs, Apple M-series, machine
+shared with other build jobs):
+
+1. *Byte-identical kernels* — the forward and inverse transforms run on
+   eight lanes (equal to the step-by-step transforms on every input);
+   `quantize_block` divides by multiplying with tabulated reciprocals
+   `⌈2²⁸ / d⌉` (exact for every quantizer value and 16-bit dividend —
+   all 2²⁸ cases were checked); token bits are priced as a sum of one
+   term per non-zero coefficient plus the EOB, without building the
+   token plan, which lets RDOQ price a candidate by exchanging the
+   terms it touches instead of re-walking the block (quadratic →
+   linear in the coefficient count); the motion search reads reference
+   rows in place and never prices a vector twice; the internal
+   reference decoder is the fast pipeline above. Every rewrite is
+   tested against the formulation it replaced and left all fifteen
+   pinned wire digests unchanged.
+2. *Order-independent mode decision + threads* — see the inter-encoder
+   bullet: the analysis of each macro block and the transform /
+   quantise / RDOQ of each block are pure functions, spread over a
+   caller-granted budget (`TheoraEncoder::with_threads` / `set_threads`,
+   `Encoder::set_execution_context`; serial by default); the
+   `LAST1` / `LAST2` resolution, token writing and DC prediction stay
+   serial. `encoder_output_is_identical_at_every_worker_budget` pins
+   four stream shapes byte-for-byte at 1, 2, 3, 4 and 7 workers.
+
+| clip | round start | now, serial | 2 threads | 4 threads | 8 threads |
+|---|---|---|---|---|---|
+| 854×480 `pan` I+P | 16.2 | 29.0 | 50.0 | 77.6 | 99.7 |
+| 1280×720 `pan` I+P | 7.5 | 13.8 | 24.2 | 38.7 | 49.9 |
+| 1280×720 `blobs` I+P | 12.9 | 19.7 | 35.3 | 61.4 | 82.0 |
+| 1280×720 `pan` intra-only | 12.3 | 42.8 | 57.5 | 73.0 | 82.8 |
+| 1920×1080 `pan` I+P | 3.4 | 6.4 | 10.7 | 17.0 | 22.6 |
+| 1920×1080 `blobs` I+P | 5.8 | 9.1 | 16.5 | 28.8 | 38.3 |
+| 1920×1080 `pan` intra-only | 5.9 | 19.9 | 25.6 | 33.9 | 37.6 |
+
+**Rate-distortion.** The reorganised decision is not just neutral: on
+the six-sequence battery (`rd_ladder --fixtures … --ref <round-457
+save>`, qi 8/20/32/44/56, keyframe interval 16) it measures, against
+the encoder as round 457 left it:
+
+| sequence | BD-rate Y | BD-rate C | BD-rate SSIM | BD-PSNR Y |
+|---|---|---|---|---|
+| square0 | −5.73 % | −7.06 % | −5.07 % | +1.26 dB |
+| cut | −3.00 % | −2.75 % | −2.21 % | +0.23 dB |
+| fx-all-mb-modes | −1.31 % | +0.06 % | −4.06 % | +0.09 dB |
+| pan | −0.36 % | −0.34 % | −0.20 % | +0.01 dB |
+| blobs | +0.01 % | +0.07 % | −0.00 % | −0.00 dB |
+| fx-kf-interval-30 | 0.00 % | 0.00 % | 0.00 % | 0.00 dB |
+| **mean** | **−1.73 %** | **−1.67 %** | **−1.92 %** | **+0.26 dB** |
+
+Measured steps on the way (mean luma BD-rate against the same
+reference): dropping the predictor seeds altogether **+0.58 %**
+(`pan` +1.6 %); seeding from the previous frame's field −0.79 %
+(`square0` −5.1 %, `pan` still +1.6 %); adding the neighbour /
+dominant-vector adoption pass **−1.86 %**; replacing the four full
+per-block searches of the four-vector candidate by local searches
+around the surrounding vectors −1.73 % for 19 % more speed (seeded by
+the macro block's own vector alone it was −1.19 %). Two pruning rules
+were measured and **not** adopted: pricing golden candidates only when
+the golden search matched better (+0.24 % for no measurable speed) and
+skipping the intra candidate when the inter SAD is below the luma
+activity (+0.11 % for 6 % speed, the loss concentrated in the
+intra-heavy fixture). Pricing every analysed candidate rather than the
+fixed set was also rejected (`blobs` +0.3 % chroma). The campaign
+floors in `tests/bd_rate.rs` are tightened to the new curves
+(`square0` −28.3 % / `cut` −23.1 % / `pan` −17.8 % luma against the
+round-453 reference; `blobs` unchanged), and the re-pinned corpus was
+re-validated 15/15 byte-identical through the black-box route
+(`tests/encoded-corpus-notes.md`).
+
+Operating points after round 492 (bytes / luma PSNR dB; `blobs` and
+the keyframe-interval fixture are within a few bytes of the round-457
+table below):
+
+| sequence | qi 8 | qi 20 | qi 32 | qi 44 | qi 56 |
+|---|---|---|---|---|---|
+| square0 | 9047 / 33.65 | 10381 / 40.24 | 12890 / 44.84 | 15204 / 48.41 | 21091 / 51.71 |
+| blobs | 2423 / 34.49 | 4435 / 37.06 | 7555 / 38.79 | 11127 / 39.73 | 22015 / 43.19 |
+| pan | 8387 / 30.45 | 12865 / 33.16 | 20466 / 35.21 | 49295 / 36.57 | 122986 / 39.80 |
+| cut | 5660 / 34.05 | 7454 / 38.54 | 10324 / 40.86 | 14051 / 42.13 | 22910 / 44.44 |
+| fx-all-mb-modes | 2864 / 28.41 | 5656 / 32.23 | 10489 / 35.79 | 17257 / 40.37 | 23383 / 43.03 |
+| fx-kf-interval-30 | 283 / 26.34 | 441 / 30.72 | 629 / 38.73 | 791 / 42.08 | 1064 / 45.95 |
+
+**Against a reference encoder.** `examples/rd_reference.rs` builds the
+comparison the battery cannot make on its own — the same four
+sequences through a black-box reference Theora encoder reached via
+`ffmpeg`, scored with the same PSNR / SSIM code, Bjøntegaard deltas of
+this encoder against it. It needs an `ffmpeg` whose `-encoders` list
+includes a Theora encoder and skips at run time otherwise; the machine
+this round ran on carries only the decoder, so **no cross-encoder
+figure is claimed here** and the reference branch of the example is
+unexercised.
+
 ## Measured rate-distortion (round 457)
 
 `tests/bd_rate.rs` pins the crate's Bjøntegaard battery: four
@@ -775,27 +889,28 @@ Frames per second, decode + display crop, before → after
 (`cargo run --release --example speed -- --load <chain> --threads n`;
 streams self-encoded at qi 32 from the `pan` / `blobs` generators of
 `tests/common/rd.rs`, 24 inter frames at keyframe interval 64 or 8
-intra-only frames; Apple M-series, medians of 7–9 runs taken back to
-back on a machine shared with nine other build jobs, so absolute
-numbers are conservative and noisy — the ratios are the measurement;
-the decoded-plane digest is identical in every cell):
+intra-only frames; Apple M-series, medians of 9–11 runs taken back to
+back on a machine shared with other build jobs, so absolute numbers
+are noisy — the ratios are the measurement; the decoded-plane digest
+is identical in every cell):
 
 | stream | before | after, serial | 2 threads | 4 threads | 8 threads |
 |---|---|---|---|---|---|
-| 854×480 `pan` inter | 307 | 1011 | 1011 | 861 | 1001 |
-| 854×480 `pan` intra-only | 187 | 548 | 505 | 649 | 660 |
-| 854×480 `blobs` inter | 850 | 2832 | 2918 | 3220 | 2216 |
-| 1280×720 `pan` inter | 168 | 528 | 667 | 750 | 825 |
-| 1280×720 `pan` intra-only | 98 | 276 | 323 | 401 | 417 |
-| 1280×720 `blobs` inter | 571 | 1953 | 2400 | 2391 | 2148 |
-| 1920×1080 `pan` inter | 103 | 293 | 404 | 480 | 502 |
-| 1920×1080 `pan` intra-only | 46 | 139 | 166 | 182 | 189 |
-| 1920×1080 `blobs` inter | 255 | 900 | 957 | 1011 | 1079 |
+| 854×480 `pan` inter | 517 | 1485 | 1905 | 2148 | 1883 |
+| 854×480 `pan` intra-only | 232 | 692 | 821 | 894 | 860 |
+| 854×480 `blobs` inter | 1230 | 4237 | 4658 | 4945 | 3463 |
+| 1280×720 `pan` inter | 240 | 680 | 921 | 1095 | 1038 |
+| 1280×720 `pan` intra-only | 109 | 309 | 383 | 421 | 421 |
+| 1280×720 `blobs` inter | 575 | 2005 | 1804 | 2306 | 2224 |
+| 1920×1080 `pan` inter | 106 | 305 | 413 | 503 | 499 |
+| 1920×1080 `pan` intra-only | 49 | 139 | 170 | 192 | 193 |
+| 1920×1080 `blobs` inter | 264 | 940 | 1196 | 1412 | 1253 |
 
 Serial decode is 2.8–3.5× faster. Thread scaling is bounded by the
 serial token pass (over half of an intra frame's time once
-reconstruction is fast) and, below 720p, by the per-frame cost of
-starting workers; it pays from 720p up. A design that recorded tokens
+reconstruction is fast) and by the per-frame cost of starting workers,
+which shows as the flat or falling 8-thread column; four workers give
+1.4–1.6× at 720p and above. A design that recorded tokens
 sequentially and replayed them per band (moving the coefficient
 scatter into the parallel phase) was measured and rejected: on this
 machine it was 20–40 % slower serially than scattering during the
@@ -878,7 +993,10 @@ fix, MV coding, RDOQ + seeded search, selector re-pricing): all
 **15/15 scenarios byte-identical** each time, and two new stream
 shapes (a two-pass rate-controlled stream and an auto-adaptive-quant
 stream) were validated the same way (see
-`tests/encoded-corpus-notes.md`).
+`tests/encoded-corpus-notes.md`). Round 492 re-ran the route on the
+corpus re-pinned by the order-independent mode decision: **15/15
+byte-identical** again (the helper now muxes through the sibling
+container crate; `dupframes` is compared over its coded frames).
 
 ## Usage
 

@@ -24,8 +24,8 @@ All notable changes to `oxideav-theora` are recorded here.
   slot). `TheoraDecoder` crops and flips straight out of the reference
   store — one copy per plane per frame instead of four. Measured on
   self-encoded streams (single thread, medians of back-to-back runs on
-  a shared machine): 1080p inter 103 → 293 fps, 1080p intra-only
-  46 → 139 fps, 720p inter 168 → 528 fps, 480p inter 307 → 1011 fps
+  a shared machine): 1080p inter 106 → 305 fps, 1080p intra-only
+  49 → 139 fps, 720p inter 240 → 680 fps, 480p inter 517 → 1485 fps
   (2.8–3.5×; full table in the README).
 - **Decoder threading under a caller budget** — `FrameDecoder::set_threads`
   / `TheoraDecoder::with_threads` / `set_threads`, and
@@ -74,8 +74,9 @@ All notable changes to `oxideav-theora` are recorded here.
   per-coefficient terms without materialising the token plan, which
   lets RDOQ price each candidate by exchanging the terms it touches
   instead of re-walking the block; the motion search reads reference
-  rows in place and never prices a vector twice. 720p `pan`
-  6.8 → 11.9 fps with the same bytes out.
+  rows in place and never prices a vector twice. Measured at that
+  commit: 720p `pan` 6.8 → 12.1 fps, intra-only 10.6 → 38.0 fps, with
+  the same bytes out.
 
 ### Fixed
 

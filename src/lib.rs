@@ -351,6 +351,7 @@ mod fixture_data;
 mod vp31_huffman_data;
 
 mod frame_pipeline;
+mod inter_decision;
 
 use oxideav_core::RuntimeContext;
 
@@ -13800,6 +13801,20 @@ pub struct FrameEncoder {
     /// masks error — take the coarser candidate and flat blocks the
     /// finer one. Only the multi-`qi` paths read it.
     activity_masking: u8,
+    /// Worker budget for the per-macro-block and per-block stages
+    /// (1 = serial). The emitted packets do not depend on it.
+    threads: usize,
+    /// The previous-reference vector the motion search settled on for
+    /// each macro block of the last committed inter frame — seeds for
+    /// the next frame's searches (fixed before a frame starts, so the
+    /// per-macro-block analysis stays order independent).
+    motion_hint: Option<Vec<MotionVector>>,
+    /// The searched vector field of the most recently *planned* inter
+    /// frame, promoted to `motion_hint` once that frame is committed.
+    planned_motion: std::sync::Mutex<Option<Vec<MotionVector>>>,
+    /// The left / right / lower / upper neighbour of every macro block
+    /// (coded-order indices; `u32::MAX` at a frame edge).
+    mb_neighbors: Vec<[u32; 4]>,
 }
 
 /// Per-macro-block motion strategy the shared inter-frame encode body
@@ -13998,6 +14013,10 @@ fn rd_lambda_for_qis(
     Ok(inter_rd_lambda_from_step(gm as u16))
 }
 
+/// A coded block's quantised coefficients (zig-zag order) and its
+/// §7.6 `qi` index.
+type CodedBlock = ([i16; 64], u8);
+
 struct InterFramePlan {
     /// Per-macro-block §7.5.2 coding mode, post LAST1/LAST2 recode.
     mbmodes: Vec<MacroBlockMode>,
@@ -14028,12 +14047,48 @@ impl FrameEncoder {
             return Err(Error::QuantIndexOutOfRange { qi: qi as usize });
         }
         let geometry = build_frame_geometry(&ident)?;
+        // Macro-block adjacency in the frame, from the position of
+        // each macro block's first luma block.
+        let (mbw, mbh) = (ident.fmbw as usize, ident.fmbh as usize);
+        let mut mb_at = vec![u32::MAX; mbw * mbh];
+        let mb_pos: Vec<(usize, usize)> = geometry
+            .macro_block_to_luma_blocks
+            .iter()
+            .map(|abcd| {
+                let bi = abcd[0] as usize;
+                (
+                    geometry.bx_of_block[bi] as usize / 16,
+                    geometry.by_of_block[bi] as usize / 16,
+                )
+            })
+            .collect();
+        for (mbi, &(x, y)) in mb_pos.iter().enumerate() {
+            if let Some(slot) = mb_at.get_mut(y * mbw + x) {
+                *slot = mbi as u32;
+            }
+        }
+        let mb_neighbors: Vec<[u32; 4]> = mb_pos
+            .iter()
+            .map(|&(x, y)| {
+                let at = |x: usize, y: usize| mb_at[y * mbw + x];
+                [
+                    if x > 0 { at(x - 1, y) } else { u32::MAX },
+                    if x + 1 < mbw { at(x + 1, y) } else { u32::MAX },
+                    if y > 0 { at(x, y - 1) } else { u32::MAX },
+                    if y + 1 < mbh { at(x, y + 1) } else { u32::MAX },
+                ]
+            })
+            .collect();
         Ok(Self {
             ident,
             setup,
             geometry,
             qi,
             activity_masking: 0,
+            threads: 1,
+            mb_neighbors,
+            motion_hint: None,
+            planned_motion: std::sync::Mutex::new(None),
         })
     }
 
@@ -14042,6 +14097,42 @@ impl FrameEncoder {
     /// values clamp to `2`). See [`TheoraEncoder::with_activity_masking`].
     pub fn set_activity_masking(&mut self, level: u8) {
         self.activity_masking = level.min(2);
+    }
+
+    /// Grant the encoder a worker budget for its per-macro-block
+    /// analysis and per-block coding stages. The default is `1`
+    /// (serial); values below 1 are treated as 1. Every packet is
+    /// byte-identical at every budget.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+    }
+
+    /// The worker budget set by [`FrameEncoder::set_threads`].
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// Adopt the motion field of the inter frame planned last as the
+    /// search seeds of the next one. Call when that frame's packet is
+    /// the one actually emitted.
+    pub(crate) fn promote_planned_motion(&mut self) {
+        let planned = self
+            .planned_motion
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if planned.is_some() {
+            self.motion_hint = planned;
+        }
+    }
+
+    /// Forget a planned motion field whose frame was not emitted as
+    /// planned (replaced by a keyframe).
+    pub(crate) fn discard_planned_motion(&mut self) {
+        *self
+            .planned_motion
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Mean absolute deviation of an 8×8 block from its own mean, in
@@ -15049,222 +15140,19 @@ impl FrameEncoder {
                 }
             }
             MotionPlan::RateDistortion => {
-                // Running §7.5.2 LAST1 / LAST2 motion-vector predictor
-                // state, advanced exactly as the post-decision recode pass
-                // (and the decoder) advance it. An `INTER_MV` candidate
-                // whose vector already equals `last1` or `last2` will be
-                // recoded as `INTER_MV_LAST` / `INTER_MV_LAST2` (no
-                // explicit MV bits), so the RD rate term must charge it
-                // zero MV bits here too — otherwise the decision would
-                // over-penalise a vector the predictor already supplies for
-                // free. Predicting the discount inside the loop lets a
-                // predictor-matching `INTER_MV` win where a flat 12-bit MV
-                // charge would have lost to `INTER_NOMV`.
-                let mut last1 = MotionVector::ZERO;
-                let mut last2 = MotionVector::ZERO;
-                // The previous macro block's searched winners, seeding
-                // the next search (coded-order spatial coherence).
-                let mut neighbor_prev = MotionVector::ZERO;
-                let mut neighbor_gold = MotionVector::ZERO;
-                for mbi in 0..nmbs {
-                    // SAD-domain λ for the in-search MV rate penalty:
-                    // λ prices SSD per bit; per-sample absolute error
-                    // scales as its square root over the 256-sample
-                    // macro block, so √λ is the right order. Measured
-                    // near-neutral to slightly positive on the ladder
-                    // battery (the RD mode decision already reprices
-                    // the winner); kept because it bounds how far the
-                    // descent wanders for noise-level SAD gains.
-                    let lambda_sad = isqrt_u64(lambda) as u32;
-                    let (prev_mv, _) = self.search_macro_block_mv_seeded_priced(
-                        frame,
-                        refs,
-                        mbi,
-                        ReferenceFrame::Previous,
-                        &[last1, last2, neighbor_prev],
-                        lambda_sad,
-                    );
-                    // (Seeding the golden search with the previous-
-                    // reference winners as well was measured at
-                    // +0.2 % mean BD-rate — the two references rarely
-                    // share a displacement — so it keeps its own
-                    // spatial seed only.)
-                    let (gold_mv, _) = self.search_macro_block_mv_seeded_priced(
-                        frame,
-                        refs,
-                        mbi,
-                        ReferenceFrame::Golden,
-                        &[neighbor_gold],
-                        lambda_sad,
-                    );
-                    neighbor_prev = prev_mv;
-                    neighbor_gold = gold_mv;
-
-                    // Candidate uniform modes, each scored by its true
-                    // rate-distortion cost. INTER_NOMV is always a
-                    // candidate (zero MV, previous reference, no MV bits);
-                    // the searched previous / golden vectors add their
-                    // explicit-MV and zero-MV golden variants.
-                    let mut candidates: Vec<(MacroBlockMode, MotionVector)> = vec![
-                        (MacroBlockMode::InterNoMv, MotionVector::ZERO),
-                        (MacroBlockMode::InterMv, prev_mv),
-                        (MacroBlockMode::InterGoldenNoMv, MotionVector::ZERO),
-                        (MacroBlockMode::InterGoldenMv, gold_mv),
-                    ];
-                    // The running LAST1 / LAST2 predictors as explicit
-                    // candidates of their own: the SAD descent only
-                    // takes them as seeds, so a predictor that loses
-                    // the SAD race by a few units to a searched vector
-                    // still wins the *rate-distortion* race when the
-                    // searched vector has to pay its Table 7.23 bits
-                    // and the predictor pays none (it recodes as
-                    // INTER_MV_LAST / INTER_MV_LAST2).
-                    for seed in [last1, last2] {
-                        if seed != MotionVector::ZERO
-                            && !candidates
-                                .iter()
-                                .any(|&(m, v)| m == MacroBlockMode::InterMv && v == seed)
-                        {
-                            candidates.push((MacroBlockMode::InterMv, seed));
-                        }
-                    }
-
-                    let mut best_mode = MacroBlockMode::InterNoMv;
-                    let mut best_mv = MotionVector::ZERO;
-                    let mut best_cost = u64::MAX;
-                    for &(mode, mv) in candidates.iter() {
-                        // An explicit-MV candidate whose vector is zero is
-                        // redundant with its NOMV sibling (same predictor,
-                        // but it would spend MV bits) — skip it.
-                        if matches!(
-                            mode,
-                            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv
-                        ) && mv == MotionVector::ZERO
-                        {
-                            continue;
-                        }
-                        // MV-bit charge: an `INTER_MV` whose vector matches
-                        // the running predictor recodes to a LAST mode and
-                        // spends no MV bits; the GOLDEN explicit mode is
-                        // never in the LAST history so always pays full
-                        // bits; zero-MV / NOMV modes pay nothing.
-                        let mv_bits = match mode {
-                            MacroBlockMode::InterMv if mv == last1 || mv == last2 => 0,
-                            MacroBlockMode::InterMv | MacroBlockMode::InterGoldenMv => {
-                                mv_huffman_bits(mv)
-                            }
-                            _ => 0,
-                        };
-                        let cost = self.mb_uniform_mode_cost(
-                            frame,
-                            refs,
-                            &qmats,
-                            &token_costs,
-                            mbi,
-                            mode,
-                            mv,
-                            lambda,
-                            mv_bits,
-                        )?;
-                        // Strict improvement keeps the earlier (cheaper-
-                        // header) candidate on ties, biasing toward
-                        // INTER_NOMV / previous-reference modes.
-                        if cost < best_cost {
-                            best_cost = cost;
-                            best_mode = mode;
-                            best_mv = mv;
-                        }
-                    }
-
-                    // INTRA candidate: the eighth §7.5.2 coding mode.
-                    // New or occluded content can be cheaper to code
-                    // from scratch (the §7.9.1.1 flat-128 predictor and
-                    // the qti = 0 intra matrices) than as a residual
-                    // against either reference. Its blocks are always
-                    // coded (an uncoded block would copy the zero-MV
-                    // previous reference — the wrong predictor), it
-                    // transmits no MV bits, and per §7.5.2 it neither
-                    // recodes to a LAST mode nor perturbs the running
-                    // LAST1 / LAST2 history.
-                    let intra_cost =
-                        self.mb_intra_mode_cost(frame, &qmats_intra, &token_costs, mbi, lambda)?;
-                    if intra_cost < best_cost {
-                        best_cost = intra_cost;
-                        best_mode = MacroBlockMode::Intra;
-                        best_mv = MotionVector::ZERO;
-                    }
-
-                    // Four-MV candidate: an independent vector per luma
-                    // block. Only worth coding when its delivered
-                    // distortion beats every uniform mode by enough to
-                    // pay for the four explicit vectors; the §7.4 mode
-                    // code + 4×12 MV bits are already folded into its
-                    // cost. A four-MV whose searched vectors are all
-                    // identical is strictly dominated by the uniform
-                    // INTER_MV (same predictor, fewer MV bits), so it can
-                    // never win the strict comparison and falls back to
-                    // the uniform winner.
-                    // The per-block searches are priced for their
-                    // explicit vector bits but deliberately *not*
-                    // seeded with the macro block's uniform winner:
-                    // seeding was measured at +0.9 % mean BD-rate
-                    // (the descent then settles next to the uniform
-                    // vector and four-MV loses the per-block
-                    // diversity that is its whole point), pricing at
-                    // −0.4 %.
-                    let (four_cost, four_luma) = self.mb_four_mv_cost(
-                        frame,
-                        refs,
-                        &qmats,
-                        &token_costs,
-                        mbi,
-                        lambda,
-                        &[],
-                        lambda_sad,
-                    )?;
-                    let chosen_mode;
-                    if four_cost < best_cost {
-                        chosen_mode = MacroBlockMode::InterMvFour;
-                        mbmodes[mbi] = MacroBlockMode::InterMvFour;
-                        four_mv_luma[mbi] = Some(four_luma);
-                        // `mb_mv` is unused for four-MV blocks; leave it
-                        // at the zero default.
-                    } else {
-                        chosen_mode = best_mode;
-                        mbmodes[mbi] = best_mode;
-                        mb_mv[mbi] = best_mv;
-                    }
-
-                    // Advance the LAST1 / LAST2 predictor mirroring the
-                    // recode pass. Only previous-reference explicit-MV
-                    // modes update it: an `INTER_MV` that matches the
-                    // predictor recodes to a LAST mode (LAST1 unchanged for
-                    // LAST1, LAST1/LAST2 swap for LAST2), a non-matching
-                    // `INTER_MV` shifts (LAST2 = LAST1, LAST1 = mv), and
-                    // `INTER_MV_FOUR` shifts in its last coded luma vector
-                    // (here approximated by the macro block's searched
-                    // previous vector — the four searched vectors only
-                    // differ when four-MV wins, and the recode pass applies
-                    // the exact rule against the real coded table). NOMV /
-                    // GOLDEN modes leave the predictor untouched.
-                    match chosen_mode {
-                        MacroBlockMode::InterMv => {
-                            if best_mv == last1 {
-                                // INTER_MV_LAST: no update.
-                            } else if best_mv == last2 {
-                                std::mem::swap(&mut last1, &mut last2);
-                            } else {
-                                last2 = last1;
-                                last1 = best_mv;
-                            }
-                        }
-                        MacroBlockMode::InterMvFour => {
-                            last2 = last1;
-                            last1 = prev_mv;
-                        }
-                        _ => {}
-                    }
-                }
+                // The joint decision over every §7.5.2 mode: a
+                // per-macro-block analysis (motion search plus the
+                // priced candidates) and a serial sweep that resolves
+                // the LAST1 / LAST2 bit charges — see `inter_decision`.
+                let decision =
+                    self.decide_modes_rd(frame, refs, &qmats, &qmats_intra, &token_costs, lambda)?;
+                mb_mv = decision.mb_mv;
+                mbmodes = decision.mbmodes;
+                four_mv_luma = decision.four_mv_luma;
+                *self
+                    .planned_motion
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(decision.searched_prev);
             }
         }
 
@@ -15318,6 +15206,17 @@ impl FrameEncoder {
         // *selected* tables — the codes the stream actually spends.
         // The mode decision and motion vectors are fixed before this
         // loop and are unaffected.
+        // Every block's motion vector, resolved once: INTER_MV_FOUR
+        // macro blocks already populated `block_mv` per block (luma
+        // per-block, chroma averaged) above; every other mode shares
+        // the macro block's uniform vector, which the §7.5.2 INTER_MV /
+        // INTER_GOLDEN_MV decode assigns to every coded block.
+        for (bi, mv) in block_mv.iter_mut().enumerate() {
+            let mbi = g.mbi_of_block[bi] as usize;
+            if mbmodes[mbi] != MacroBlockMode::InterMvFour {
+                *mv = mb_mv[mbi];
+            }
+        }
         let mut plane_costs: Option<[TokenBitCosts; 2]> = None;
         for phase in 0..2 {
             if phase == 1 {
@@ -15340,184 +15239,183 @@ impl FrameEncoder {
                 coeffs.iter_mut().for_each(|c| *c = [0i16; 64]);
                 qiis.iter_mut().for_each(|q| *q = 0);
             }
-            for bi in 0..nbs {
-                let pli = g.pli_of_block[bi] as usize;
-                let costs_in_use: &TokenBitCosts = match &plane_costs {
-                    Some(pc) => &pc[usize::from(pli != 0)],
-                    None => &token_costs,
-                };
-                let (plane, pw, ph) = match pli {
-                    0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
-                    1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
-                    _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
-                };
-                let bx = g.bx_of_block[bi];
-                let by = g.by_of_block[bi];
-                let mbi = g.mbi_of_block[bi] as usize;
-                let mode = mbmodes[mbi];
-                let force_coded = force_coded_for(mode);
-                // The block's motion vector. INTER_MV_FOUR macro blocks
-                // already populated `block_mv` per block (luma per-block,
-                // chroma averaged) above; every other mode shares the macro
-                // block's uniform vector, which the §7.5.2 INTER_MV /
-                // INTER_GOLDEN_MV decode assigns to every coded block.
-                if mode != MacroBlockMode::InterMvFour {
-                    block_mv[bi] = mb_mv[mbi];
-                }
-                let mv = block_mv[bi];
+            // Each block is coded independently of the others (modes,
+            // vectors and token prices are fixed), so the blocks are
+            // spread over the worker budget.
+            let coded_blocks: Vec<Result<Option<CodedBlock>, Error>> =
+                inter_decision::par_map(self.threads, nbs, |bi| {
+                    let pli = g.pli_of_block[bi] as usize;
+                    let costs_in_use: &TokenBitCosts = match &plane_costs {
+                        Some(pc) => &pc[usize::from(pli != 0)],
+                        None => &token_costs,
+                    };
+                    let (plane, pw, ph) = match pli {
+                        0 => (&frame.samples_y, g.dims_y.width, g.dims_y.height),
+                        1 => (&frame.samples_cb, g.dims_c.width, g.dims_c.height),
+                        _ => (&frame.samples_cr, g.dims_c.width, g.dims_c.height),
+                    };
+                    let bx = g.bx_of_block[bi];
+                    let by = g.by_of_block[bi];
+                    let mbi = g.mbi_of_block[bi] as usize;
+                    let mode = mbmodes[mbi];
+                    let force_coded = force_coded_for(mode);
+                    let mv = block_mv[bi];
 
-                let src = Self::extract_block(plane, pw, ph, bx, by)?;
-                // Predictor tile + forward-DCT residual + quantization
-                // matrices, per the macro block's mode. INTRA blocks use
-                // the §7.9.1.1 flat-128 predictor and the qti = 0 intra
-                // matrices (§7.9.4 step 2(d)ii resolves qti from the
-                // block's coding mode, not the frame type — no reference
-                // frame is read); every other mode reads its
-                // motion-compensated reference (§7.9.4 Table 7.75: Golden
-                // for the GOLDEN modes, Previous otherwise) and the
-                // qti = 1 inter matrices.
-                let (pred, dqc, dc_mat, ac_mats) = if mode == MacroBlockMode::Intra {
-                    let pred = [[128u8; 8]; 8];
-                    let mut residual = [[0i16; 8]; 8];
-                    for r in 0..8 {
-                        for c in 0..8 {
-                            residual[r][c] = src[r][c] - 128;
-                        }
-                    }
-                    (
-                        pred,
-                        frame_pipeline::forward_dct_block(&residual),
-                        &qmats_intra[pli],
-                        &qmats_ac_intra[..],
-                    )
-                } else {
-                    let refframe = reference_frame_for_mb_mode(mode);
-                    let refp = refs.pick(refframe, pli)?;
-                    let (hsub, vsub) = plane_subsampling(g.pf, pli);
-                    let pred = inter_block_predictor_plane(&refp, bx, by, mv, hsub, vsub)?;
-
-                    // Residual = source - predictor.
-                    let mut residual = [[0i16; 8]; 8];
-                    for r in 0..8 {
-                        for c in 0..8 {
-                            residual[r][c] = src[r][c] - pred[r][c] as i16;
-                        }
-                    }
-                    (
-                        pred,
-                        frame_pipeline::forward_dct_block(&residual),
-                        &qmats[pli],
-                        &qmats_ac_inter[..],
-                    )
-                };
-
-                // Quantize. A single-qi frame takes one pass at qis[0]; a
-                // multi-qi frame scores every candidate AC quantizer by
-                // delivered distortion + λ × measured token rate and
-                // records the winner's §7.6 selector. The DC quantizer is
-                // always qis[0] (the §7.6 preamble's rule, so §7.8 DC
-                // prediction is untouched by the per-block choice).
-                let block_lambda = Self::masked_lambda(
-                    lambda,
-                    self.activity_masking,
-                    Self::block_activity(&src),
-                    mean_activity,
-                );
-                let (mut q, qii) = if nqis == 1 {
-                    (quantize_block(&dqc, dc_mat, &ac_mats[0][pli]), 0u8)
-                } else {
-                    let mut best_q = [0i16; 64];
-                    let mut best_qii = 0u8;
-                    let mut best_cost = u64::MAX;
-                    for (cand, ac) in ac_mats.iter().enumerate() {
-                        let qc = quantize_block(&dqc, dc_mat, &ac[pli]);
-                        // Reconstruct exactly as the decoder will and take
-                        // the delivered SSD against the source block.
-                        let dqc_rec = dequantize_block(&qc, dc_mat, &ac[pli]);
-                        let rec = frame_pipeline::inverse_dct_block(&dqc_rec);
-                        let mut ssd = 0u64;
+                    let src = Self::extract_block(plane, pw, ph, bx, by)?;
+                    // Predictor tile + forward-DCT residual + quantization
+                    // matrices, per the macro block's mode. INTRA blocks use
+                    // the §7.9.1.1 flat-128 predictor and the qti = 0 intra
+                    // matrices (§7.9.4 step 2(d)ii resolves qti from the
+                    // block's coding mode, not the frame type — no reference
+                    // frame is read); every other mode reads its
+                    // motion-compensated reference (§7.9.4 Table 7.75: Golden
+                    // for the GOLDEN modes, Previous otherwise) and the
+                    // qti = 1 inter matrices.
+                    let (pred, dqc, dc_mat, ac_mats) = if mode == MacroBlockMode::Intra {
+                        let pred = [[128u8; 8]; 8];
+                        let mut residual = [[0i16; 8]; 8];
                         for r in 0..8 {
                             for c in 0..8 {
+                                residual[r][c] = src[r][c] - 128;
+                            }
+                        }
+                        (
+                            pred,
+                            frame_pipeline::forward_dct_block(&residual),
+                            &qmats_intra[pli],
+                            &qmats_ac_intra[..],
+                        )
+                    } else {
+                        let refframe = reference_frame_for_mb_mode(mode);
+                        let refp = refs.pick(refframe, pli)?;
+                        let (hsub, vsub) = plane_subsampling(g.pf, pli);
+                        let pred = inter_block_predictor_plane(&refp, bx, by, mv, hsub, vsub)?;
+
+                        // Residual = source - predictor.
+                        let mut residual = [[0i16; 8]; 8];
+                        for r in 0..8 {
+                            for c in 0..8 {
+                                residual[r][c] = src[r][c] - pred[r][c] as i16;
+                            }
+                        }
+                        (
+                            pred,
+                            frame_pipeline::forward_dct_block(&residual),
+                            &qmats[pli],
+                            &qmats_ac_inter[..],
+                        )
+                    };
+
+                    // Quantize. A single-qi frame takes one pass at qis[0]; a
+                    // multi-qi frame scores every candidate AC quantizer by
+                    // delivered distortion + λ × measured token rate and
+                    // records the winner's §7.6 selector. The DC quantizer is
+                    // always qis[0] (the §7.6 preamble's rule, so §7.8 DC
+                    // prediction is untouched by the per-block choice).
+                    let block_lambda = Self::masked_lambda(
+                        lambda,
+                        self.activity_masking,
+                        Self::block_activity(&src),
+                        mean_activity,
+                    );
+                    let (mut q, qii) = if nqis == 1 {
+                        (quantize_block(&dqc, dc_mat, &ac_mats[0][pli]), 0u8)
+                    } else {
+                        let mut best_q = [0i16; 64];
+                        let mut best_qii = 0u8;
+                        let mut best_cost = u64::MAX;
+                        for (cand, ac) in ac_mats.iter().enumerate() {
+                            let qc = quantize_block(&dqc, dc_mat, &ac[pli]);
+                            // Reconstruct exactly as the decoder will and take
+                            // the delivered SSD against the source block.
+                            let dqc_rec = dequantize_block(&qc, dc_mat, &ac[pli]);
+                            let rec = frame_pipeline::inverse_dct_block(&dqc_rec);
+                            let mut ssd = 0u64;
+                            for r in 0..8 {
+                                for c in 0..8 {
+                                    let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
+                                    let d = src[r][c] as i32 - pv;
+                                    ssd += (d * d) as u64;
+                                }
+                            }
+                            let bits = costs_in_use
+                                .block_bits(&qc)
+                                .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
+                            let cost = ssd + block_lambda.saturating_mul(u64::from(bits));
+                            if cost < best_cost {
+                                best_cost = cost;
+                                best_q = qc;
+                                best_qii = cand as u8;
+                            }
+                        }
+                        (best_q, best_qii)
+                    };
+                    // Rate-distortion-optimized quantization: refine the AC
+                    // levels of the winning spelling against the measured
+                    // token plan (DC untouched — it feeds the §7.8 prediction
+                    // chain). Runs before the skip decision, which then judges
+                    // the refined spelling.
+                    rdoq_refine(
+                        &mut q,
+                        &dqc,
+                        &ac_mats[qii as usize][pli],
+                        costs_in_use,
+                        lambda,
+                    );
+
+                    // A block whose quantized residual is all-zero is uncoded
+                    // (unless the macro block's mode forces it coded — any
+                    // non-zero-MV INTER_MV / INTER_GOLDEN_* / INTRA macro block,
+                    // see `force_coded_for`; an all-zero forced-coded block
+                    // reconstructs as the exact predictor, so forcing it is
+                    // still bit-faithful). Uncoded blocks keep the default
+                    // selector 0 (they never reach the §7.6 stream).
+                    let any_nonzero = q.iter().any(|&v| v != 0);
+                    let mut coded = any_nonzero || force_coded;
+
+                    // Rate-distortion skip decision. For an INTER_NOMV macro
+                    // block the decoder's uncoded path (§7.9.4 step 2(e)) copies
+                    // the zero-MV colocated previous reference — exactly `pred`
+                    // here — so *skipping* a block with a non-zero quantized
+                    // residual is a legal spelling whose delivered reconstruction
+                    // is the bare predictor. Score both spellings by the same
+                    // Lagrangian the mode decision uses — skip at
+                    // `SSD(src, pred)` and zero token bits, code at
+                    // `SSD(src, clamp(pred + rec)) + λ·bits` — and keep the
+                    // cheaper one. A near-noise residual whose tokens buy almost
+                    // no distortion reduction is dropped (a pure rate win); any
+                    // residual that pays for itself is kept. Ties keep the coded
+                    // spelling (equal cost, and the coded block's loop-filter
+                    // edges then behave exactly as before this decision existed).
+                    if coded && !force_coded && any_nonzero {
+                        let dqc_rec = dequantize_block(&q, dc_mat, &ac_mats[qii as usize][pli]);
+                        let rec = frame_pipeline::inverse_dct_block(&dqc_rec);
+                        let mut ssd_coded = 0u64;
+                        let mut ssd_skip = 0u64;
+                        for r in 0..8 {
+                            for c in 0..8 {
+                                let s = src[r][c] as i32;
                                 let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
-                                let d = src[r][c] as i32 - pv;
-                                ssd += (d * d) as u64;
+                                let dc = s - pv;
+                                ssd_coded += (dc * dc) as u64;
+                                let ds = s - pred[r][c] as i32;
+                                ssd_skip += (ds * ds) as u64;
                             }
                         }
                         let bits = costs_in_use
-                            .block_bits(&qc)
+                            .block_bits(&q)
                             .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
-                        let cost = ssd + block_lambda.saturating_mul(u64::from(bits));
-                        if cost < best_cost {
-                            best_cost = cost;
-                            best_q = qc;
-                            best_qii = cand as u8;
+                        let cost_coded =
+                            ssd_coded.saturating_add(lambda.saturating_mul(u64::from(bits)));
+                        if ssd_skip < cost_coded {
+                            coded = false;
                         }
                     }
-                    (best_q, best_qii)
-                };
-                // Rate-distortion-optimized quantization: refine the AC
-                // levels of the winning spelling against the measured
-                // token plan (DC untouched — it feeds the §7.8 prediction
-                // chain). Runs before the skip decision, which then judges
-                // the refined spelling.
-                rdoq_refine(
-                    &mut q,
-                    &dqc,
-                    &ac_mats[qii as usize][pli],
-                    costs_in_use,
-                    lambda,
-                );
 
-                // A block whose quantized residual is all-zero is uncoded
-                // (unless the macro block's mode forces it coded — any
-                // non-zero-MV INTER_MV / INTER_GOLDEN_* / INTRA macro block,
-                // see `force_coded_for`; an all-zero forced-coded block
-                // reconstructs as the exact predictor, so forcing it is
-                // still bit-faithful). Uncoded blocks keep the default
-                // selector 0 (they never reach the §7.6 stream).
-                let any_nonzero = q.iter().any(|&v| v != 0);
-                let mut coded = any_nonzero || force_coded;
-
-                // Rate-distortion skip decision. For an INTER_NOMV macro
-                // block the decoder's uncoded path (§7.9.4 step 2(e)) copies
-                // the zero-MV colocated previous reference — exactly `pred`
-                // here — so *skipping* a block with a non-zero quantized
-                // residual is a legal spelling whose delivered reconstruction
-                // is the bare predictor. Score both spellings by the same
-                // Lagrangian the mode decision uses — skip at
-                // `SSD(src, pred)` and zero token bits, code at
-                // `SSD(src, clamp(pred + rec)) + λ·bits` — and keep the
-                // cheaper one. A near-noise residual whose tokens buy almost
-                // no distortion reduction is dropped (a pure rate win); any
-                // residual that pays for itself is kept. Ties keep the coded
-                // spelling (equal cost, and the coded block's loop-filter
-                // edges then behave exactly as before this decision existed).
-                if coded && !force_coded && any_nonzero {
-                    let dqc_rec = dequantize_block(&q, dc_mat, &ac_mats[qii as usize][pli]);
-                    let rec = frame_pipeline::inverse_dct_block(&dqc_rec);
-                    let mut ssd_coded = 0u64;
-                    let mut ssd_skip = 0u64;
-                    for r in 0..8 {
-                        for c in 0..8 {
-                            let s = src[r][c] as i32;
-                            let pv = (pred[r][c] as i32 + rec[r][c] as i32).clamp(0, 255);
-                            let dc = s - pv;
-                            ssd_coded += (dc * dc) as u64;
-                            let ds = s - pred[r][c] as i32;
-                            ssd_skip += (ds * ds) as u64;
-                        }
-                    }
-                    let bits = costs_in_use
-                        .block_bits(&q)
-                        .unwrap_or(TokenBitCosts::OVERFLOW_BITS);
-                    let cost_coded =
-                        ssd_coded.saturating_add(lambda.saturating_mul(u64::from(bits)));
-                    if ssd_skip < cost_coded {
-                        coded = false;
-                    }
-                }
-
-                if coded {
+                    Ok(coded.then_some((q, qii)))
+                });
+            for (bi, block) in coded_blocks.into_iter().enumerate() {
+                if let Some((q, qii)) = block? {
                     bcoded[bi] = 1;
                     coeffs[bi] = q;
                     qiis[bi] = qii;
@@ -15756,6 +15654,52 @@ impl FrameEncoder {
         seeds: &[MotionVector],
         lambda_sad: u32,
     ) -> (MotionVector, u32) {
+        self.macro_block_mv_search(frame, refs, mbi, which, seeds, lambda_sad, None)
+    }
+
+    /// Second-chance pass for a searched vector: keep `current` unless
+    /// one of `candidates` (vectors that won elsewhere in the frame)
+    /// has a strictly lower priced cost for this macro block, in which
+    /// case that candidate is adopted and refined to half-pixel
+    /// accuracy. No descent is run — the candidates are the search.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adopt_better_macro_block_mv(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        mbi: usize,
+        which: ReferenceFrame,
+        current: MotionVector,
+        candidates: &[MotionVector],
+        lambda_sad: u32,
+    ) -> MotionVector {
+        self.macro_block_mv_search(
+            frame,
+            refs,
+            mbi,
+            which,
+            candidates,
+            lambda_sad,
+            Some(current),
+        )
+        .0
+    }
+
+    /// The macro-block motion estimator behind
+    /// [`Self::search_macro_block_mv_seeded_priced`] (`keep = None`:
+    /// seeded step search plus half-pixel refinement) and
+    /// [`Self::adopt_better_macro_block_mv`] (`keep = Some(current)`).
+    #[allow(clippy::too_many_arguments)]
+    fn macro_block_mv_search(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        mbi: usize,
+        which: ReferenceFrame,
+        seeds: &[MotionVector],
+        lambda_sad: u32,
+        keep: Option<MotionVector>,
+    ) -> (MotionVector, u32) {
         let g = &self.geometry;
         let refp = match refs.pick(which, 0) {
             Ok(p) => p,
@@ -15827,6 +15771,23 @@ impl FrameEncoder {
                 u32::MAX
             }
         };
+        if let Some(current) = keep {
+            let mut best_mv = current;
+            let mut best_cost = cost_for(current, u32::MAX);
+            let mut moved = false;
+            for &cand in seeds {
+                let cost = cost_for(cand, best_cost);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mv = cand;
+                    moved = true;
+                }
+            }
+            if moved {
+                best_mv = refine_half_pixel_mv(best_mv, best_cost, cost_for).0;
+            }
+            return (best_mv, sad_for(best_mv));
+        }
         // Seeded four-step whole-pixel descent, zero-biased: strict
         // improvement required to move off the zero vector.
         let (best_mv, best_cost) = whole_pixel_step_search_seeded(seeds, cost_for);
@@ -15852,7 +15813,7 @@ impl FrameEncoder {
         refs: &ReferencePlaneSet<'_>,
         bi: usize,
     ) -> MotionVector {
-        self.search_luma_block_mv_seeded_priced(frame, refs, bi, &[], 0)
+        self.search_luma_block_mv_seeded_priced(frame, refs, bi, &[], 0, false)
     }
 
     /// [`FrameEncoder::search_luma_block_mv`] with predictor seeding
@@ -15872,6 +15833,7 @@ impl FrameEncoder {
         bi: usize,
         seeds: &[MotionVector],
         lambda_sad: u32,
+        local_only: bool,
     ) -> MotionVector {
         let g = &self.geometry;
         let refp = match refs.pick(ReferenceFrame::Previous, 0) {
@@ -15910,6 +15872,21 @@ impl FrameEncoder {
                 u32::MAX
             }
         };
+        if local_only {
+            // Start from the best of zero and the seeds and refine
+            // locally: a block's vector is a small departure from its
+            // macro block's, not an independent motion.
+            let mut best_mv = MotionVector::ZERO;
+            let mut best_cost = cost_for(MotionVector::ZERO, u32::MAX);
+            for &seed in seeds {
+                let cost = cost_for(seed, best_cost);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mv = seed;
+                }
+            }
+            return refine_half_pixel_mv(best_mv, best_cost, cost_for).0;
+        }
         // Seeded four-step whole-pixel descent, as
         // `search_macro_block_mv_seeded_priced`.
         let (best_mv, best_cost) = whole_pixel_step_search_seeded(seeds, cost_for);
@@ -16067,8 +16044,11 @@ impl FrameEncoder {
     /// folds in the per-mode header rate (the §7.4 mode code plus, for an
     /// explicit-MV mode, the §7.5 `MVMODE = 1` fixed-length components).
     /// The Lagrangian cost is `D + λ·R`.
+    /// Distortion and rate (token bits plus the §7.4 mode code, no
+    /// motion-vector bits) of coding macro block `mbi` in the uniform
+    /// mode `mode` with vector `mv`.
     #[allow(clippy::too_many_arguments)]
-    fn mb_uniform_mode_cost(
+    pub(crate) fn mb_uniform_mode_parts(
         &self,
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
@@ -16078,8 +16058,7 @@ impl FrameEncoder {
         mode: MacroBlockMode,
         mv: MotionVector,
         lambda: u64,
-        mv_bits: u32,
-    ) -> Result<u64, Error> {
+    ) -> Result<(u64, u32), Error> {
         let g = &self.geometry;
         let force_coded = !matches!(mode, MacroBlockMode::InterNoMv);
         let refframe = reference_frame_for_mb_mode(mode);
@@ -16125,15 +16104,13 @@ impl FrameEncoder {
         }
 
         // Header rate: the §7.4 mode code (~3 bits in the encoder's
-        // MSCHEME = 7 direct scheme) plus the caller-supplied §7.5
-        // explicit-MV bit charge. The caller predicts whether an
-        // `INTER_MV` candidate will recode to a zero-MV-bit
-        // `INTER_MV_LAST` / `INTER_MV_LAST2` mode (matching the running
-        // §7.5.2 predictor) and passes `0`, or the vector's Table 7.23
-        // (`MVMODE = 0`) length otherwise.
-        rate += 3 + mv_bits;
+        // MSCHEME = 7 direct scheme). The §7.5 explicit-MV bits are
+        // the caller's to add: whether an `INTER_MV` vector re-spells
+        // as a zero-MV-bit `INTER_MV_LAST` / `INTER_MV_LAST2` depends
+        // on the running §7.5.2 predictors.
+        rate += 3;
 
-        Ok(distortion + lambda.saturating_mul(rate as u64))
+        Ok((distortion, rate))
     }
 
     /// Rate-distortion cost of coding one block INTRA inside an inter
@@ -16219,28 +16196,44 @@ impl FrameEncoder {
         Ok(distortion + lambda.saturating_mul(rate as u64))
     }
 
-    /// Evaluate the rate-distortion cost of coding one macro block in
-    /// `INTER_MV_FOUR` mode: an independent previous-reference vector per
-    /// luma block, with each chroma block carrying the §7.5.2 averaged
-    /// vector for the pixel format.
+    /// The four per-luma-block vectors an `INTER_MV_FOUR` spelling of
+    /// macro block `mbi` would carry, in raster `[A, B, C, D]` order.
     ///
-    /// Returns the Lagrangian cost `D + λ·R` together with the four
-    /// per-luma-block vectors (raster `[A, B, C, D]`) that produced it, so
-    /// the [`MotionPlan::RateDistortion`] decision can fold four-MV into
-    /// the same candidate set as the uniform modes and, when it wins, hand
-    /// those vectors straight to the per-block encode table.
-    ///
-    /// The distortion is summed over the macro block's luma blocks (each
-    /// scored with its own searched vector) and its chroma blocks (each
-    /// scored with the averaged vector), through the same
-    /// forward-quantize → reconstruct → SSD path [`block_rd_cost`] runs for
-    /// the uniform modes — so a four-MV candidate is judged on delivered
-    /// fidelity, not a pre-quantization SAD proxy. Every block is always
-    /// coded (the §7.9.4 uncoded path would copy the wrong zero-MV
-    /// predictor), so the rate folds in the §7.4 mode code plus one §7.5
-    /// `MVMODE = 1` explicit vector per luma block (12 bits each).
+    /// Each block is searched on its own (the per-block estimator),
+    /// priced for its explicit vector bits. A block covers a quarter of
+    /// the macro block's samples, so its SAD-domain rate penalty is
+    /// half the macro block's (SAD scales with the square root of the
+    /// sample count at a given error level). With `seeds` the search
+    /// starts from the best of zero and the seeds and only refines
+    /// locally; without, it is the full step search from zero.
+    pub(crate) fn mb_four_mv_vectors(
+        &self,
+        frame: &SourceFrame,
+        refs: &ReferencePlaneSet<'_>,
+        mbi: usize,
+        seeds: &[MotionVector],
+        lambda_sad: u32,
+    ) -> [MotionVector; 4] {
+        let abcd = self.geometry.macro_block_to_luma_blocks[mbi];
+        abcd.map(|bi| {
+            self.search_luma_block_mv_seeded_priced(
+                frame,
+                refs,
+                bi as usize,
+                seeds,
+                lambda_sad / 2,
+                !seeds.is_empty(),
+            )
+        })
+    }
+
+    /// Rate-distortion cost of coding macro block `mbi` as
+    /// `INTER_MV_FOUR` with the luma vectors `luma`
+    /// ([`Self::mb_four_mv_vectors`]): every block forced coded, chroma
+    /// on the §7.5.2 averaged vectors, the mode code plus four explicit
+    /// vectors in the header rate.
     #[allow(clippy::too_many_arguments)]
-    fn mb_four_mv_cost(
+    pub(crate) fn mb_four_mv_cost(
         &self,
         frame: &SourceFrame,
         refs: &ReferencePlaneSet<'_>,
@@ -16248,48 +16241,10 @@ impl FrameEncoder {
         costs: &TokenBitCosts,
         mbi: usize,
         lambda: u64,
-        seeds: &[MotionVector],
-        lambda_sad: u32,
-    ) -> Result<(u64, [MotionVector; 4]), Error> {
+        luma: [MotionVector; 4],
+    ) -> Result<u64, Error> {
         let g = &self.geometry;
         let abcd = g.macro_block_to_luma_blocks[mbi];
-        // Per-luma-block search (the same per-block estimator
-        // `MotionPlan::SearchFourMv` uses), seeded with the macro
-        // block's established vectors and priced for its explicit
-        // per-block MV bits. A block covers a quarter of the macro
-        // block's samples, so its SAD-domain rate penalty is half the
-        // macro block's (SAD scales with the square root of the
-        // sample count at a given error level).
-        let luma = [
-            self.search_luma_block_mv_seeded_priced(
-                frame,
-                refs,
-                abcd[0] as usize,
-                seeds,
-                lambda_sad / 2,
-            ),
-            self.search_luma_block_mv_seeded_priced(
-                frame,
-                refs,
-                abcd[1] as usize,
-                seeds,
-                lambda_sad / 2,
-            ),
-            self.search_luma_block_mv_seeded_priced(
-                frame,
-                refs,
-                abcd[2] as usize,
-                seeds,
-                lambda_sad / 2,
-            ),
-            self.search_luma_block_mv_seeded_priced(
-                frame,
-                refs,
-                abcd[3] as usize,
-                seeds,
-                lambda_sad / 2,
-            ),
-        ];
 
         let mut distortion = 0u64;
         let mut rate = 0u32;
@@ -16339,7 +16294,7 @@ impl FrameEncoder {
         // four vectors are transmitted, each at its Table 7.23 length).
         rate += 3 + luma.iter().map(|&mv| mv_huffman_bits(mv)).sum::<u32>();
 
-        Ok((distortion + lambda.saturating_mul(rate as u64), luma))
+        Ok(distortion + lambda.saturating_mul(rate as u64))
     }
 }
 
@@ -19295,6 +19250,29 @@ impl TheoraEncoder {
         Self::with_keyframe_interval(codec_id, ident, tuned, qi, keyframe_interval)
     }
 
+    /// Grant the encoder a worker budget (builder form of
+    /// [`TheoraEncoder::set_threads`]).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.set_threads(threads);
+        self
+    }
+
+    /// Grant the encoder a worker budget: up to `threads` threads share
+    /// the per-macro-block analysis of the rate-distortion mode
+    /// decision (motion search and candidate pricing), the per-block
+    /// transform / quantise / RDOQ stage, and the reconstruction of the
+    /// internal reference decoder. The default is `1` (serial) and
+    /// every emitted packet is byte-identical at every budget. The same
+    /// budget arrives through
+    /// [`set_execution_context`](oxideav_core::Encoder::set_execution_context).
+    pub fn set_threads(&mut self, threads: usize) {
+        let threads = threads.max(1);
+        self.frame_encoder.set_threads(threads);
+        if let Some(mirror) = self.mirror.as_mut() {
+            mirror.set_threads(threads);
+        }
+    }
+
     /// Set the P-frame inter mode-decision strategy (see
     /// [`InterModeStrategy`]). Returns `self` for builder chaining. The
     /// default is [`InterModeStrategy::RateDistortion`].
@@ -20191,12 +20169,18 @@ impl TheoraEncoder {
         let mirror = match self.mirror.as_mut() {
             Some(m) => m,
             None => {
-                let dec = FrameDecoder::new(self.ident.clone(), self.setup.clone())?;
+                let mut dec = FrameDecoder::new(self.ident.clone(), self.setup.clone())?;
+                dec.set_threads(self.frame_encoder.threads());
                 self.mirror = Some(Box::new(dec));
                 self.mirror.as_mut().unwrap()
             }
         };
-        mirror.decode_frame(&bytes)?;
+        mirror.decode_frame_in_place(&bytes)?;
+        if want_keyframe {
+            self.frame_encoder.discard_planned_motion();
+        } else {
+            self.frame_encoder.promote_planned_motion();
+        }
 
         // Rate control: fold the just-coded frame's size into the bucket
         // and recompute the quantizer for the next frame. The keyframe flag
@@ -20352,6 +20336,10 @@ impl oxideav_core::Encoder for TheoraEncoder {
         self.pending
             .pop_front()
             .ok_or(oxideav_core::Error::NeedMore)
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.set_threads(ctx.threads);
     }
 
     fn flush(&mut self) -> oxideav_core::Result<()> {

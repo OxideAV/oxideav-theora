@@ -6,7 +6,9 @@
 //! non-macro-block-aligned included), pixel format, quantizer,
 //! keyframe interval, inter-mode strategy, optional adaptive
 //! quantization / activity masking / target-bitrate rate control /
-//! lookahead window / VBV model, and every plane's content.
+//! lookahead window / VBV model, a worker budget of 1..=4 for both
+//! directions (the high bits of the quantizer byte), and every
+//! plane's content.
 //! `TheoraEncoder` (the zero-setup encoder-defaults entry point)
 //! encodes the frames through the `oxideav_core::Encoder` trait
 //! (`flush` drains a lookahead window);
@@ -48,6 +50,7 @@ fuzz_target!(|data: &[u8]| {
         _ => PixelFormat::Yuv444,
     };
     let qi = data[3] % 64;
+    let workers = 1 + (data[3] >> 6) as usize;
     let interval = 1 + (data[4] % 4) as u32;
     let nframes = 1 + (data[5] % MAX_FRAMES as u8) as usize;
     let opts = data[6];
@@ -83,6 +86,8 @@ fuzz_target!(|data: &[u8]| {
             enc = enc.with_vbv_buffer(20_000 + 40_000 * (opts >> 6) as u64);
         }
     }
+
+    enc = enc.with_threads(workers);
 
     // Plane fill: cycle the fuzz content bytes with a per-frame,
     // per-plane offset so successive frames differ (exercising the
@@ -149,6 +154,7 @@ fuzz_target!(|data: &[u8]| {
     // advertised parameters.
     let mut dec = make_decoder(enc.output_params())
         .expect("encoder-advertised extradata must build a decoder");
+    dec.set_execution_context(&oxideav_core::ExecutionContext::with_threads(workers));
     let tb = TimeBase::from_rate(30);
     let mut frames_out = 0usize;
     for pkt in packets.iter() {

@@ -1,4 +1,5 @@
-//! Pinned Bjøntegaard rate-distortion battery (round 457).
+//! Pinned Bjøntegaard rate-distortion battery (round 457, floors
+//! re-measured in round 492).
 //!
 //! Four deterministic 176×144 4:2:0 scenes (`tests/common/rd.rs`:
 //! `square0` gradient + moving square, `blobs` sub-pixel drifting blobs
@@ -13,7 +14,7 @@
 //! The pins:
 //!
 //! * **campaign floors** — the per-scene luma and chroma BD-rates the
-//!   round-457 campaign measured against the round-453 encoder's
+//!   latest campaign measured against the round-453 encoder's
 //!   curves (`BASELINE_R453`, the operating points the README's
 //!   round-453 table records) must still be delivered
 //!   (`CAMPAIGN_FLOOR_PCT`; a positive entry records a scene the
@@ -63,15 +64,17 @@ const BASELINE_R453: &[(&str, u8, usize, f64, f64, f64)] = &[
 const QI_LADDER: [u8; 5] = [8, 20, 32, 44, 56];
 
 /// Per-scene luma and chroma BD-rate (percent, negative = fewer bytes
-/// at equal PSNR) the round-457 campaign must keep delivering against
-/// the round-453 reference. Set from the measured campaign result;
-/// tighten when the encoder improves, never loosen without a README
-/// note.
+/// at equal PSNR) the encoder must keep delivering against the
+/// round-453 reference. Set from the measured result of the latest
+/// campaign (round 492: the order-independent motion estimation moved
+/// `square0` −24.2 → −28.4 %, `cut` −20.8 → −23.2 %, `pan`
+/// −17.6 → −17.9 % luma with `blobs` unchanged); tighten when the
+/// encoder improves, never loosen without a README note.
 const CAMPAIGN_FLOOR_PCT: &[(&str, f64, f64)] = &[
-    ("square0", -24.0, -16.0),
+    ("square0", -28.3, -21.8),
     ("blobs", -0.4, 1.3),
-    ("pan", -17.5, -12.5),
-    ("cut", -20.7, -8.2),
+    ("pan", -17.8, -13.1),
+    ("cut", -23.1, -10.9),
 ];
 
 /// Slack on the campaign-floor comparison, in BD-rate percent: the

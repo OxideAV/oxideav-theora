@@ -37,6 +37,32 @@ All notable changes to `oxideav-theora` are recorded here.
   `pipeline_vs_stepwise` fuzz target).
 - The bit writer packs whole fields through a 64-bit register instead
   of one bit per iteration (same bytes).
+- **Order-independent rate-distortion mode decision (round 492)** —
+  the inter-frame decision (`src/inter_decision.rs`) is now a
+  per-macro-block analysis plus a serial resolution sweep. The motion
+  search is seeded by the previous inter frame's vector field instead
+  of by the running `LAST1` / `LAST2` state, then every macro block may
+  adopt a vector that won at one of its four neighbours or one of the
+  frame's three most common vectors; each candidate mode is priced
+  without motion-vector bits; the sweep adds the bit charge the
+  `LAST` predictors actually leave and prices the two predictors
+  themselves. Four-vector macro blocks search each block locally
+  around the macro block's and its neighbours' vectors and are not
+  priced when their four vectors coincide (a dominated spelling); the
+  golden search is skipped while the golden frame *is* the previous
+  frame. Battery BD-rate against the round-457 encoder: **−1.7 % luma,
+  −1.7 % chroma, −1.9 % SSIM** on the mean (`square0` −5.7 %, `cut`
+  −3.0 %, fixture `all-mb-modes` −1.3 %, `pan` −0.4 %, `blobs`
+  ±0.0 %); the pinned streams were re-validated byte-for-byte in a
+  black-box decoder and the campaign floors of `tests/bd_rate.rs`
+  tightened.
+- **Encoder threading under a caller budget** —
+  `TheoraEncoder::with_threads` / `set_threads`,
+  `Encoder::set_execution_context`, `FrameEncoder::set_threads`;
+  serial by default. The analysis stage and the per-block transform /
+  quantise / RDOQ stage are spread over the budget (the internal
+  reference decoder uses it too); packets are byte-identical at every
+  budget (`encoder_output_is_identical_at_every_worker_budget`).
 - **Encoder speed, byte-identical output (round 492)** — the forward
   and inverse transforms of the encoder run on eight lanes
   (`forward_dct_block` / `inverse_dct_block`, equal to the

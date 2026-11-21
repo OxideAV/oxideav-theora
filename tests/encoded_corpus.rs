@@ -333,33 +333,33 @@ fn encoded_corpus_digests_are_stable() {
     const PINS: [Pin; 12] = [
         Pin {
             name: "basic420",
-            wire_sha256: "b9b647f6d040cbd04dd9fee031c393b9ed06ddf436714dac011cd90e9660f408",
-            recon_sha256: "4ba1a1a2cad9c92814354fee4d512010637fd45d253dad6a80b7d2b14db98264",
+            wire_sha256: "0fe87e932ba601d59d524b3371880ec2d7c2c1009bbcc8c11e5ee690b54dc917",
+            recon_sha256: "d7f8ed943dac6220d8d5cfb401916a26e74635a125e4a7e086e065c114ac47fb",
         },
         Pin {
             name: "fmt422",
-            wire_sha256: "d2d6cd083eb1c165cadd5b3402c17aa70a8389f69123ab07371e0b86bd706005",
-            recon_sha256: "a3845d69e1593033b3d5df3c44b0ce9554640609152c3774515f0636894b3c2e",
+            wire_sha256: "c3e2cd120e6fa4266cee5c89264845a60b22ec23f9a1fa13458a07ce730ef425",
+            recon_sha256: "c5396848452700e9030a2352663a097ba979a13113bfe0a28bcf559a143a35e9",
         },
         Pin {
             name: "fmt444",
-            wire_sha256: "d5787db5b1021a1ccbde9d286ed196bf339b45f315c2aa3b0c2c90c33293757b",
-            recon_sha256: "7aa2feea47674cd19a9c359bf4e528bd1923c95cfa24ac22bc56fcf2d6e1b19d",
+            wire_sha256: "ec383a0ed434812c504c611660d29afc4ab6a84aed2055a3f95e86c08af0121a",
+            recon_sha256: "b75fe454b4282530d1918cf3a9f60cf9676b49d15b1ebae2a06caa246b83e6df",
         },
         Pin {
             name: "piccrop",
-            wire_sha256: "bfd78edcab40a29c8ec403447c3dd4d975f3184066b02e85c27828008275cf02",
-            recon_sha256: "336ded3d76102642b894c826f33fad62da8cf0671685d781fb800ba5d7cd2c6c",
+            wire_sha256: "e66e860e6ca6e8745580cb70838d30e12a57d54cd112e1cfb95299ec3adfcf8f",
+            recon_sha256: "a6182e25dd5898948543fa7ef84c5d5377de37b711da1d4d87414ffbe50df0e9",
         },
         Pin {
             name: "adaptiveq",
-            wire_sha256: "410a17d6d489c60809375867aeb2337ae82f044a3750d45548bd506645b8312c",
-            recon_sha256: "18939a35f76a4876fa81a8383f655c3daf15cf1f131b66147a98045807258247",
+            wire_sha256: "270ab77f3d0c7f42230a1aa165a3e3bb24b890509f797ac6bd42a94695f8ecd3",
+            recon_sha256: "ba1ace2097654ca4215307c4da2931a5543680431c3d153872500bf4b0f1c2b1",
         },
         Pin {
             name: "ratecontrol",
-            wire_sha256: "d847a5a551129cac2c391eda6ad075e0c23a8a743bbdb218fb69c36c793b2c16",
-            recon_sha256: "e3e3073cd047e8401236059f9a3af46dde4d67851e034caec7d089de1286660a",
+            wire_sha256: "1fe78830d31e6647b9d48db259faca373a3c0a549fcbd1ed5c148b3feb75e40e",
+            recon_sha256: "82f06d9c9028d38803a862fd7484354eba42d29689441e7ecbc46686b5a182db",
         },
         Pin {
             name: "dupframes",
@@ -368,13 +368,13 @@ fn encoded_corpus_digests_are_stable() {
         },
         Pin {
             name: "scenecut",
-            wire_sha256: "3da72893cdba2c4a1230bc78edb852e7894b448b9177857fd526ce393899eae4",
-            recon_sha256: "4e3f35489d7f0ed2a38fdb1c145b063ce9a93d8212a1ccf069a66b444d36a04a",
+            wire_sha256: "5a6089b67447bb2a68b90a27db8119ba42505e80b1f2081d923c3c87b4d7f346",
+            recon_sha256: "1154dde1ed53023003ee9e12e10a62832c87ad5ea3b649e147a0da46de9d7231",
         },
         Pin {
             name: "goptuned",
-            wire_sha256: "f0913cf1aa3deed1ae762beed7b98501f4ac92961b512501e729cf2c88ed9d9f",
-            recon_sha256: "cda13865ff0f1274b4f9d3464527da3cc7d7ea29f4218748848f3bdbba51267f",
+            wire_sha256: "08d7e02823d5f965a0d7f8f5f5d1488d91d27f3ca0caf4de090f5792f612822d",
+            recon_sha256: "0900aa5c7a187a9cc7bd477b8b0d5352688d0141ec435f41c679e4faf4001dc6",
         },
         Pin {
             name: "fourmv",
@@ -388,8 +388,8 @@ fn encoded_corpus_digests_are_stable() {
         },
         Pin {
             name: "rcadaptive",
-            wire_sha256: "f983fd982c619a7b85dcbb92b04242f7063f28ee7dfa5a0efd007a5b9ef43c8a",
-            recon_sha256: "cc31ab8f161a3742e088e07582c878d524a42de3192b2bf9ff96633618538b22",
+            wire_sha256: "9fcde4f18c3140dd06b73301db736623bbaa6d6ceb3a3598bab7474f9f9227c4",
+            recon_sha256: "7addfb151bcd3d357c2df52fc225e26f4b0dd52296a680697e110337db15b28c",
         },
     ];
 
@@ -655,18 +655,18 @@ fn encoded_corpus_decode_corner_digests_are_stable() {
     const PINS: [Pin; 3] = [
         Pin {
             name: "lflims127",
-            wire_sha256: "5744fe77265ba7cd2069f1e134f4a45a8312414182e6bff27ee2574895f2e590",
-            recon_sha256: "f962808418984a5d35cff6746b0b10ac016a874629d68733311ac24225b73704",
+            wire_sha256: "266a525d81582ee9e43b028fa4f67e5c09495c78d408cd5206d04600c1b70282",
+            recon_sha256: "488c9a4effcbb66aef10149319df61343d1effbf6f107954b014a249040ae11a",
         },
         Pin {
             name: "lflims0",
-            wire_sha256: "e6adc5988dc2922e10bd0784d6501b2262cb6c285d84f4e5291d5208e5c3e0c6",
-            recon_sha256: "64646441b5f7ecc87ab7494dd59d11afb4e26e5a0f3abc1891c6e0910045786c",
+            wire_sha256: "117aab197bac68fae2ac49eba5af4bf9f7f5bac685246b3adf15d018afbdd30c",
+            recon_sha256: "a19c9a46926caa57b583823165b8f127a6a9ee7c90707ae9d69d36a9ae6de409",
         },
         Pin {
             name: "multiqrange",
-            wire_sha256: "534355291a8b43cb7e1618dd77aaa76581849f1b15dbbe4177aaf2dd6cfc19ac",
-            recon_sha256: "678330a4c896bba8902574a6fc9f124ec500f31bf9d3df2f48aac12894e0601d",
+            wire_sha256: "f58b2a1834c5fb9f5ee98c185294deab4b050fa479fe4021cdc3ad2aab573061",
+            recon_sha256: "e980bdf8098e6dcac8bf8111e9cf5347e05b835817b5a747767f12230da076f2",
         },
     ];
 
@@ -725,6 +725,60 @@ fn encoded_corpus_decode_corner_digests_are_stable() {
         false,
     );
     check(&PINS[2], &id, &pkts);
+}
+
+/// The encoder's packets do not depend on its worker budget: the
+/// per-macro-block analysis and per-block coding stages are pure
+/// functions of their inputs and the order-dependent part (the
+/// LAST1 / LAST2 bit charges) is resolved serially. Three stream
+/// shapes — plain rate-distortion I/P at a non-MB-aligned size,
+/// 4:2:2 with adaptive quantization, and a rate-controlled stream —
+/// must come out byte-identical at 1, 2, 3, 4 and 7 workers.
+#[test]
+fn encoder_output_is_identical_at_every_worker_budget() {
+    let cid = || CodecId::new(THEORA_CODEC_ID);
+    type Build = fn(CodecId, &TheoraIdentHeader) -> TheoraEncoder;
+    let shapes: [(&str, TheoraIdentHeader, Build, u32); 3] = [
+        (
+            "rd 4:2:0 210x130",
+            ident(210, 130, PixelFormat::Yuv420),
+            |cid, id| {
+                TheoraEncoder::with_default_setup_keyframe_interval(cid, id.clone(), 30, 6).unwrap()
+            },
+            12,
+        ),
+        (
+            "adaptive 4:2:2 176x144",
+            ident(176, 144, PixelFormat::Yuv422),
+            |cid, id| {
+                TheoraEncoder::with_default_setup_keyframe_interval(cid, id.clone(), 40, 5)
+                    .unwrap()
+                    .with_adaptive_quant(vec![40, 20, 56])
+            },
+            8,
+        ),
+        (
+            "rate-controlled 4:2:0 176x144",
+            ident(176, 144, PixelFormat::Yuv420),
+            |cid, id| {
+                TheoraEncoder::with_default_setup_keyframe_interval(cid, id.clone(), 32, 8)
+                    .unwrap()
+                    .with_target_bitrate(150_000)
+            },
+            12,
+        ),
+    ];
+    for (name, id, build, nframes) in shapes {
+        let reference = packet_chain_bytes(&drive(build(cid(), &id), &id, nframes, fam_cut, false));
+        for workers in [2usize, 3, 4, 7] {
+            let enc = build(cid(), &id).with_threads(workers);
+            let got = packet_chain_bytes(&drive(enc, &id, nframes, fam_cut, false));
+            assert!(
+                got == reference,
+                "{name}: packets at {workers} workers differ from the serial encode"
+            );
+        }
+    }
 }
 
 /// The test-local SHA-256 must match FIPS 180-4 vectors (so the pins

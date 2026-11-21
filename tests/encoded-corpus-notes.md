@@ -179,3 +179,36 @@ Re-pins this round, each validated 15/15 byte-identical:
    scenario re-spelled — the black-box decoder reads the flattened
    matrices from the stream's own §6.4 setup header — 15/15
    byte-identical.
+
+## Round 492 — order-independent mode decision
+
+The inter-frame rate-distortion decision was reorganised (per-macro-block
+analysis seeded by the previous frame's vector field, neighbour /
+dominant-vector adoption pass, serial `LAST1` / `LAST2` resolution,
+local four-vector searches) so that it can run under a worker budget
+with byte-identical output. Every stream planned by the
+rate-distortion strategy re-spelled: twelve of the fifteen pins moved
+(`fourmv`, `golden` and `dupframes` use the fixed strategies or carry
+no re-planned frame and kept their bytes).
+
+The scripted route was re-run on the dumped corpus
+(`CORPUS_DUMP=<dir>`): each `<name>.chain` muxed to `.ogv` through the
+sibling container crate in a throwaway helper project (Xiph-laced
+extradata, `pts` = frame index, `unit_boundary` on keyframes, 4096-byte
+page target), `oggz-validate` exit status 0, black-box decoded by
+`ffmpeg` 9.0.1 (`-fps_mode passthrough -f rawvideo`, the stream's own
+pixel format) and byte-compared against `<name>.recon`.
+
+**Verdict: 15/15 byte-identical** — fourteen over every frame, and
+`dupframes` over its coded frames (ten of its twelve data packets are
+zero-byte duplicates, for which the black-box decoder emits nothing).
+
+Two measurements ride along with the re-pin:
+
+* the worker budget does not change a byte
+  (`encoder_output_is_identical_at_every_worker_budget`: three stream
+  shapes at 1, 2, 3, 4 and 7 workers);
+* the earlier byte-identical speed work of the round (lane transforms,
+  reciprocal quantiser, separable token pricing, incremental RDOQ,
+  in-place SAD) left all fifteen digests untouched and needed no
+  re-validation.

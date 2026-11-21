@@ -7,6 +7,43 @@ All notable changes to `oxideav-theora` are recorded here.
 ### Changed
 
 - edition 2024, MSRV 1.95
+- **Decoder throughput (round 492)** — `FrameDecoder::decode_frame`
+  and `TheoraDecoder` now run a reorganised §7.11 pipeline
+  (`src/frame_pipeline.rs`) with bit-identical output: prefix lookup
+  tables for the 80 §6.4.4 token codebooks with the extra bits taken
+  from the same 32-bit peek (a word-based bit reader replaces the
+  bit-at-a-time one), §7.7.3 passes over a shrinking list of open
+  blocks instead of every block of the frame, DC prediction undone in
+  one raster sweep per plane, quantisation matrices evaluated once per
+  frame instead of twice per block, a 16-bit eight-lane inverse DCT
+  that drops the upper inputs when the coefficient count proves them
+  zero, predictor rows read straight from the reference plane, a
+  table-driven loop filter on row slices, and the new frame
+  reconstructed into a spare plane set that is *swapped* with the
+  previous-frame reference (keyframes pay one copy into the golden
+  slot). `TheoraDecoder` crops and flips straight out of the reference
+  store — one copy per plane per frame instead of four. Measured on
+  self-encoded streams (single thread, medians of back-to-back runs on
+  a shared machine): 1080p inter 103 → 293 fps, 1080p intra-only
+  46 → 139 fps, 720p inter 168 → 528 fps, 480p inter 307 → 1011 fps
+  (2.8–3.5×; full table in the README).
+- **Decoder threading under a caller budget** — `FrameDecoder::set_threads`
+  / `TheoraDecoder::with_threads` / `set_threads`, and
+  `Decoder::set_execution_context`; serial by default. Reconstruction
+  and the loop filter run on bands of whole super-block rows; the loop
+  filter's raster-order dependency is confined to the four pixel rows
+  at each band boundary, which every band replays on a private copy, so
+  the output is identical at every budget (pinned by tests and by the
+  `pipeline_vs_stepwise` fuzz target).
+- The bit writer packs whole fields through a 64-bit register instead
+  of one bit per iteration (same bytes).
+
+### Fixed
+
+- §7.7.1 step 7(b): a zero-length EOB run now counts only *coded*
+  blocks still open, as the specification states — the previous driver
+  also counted the uncoded blocks of an inter frame, which made such a
+  packet fail with a left-over EOB run.
 
 Round 457 encoder-quality campaign, cumulative against the round-453
 encoder on the battery: **−15.3 % luma / −9.0 % chroma BD-rate,
@@ -27,6 +64,19 @@ stream black-box decoded byte-identically.
 
 ### Added
 
+- `FrameDecoder::decode_frame_in_place` — decode into the reference
+  store without returning a copy of the frame;
+  `FrameDecoder::decode_frame_stepwise` (hidden) keeps the previous
+  procedure-by-procedure chain as the oracle the pipeline is tested
+  against.
+- `fuzz/fuzz_targets/pipeline_vs_stepwise.rs` — differential target:
+  the pipeline at the serial budget and at 2..=5 workers against the
+  step-by-step chain on hostile packet chains (acceptance, frames and
+  reference planes must agree); `.github/workflows/fuzz.yml` schedules
+  all seven targets daily.
+- `examples/speed.rs` — encode / decode throughput probe on the shared
+  synthetic sequences (frames per second, wire and reconstruction
+  digests, worker budget).
 - **Pinned Bjøntegaard battery (round 457)** — `tests/bd_rate.rs`
   encodes four deterministic 176×144 scenes (`square0`, `blobs`, `pan`,
   `cut`; 24 frames, keyframe interval 16) across the five-point quantizer

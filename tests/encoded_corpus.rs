@@ -16,8 +16,8 @@
 
 use oxideav_core::{CodecId, Decoder as _, Encoder as _, Packet};
 use oxideav_theora::{
-    InterModeStrategy, PixelFormat, SetupHeaderTables, SourceFrame, THEORA_CODEC_ID, TheoraDecoder,
-    TheoraEncoder, TheoraIdentHeader,
+    FrameDecoder, InterModeStrategy, PixelFormat, SetupHeaderTables, SourceFrame, THEORA_CODEC_ID,
+    TheoraDecoder, TheoraEncoder, TheoraIdentHeader, decode_setup_header,
 };
 
 // ----------------------------------------------------------------------
@@ -250,6 +250,36 @@ struct Pin {
     recon_sha256: &'static str,
 }
 
+/// Decode the chain through the step-by-step §7 procedures and
+/// through the decoder's throughput pipeline at several worker
+/// budgets: every frame, and the reference store after it, must be
+/// identical.
+fn assert_pipeline_matches_stepwise(name: &str, id: &TheoraIdentHeader, pkts: &[Packet]) {
+    let setup = decode_setup_header(&pkts[2].data).unwrap();
+    let mut oracle = FrameDecoder::new(id.clone(), setup.clone()).unwrap();
+    let mut fast: Vec<FrameDecoder> = [1usize, 2, 3, 5]
+        .iter()
+        .map(|&n| {
+            let mut d = FrameDecoder::new(id.clone(), setup.clone()).unwrap();
+            d.set_threads(n);
+            d
+        })
+        .collect();
+    for (fi, p) in pkts.iter().filter(|p| !p.flags.header).enumerate() {
+        let want = oracle.decode_frame_stepwise(&p.data).unwrap();
+        for d in &mut fast {
+            let n = d.threads();
+            let got = d.decode_frame(&p.data).unwrap();
+            assert_eq!(got, want, "{name}: frame {fi}, {n} worker(s)");
+            assert_eq!(
+                d.reference_store(),
+                oracle.reference_store(),
+                "{name}: references after frame {fi}, {n} worker(s)"
+            );
+        }
+    }
+}
+
 fn check(pin: &Pin, id: &TheoraIdentHeader, pkts: &[Packet]) {
     assert_eq!(
         pkts.iter().filter(|p| p.flags.header).count(),
@@ -257,6 +287,7 @@ fn check(pin: &Pin, id: &TheoraIdentHeader, pkts: &[Packet]) {
         "{}: three §6 header packets",
         pin.name
     );
+    assert_pipeline_matches_stepwise(pin.name, id, pkts);
     let wire = sha256_hex(&packet_chain_bytes(pkts));
     let recon = sha256_hex(&reconstruction_bytes(id, pkts));
     // `CORPUS_DUMP=<dir>` writes each scenario's packet chain (the

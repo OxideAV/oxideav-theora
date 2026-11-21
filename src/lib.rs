@@ -350,6 +350,8 @@ mod fixture_data;
 
 mod vp31_huffman_data;
 
+mod frame_pipeline;
+
 use oxideav_core::RuntimeContext;
 
 /// Crate-local error type.
@@ -7237,8 +7239,14 @@ pub(crate) fn decode_dct_coefficients_inner(
     // bounds rather than assert! to surface as DctCoefficientHuffman*
     // errors at the call site.
 
-    // Step 2: TIS[bi] = 0 for all bi.
-    let mut tis: Vec<u8> = vec![0u8; nbs_us];
+    // Step 2: TIS[bi] = 0 for all bi. Uncoded blocks start closed
+    // (`TIS = 64`) instead: the main loop never visits them, and
+    // §7.7.1 step 7(b) counts only *coded* blocks whose `TIS` is below
+    // 64 when a zero-length EOB run is expanded.
+    let mut tis: Vec<u8> = bcoded
+        .iter()
+        .map(|&coded| if coded != 0 { 0 } else { 64 })
+        .collect();
     // COEFFS starts all-zero so the implicit "any additional
     // coefficients are still set to zero" clause from the §7.7.3
     // prose (paragraph 2) holds for every block we never visit at
@@ -9817,45 +9825,84 @@ pub fn forward_dct_2d(input: &[[i16; 8]; 8]) -> [i16; 64] {
 #[derive(Debug)]
 struct BitReader<'a> {
     buf: &'a [u8],
-    /// Byte index of the byte currently being consumed. `bit_pos`
-    /// counts down from 7 to 0 within this byte.
-    byte_pos: usize,
-    /// Bit index within `buf[byte_pos]`. Values 7..=0 correspond to
-    /// the MSb..LSb of the current byte; -1 means "advance to the
-    /// next byte before the next read". Stored as `i8` (signed)
-    /// rather than `u8` so the underflow is cheap to test.
-    bit_pos: i8,
+    /// Number of bits consumed so far: bit `pos` of the stream is bit
+    /// `7 - (pos & 7)` of `buf[pos >> 3]` (§5.2 MSb-first order).
+    pos: usize,
 }
 
 impl<'a> BitReader<'a> {
     /// Create a reader positioned at the MSb of `buf[0]`.
     fn new(buf: &'a [u8]) -> Self {
-        Self {
-            buf,
-            byte_pos: 0,
-            bit_pos: 7,
+        Self { buf, pos: 0 }
+    }
+
+    /// Total number of bits consumed so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn bits_consumed(&self) -> usize {
+        self.pos
+    }
+
+    /// Number of unread bits left in the buffer.
+    #[inline]
+    fn bits_left(&self) -> usize {
+        self.buf.len() * 8 - self.pos
+    }
+
+    /// The 64 stream bits starting at the byte holding the cursor,
+    /// MSb-first, zero-padded past the end of the buffer.
+    #[inline]
+    fn window(&self) -> u64 {
+        let byte = self.pos >> 3;
+        if let Some(chunk) = self.buf.get(byte..byte + 8) {
+            u64::from_be_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        } else {
+            let mut tmp = [0u8; 8];
+            let tail = self.buf.get(byte..).unwrap_or(&[]);
+            tmp[..tail.len()].copy_from_slice(tail);
+            u64::from_be_bytes(tmp)
         }
+    }
+
+    /// The next 32 stream bits without consuming them, zero-padded
+    /// past the end of the buffer (the caller validates what it
+    /// actually uses with [`BitReader::skip`]).
+    #[inline]
+    fn peek32(&self) -> u32 {
+        ((self.window() << (self.pos & 7)) >> 32) as u32
+    }
+
+    /// Consume `n` bits already inspected through
+    /// [`BitReader::peek32`]. Returns [`Error::TruncatedHeader`] (and
+    /// parks the cursor at the end of the buffer) when fewer than `n`
+    /// bits remain.
+    #[inline]
+    fn skip(&mut self, n: u32, field: &'static str) -> Result<(), Error> {
+        if n as usize > self.bits_left() {
+            self.pos = self.buf.len() * 8;
+            return Err(Error::TruncatedHeader { field });
+        }
+        self.pos += n as usize;
+        Ok(())
     }
 
     /// Read `n` bits (0 ≤ n ≤ 32) as an unsigned integer, MSb first.
     /// Returns [`Error::TruncatedHeader`] if the stream is exhausted
     /// before `n` bits have been read.
+    #[inline]
     fn read_bits(&mut self, n: u32, field: &'static str) -> Result<u32, Error> {
         debug_assert!(n <= 32, "read_bits called with n > 32");
-        let mut value: u32 = 0;
-        for _ in 0..n {
-            if self.byte_pos >= self.buf.len() {
-                return Err(Error::TruncatedHeader { field });
-            }
-            let bit = (self.buf[self.byte_pos] >> (self.bit_pos as u8)) & 1;
-            value = (value << 1) | (bit as u32);
-            self.bit_pos -= 1;
-            if self.bit_pos < 0 {
-                self.bit_pos = 7;
-                self.byte_pos += 1;
-            }
+        if n == 0 {
+            return Ok(0);
         }
-        Ok(value)
+        if n as usize > self.bits_left() {
+            self.pos = self.buf.len() * 8;
+            return Err(Error::TruncatedHeader { field });
+        }
+        let value = (self.window() << (self.pos & 7)) >> (64 - n);
+        self.pos += n as usize;
+        Ok(value as u32)
     }
 }
 
@@ -9888,18 +9935,24 @@ impl BitWriter {
 
     /// Write the low `n` bits of `value` (0 ≤ n ≤ 32), MSb first. Bits
     /// above bit `n - 1` are ignored.
+    #[inline]
     fn write_bits(&mut self, value: u32, n: u32) {
         debug_assert!(n <= 32, "write_bits called with n > 32");
-        for i in (0..n).rev() {
-            let bit = ((value >> i) & 1) as u8;
-            self.cur = (self.cur << 1) | bit;
-            self.nbits += 1;
-            if self.nbits == 8 {
-                self.bytes.push(self.cur);
-                self.cur = 0;
-                self.nbits = 0;
-            }
+        if n == 0 {
+            return;
         }
+        // Accumulate MSb-first in a 64-bit register: at most 7 pending
+        // bits plus 32 new ones, then flush every whole byte.
+        let masked = u64::from(value) & ((1u64 << n) - 1);
+        let mut acc = (u64::from(self.cur) << n) | masked;
+        let mut have = u32::from(self.nbits) + n;
+        while have >= 8 {
+            have -= 8;
+            self.bytes.push((acc >> have) as u8);
+        }
+        acc &= (1u64 << have) - 1;
+        self.cur = acc as u8;
+        self.nbits = have as u8;
     }
 
     /// Finish writing and return the packed bytes. Any partially-filled
@@ -13201,6 +13254,10 @@ pub struct FrameDecoder {
     /// Number of frames decoded so far; the first must be intra per
     /// §7.1 step 2.
     frames_decoded: u64,
+    /// Cross-frame state of the throughput-oriented pipeline (token
+    /// lookup tables, coefficient scratch, spare plane set, worker
+    /// budget).
+    pipeline: frame_pipeline::PipelineState,
 }
 
 impl FrameDecoder {
@@ -13213,13 +13270,28 @@ impl FrameDecoder {
     pub fn new(ident: TheoraIdentHeader, setup: SetupHeaderTables) -> Result<Self, Error> {
         let geometry = build_frame_geometry(&ident)?;
         let refs = ReferenceFrameStore::zeroed(geometry.dims_y, geometry.dims_c)?;
+        let pipeline = frame_pipeline::PipelineState::new(&geometry, &setup.huffman_tables[..]);
         Ok(Self {
             ident,
             setup,
             geometry,
             refs,
             frames_decoded: 0,
+            pipeline,
         })
+    }
+
+    /// Grant the decoder a worker budget: up to `threads` threads
+    /// reconstruct and loop-filter bands of super-block rows
+    /// concurrently. The default is `1` (serial); values below 1 are
+    /// treated as 1. The decoded output is identical at every budget.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.pipeline.threads = threads.max(1);
+    }
+
+    /// The worker budget set by [`FrameDecoder::set_threads`].
+    pub fn threads(&self) -> usize {
+        self.pipeline.threads
     }
 
     /// The identification header this decoder was built from.
@@ -13285,6 +13357,117 @@ impl FrameDecoder {
     /// zero-byte duplicate-frame marker (there is no reference frame to
     /// duplicate at stream start).
     pub fn decode_frame(&mut self, packet: &[u8]) -> Result<DecodedFrame, Error> {
+        let (ftype, qis) = self.decode_frame_in_place(packet)?;
+        Ok(DecodedFrame {
+            ftype,
+            qis,
+            frame: ReconstructedFrame {
+                samples_y: self.refs.previous_y.clone(),
+                samples_cb: self.refs.previous_cb.clone(),
+                samples_cr: self.refs.previous_cr.clone(),
+                dims_y: self.geometry.dims_y,
+                dims_cb: self.geometry.dims_c,
+                dims_cr: self.geometry.dims_c,
+            },
+        })
+    }
+
+    /// Decode one video-data packet per §7.11, leaving the
+    /// reconstructed frame in the previous-frame slot of
+    /// [`FrameDecoder::reference_store`] instead of returning a copy.
+    /// Returns the frame type and the frame's `qi` list.
+    ///
+    /// This is the allocation-free form of
+    /// [`FrameDecoder::decode_frame`] (same procedure, same errors,
+    /// same reference-frame state afterwards): the frame is
+    /// reconstructed into a spare plane set which is then swapped with
+    /// the previous-frame reference.
+    pub fn decode_frame_in_place(&mut self, packet: &[u8]) -> Result<(FrameType, Vec<u8>), Error> {
+        let g = &self.geometry;
+        let data = match classify_frame_decode_packet(packet) {
+            FrameDecodePacket::Empty => {
+                // §7.11 step 2: an inter frame with no coded blocks.
+                // Every block is copied from the previous frame and
+                // the loop filter has no coded block to visit, so the
+                // previous-frame reference already *is* the result.
+                if self.frames_decoded == 0 {
+                    return Err(Error::FirstFrameEmptyPacket);
+                }
+                if g.nbs == 0 {
+                    return Err(Error::EmptyPacketFrameStateZeroNbs);
+                }
+                self.frames_decoded += 1;
+                return Ok((FrameType::Inter, vec![63u8]));
+            }
+            FrameDecodePacket::Data(data) => data,
+        };
+        let cb_slices: Vec<&[u32]> = g.chroma_cb.iter().map(|v| v.as_slice()).collect();
+        let cr_slices: Vec<&[u32]> = g.chroma_cr.iter().map(|v| v.as_slice()).collect();
+        let mut r = BitReader::new(data);
+        // §7.11 steps 1(a)–1(e) on the shared reader.
+        let header = decode_frame_header_inner(&mut r, self.frames_decoded == 0)?;
+        let bcoded = decode_coded_block_flags_inner(
+            &mut r,
+            header.ftype,
+            g.nsbs,
+            g.nbs,
+            &g.block_to_super_block,
+        )?;
+        let mbmodes = decode_macroblock_modes_inner(
+            &mut r,
+            header.ftype,
+            g.nmbs,
+            g.nbs,
+            &bcoded,
+            &g.macro_block_to_luma_blocks,
+        )?;
+        let mvects = decode_macroblock_motion_vectors_inner(
+            &mut r,
+            header.ftype,
+            g.pf,
+            g.nbs,
+            g.nmbs,
+            &bcoded,
+            &mbmodes,
+            &g.macro_block_to_luma_blocks,
+            ChromaBlockLayout {
+                cb: &cb_slices,
+                cr: &cr_slices,
+            },
+        )?;
+        let qiis = decode_block_level_qi_inner(&mut r, g.nbs, &bcoded, header.nqis())?;
+        // Steps 1(f)–8.
+        frame_pipeline::finish_frame(
+            &mut r,
+            &frame_pipeline::FrontEnd {
+                ftype: header.ftype,
+                qis: &header.qis,
+                bcoded: &bcoded,
+                mbmodes: &mbmodes,
+                mvects: &mvects,
+                qiis: &qiis,
+            },
+            g,
+            &self.setup.huffman_tables[..],
+            &self.setup.quantization_parameters,
+            &self.setup.loop_filter_limits,
+            &mut self.pipeline,
+            &mut self.refs,
+        )?;
+        self.frames_decoded += 1;
+        Ok((header.ftype, header.qis))
+    }
+
+    /// [`FrameDecoder::decode_frame`] computed by chaining the
+    /// step-by-step §7 procedures ([`decode_data_packet_header_and_blocks`]
+    /// → [`reconstruct_frame`] → [`loop_filter_frame`] →
+    /// [`ReferenceFrameStore::promote_from_reconstructed`]) with every
+    /// intermediate array materialised. Slow; kept as the
+    /// specification-literal oracle the throughput-oriented pipeline is
+    /// tested against.
+    // internal — exposed for tests/fuzz; not part of the stable API
+    #[doc(hidden)]
+    pub fn decode_frame_stepwise(&mut self, packet: &[u8]) -> Result<DecodedFrame, Error> {
         let g = &self.geometry;
         let nbs = g.nbs as usize;
         let nmbs = g.nmbs as usize;
@@ -17399,6 +17582,7 @@ pub const THEORA_CODEC_ID: &str = "theora";
 /// upward, so emitting top-down raster is a row reversal: row `y` of the
 /// output is row `h - 1 - y` of the stored plane. The plane is tightly
 /// packed (`width` bytes per row).
+#[cfg(test)]
 fn plane_to_top_down(samples: &[u8], dims: PlaneDimensions) -> Vec<u8> {
     let w = dims.width as usize;
     let h = dims.height as usize;
@@ -17410,31 +17594,91 @@ fn plane_to_top_down(samples: &[u8], dims: PlaneDimensions) -> Vec<u8> {
     out
 }
 
-/// Convert a §2.2-cropped display frame into a top-down
-/// [`oxideav_core::VideoFrame`].
-///
-/// The three planes are flipped to top-down raster (`plane_to_top_down`)
-/// and packed with a stride equal to their pixel width — the cropped
-/// planes are already tightly packed at `PICW` / chroma-cropped widths.
-fn cropped_to_video_frame(cropped: &CroppedFrame, pts: Option<i64>) -> oxideav_core::VideoFrame {
+/// Crop one stored plane (lower-left origin, bottom-up rows) to `win`
+/// and emit it top-down in a single pass — the composition of
+/// `crop_plane` and `plane_to_top_down` without the intermediate copy.
+fn crop_plane_top_down(
+    src: &[u8],
+    pli: u8,
+    src_dims: PlaneDimensions,
+    win: CropWindow,
+) -> Result<Vec<u8>, Error> {
+    let src_w = src_dims.width;
+    let src_h = src_dims.height;
+    let expected = (src_w as usize) * (src_h as usize);
+    if src.len() != expected {
+        return Err(Error::CropPlaneLenMismatch {
+            pli,
+            got: src.len(),
+            expected,
+        });
+    }
+    if win.x.checked_add(win.w).is_none_or(|e| e > src_w)
+        || win.y.checked_add(win.h).is_none_or(|e| e > src_h)
+    {
+        return Err(Error::CropRegionOutOfPlane {
+            pli,
+            x: win.x,
+            y: win.y,
+            w: win.w,
+            h: win.h,
+            plane_w: src_w,
+            plane_h: src_h,
+        });
+    }
+    let stride = src_w as usize;
+    let w = win.w as usize;
+    let mut out = Vec::with_capacity(w * win.h as usize);
+    for row in (0..win.h as usize).rev() {
+        let base = (win.y as usize + row) * stride + win.x as usize;
+        out.extend_from_slice(&src[base..base + w]);
+    }
+    Ok(out)
+}
+
+/// The §2.2 display crop of the frame held in the previous-frame slot
+/// of `store`, as a top-down [`oxideav_core::VideoFrame`] — what
+/// [`crop_frame_to_picture_region`] followed by a top-down row flip
+/// produces, in one copy per plane.
+fn reference_to_video_frame(
+    store: &ReferenceFrameStore,
+    ident: &TheoraIdentHeader,
+    pts: Option<i64>,
+) -> Result<oxideav_core::VideoFrame, Error> {
     use oxideav_core::frame::VideoPlane;
-    oxideav_core::VideoFrame {
+    let (sx, sy) = chroma_subsampling_factors(ident.pf);
+    let (lx, ly, lw, lh) = (ident.picx as u32, ident.picy as u32, ident.picw, ident.pich);
+    let luma_win = CropWindow {
+        x: lx,
+        y: ly,
+        w: lw,
+        h: lh,
+    };
+    let (cx, cw) = chroma_crop_axis(lx, lw, sx);
+    let (cy, ch) = chroma_crop_axis(ly, lh, sy);
+    let chroma_win = CropWindow {
+        x: cx,
+        y: cy,
+        w: cw,
+        h: ch,
+    };
+    Ok(oxideav_core::VideoFrame {
         pts,
         planes: vec![
             VideoPlane {
-                stride: cropped.dims_y.width as usize,
-                data: plane_to_top_down(&cropped.samples_y, cropped.dims_y),
+                stride: lw as usize,
+                data: crop_plane_top_down(&store.previous_y, 0, store.dims_y, luma_win)?,
             },
             VideoPlane {
-                stride: cropped.dims_c.width as usize,
-                data: plane_to_top_down(&cropped.samples_cb, cropped.dims_c),
+                stride: cw as usize,
+                data: crop_plane_top_down(&store.previous_cb, 1, store.dims_c, chroma_win)?,
             },
             VideoPlane {
-                stride: cropped.dims_c.width as usize,
-                data: plane_to_top_down(&cropped.samples_cr, cropped.dims_c),
+                stride: cw as usize,
+                data: crop_plane_top_down(&store.previous_cr, 2, store.dims_c, chroma_win)?,
             },
         ],
-    }
+    })
 }
 
 /// Header-decode progress before frame data can be decoded.
@@ -17478,6 +17722,8 @@ pub struct TheoraDecoder {
     state: HeaderState,
     pending: std::collections::VecDeque<oxideav_core::Packet>,
     eof: bool,
+    /// Worker budget handed to the [`FrameDecoder`] (1 = serial).
+    threads: usize,
 }
 
 impl std::fmt::Debug for TheoraDecoder {
@@ -17513,6 +17759,27 @@ impl TheoraDecoder {
             },
             pending: std::collections::VecDeque::new(),
             eof: false,
+            threads: 1,
+        }
+    }
+
+    /// Grant the decoder a worker budget (builder form of
+    /// [`TheoraDecoder::set_threads`]).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.set_threads(threads);
+        self
+    }
+
+    /// Grant the decoder a worker budget: up to `threads` threads
+    /// reconstruct and loop-filter bands of super-block rows
+    /// concurrently. The default is `1` (serial) and the decoded
+    /// frames are identical at every budget. The same budget arrives
+    /// through
+    /// [`set_execution_context`](oxideav_core::Decoder::set_execution_context).
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+        if let HeaderState::Ready(fd) = &mut self.state {
+            fd.set_threads(self.threads);
         }
     }
 
@@ -17556,7 +17823,8 @@ impl TheoraDecoder {
         // Promote to Ready once ident + setup are both in hand. The
         // comment header is optional for decoding.
         if let (Some(i), Some(s)) = (ident.clone(), setup.clone()) {
-            let fd = FrameDecoder::new(i, *s)?;
+            let mut fd = FrameDecoder::new(i, *s)?;
+            fd.set_threads(self.threads);
             self.state = HeaderState::Ready(Box::new(fd));
         }
         Ok(())
@@ -17597,18 +17865,20 @@ impl oxideav_core::Decoder for TheoraDecoder {
                  identification and §6.4 setup headers",
             ));
         };
-        let decoded = fd
-            .decode_frame(&pkt.data)
+        fd.decode_frame_in_place(&pkt.data)
             .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
-        let cropped = crop_frame_to_picture_region(&decoded.frame, fd.ident())
+        let vf = reference_to_video_frame(fd.reference_store(), fd.ident(), pkt.pts)
             .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
-        let vf = cropped_to_video_frame(&cropped, pkt.pts);
         Ok(oxideav_core::Frame::Video(vf))
     }
 
     fn flush(&mut self) -> oxideav_core::Result<()> {
         self.eof = true;
         Ok(())
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.set_threads(ctx.threads);
     }
 
     fn reset(&mut self) -> oxideav_core::Result<()> {
@@ -17619,8 +17889,9 @@ impl oxideav_core::Decoder for TheoraDecoder {
         self.pending.clear();
         self.eof = false;
         if let HeaderState::Ready(fd) = &self.state {
-            let fresh = FrameDecoder::new(fd.ident().clone(), fd.setup_tables().clone())
+            let mut fresh = FrameDecoder::new(fd.ident().clone(), fd.setup_tables().clone())
                 .map_err(|e| oxideav_core::Error::invalid(e.to_string()))?;
+            fresh.set_threads(self.threads);
             self.state = HeaderState::Ready(Box::new(fresh));
         }
         Ok(())
@@ -26580,9 +26851,8 @@ mod tests {
                 &mut coeffs,
             )
             .unwrap();
-            // Compute how many bits the reader has advanced. byte_pos
-            // and bit_pos let us reconstruct the total.
-            let bits_consumed = (r.byte_pos as u32) * 8 + (7u32.wrapping_sub(r.bit_pos as u32));
+            // Compute how many bits the reader has advanced.
+            let bits_consumed = r.bits_consumed() as u32;
             assert_eq!(
                 bits_consumed, expected_bits,
                 "TOKEN={token} expected {expected_bits} bits, got {bits_consumed}"

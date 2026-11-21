@@ -726,17 +726,97 @@ equal-or-lower PSNR), with the scene-cut and measured-rate keyframe
 policies covering content changes — the `TheoraEncoder` guidance is
 interval 16–30 plus those policies, not short intervals.
 
-## Robustness and fuzzing (round 437, extended round 457)
+## Decoder throughput (round 492)
 
-The decode surface is fuzzed by a `fuzz/` sub-crate with six
-libFuzzer targets (round 457 added `setup_header_pair`, a structured
+`FrameDecoder::decode_frame` / `TheoraDecoder` run a reorganised §7.11
+pipeline (`src/frame_pipeline.rs`) whose output is bit-identical to the
+procedure-by-procedure chain it replaced (kept as the hidden
+`decode_frame_stepwise` oracle; the two are compared frame by frame on
+every staged third-party fixture, on the whole pinned self-encoded
+corpus, and continuously by the `pipeline_vs_stepwise` fuzz target):
+
+* **Tokens (§7.7)** — a 9-bit prefix table per codebook resolves a
+  token in one read and the extra bits come out of the same 32-bit
+  peek of a word-based bit reader; each `ti` pass walks only the blocks
+  still open instead of all of them; coefficients land directly in the
+  layout the inverse DCT consumes, in a buffer kept all-zero between
+  frames.
+* **DC prediction (§7.8)** — one raster sweep per plane over two
+  block-row buffers.
+* **Reconstruction (§7.9)** — the quantisation matrices are evaluated
+  once per frame (they were evaluated twice per block); the inverse DCT
+  runs eight lanes at a time in 16-bit arithmetic (proved equivalent to
+  the wider-integer procedure: the specification truncates to 16 bits
+  before every multiplication) and drops the upper four inputs when
+  the block's coefficient count shows them zero; predictor rows are
+  read straight from the reference plane, half-pixel averaging a row
+  at a time.
+* **Loop filter (§7.10)** — the specification's edge order on row
+  slices, with the limit function tabulated once per frame.
+* **Reference frames (§7.11 steps 7–8)** — the frame is reconstructed
+  into a spare plane set that is swapped with the previous-frame
+  reference (a keyframe pays one copy into the golden slot);
+  `TheoraDecoder` crops and flips straight out of the reference store,
+  one copy per plane per frame instead of four, and
+  `FrameDecoder::decode_frame_in_place` exposes the copy-free form.
+
+**Threads** are used only under a caller budget
+(`TheoraDecoder::with_threads` / `set_threads`,
+`Decoder::set_execution_context`, `FrameDecoder::set_threads`; the
+default is serial). Token decoding is inherently serial; reconstruction
+and the loop filter run on bands of whole super-block rows. The loop
+filter is order dependent, but only through the four pixel rows
+straddling a band boundary, and that strip evolves independently of
+the rest while the lower block row is filtered — so each band replays
+the neighbouring row's strip operations on a private copy and the
+result equals the serial order at every budget.
+
+Frames per second, decode + display crop, before → after
+(`cargo run --release --example speed -- --load <chain> --threads n`;
+streams self-encoded at qi 32 from the `pan` / `blobs` generators of
+`tests/common/rd.rs`, 24 inter frames at keyframe interval 64 or 8
+intra-only frames; Apple M-series, medians of 7–9 runs taken back to
+back on a machine shared with nine other build jobs, so absolute
+numbers are conservative and noisy — the ratios are the measurement;
+the decoded-plane digest is identical in every cell):
+
+| stream | before | after, serial | 2 threads | 4 threads | 8 threads |
+|---|---|---|---|---|---|
+| 854×480 `pan` inter | 307 | 1011 | 1011 | 861 | 1001 |
+| 854×480 `pan` intra-only | 187 | 548 | 505 | 649 | 660 |
+| 854×480 `blobs` inter | 850 | 2832 | 2918 | 3220 | 2216 |
+| 1280×720 `pan` inter | 168 | 528 | 667 | 750 | 825 |
+| 1280×720 `pan` intra-only | 98 | 276 | 323 | 401 | 417 |
+| 1280×720 `blobs` inter | 571 | 1953 | 2400 | 2391 | 2148 |
+| 1920×1080 `pan` inter | 103 | 293 | 404 | 480 | 502 |
+| 1920×1080 `pan` intra-only | 46 | 139 | 166 | 182 | 189 |
+| 1920×1080 `blobs` inter | 255 | 900 | 957 | 1011 | 1079 |
+
+Serial decode is 2.8–3.5× faster. Thread scaling is bounded by the
+serial token pass (over half of an intra frame's time once
+reconstruction is fast) and, below 720p, by the per-frame cost of
+starting workers; it pays from 720p up. A design that recorded tokens
+sequentially and replayed them per band (moving the coefficient
+scatter into the parallel phase) was measured and rejected: on this
+machine it was 20–40 % slower serially than scattering during the
+token pass.
+
+## Robustness and fuzzing (round 437, extended rounds 457 and 492)
+
+The decode surface is fuzzed by a `fuzz/` sub-crate with seven
+libFuzzer targets, scheduled daily by `.github/workflows/fuzz.yml`
+(added in round 492, which also added `pipeline_vs_stepwise`: the
+throughput pipeline at the serial budget and at 2..=5 workers against
+the step-by-step §7 chain on hostile packet chains — acceptance, frames
+and reference planes must agree; bounded sessions of the targets this
+round found nothing). Round 457 added `setup_header_pair`, a structured
 writer/parser target: fuzz-perturbed *valid* §6.4 tables — 7-bit
 loop-filter limits including the `NBITS = 0` table, 16-bit scale
 ladders, up to eight base matrices, fresh multi-range quant layouts —
 must serialize, parse, decode back equal, re-serialize
 byte-identically and evaluate §6.4.3 everywhere; the encoder→decoder
 contract target now also drives lookahead, VBV and activity masking;
-bounded sessions of all six this round found nothing): arbitrary bytes at the three §6 header decoders
+bounded sessions of all six that round found nothing. The targets cover arbitrary bytes at the three §6 header decoders
 (with the crate's own serializers as self-inverse oracles — an
 accepted ident header re-encodes byte-exactly, accepted setup tables
 survive an encode → decode fixpoint), hostile §7 packet chains

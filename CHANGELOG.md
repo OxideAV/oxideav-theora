@@ -26,7 +26,7 @@ All notable changes to `oxideav-theora` are recorded here.
   self-encoded streams (single thread, medians of back-to-back runs on
   a shared machine): 1080p inter 106 → 305 fps, 1080p intra-only
   49 → 139 fps, 720p inter 240 → 680 fps, 480p inter 517 → 1485 fps
-  (2.8–3.5×; full table in the README).
+  (2.8–3.6× across the table in the README).
 - **Decoder threading under a caller budget** — `FrameDecoder::set_threads`
   / `TheoraDecoder::with_threads` / `set_threads`, and
   `Decoder::set_execution_context`; serial by default. Reconstruction

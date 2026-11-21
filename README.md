@@ -24,7 +24,7 @@ codebooks, non-macro-block-aligned picture regions, duplicate-frame
 packets, and one-pass or two-pass target-bitrate rate control. Both
 directions take a caller-granted worker budget (serial by default)
 with output identical at every budget; round 492 made the decoder
-2.8–3.5× faster serially and the encoder 1.6–3.4× (see the throughput
+2.8–3.6× faster serially and the encoder 1.5–3.5× (see the throughput
 sections). The
 round-453 quality campaign is **measured**: −21.0 % mean BD-rate /
 +2.35 dB mean BD-PSNR over the six-sequence `rd_ladder` battery versus
@@ -906,7 +906,7 @@ is identical in every cell):
 | 1920×1080 `pan` intra-only | 49 | 139 | 170 | 192 | 193 |
 | 1920×1080 `blobs` inter | 264 | 940 | 1196 | 1412 | 1253 |
 
-Serial decode is 2.8–3.5× faster. Thread scaling is bounded by the
+Serial decode is 2.8–3.6× faster. Thread scaling is bounded by the
 serial token pass (over half of an intra frame's time once
 reconstruction is fast) and by the per-frame cost of starting workers,
 which shows as the flat or falling 8-thread column; four workers give
